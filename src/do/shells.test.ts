@@ -15,7 +15,7 @@ const DO_BINDINGS = [
 describe("DO shells", () => {
   for (const [binding, className] of DO_BINDINGS) {
     it(`${className} initializes schema and responds ok`, async () => {
-      const ns = env[binding] as DurableObjectNamespace;
+      const ns = env[binding] as unknown as DurableObjectNamespace;
       const id = ns.idFromName(`shell-test-${className}`);
       const stub = ns.get(id);
       const res = await stub.fetch(new Request("https://x/ping"));

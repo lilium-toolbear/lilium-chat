@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import type { Env } from "./env";
 import { ApiError, errorResponse } from "./errors";
 import { uuidv7 } from "./ids/uuidv7";
+import { bootstrapHandler } from "./routes/bootstrap";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -36,7 +37,7 @@ app.onError((err, c) => {
   return errorResponse(new ApiError("CHAT_WORKER_UNAVAILABLE", "worker temporarily unavailable"), requestId);
 });
 
-// Phase 0: no real routes yet. 404 for anything under /api/chat except bootstrap (Task 9) and ws (Task 10).
+app.get("/api/chat/bootstrap", (c) => bootstrapHandler(c));
 app.all("/api/chat/*", (c) => {
   throw new ApiError("CHANNEL_NOT_FOUND", "not implemented in phase 0", { httpStatus: 404 });
 });

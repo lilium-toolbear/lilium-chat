@@ -50,8 +50,9 @@ export async function resolveUserSummaries(
 
   for (let i = 0; i < unique.length; i += batchSize) {
     const batch = unique.slice(i, i + batchSize);
-    const client = opts.clientFactory ? opts.clientFactory(env.TOOLBEAR_DB.connectionString) : await defaultClientFactory(env.TOOLBEAR_DB.connectionString);
+    let client: ClientLike | null = null;
     try {
+      client = opts.clientFactory ? opts.clientFactory(env.TOOLBEAR_DB.connectionString) : await defaultClientFactory(env.TOOLBEAR_DB.connectionString);
       await client.connect();
       const res = await client.query(
         "SELECT user_id::text, full_name, avatar_url FROM users WHERE user_id = ANY($1)",
@@ -65,7 +66,7 @@ export async function resolveUserSummaries(
       // leave these ids absent; caller applies fallback
     } finally {
       try {
-        await client.end();
+        await client?.end();
       } catch {
         // ignore
       }
