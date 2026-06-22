@@ -1,0 +1,30 @@
+{
+  "name": "lilium-chat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "node ./scripts/deploy.mjs",
+    "deploy:wrangler": "wrangler deploy",
+    "test": "vitest",
+    "test:once": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "aws4fetch": "^1.0.20",
+    "hono": "^4.7.0",
+    "jose": "^6.0.0",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.16.18",
+    "@cloudflare/workers-types": "^4.20250615.0",
+    "@sentry/cli": "^3.4.2",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.103.0"
+  }
+}
