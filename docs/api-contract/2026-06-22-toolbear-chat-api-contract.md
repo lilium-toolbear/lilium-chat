@@ -49,7 +49,7 @@ Worker 验证：
 - subject 对应现有 ToolBear user UUID。
 - token type 是 browser user session。
 - machine token（带 `client_id`）拒绝。
-- delegated / managed session（`managed_session=true`，或 `owner_user_id != sub`）拒绝。
+- delegated / managed session 拒绝：`managed_session=true`，或 `owner_user_id != sub`，或 `effective_account_user_id != sub`（任一即拒）(v2 delta)。
 
 拒绝 delegated / managed session 的错误码固定为：
 
@@ -168,9 +168,9 @@ HTTP API 保留给首屏 bootstrap、历史分页、频道/成员管理、附件
 
 ### 3.1 UserSummary
 
-用户展示必须包含 display name 和 avatar。`avatar_url` 可以为 `null`，前端使用标准 fallback。
+用户展示必须包含 display name 和 avatar。`avatar_url` 可以为 `null`，前端使用标准 fallback。**`display_name` 类型为 `string`（非 null）** (v2 delta)。
 
-后端只在持久化层内保存 `user_id`。返回 `UserSummary` 前，Worker 只读 ToolBear `users` 表批量解析 `user_id` (v2 delta)。display name 不可为空（如解析不到，使用 fallback 显示名，**不展示裸 user_id 作为主身份**）。
+后端只在持久化层内保存 `user_id`。返回 `UserSummary` 前，Worker 只读 ToolBear `users` 表批量解析 `user_id` (v2 delta)。display name 不可为空（如解析不到，使用 fallback 显示名（形如 `user-<前8位>`），**不展示裸 user_id 作为主身份**）。
 
 ```json
 {
@@ -432,7 +432,7 @@ GET /api/chat/bootstrap?channel_id=00000000-0000-7000-8000-000000000201
 {
   "me": {
     "user_id": "00000000-0000-7000-8000-000000000101",
-    "display_name": null,
+    "display_name": "user-00000000",
     "avatar_url": null
   },
   "channels": [],

@@ -25,7 +25,7 @@ Copied verbatim from the design (`docs/superpowers/specs/2026-06-22-lilium-chat-
 - **Idempotency:** in-DO `idempotency_keys` table keyed `(principal_kind, principal_id, operation, idempotency_key)`, written in the same DO transaction as the business write. KV is response-cache only, never the correctness gate. Phase 0 builds the table + helper; business use starts later.
 - **CORS:** `app.use("/api/chat/*", cors({ origin: ["https://lilium.kuma.homes"], allowHeaders: ["Authorization","Content-Type","Idempotency-Key"], exposeHeaders: ["X-Request-Id"], credentials: false, maxAge: 86400 }))`. Dev adds `http://localhost:5173`.
 - **WS Origin check:** upgrade handler rejects `Origin` not in `{https://lilium.kuma.homes, http://localhost:5173}`.
-- **JWT verification rules (from `dzmm_archive/toolbear_ui/auth_utils.py`):** HS256 with `JWT_SECRET` (wrangler secret, same value game-worker uses). Reject if `client_id` present → `401 MACHINE_TOKEN_NOT_ALLOWED`. Reject if `managed_session===true` OR (`owner_user_id !== sub` AND `effective_account_user_id === sub`) → `403 SESSION_NOT_ALLOWED`. Self-session = no `client_id` + `owner_user_id == sub` + `effective_account_user_id == sub` + not managed. Library: `jose`.
+- **JWT verification rules (stricter than `dzmm_archive/toolbear_ui/auth_utils.py`; aligned to contract v2 §2.1):** HS256 with `JWT_SECRET` (wrangler secret, same value game-worker uses). Reject if `client_id` present → `401 MACHINE_TOKEN_NOT_ALLOWED`. Reject (→ `403 SESSION_NOT_ALLOWED`) if ANY of: `managed_session === true`; OR `owner_user_id !== undefined && owner_user_id !== sub`; OR `effective_account_user_id !== undefined && effective_account_user_id !== sub`. Self-session = no `client_id` + no `managed_session` + `owner_user_id` absent-or-==sub + `effective_account_user_id` absent-or-==sub. This is stricter than the Python whitelist-derived rule and covers future token shapes where `owner != sub` but `effective != sub`. Library: `jose`.
 - **request_id:** every HTTP response gets `X-Request-Id: req_<uuidv7>`; included in error envelope `request_id`. WS commands get a request_id echoed in ack/error frames.
 - **Errors:** envelope `{"error":{"code","message","retryable"},"request_id"}`. Codes from contract §11.
 - **No placeholders, no business logic beyond bootstrap:** Phase 0 ships shells + bootstrap + spikes. No messages, no members, no fanout logic, no real event emission — only the tables and generators those need later.
@@ -36,14 +36,16 @@ Copied verbatim from the design (`docs/superpowers/specs/2026-06-22-lilium-chat-
 
 ```
 lilium-chat/
-├── wrangler.jsonc                      # Worker config: routes, DO bindings, Hyperdrive, migrations
+├── wrangler.jsonc                      # Production config: routes, 8 DO bindings, Hyperdrive, migrations
+├── wrangler.test.jsonc                 # Test config: 8 DOs + SchedulerProbe (test-only); deployed nowhere
 ├── package.json                        # deps + scripts (dev/deploy/test/test:once/typecheck)
 ├── tsconfig.json
-├── vitest.config.ts                    # cloudflareTest plugin, points at wrangler.jsonc
+├── vitest.config.ts                    # cloudflareTest plugin, points at wrangler.test.jsonc
 ├── .gitignore
 ├── src/
 │   ├── index.ts                        # Hono app: CORS, request_id, routes, WS upgrade proxy
-│   ├── env.ts                          # Env interface (DO bindings, Hyperdrive, secrets, vars)
+│   ├── env.ts                          # Production Env interface (8 DO bindings, Hyperdrive, secrets, vars)
+├── test-env.ts                     # TestEnv extends Env with SCHEDULER_PROBE (test-only)
 │   ├── auth/
 │   │   ├── jwt.ts                      # verifyBrowserJwt(token, secret) → {user_id} | throws ApiError
 │   │   └── jwt.test.ts                 # unit tests: self-session + all reject cases
@@ -84,6 +86,7 @@ lilium-chat/
 │       ├── alarm-single.test.ts        # spike: single-alarm earliest-wins loop over multiple pendings
 │       ├── outbox-flush.test.ts        # spike: outbox row + alarm flush to target DO, idempotent
 │       ├── message-index-routing.test.ts # spike: /messages/{id} via MessageIndex outbox lag → ROUTE_INDEX_PENDING
+│       ├── invite-index-routing.test.ts  # spike: /invites/{code} via InviteDirectory outbox lag → ROUTE_INDEX_PENDING
 │       └── replay-after-delete.test.ts # spike: message.created replay filtered by current status
 └── scripts/
     └── deploy.mjs                      # typecheck → wrangler deploy → sentry sourcemaps
@@ -254,7 +257,7 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 export default defineConfig({
   plugins: [
     cloudflareTest({
-      wrangler: { configPath: "./wrangler.jsonc" },
+      wrangler: { configPath: "./wrangler.test.jsonc" },
       miniflare: {
         compatibilityFlags: ["nodejs_compat"],
       },
@@ -262,14 +265,11 @@ export default defineConfig({
   ],
   test: {
     include: ["test/**/*.test.ts", "src/**/*.test.ts"],
-    environmentMatchGlobs: [
-      ["test/spikes/**", "skip-in-ci"],
-    ],
   },
 });
 ```
 
-(Spike tests get a `// @skip-in-ci` guard inside them — see Task 11. The glob here is structural; the skip logic is in-file.)
+Live-resource spikes (hyperdrive, seaweedfs) are guarded in-file with `it.skipIf(!process.env.SPIKE_LIVE)`; the miniflare-only spikes run in normal CI. No `environmentMatchGlobs` needed — vitest environments are `node`/`jsdom`/etc only, and `"skip-in-ci"` is neither a valid environment nor a skip tag.
 
 - [ ] **Step 6: Install deps and generate types**
 
@@ -717,7 +717,7 @@ Verification rules (from `dzmm_archive/toolbear_ui/auth_utils.py` + Global Const
 1. `jwtVerify(token, secret, { algorithms: ["HS256"] })` — invalid signature/exp → `UNAUTHORIZED "Invalid or expired token"`.
 2. `payload.sub` missing/non-string → `UNAUTHORIZED`.
 3. `payload.client_id` present → `MACHINE_TOKEN_NOT_ALLOWED "Machine tokens are not allowed"`.
-4. managed = `payload.managed_session === true` OR (`payload.owner_user_id !== undefined` AND `payload.owner_user_id !== payload.sub` AND `payload.effective_account_user_id === payload.sub`) → `SESSION_NOT_ALLOWED "Chat requires a direct user session"`.
+4. managed/rejected = `payload.managed_session === true` OR (`payload.owner_user_id !== undefined && String(payload.owner_user_id) !== sub`) OR (`payload.effective_account_user_id !== undefined && String(payload.effective_account_user_id) !== sub`) → `SESSION_NOT_ALLOWED "Chat requires a direct user session"`.
 5. Else return `{ user_id: payload.sub }`.
 
 - [ ] **Step 1: Create `test/helpers.ts` with the JWT signer**
@@ -789,8 +789,32 @@ describe("verifyBrowserJwt", () => {
     });
   });
 
-  it("rejects delegated session (owner != sub, effective == sub) with SESSION_NOT_ALLOWED", async () => {
+  it("rejects delegated session where owner != sub, effective == sub with SESSION_NOT_ALLOWED", async () => {
     const token = await makeJwt({ sub: "u1", owner_user_id: "u-owner", effective_account_user_id: "u1" });
+    await expect(verifyBrowserJwt(token, TEST_SECRET)).rejects.toMatchObject({
+      code: "SESSION_NOT_ALLOWED",
+      httpStatus: 403,
+    });
+  });
+
+  it("rejects delegated session where owner != sub, effective != sub with SESSION_NOT_ALLOWED", async () => {
+    const token = await makeJwt({ sub: "u1", owner_user_id: "u-owner", effective_account_user_id: "u-other" });
+    await expect(verifyBrowserJwt(token, TEST_SECRET)).rejects.toMatchObject({
+      code: "SESSION_NOT_ALLOWED",
+      httpStatus: 403,
+    });
+  });
+
+  it("rejects delegated session where only effective != sub with SESSION_NOT_ALLOWED", async () => {
+    const token = await makeJwt({ sub: "u1", effective_account_user_id: "u-other" });
+    await expect(verifyBrowserJwt(token, TEST_SECRET)).rejects.toMatchObject({
+      code: "SESSION_NOT_ALLOWED",
+      httpStatus: 403,
+    });
+  });
+
+  it("rejects where only owner != sub with SESSION_NOT_ALLOWED", async () => {
+    const token = await makeJwt({ sub: "u1", owner_user_id: "u-owner" });
     await expect(verifyBrowserJwt(token, TEST_SECRET)).rejects.toMatchObject({
       code: "SESSION_NOT_ALLOWED",
       httpStatus: 403,
@@ -870,13 +894,11 @@ export async function verifyBrowserJwt(token: string, secret: string): Promise<B
     throw new ApiError("MACHINE_TOKEN_NOT_ALLOWED", "Machine tokens are not allowed");
   }
 
-  const managed =
+  const rejected =
     payload.managed_session === true ||
-    (payload.owner_user_id !== undefined &&
-      String(payload.owner_user_id) !== sub &&
-      payload.effective_account_user_id !== undefined &&
-      String(payload.effective_account_user_id) === sub);
-  if (managed) {
+    (payload.owner_user_id !== undefined && String(payload.owner_user_id) !== sub) ||
+    (payload.effective_account_user_id !== undefined && String(payload.effective_account_user_id) !== sub);
+  if (rejected) {
     throw new ApiError("SESSION_NOT_ALLOWED", "Chat requires a direct user session");
   }
 
@@ -1292,12 +1314,16 @@ This test creates a scratch DO with a `due_table` and verifies the scheduler pic
 ```ts
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
-import { SchedulerProbe } from "../../src/do/scheduler-probe";
+import type { TestEnv } from "../../src/test-env";
+
+// env from cloudflare:workers is the merged test-config env; cast to TestEnv
+// to access SCHEDULER_PROBE (test-only binding, absent from production Env).
+const tEnv = env as unknown as TestEnv;
 
 describe("per-DO scheduler", () => {
   it("processes the earliest due row and re-arms the alarm", async () => {
-    const id = env.SCHEDULER_PROBE.idFromName("t1");
-    const stub = env.SCHEDULER_PROBE.get(id);
+    const id = tEnv.SCHEDULER_PROBE.idFromName("t1");
+    const stub = tEnv.SCHEDULER_PROBE.get(id);
     // insert two due rows at t=100 and t=200, "now"=150
     const setupRes = await stub.fetch(new Request("https://x/setup", { method: "POST", body: JSON.stringify({ rows: [100, 200] }) }));
     expect(setupRes.status).toBe(200);
@@ -1309,8 +1335,8 @@ describe("per-DO scheduler", () => {
   });
 
   it("deletes the alarm when no pending rows remain", async () => {
-    const id = env.SCHEDULER_PROBE.idFromName("t2");
-    const stub = env.SCHEDULER_PROBE.get(id);
+    const id = tEnv.SCHEDULER_PROBE.idFromName("t2");
+    const stub = tEnv.SCHEDULER_PROBE.get(id);
     await stub.fetch(new Request("https://x/setup", { method: "POST", body: JSON.stringify({ rows: [] }) }));
     const runRes = await stub.fetch(new Request("https://x/run", { method: "POST", body: JSON.stringify({ now: 150 }) }));
     const runBody = await runRes.json() as { processed: number[]; nextAlarm: number | null };
@@ -1322,9 +1348,69 @@ describe("per-DO scheduler", () => {
 
 This requires a `SchedulerProbe` DO (declared in wrangler.jsonc test config / a separate `test/wrangler.jsonc` or added to main). To avoid bloating main `wrangler.jsonc`, create the probe DO as a real export in `src/do/scheduler-probe.ts` and add it to a `wrangler.test.jsonc`. Simpler approach given vitest-pool-workers reads `wrangler.jsonc`: add `SCHEDULER_PROBE` to the main `wrangler.jsonc` DO bindings and migrations for Phase 0 (it's a test-only class, removed in a later phase). I'll add it.
 
-- [ ] **Step 2: Add `SchedulerProbe` DO to `wrangler.jsonc`**
+- [ ] **Step 2: Add `SchedulerProbe` DO to a test-only config (NOT main `wrangler.jsonc`)**
 
-Modify `wrangler.jsonc` `durable_objects.bindings` to add `{ "name": "SCHEDULER_PROBE", "class_name": "SchedulerProbe" }`, and add `"SchedulerProbe"` to `new_sqlite_classes`. Create `src/do/scheduler-probe.ts` (the DO under test):
+Create `wrangler.test.jsonc` — a copy of `wrangler.jsonc` with two additions: the `SCHEDULER_PROBE` binding and `"SchedulerProbe"` in `new_sqlite_classes`. Keep the main `wrangler.jsonc` at exactly 8 business DOs. Point `vitest.config.ts` at the test config (see Task 1 Step 5 update below).
+
+`wrangler.test.jsonc`:
+```jsonc
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lilium-chat-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "API_BASE_URL": "https://lilium.kuma.homes",
+    "S3_ENDPOINT": "https://s3.kuma.homes",
+    "S3_BUCKET": "lilium-chat-attachments",
+    "S3_PUBLIC_BASE": "https://s3.kuma.homes",
+    "S3_REGION": "us-east-1"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "CHAT_CHANNEL", "class_name": "ChatChannel" },
+      { "name": "USER_DIRECTORY", "class_name": "UserDirectory" },
+      { "name": "USER_CONNECTION", "class_name": "UserConnection" },
+      { "name": "CHANNEL_DIRECTORY", "class_name": "ChannelDirectory" },
+      { "name": "MESSAGE_INDEX", "class_name": "MessageIndex" },
+      { "name": "INVITE_DIRECTORY", "class_name": "InviteDirectory" },
+      { "name": "BOT_REGISTRY", "class_name": "BotRegistry" },
+      { "name": "CHANNEL_FANOUT", "class_name": "ChannelFanout" },
+      { "name": "SCHEDULER_PROBE", "class_name": "SchedulerProbe" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "ChatChannel", "UserDirectory", "UserConnection", "ChannelDirectory",
+        "MessageIndex", "InviteDirectory", "BotRegistry", "ChannelFanout",
+        "SchedulerProbe"
+      ]
+    }
+  ]
+}
+```
+
+Then update `vitest.config.ts` (already created in Task 1 Step 5, now point it at the test config):
+```ts
+cloudflareTest({ wrangler: { configPath: "./wrangler.test.jsonc" }, miniflare: { compatibilityFlags: ["nodejs_compat"] } })
+```
+
+Create `src/test-env.ts`:
+```ts
+import type { Env } from "./env";
+import type { SchedulerProbe } from "./do/scheduler-probe";
+
+export interface TestEnv extends Env {
+  SCHEDULER_PROBE: DurableObjectNamespace<SchedulerProbe>;
+}
+```
+
+Scheduler tests cast `env` to `TestEnv` (e.g. `const tEnv = env as unknown as TestEnv; const id = tEnv.SCHEDULER_PROBE.idFromName("t1")`).
+
+Create `src/do/scheduler-probe.ts` (the DO under test):
 
 ```ts
 import { DurableObject } from "cloudflare:workers";
@@ -1393,7 +1479,14 @@ export class SchedulerProbe extends DurableObject<Env> {
 }
 ```
 
-Also update `src/env.ts` to add `SCHEDULER_PROBE: DurableObjectNamespace<SchedulerProbe>;` and the import/re-export. (This is a test-only binding but lives in the main Env for Phase 0; a later phase removes it.)
+Also update `src/env.ts` to add `SCHEDULER_PROBE: DurableObjectNamespace<SchedulerProbe>;` and the import/re-export — **but only in the test-scoped Env**. To keep `SchedulerProbe` out of the production Worker (Phase 0 boundary = 8 business DOs), do NOT add `SCHEDULER_PROBE` to the main `wrangler.jsonc` or the production `Env`. Instead:
+
+- Create `wrangler.test.jsonc` (next step) that copies the main config's 8 DO bindings and adds `SCHEDULER_PROBE`.
+- Create `src/test-env.ts` exporting `TestEnv extends Env` with the extra `SCHEDULER_PROBE` binding.
+- The scheduler test imports `TestEnv` and casts `env` to it; the production `Env` stays at 8 DOs.
+- The hibernation/alarm spikes that use `SCHEDULER_PROBE` import from `test-env.ts`.
+
+This costs one extra config file but keeps the production Deploy free of test-only DOs (the Phase 0 boundary).
 
 - [ ] **Step 3: Run test to verify it fails**
 
@@ -1469,7 +1562,7 @@ Expected: PASS (2 tests).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/do/sql.ts src/do/scheduler.ts src/do/scheduler-probe.ts src/do/scheduler.test.ts wrangler.jsonc src/env.ts
+git add src/do/sql.ts src/do/scheduler.ts src/do/scheduler-probe.ts src/do/scheduler.test.ts src/test-env.ts wrangler.test.jsonc vitest.config.ts
 git commit -m "feat(do): shared SQL + per-DO unified scheduler (earliest-wins alarm)"
 ```
 
@@ -1608,17 +1701,20 @@ const SCHEMA = [
     options_json TEXT NOT NULL, default_perm TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL, UNIQUE (bot_id, name)
   )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uniq_enabled_command_name ON commands(name) WHERE enabled = 1`,
   `CREATE TABLE IF NOT EXISTS invocations (
     invocation_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, bot_id TEXT NOT NULL,
-    invoker_user_id TEXT NOT NULL, client_invocation_id TEXT NOT NULL, options_json TEXT NOT NULL,
+    invoker_user_id TEXT NOT NULL, dedupe_principal_key TEXT NOT NULL,
+    client_invocation_id TEXT NOT NULL, options_json TEXT NOT NULL,
     status TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT, error_code TEXT,
-    UNIQUE (command_id, client_invocation_id)
+    UNIQUE (command_id, dedupe_principal_key, client_invocation_id)
   )`,
   `CREATE TABLE IF NOT EXISTS interactions (
     interaction_id TEXT PRIMARY KEY, message_id TEXT NOT NULL, component_id TEXT NOT NULL,
-    custom_id TEXT NOT NULL, actor_user_id TEXT NOT NULL, client_interaction_id TEXT NOT NULL,
+    custom_id TEXT NOT NULL, actor_user_id TEXT NOT NULL, dedupe_principal_key TEXT NOT NULL,
+    client_interaction_id TEXT NOT NULL,
     value_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
-    UNIQUE (message_id, client_interaction_id)
+    UNIQUE (message_id, dedupe_principal_key, client_interaction_id)
   )`,
   `CREATE TABLE IF NOT EXISTS invites (
     invite_code TEXT PRIMARY KEY, created_by TEXT NOT NULL, expires_at TEXT NOT NULL,
@@ -1627,7 +1723,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, channel_id TEXT NOT NULL,
     actor_kind TEXT, actor_id TEXT, actor_session_id TEXT, payload_json TEXT NOT NULL,
-    membership_version_at_event INTEGER, occurred_at TEXT NOT NULL
+    membership_version_at_event INTEGER NOT NULL DEFAULT 0, occurred_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_events_after ON events(event_id)`,
   `CREATE TABLE IF NOT EXISTS event_seq ( last_ms INTEGER NOT NULL, counter INTEGER NOT NULL )`,
@@ -1731,6 +1827,16 @@ export class UserDirectory extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/ping") return Response.json({ ok: true });
+    if (url.pathname === "/my-channels") {
+      // Phase 0: read active my_channels for the caller (empty until Phase 1 join logic).
+      // Caller identity comes from the Worker-set header (DO is not auth-verifyable itself).
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      const rows = this.ctx.storage.sql.exec(
+        "SELECT channel_id, kind, last_read_event_id FROM my_channels WHERE user_id = ? AND status = 'active'",
+        userId,
+      ).toArray() as { channel_id: string; kind: string; last_read_event_id: string | null }[];
+      return Response.json({ items: rows });
+    }
     return new Response("not found", { status: 404 });
   }
   async alarm(): Promise<void> {
@@ -1761,11 +1867,20 @@ export class UserConnection extends DurableObject<Env> {
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
     }
-    // Phase 2 fills in acceptWebSocket + subscribe + cursor replay.
+    // Identity is verified by the Worker (WS upgrade route) and forwarded here.
+    const userId = request.headers.get("X-Verified-User-Id");
+    if (!userId) return new Response("missing verified user", { status: 401 });
+    const sessionId = crypto.randomUUID();
+    const cursorsParam = url.searchParams.get("cursors") ?? "";
+    let per_channel_cursors: Record<string, string> = {};
+    if (cursorsParam) {
+      try { per_channel_cursors = JSON.parse(atob(cursorsParam)) as Record<string, string>; } catch { /* ignore malformed */ }
+    }
+    // Phase 2 fills in real subscribe + cursor replay. Phase 0 just persists identity + cursors.
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    this.ctx.acceptWebSocket(server, ["user-conn"]);
-    server.serializeAttachment({ user_id: "", session_id: "", per_channel_cursors: {} } satisfies ConnectionAttachment);
+    this.ctx.acceptWebSocket(server, ["user-conn:" + userId]);
+    server.serializeAttachment({ user_id: userId, session_id: sessionId, per_channel_cursors } satisfies ConnectionAttachment);
     return new Response(null, { status: 101, webSocket: client });
   }
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -2010,9 +2125,13 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env }>): Promise<R
   const map = await resolveUserSummaries([user_id], c.env);
   const me = map.get(user_id) ?? fallbackMe(user_id);
 
-  // Phase 0: UserDirectory has no my_channels yet → empty channels.
-  // (Real my_channels read wired in Phase 1.)
-  const channels: unknown[] = [];
+  // Phase 0: read my_channels from UserDirectory DO. The DO has no channels yet
+  // (no join logic until Phase 1), so this returns []. This still exercises the
+  // Worker→UserDirectory routing, schema init, and empty-projection read path.
+  const dirStub = c.env.USER_DIRECTORY.getByName(user_id);
+  const dirRes = await dirStub.fetch(new Request("https://internal/my-channels", { headers: { "X-Verified-User-Id": user_id } }));
+  const myChannels = (dirRes.ok ? (await dirRes.json() as { items: unknown[] }) : { items: [] }).items;
+  const channels = myChannels; // Phase 0: []
   const active_channel = null;
   const messages = { items: [], next_cursor: null };
 
@@ -2288,12 +2407,13 @@ git commit -m "feat(ws): upgrade route with subprotocol JWT + Origin check, prox
 - Create: `test/spikes/alarm-single.test.ts`
 - Create: `test/spikes/outbox-flush.test.ts`
 - Create: `test/spikes/message-index-routing.test.ts`
+- Create: `test/spikes/invite-index-routing.test.ts`
 - Create: `test/spikes/replay-after-delete.test.ts`
 - Modify: `vitest.config.ts` (tag spikes so CI skips by default; run via `npx vitest run --dir test/spikes`)
 
 **Purpose:** de-risk every platform capability Phase 1+ depends on. Each spike is a focused, real-environment check (not mocked) that fails loudly if the platform behavior we assumed is wrong. Spikes that need external resources (real Hyperdrive PG, real SeaweedFS) are guarded with `it.skipIf(!process.env.SPIKE_LIVE)` so CI passes without them; run them manually before Phase 1 with `SPIKE_LIVE=1 npx vitest run test/spikes`.
 
-The hibernation, alarm-single, outbox-flush, message-index-routing, and replay-after-delete spikes run fully in miniflare (no external deps) — they MUST pass in CI. The hyperdrive and seaweedfs spikes need live resources and are skipped without `SPIKE_LIVE=1`.
+The hibernation, alarm-single, outbox-flush, message-index-routing, invite-index-routing, and replay-after-delete spikes run fully in miniflare (no external deps) — they MUST pass in CI. The hyperdrive and seaweedfs spikes need live resources and are skipped without `SPIKE_LIVE=1`.
 
 **Interfaces:** consumes DOs + helpers from earlier tasks. Produces: green spikes = green light for Phase 1.
 
@@ -2306,25 +2426,31 @@ import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
 
 describe("spike: DO WebSocket hibernation restores attachment", () => {
-  it("survives eviction and restores serializeAttachment on wake", async () => {
+  it("persists X-Verified-User-Id into socket attachment and restores on wake", async () => {
+    const userId = "00000000-0000-7000-8000-000000000301";
     const id = env.USER_CONNECTION.idFromName("hib-1");
     const stub = env.USER_CONNECTION.get(id);
-    // open a WS via the DO's fetch upgrade
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    // drive the DO fetch with an upgrade request that carries the server side
-    // (miniflare accepts WebSocketPair server side via acceptWebSocket)
-    const res = await stub.fetch(new Request("https://x/ws", { headers: { Upgrade: "websocket" } }));
+    // Drive the DO fetch with an upgrade request carrying the Worker-verified identity.
+    // (In real flow the Worker sets this header after JWT verification.)
+    const res = await stub.fetch(new Request("https://x/ws", { headers: { Upgrade: "websocket", "X-Verified-User-Id": userId } }));
     expect(res.status).toBe(101);
-    // The DO shell stamps a default attachment; assert via runInDurableObject
-    // that getWebSockets() returns one socket whose deserializeAttachment is defined.
+    // Assert via runInDurableObject that the socket's attachment carries the verified user_id.
     const { runInDurableObject } = await import("cloudflare:test");
     await runInDurableObject(stub, async (instance, state) => {
       const sockets = state.getWebSockets();
       expect(sockets.length).toBeGreaterThanOrEqual(1);
-      const att = sockets[0].deserializeAttachment();
+      const att = sockets[0].deserializeAttachment() as { user_id: string; session_id: string; per_channel_cursors: Record<string,string> } | null;
       expect(att).toBeDefined();
+      expect(att!.user_id).toBe(userId); // identity link persisted through hibernation
+      expect(att!.session_id).toBeTruthy();
     });
+  });
+
+  it("rejects an upgrade without X-Verified-User-Id (401)", async () => {
+    const id = env.USER_CONNECTION.idFromName("hib-2");
+    const stub = env.USER_CONNECTION.get(id);
+    const res = await stub.fetch(new Request("https://x/ws", { headers: { Upgrade: "websocket" } }));
+    expect(res.status).toBe(401);
   });
 });
 ```
@@ -2447,6 +2573,46 @@ describe("spike: MessageIndex lookup → ROUTE_INDEX_PENDING before flush, resol
     const after = await idx.fetch(new Request("https://x/get?message_id=" + mid));
     const afterBody = await after.json() as { channel_id?: string };
     expect(afterBody.channel_id).toBe("ch-routing-1");
+  });
+});
+```
+
+- [ ] **Step 4b: `test/spikes/invite-index-routing.test.ts` — `/invites/{code}` via InviteDirectory, lag → ROUTE_INDEX_PENDING**
+
+Mirrors the message-index spike but for invite codes. Requires a `/get` + `/upsert` endpoint on the InviteDirectory shell (same pattern as MessageIndex). Add to `src/do/invite-directory.ts` `fetch`:
+```ts
+if (url.pathname === "/upsert") {
+  const b = await request.json() as { invite_code: string; channel_id: string; status?: string };
+  this.ctx.storage.sql.exec(
+    "INSERT OR REPLACE INTO invite_index (invite_code, channel_id, status, expires_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    b.invite_code, b.channel_id, b.status ?? "active", "2999-01-01T00:00:00Z", new Date().toISOString(),
+  );
+  return new Response("ok");
+}
+if (url.pathname === "/get") {
+  const code = url.searchParams.get("code") ?? "";
+  const row = this.ctx.storage.sql.exec("SELECT channel_id, status FROM invite_index WHERE invite_code=?", code).toArray()[0] as { channel_id: string; status: string } | undefined;
+  return Response.json(row ?? {});
+}
+```
+
+```ts
+import { describe, it, expect } from "vitest";
+import { env } from "cloudflare:workers";
+
+describe("spike: InviteDirectory lookup → ROUTE_INDEX_PENDING before flush, resolves after", () => {
+  it("invite lookup miss then hit after upsert", async () => {
+    const code = "invite-routing-1";
+    const idx = env.INVITE_DIRECTORY.getByName(code);
+    const before = await idx.fetch(new Request("https://x/get?code=" + code));
+    const beforeBody = await before.json() as { channel_id?: string };
+    expect(beforeBody.channel_id).toBeUndefined(); // not indexed → route would return ROUTE_INDEX_PENDING
+
+    await idx.fetch(new Request("https://x/upsert", { method: "POST", body: JSON.stringify({ invite_code: code, channel_id: "ch-invite-1" }) }));
+    const after = await idx.fetch(new Request("https://x/get?code=" + code));
+    const afterBody = await after.json() as { channel_id?: string; status?: string };
+    expect(afterBody.channel_id).toBe("ch-invite-1");
+    expect(afterBody.status).toBe("active");
   });
 });
 ```
@@ -2587,7 +2753,7 @@ export default defineConfig({
 
 - [ ] **Step 9: Run miniflare-only spikes (CI gate)**
 
-Run: `npx vitest run test/spikes/hibernation.test.ts test/spikes/alarm-single.test.ts test/spikes/outbox-flush.test.ts test/spikes/message-index-routing.test.ts test/spikes/replay-after-delete.test.ts`
+Run: `npx vitest run test/spikes/hibernation.test.ts test/spikes/alarm-single.test.ts test/spikes/outbox-flush.test.ts test/spikes/message-index-routing.test.ts test/spikes/invite-index-routing.test.ts test/spikes/replay-after-delete.test.ts`
 Expected: PASS for all 5.
 
 - [ ] **Step 10: Run the full suite**
@@ -2598,8 +2764,8 @@ Expected: PASS — all unit tests + miniflare spikes; hyperdrive/seaweedfs spike
 - [ ] **Step 11: Commit**
 
 ```bash
-git add test/spikes/ vitest.config.ts src/do/chat-channel.ts src/do/message-index.ts
-git commit -m "test(spikes): platform de-risk suite (hibernation/alarm/outbox/routing/replay + live-skip hyperdrive/s3)"
+git add test/spikes/ vitest.config.ts src/do/chat-channel.ts src/do/message-index.ts src/do/invite-directory.ts src/do/user-connection.ts
+git commit -m "test(spikes): platform de-risk suite (hibernation identity-link / alarm / outbox / index-routing x2 / replay + live-skip hyperdrive/s3)"
 ```
 
 ---
@@ -2644,7 +2810,7 @@ if (process.env.SENTRY_AUTH_TOKEN && process.env.SENTRY_DSN) {
 - [ ] **Step 2: Run full typecheck**
 
 Run: `npx tsc --noEmit`
-Expected: PASS with zero errors. If errors reference missing DO classes or the `SCHEDULER_PROBE` binding in `Env`, fix by ensuring `src/env.ts` imports all 9 DO classes (8 + SchedulerProbe) and `wrangler.jsonc` declares all 9 bindings.
+Expected: PASS with zero errors. If errors reference missing DO classes, fix by ensuring `src/env.ts` imports all 8 production DO classes and `wrangler.jsonc` declares exactly those 8 bindings (no `SCHEDULER_PROBE` in production `Env` — it lives only in `src/test-env.ts` + `wrangler.test.jsonc`).
 
 - [ ] **Step 3: Run full test suite**
 
