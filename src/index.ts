@@ -4,6 +4,7 @@ import type { Env } from "./env";
 import { ApiError, errorResponse } from "./errors";
 import { uuidv7 } from "./ids/uuidv7";
 import { bootstrapHandler } from "./routes/bootstrap";
+import { wsUpgradeHandler } from "./routes/ws";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -38,6 +39,7 @@ app.onError((err, c) => {
 });
 
 app.get("/api/chat/bootstrap", (c) => bootstrapHandler(c));
+app.get("/api/chat/ws", (c) => wsUpgradeHandler(c));
 app.all("/api/chat/*", (c) => {
   throw new ApiError("CHANNEL_NOT_FOUND", "not implemented in phase 0", { httpStatus: 404 });
 });
