@@ -1086,7 +1086,7 @@ per-channel cursor 改动需同步落到前端状态模型（`chatConnectionStor
 
 ## 9. API contract v2 修订（per-channel cursor）
 
-per-channel cursor 是产品方确认的 contract API 形状修订（见第 0.2 节 E）。需在 `dzmm_archive/docs/plans/` 出一份正式 contract 修订（`2026-06-22-toolbear-chat-api-contract-cursor-v2.md`），与 2026-06-21 原 contract 并存，明确 delta：
+per-channel cursor 是产品方确认的 contract API 形状修订（见第 0.2 节 E）。已落地为权威 contract v2：`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（本仓库），与 2026-06-21 原 contract（dzmm_archive）并存，明确 delta：
 
 - `GET /api/chat/bootstrap` 响应 `event_state` 改为：
 
@@ -1119,5 +1119,5 @@ per-channel cursor 是产品方确认的 contract API 形状修订（见第 0.2 
 - `message.send` 不再强制独立 `idempotency_key`（contract 6.2 原文同时传 `command_id` + `idempotency_key` + `payload.client_message_id`）。v3.1 简化：`message.send` 用 `command_id`(ack 关联) + `payload.client_message_id`(业务幂等)，`idempotency_key` 服务端缺省映射为 `client_message_id`。`command.invoke`/`interaction.submit` 仍用 `client_invocation_id`/`client_interaction_id`。
 - 新增错误码 `409 ROUTE_INDEX_PENDING`（`retryable: true`）：`/messages/{id}`、`/invites/{code}` 在索引 outbox lag 窗口内返回此码而非 `404`。
 
-该 contract 修订在本 spec 实现前由 dzmm_archive 出文档（`2026-06-22-toolbear-chat-api-contract-cursor-v2.md`，含 per-channel cursor + committed_ack + 幂等简化 + ROUTE_INDEX_PENDING delta）并与前端 `chatConnectionStore` 重构同步。后端阶段 1/2 实现按此修订形状，不实现原 contract 的单全局 cursor 与 accepted-only ack。
+权威 contract v2 已落本仓库 `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（含 per-channel cursor + committed_ack + 幂等简化 + ROUTE_INDEX_PENDING + 风险登记 delta）。前端开工前须按此 v2 contract 接入，并与前端 `chatConnectionStore` 重构同步（`last_event_id` → per-channel map）。后端阶段 1/2 实现按 v2 contract 形状，不实现原 2026-06-21 contract 的单全局 cursor 与 accepted-only ack。
 
