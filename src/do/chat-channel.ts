@@ -130,6 +130,40 @@ export class ChatChannel extends DurableObject<Env> {
     const url = new URL(request.url);
     if (url.pathname === "/ping") return Response.json({ ok: true });
 
+    if (url.pathname === "/outbox-insert") {
+      const b = (await request.json()) as {
+        outbox_id: string;
+        target_key: string;
+        payload: Record<string, unknown>;
+      };
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at) VALUES (?, 'message_index', ?, '', ?, 'pending', ?, ?, ?)",
+        b.outbox_id,
+        b.target_key,
+        JSON.stringify(b.payload),
+        new Date().toISOString(),
+        new Date().toISOString(),
+        new Date().toISOString(),
+      );
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/outbox-flush") {
+      const rows = this.ctx.storage.sql.exec(
+        "SELECT outbox_id, target_key, payload_json FROM projection_outbox WHERE status='pending'",
+      ).toArray() as Array<{ outbox_id: string; target_key: string; payload_json: string }>;
+      for (const r of rows) {
+        const target = this.env.MESSAGE_INDEX.getByName(r.target_key);
+        await target.fetch(new Request("https://x/upsert", { method: "POST", body: r.payload_json }));
+        this.ctx.storage.sql.exec(
+          "UPDATE projection_outbox SET status='delivered', updated_at=? WHERE outbox_id=?",
+          new Date().toISOString(),
+          r.outbox_id,
+        );
+      }
+      return new Response("ok");
+    }
+
     if (url.pathname === "/next-event-id") {
       const count = Math.max(0, Number(url.searchParams.get("count") ?? "1"));
       const ms = Number(url.searchParams.get("ms") ?? String(Date.now()));
@@ -141,6 +175,60 @@ export class ChatChannel extends DurableObject<Env> {
         }
       });
       return Response.json({ ids });
+    }
+
+    if (url.pathname === "/spike-create") {
+      const b = (await request.json()) as { message_id: string; event_id: string; text: string };
+      const now = new Date().toISOString();
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO messages (message_id, client_message_id, dedupe_principal_key, channel_id, sender_kind, type, status, text, created_at, updated_at) VALUES (?, 'c', 'user:x', 'replay-1', 'user', 'text', 'normal', ?, ?, ?)",
+        b.message_id,
+        b.text,
+        now,
+        now,
+      );
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO events (event_id, event_type, channel_id, payload_json, occurred_at) VALUES (?, 'message.created', 'replay-1', ?, ?)",
+        b.event_id,
+        JSON.stringify({ message_id: b.message_id, text: b.text }),
+        now,
+      );
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/spike-delete") {
+      const b = (await request.json()) as { message_id: string };
+      const now = new Date().toISOString();
+      this.ctx.storage.sql.exec("UPDATE messages SET status='deleted', deleted_at=? WHERE message_id=?", now, b.message_id);
+      this.ctx.storage.sql.exec(
+        "INSERT INTO events (event_id, event_type, channel_id, payload_json, occurred_at) VALUES (?, 'message.deleted', 'replay-1', ?, ?)",
+        "e-r-del",
+        JSON.stringify({ message_id: b.message_id, status: "deleted" }),
+        now,
+      );
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/spike-replay") {
+      const after = url.searchParams.get("after") ?? "";
+      const rows = this.ctx.storage.sql.exec(
+        "SELECT event_id, event_type, payload_json FROM events WHERE event_id > ? ORDER BY event_id",
+        after,
+      ).toArray() as Array<{ event_id: string; event_type: string; payload_json: string }>;
+      const out: Array<{ event_id: string; event_type: string }> = [];
+      for (const r of rows) {
+        if (r.event_type === "message.created") {
+          const p = JSON.parse(r.payload_json) as { message_id: string };
+          const statusRow = this.ctx.storage.sql.exec("SELECT status FROM messages WHERE message_id=?", p.message_id).toArray()[0] as
+            | { status: string }
+            | undefined;
+          if (statusRow && (statusRow.status === "deleted" || statusRow.status === "recalled")) {
+            continue;
+          }
+        }
+        out.push({ event_id: r.event_id, event_type: r.event_type });
+      }
+      return Response.json({ events: out });
     }
 
     return new Response("not found", { status: 404 });

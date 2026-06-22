@@ -21,9 +21,10 @@ export class MessageIndex extends DurableObject<Env> {
 
     if (request.method === "POST" && url.pathname === "/upsert") {
       const body = (await request.json()) as { message_id?: string; channel_id?: string };
+      const messageId = body.message_id ?? "";
       this.ctx.storage.sql.exec(
         "INSERT OR REPLACE INTO message_index (message_id, channel_id, created_at) VALUES (?, ?, ?)",
-        body.message_id ?? "",
+        messageId,
         body.channel_id ?? "",
         new Date().toISOString(),
       );
