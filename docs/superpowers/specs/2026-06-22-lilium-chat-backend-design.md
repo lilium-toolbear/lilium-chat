@@ -219,7 +219,7 @@ CREATE TABLE messages (
   client_message_id TEXT NOT NULL,
   dedupe_principal_key TEXT NOT NULL,        -- v3.2: user:<uid> | bot:<bot_id> | system:<...>,幂等命名空间化
   channel_id        TEXT NOT NULL,
-  sender_kind       TEXT NOT NULL,           -- user | bot
+  sender_kind       TEXT NOT NULL,           -- user | bot | system
   sender_user_id    TEXT,
   sender_bot_id     TEXT,
   type              TEXT NOT NULL,           -- text | image | system

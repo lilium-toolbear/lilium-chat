@@ -1354,6 +1354,8 @@ Create `wrangler.test.jsonc` — a copy of `wrangler.jsonc` with two additions: 
 
 `wrangler.test.jsonc`:
 ```jsonc
+// wrangler.test.jsonc — full copy of wrangler.jsonc (prod: 8 DOs + Hyperdrive + vars
+// + compat flags) PLUS the test-only SchedulerProbe. Deployed nowhere; used only by vitest.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "lilium-chat-test",
@@ -1365,7 +1367,8 @@ Create `wrangler.test.jsonc` — a copy of `wrangler.jsonc` with two additions: 
     "S3_ENDPOINT": "https://s3.kuma.homes",
     "S3_BUCKET": "lilium-chat-attachments",
     "S3_PUBLIC_BASE": "https://s3.kuma.homes",
-    "S3_REGION": "us-east-1"
+    "S3_REGION": "us-east-1",
+    "SENTRY_ENVIRONMENT": "test"
   },
   "durable_objects": {
     "bindings": [
@@ -1380,6 +1383,9 @@ Create `wrangler.test.jsonc` — a copy of `wrangler.jsonc` with two additions: 
       { "name": "SCHEDULER_PROBE", "class_name": "SchedulerProbe" }
     ]
   },
+  "hyperdrive": [
+    { "binding": "TOOLBEAR_DB", "id": "<hyperdrive-config-id>", "localConnectionString": "postgres://readonly_user:password@localhost:5432/toolbear" }
+  ],
   "migrations": [
     {
       "tag": "v1",
@@ -1392,6 +1398,8 @@ Create `wrangler.test.jsonc` — a copy of `wrangler.jsonc` with two additions: 
   ]
 }
 ```
+
+(The Hyperdrive binding must be present here so the live hyperdrive spike — and the bootstrap test's `resolveUserSummaries` path — see `env.TOOLBEAR_DB`. Keep the same `id` as production, or a separate test Hyperdrive config; `localConnectionString` makes `wrangler dev`/vitest use a local PG.)
 
 Then update `vitest.config.ts` (already created in Task 1 Step 5, now point it at the test config):
 ```ts
@@ -1658,7 +1666,8 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS messages (
     message_id TEXT PRIMARY KEY, client_message_id TEXT NOT NULL,
     dedupe_principal_key TEXT NOT NULL, channel_id TEXT NOT NULL,
-    sender_kind TEXT NOT NULL, sender_user_id TEXT, sender_bot_id TEXT,
+    sender_kind TEXT NOT NULL, -- user | bot | system
+    sender_user_id TEXT, sender_bot_id TEXT,
     type TEXT NOT NULL, format TEXT NOT NULL DEFAULT 'plain',
     status TEXT NOT NULL DEFAULT 'normal', text TEXT, reply_to TEXT,
     reply_snapshot_json TEXT, stream_state TEXT NOT NULL DEFAULT 'none',
@@ -1726,7 +1735,8 @@ const SCHEMA = [
     membership_version_at_event INTEGER NOT NULL DEFAULT 0, occurred_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_events_after ON events(event_id)`,
-  `CREATE TABLE IF NOT EXISTS event_seq ( last_ms INTEGER NOT NULL, counter INTEGER NOT NULL )`,
+  `CREATE TABLE IF NOT EXISTS event_seq ( id INTEGER PRIMARY KEY CHECK (id = 1), last_ms INTEGER NOT NULL, counter INTEGER NOT NULL )`,
+  `INSERT OR IGNORE INTO event_seq (id, last_ms, counter) VALUES (1, 0, 0)`,
   `CREATE TABLE IF NOT EXISTS idempotency_keys (
     principal_kind TEXT NOT NULL, principal_id TEXT NOT NULL, operation TEXT NOT NULL,
     idempotency_key TEXT NOT NULL, request_hash TEXT NOT NULL, response_json TEXT,
@@ -1756,10 +1766,10 @@ export class ChatChannel extends DurableObject<Env> {
 
   /** Allocate a per-channel monotonic event_id. Persists event_seq in the same txn as the caller. */
   nextEventId(nowMs: number = Date.now()): string {
-    const row = this.ctx.storage.sql.exec("SELECT last_ms, counter FROM event_seq").toArray()[0] as { last_ms: number; counter: number } | undefined;
+    const row = this.ctx.storage.sql.exec("SELECT last_ms, counter FROM event_seq WHERE id=1").toArray()[0] as { last_ms: number; counter: number } | undefined;
     const seq: EventSeq = row ?? { last_ms: 0, counter: 0 };
     const { id, seq: next } = monotonicUuidV7(seq, nowMs);
-    this.ctx.storage.sql.exec("UPDATE event_seq SET last_ms=?, counter=? OR REPLACE", next.last_ms, next.counter);
+    this.ctx.storage.sql.exec("UPDATE event_seq SET last_ms=?, counter=? WHERE id=1", next.last_ms, next.counter);
     return id;
   }
 
@@ -1785,14 +1795,6 @@ export class ChatChannel extends DurableObject<Env> {
 }
 ```
 
-Note: the `UPDATE ... OR REPLACE` on a single-row `event_seq` table is awkward; if `event_seq` has no PK the row may not exist on first call. Simpler: seed it in the constructor with `INSERT OR IGNORE INTO event_seq (last_ms, counter) VALUES (0, 0)`, then `nextEventId` does `UPDATE event_seq SET last_ms=?, counter=?`. Adjust: add to SCHEMA a seed-less approach — actually give `event_seq` no PK and rely on the `?? {last_ms:0,counter:0}` default + an `INSERT OR REPLACE`. Cleanest: make `event_seq` a single-row table with a fixed id:
-
-Replace the `event_seq` schema line with:
-```sql
-`CREATE TABLE IF NOT EXISTS event_seq ( id INTEGER PRIMARY KEY CHECK (id = 1), last_ms INTEGER NOT NULL, counter INTEGER NOT NULL )`,
-`INSERT OR IGNORE INTO event_seq (id, last_ms, counter) VALUES (1, 0, 0)`,
-```
-And `nextEventId` does `this.ctx.storage.sql.exec("UPDATE event_seq SET last_ms=?, counter=? WHERE id=1", next.last_ms, next.counter);`. Update the code above accordingly before running tests.
 
 - [ ] **Step 4: Implement `src/do/user-directory.ts`**
 
@@ -1874,7 +1876,11 @@ export class UserConnection extends DurableObject<Env> {
     const cursorsParam = url.searchParams.get("cursors") ?? "";
     let per_channel_cursors: Record<string, string> = {};
     if (cursorsParam) {
-      try { per_channel_cursors = JSON.parse(atob(cursorsParam)) as Record<string, string>; } catch { /* ignore malformed */ }
+      try {
+        // contract specifies base64url (not standard base64); normalize then decode.
+        const b64 = cursorsParam.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (cursorsParam.length % 4)) % 4);
+        per_channel_cursors = JSON.parse(atob(b64)) as Record<string, string>;
+      } catch { /* ignore malformed */ }
     }
     // Phase 2 fills in real subscribe + cursor replay. Phase 0 just persists identity + cursors.
     const pair = new WebSocketPair();
@@ -2460,11 +2466,15 @@ describe("spike: DO WebSocket hibernation restores attachment", () => {
 ```ts
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
+import type { TestEnv } from "../../src/test-env";
+
+// SCHEDULER_PROBE is test-only (absent from production Env); cast to TestEnv.
+const tEnv = env as unknown as TestEnv;
 
 describe("spike: single alarm earliest-wins over multiple pendings", () => {
   it("setAlarm is last-write-wins; scheduler keeps earliest due", async () => {
-    const id = env.SCHEDULER_PROBE.idFromName("alarm-1");
-    const stub = env.SCHEDULER_PROBE.get(id);
+    const id = tEnv.SCHEDULER_PROBE.idFromName("alarm-1");
+    const stub = tEnv.SCHEDULER_PROBE.get(id);
     // insert due rows at 100, 50, 300 — earliest is 50
     await stub.fetch(new Request("https://x/setup", { method: "POST", body: JSON.stringify({ rows: [100, 50, 300] }) }));
     const runRes = await stub.fetch(new Request("https://x/run", { method: "POST", body: JSON.stringify({ now: 75 }) }));
@@ -2740,7 +2750,7 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 export default defineConfig({
   plugins: [
     cloudflareTest({
-      wrangler: { configPath: "./wrangler.jsonc" },
+      wrangler: { configPath: "./wrangler.test.jsonc" },
       miniflare: { compatibilityFlags: ["nodejs_compat"] },
     }),
   ],
@@ -2754,7 +2764,7 @@ export default defineConfig({
 - [ ] **Step 9: Run miniflare-only spikes (CI gate)**
 
 Run: `npx vitest run test/spikes/hibernation.test.ts test/spikes/alarm-single.test.ts test/spikes/outbox-flush.test.ts test/spikes/message-index-routing.test.ts test/spikes/invite-index-routing.test.ts test/spikes/replay-after-delete.test.ts`
-Expected: PASS for all 5.
+Expected: PASS for all 6.
 
 - [ ] **Step 10: Run the full suite**
 
@@ -2815,7 +2825,7 @@ Expected: PASS with zero errors. If errors reference missing DO classes, fix by 
 - [ ] **Step 3: Run full test suite**
 
 Run: `npx vitest run`
-Expected: PASS — all `src/**/*.test.ts` + `test/**/*.test.ts` (spikes: 5 miniflare ones pass, 2 live ones skipped).
+Expected: PASS — all `src/**/*.test.ts` + `test/**/*.test.ts` (spikes: 6 miniflare ones pass, 2 live ones skipped).
 
 - [ ] **Step 4: Local dev smoke**
 
@@ -2832,7 +2842,7 @@ Expected: `200` with `{ me, channels: [], active_channel: null, messages: {...},
 - [ ] **Step 5: Dry-run deploy (do NOT actually deploy to chat.kuma.homes in this task — operator does that with secrets set)**
 
 Run: `npx wrangler deploy --dry-run`
-Expected: success, lists the 8+1 DO bindings, Hyperdrive binding, routes. No actual deployment.
+Expected: success, lists exactly 8 production DO bindings (no SCHEDULER_PROBE — it lives only in wrangler.test.jsonc), the Hyperdrive binding, and routes. No actual deployment.
 
 - [ ] **Step 6: Commit**
 
