@@ -42,3 +42,4 @@ app.all("/api/chat/*", (c) => {
 });
 
 export default app;
+export { SchedulerProbe } from "./do/scheduler-probe";
