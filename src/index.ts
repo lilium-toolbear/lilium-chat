@@ -1,0 +1,44 @@
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import type { Env } from "./env";
+import { ApiError, errorResponse } from "./errors";
+import { uuidv7 } from "./ids/uuidv7";
+
+const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
+
+app.use(
+  "/api/chat/*",
+  cors({
+    origin: ["https://lilium.kuma.homes", "http://localhost:5173"],
+    allowMethods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
+    allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key"],
+    exposeHeaders: ["X-Request-Id"],
+    credentials: false,
+    maxAge: 86400,
+  }),
+);
+
+// request_id middleware: assign req_<uuidv7> if absent, attach to context, set response header
+app.use("/api/chat/*", async (c, next) => {
+  const requestId = c.req.header("X-Request-Id") ?? `req_${uuidv7()}`;
+  c.set("requestId", requestId);
+  c.header("X-Request-Id", requestId);
+  await next();
+});
+
+// Error handler: ApiError → contract envelope; unknown → CHAT_WORKER_UNAVAILABLE
+app.onError((err, c) => {
+  const requestId = (c.get("requestId") as string | undefined) ?? `req_${uuidv7()}`;
+  if (err instanceof ApiError) {
+    return errorResponse(err, requestId);
+  }
+  console.error("unhandled error", { requestId, error: String(err) });
+  return errorResponse(new ApiError("CHAT_WORKER_UNAVAILABLE", "worker temporarily unavailable"), requestId);
+});
+
+// Phase 0: no real routes yet. 404 for anything under /api/chat except bootstrap (Task 9) and ws (Task 10).
+app.all("/api/chat/*", (c) => {
+  throw new ApiError("CHANNEL_NOT_FOUND", "not implemented in phase 0", { httpStatus: 404 });
+});
+
+export default app;
