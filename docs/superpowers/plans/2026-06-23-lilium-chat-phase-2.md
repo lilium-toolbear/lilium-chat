@@ -15,20 +15,25 @@
 - **No cross-DO transactions exist.** Source DO writes business + `projection_outbox` row co-atomically; alarm flushes to target DO; target writes are idempotent; exhausted retries → `dead_letter`. Do NOT invent 2PC.
 - **Single alarm per DO, earliest-wins.** Use the existing `scheduleOutboxAlarm(nowIso)` / `bumpOutboxRetry` pattern on `ChatChannel`. Add an analogous scheduler to `ChannelFanout` for its `fanout_queue`. Never call `setAlarm` blindly last-write-wins.
 - **Per-channel monotonic UUIDv7 `event_id`.** Use the existing `ChatChannel.nextEventId(nowMs)` / `monotonicUuidV7`. Client dedups per-channel by string lexicographic order. No global cursor.
-- **WebSocket command idempotency = `client_message_id` namespaced by `dedupe_principal_key`.** `message.send` only requires `client_message_id`; server maps `idempotency_key` (absent) to `client_message_id`. The `UNIQUE(channel_id, dedupe_principal_key, client_message_id)` already exists on `messages`. Do NOT add a separate mandatory `idempotency_key`.
+- **WebSocket command idempotency = `idempotency_keys` keyed by `client_message_id` (namespaced by user).** `message.send` only requires `client_message_id`; the server writes an `idempotency_keys` row `(principal_kind='user', principal_id=userId, operation='message.send', idempotency_key=client_message_id)` with a `request_hash` of the mutable body, co-atomic with the message insert. Same key+body → cached response; same key+different body → `409 IDEMPOTENCY_CONFLICT`. The `messages UNIQUE(channel_id, dedupe_principal_key, client_message_id)` is the secondary guard. Do NOT add a separate mandatory `idempotency_key` field to the command.
+- **Phase 2 is text-only.** `message.send` accepts ONLY `type:"text"`, `reply_to_message_id===null`, `attachment_ids.length===0`. image (Phase 5) and reply (Phase 4) are rejected with `INVALID_MESSAGE` so no incomplete rows are persisted.
 - **Worker never holds WS state.** No in-Worker connection set, no ack, no fanout. WS lives in the `UserConnection` DO. Worker only validates + proxies.
-- **Event payloads store actor references, NOT UserSummary.** `events.payload_json` stores `sender_user_id` / `actor_kind`+`actor_id`; UserSummary is resolved at output time by `resolveUserSummaries` (existing). Bot actor is the only exception (chat-owned), deferred to Phase 7.
+- **Persisted event payloads store actor references; the WIRE projection resolves UserSummary.** `events.payload_json` stores `sender_user_id` / `actor_kind`+`actor_id` (a ref). The live broadcast frame (in the `channel_fanout` outbox) and the replay output both run `resolveSenderForLiveBroadcast` → `resolveUserSummaries` so the client receives `sender.user.{display_name, avatar_url}`, never a bare user_id. Bot actor resolution is deferred to Phase 7 (passthrough ref). Hyperdrive IS on the broadcast + replay paths — this is spec-required (design §3.5), not deferred.
+- **Sender self-receive must not depend on connect-time registration timing.** `UserConnection.webSocketMessage` calls `ensureSubscribed(channel_id)` synchronously before routing `message.send`, so a client that sends immediately on `open` still gets its own `message.created`. The `waitUntil(registerOnlineOnConnect)` is a best-effort bulk register + replay, not a correctness dependency.
+- **Deliver gate is two-layer (design §3.3).** `member.left` writes a `channel_fanout` `unregister-user` outbox row (flush drops the session), AND `UserConnection /deliver` compares `event.membership_version_at_event` to the subscription snapshot — if the event version exceeds the subscription version, it re-checks active membership in ChatChannel and drops the event if the user is no longer a member. This catches the race where leave committed but the unregister outbox hasn't flushed.
+- **Outbox helpers that run inside a transaction MUST be synchronous.** `insertOutboxRowForFanout` is `void` (not `async`); a `sql.exec` failure throws and rolls back the message + event writes. Never write a fanout/message_index outbox row with an un-awaited `async` helper inside `ctx.storage.transaction` — that swallows insert failures and drops real-time events.
 - **Git identity is `kuma`.** `git -c user.name=kuma -c user.email=kuma@kuma.homes commit ...` if not already configured globally. **Do NOT push or deploy.** Implementation only; operator deploys.
 - **Test config:** `vitest run` (alias `npm run test:once`). Typecheck: `npm run typecheck` (`tsc --noEmit`). Tests use `env` from `cloudflare:workers`, `runInDurableObject` from `cloudflare:test`, and `getNamedDo`/`makeJwt`/`TEST_SECRET` from `test/helpers.ts`. The prod `getByName` mapping does not exist in tests — tests use `idFromName` via `getNamedDo`.
-- **Existing endpoints are stable.** `ChatChannel` keeps all `/internal/*`, `/spike-*`, `/outbox-*` routes and its `alarm()`. Phase 2 ADDS `/internal/message-send` and a `channel_fanout` outbox target kind; it does NOT rewrite existing handlers.
+- **Existing endpoints are stable.** `ChatChannel` keeps all `/internal/*`, `/spike-*`, `/outbox-*` routes and its `alarm()`. Phase 2 ADDS `/internal/message-send` + `/internal/replay` + a `channel_fanout` outbox target kind + rewrites `/internal/test-leave` to use the shared `markMemberLeftAndEnqueueFanoutUnregister` (co-atomic leave + unregister outbox). It does NOT otherwise rewrite existing handlers.
+- **No rate limiting or observability in Phase 2.** Design §6.7/§6.8 are out of scope. Phase 2 is NOT production-ready; do not open to real clients without rate limiting. The `rate_buckets` table is unused.
 
 ---
 
 ## File Structure
 
 **Create:**
-- `src/chat/command.ts` — pure helpers: `parseMessageSendCommand(frame, senderUserId)` → validated `{ client_message_id, type, text, ... } | ValidationError`; builds `dedupe_principal_key` (`user:<uid>`). No DO access. Unit-tested in isolation.
-- `src/chat/event-broadcast.ts` — pure builder: `buildEventFrame({ event_id, type, channel_id, occurred_at, payload })` → `EventFrame` (contract §10.4 shape). Also `buildMessageCreatedPayload(rawMessage)` (projection without UserSummary; sender ref only). Unit-tested.
+- `src/chat/command.ts` — pure helpers: `parseMessageSendCommand(frame, senderUserId)` → validated `{ client_message_id, type:"text", text, reply_to:null, attachment_ids:[], mentions } | ValidationError`. **Phase 2 rejects `type!=text`, `reply_to_message_id`, non-empty `attachment_ids`.** Builds `dedupe_principal_key` (`user:<uid>`). No DO access. Unit-tested in isolation.
+- `src/chat/event-broadcast.ts` — `buildEventFrame` (contract §10.4 envelope), `buildMessageCreatedPayload` (PERSISTED payload, sender as ref), and `resolveSenderForLiveBroadcast(payload, resolveUserSummaries)` (WIRE projection: replaces sender ref with resolved `{kind:'user', user: UserSummary}`, fallback `user-<shortid>`). Unit-tested with an injected resolver (no Hyperdrive in the unit test).
 - `test/chat/command.test.ts` — unit tests for `parseMessageSendCommand`.
 - `test/chat/event-broadcast.test.ts` — unit tests for `buildEventFrame` / `buildMessageCreatedPayload`.
 - `src/do/fanout-scheduler.ts` — extracted reusable scheduler helpers for the `ChannelFanout` `fanout_queue` (mirrors `ChatChannel`'s outbox scheduler): `scheduleFanoutAlarm(ctx, nowIso)`, `bumpFanoutRetry(ctx, row, nowIso, error)`. Pure functions taking `ctx` + SQL.
@@ -38,9 +43,9 @@
 - `test/integration/message-send.test.ts` — end-to-end: WS upgrade → `message.send` → `committed_ack` → `message.created` event to self.
 
 **Modify:**
-- `src/do/chat-channel.ts` — add `/internal/message-send` endpoint (transaction: dedupe check + insert message + insert `message.created` event + insert `channel_fanout` outbox row + insert `message_index` outbox row; return `{ message_id, event_id, raw }`). Extend `alarm()` to also flush `target_kind='channel_fanout'` rows (besides the existing `user_directory`).
-- `src/do/channel-fanout.ts` — implement `/register-online`, `/unregister-online`, `/fanout-enqueue` (write `fanout_events` + expand `fanout_queue` per online session), `/unregister-user` (member.left: drop sessions + queue), `alarm()` (flush `fanout_queue` to `UserConnection.deliver`), and a `/dump` test helper. Add `target_user_id` column to `fanout_queue` (needed to route deliver by user_id).
-- `src/do/user-connection.ts` — fill `webSocketMessage` (parse + route `message.send` to ChatChannel, send `committed_ack`/`command_error`), `webSocketClose`/`webSocketError` (unregister all this session's channels from ChannelFanout), and add a `/deliver` HTTP endpoint (called by ChannelFanout: send event frame + advance cursor in attachment). Add `registerOnlineOnConnect` invoked from `fetch` upgrade path. Add `fanout_events`/`fanout_queue` scheduling using `fanout-scheduler.ts`.
+- `src/do/chat-channel.ts` — add `/internal/message-send` (transaction: membership check + `idempotency_keys` conflict/cached-response + insert message + insert `message.created` event [persisted ref payload] + insert `channel_fanout` outbox row [sender-resolved live frame] + insert `message_index` outbox row; return `{ message_id, event_id }`) and `/internal/replay` (status-filtered, sender-resolved at read time). Add synchronous `insertOutboxRowForFanout` helper. Add shared `markMemberLeftAndEnqueueFanoutUnregister` (co-atomic `UPDATE members` + membership_version bump + `channel_fanout` unregister outbox). Extend `alarm()` to flush `channel_fanout` (action-dispatched: `fanout` vs `unregister-user`) and `message_index` rows. Rewrite `/internal/test-leave` to call the shared method.
+- `src/do/channel-fanout.ts` — implement `/register-online`, `/unregister-online`, `/fanout-enqueue` (write `fanout_events` + expand `fanout_queue` per online session, idempotent on `event_id`), `/unregister-user` (member.left: drop sessions + fail pending queue), `alarm()` (flush `fanout_queue` to `UserConnection /deliver` passing `membership_version_at_event`), and a `/dump` test helper. Add `target_user_id` column to `fanout_queue` (needed to route deliver by user_id).
+- `src/do/user-connection.ts` — fill `webSocketMessage` (parse + `ensureSubscribed(channel_id)` synchronously, THEN route `message.send` to ChatChannel, send `committed_ack`/`command_error`), `webSocketClose`/`webSocketError` (unregister all this session's channels from ChannelFanout), and add a `/deliver` HTTP endpoint (membership_version gate → send event frame + advance cursor in attachment). Attachment stores `subscribed_channels: Record<channel_id, membership_version>`. `registerOnlineOnConnect` runs in `waitUntil` (bulk register + replay).
 - `src/routes/events.ts` — NEW route handler for `GET /api/chat/events` (single-channel `channel_id`+`after_event_id`, and multi-channel `cursors`). Registered in `src/index.ts`.
 - `src/index.ts` — register `app.get("/api/chat/events", eventsHandler)`.
 - `test/types/miniflare-spikes.d.ts` — (no change expected; only if a new cloudflare:test helper is needed — none anticipated).
@@ -85,14 +90,15 @@ Expected: a short SHA (was `a7d4cb0` at Phase 1 close). Note it; subsequent task
 - Test: `test/chat/event-broadcast.test.ts`
 
 **Interfaces:**
-- Consumes: `CommandFrame` from `src/ws/frames.ts`; `EventFrame` from `src/ws/frames.ts`.
+- Consumes: `CommandFrame` from `src/ws/frames.ts`; `EventFrame` from `src/ws/frames.ts`; `resolveUserSummaries` from `src/profile/resolve.ts` (only used by the live-broadcast resolver, injected for testability).
 - Produces:
-  - `parseMessageSendCommand(frame: CommandFrame, senderUserId: string): { ok: true; command: ParsedMessageSend } | { ok: false; error: { code: string; message: string; retryable: boolean } }` where `ParsedMessageSend = { client_message_id: string; type: "text"; text: string; reply_to: string | null; attachment_ids: string[]; mentions: Array<{ user_id: string; start: number; end: number }> }`.
+  - `parseMessageSendCommand(frame: CommandFrame, senderUserId: string): { ok: true; command: ParsedMessageSend } | { ok: false; error: { code: string; message: string; retryable: boolean } }` where `ParsedMessageSend = { client_message_id: string; type: "text"; text: string; reply_to: string | null; attachment_ids: string[]; mentions: Array<{ user_id: string; start: number; end: number }> }`. **Phase 2 accepts ONLY `type:"text"` with `reply_to===null` and `attachment_ids.length===0`**; image (Phase 5) and reply (Phase 4) are rejected with `INVALID_MESSAGE` so we never persist incomplete rows.
   - `dedupePrincipalKeyForUser(userId: string): string` → `"user:" + userId`.
   - `buildEventFrame(args: { event_id: string; type: string; channel_id: string; occurred_at: string; payload: Record<string, unknown> }): EventFrame`.
-  - `buildMessageCreatedPayload(raw: { message_id: string; client_message_id: string; channel_id: string; sender_kind: string; sender_user_id: string | null; sender_bot_id: string | null; status: string; created_at: string; type: string; format: string; text: string | null }): Record<string, unknown>` → contract §6.2 `message.created` payload `{ message: { message_id, client_message_id, status, created_at } }` (projection WITHOUT UserSummary — sender stays as `{ kind, user_id, bot_id }` reference; full ContractMessage with resolved user is a Phase-later concern for the live event, but per spec §3.5 the event payload itself does not persist UserSummary). For Phase 2 we include the minimal contract message fields shown in §6.2's broadcast example plus `sender` ref and `type`/`text` so the timeline can render; we do NOT call `attachSummaries` in the event frame (it would require Hyperdrive in the broadcast path — deferred; the committed_ack + event carries `message_id` for the client to bind locally).
+  - `buildMessageCreatedPayload(raw: ...): Record<string, unknown>` → the **persisted** `message.created` payload. Sender is a REFERENCE `{ kind, user_id, bot_id }` — NOT a UserSummary (design §3.5: `events.payload_json` stores actor refs). This is what gets written to `events.payload_json` and what `/internal/replay` reads back.
+  - `resolveSenderForLiveBroadcast(payload, resolveUserSummaries): Promise<Record<string, unknown>>` → takes the persisted payload and returns a NEW payload where `sender` is replaced by `{ kind:'user', user: UserSummary }` (or `{ kind:'bot', bot_id }` passthrough until Phase 7). This is the **live wire** projection. Falls back to `user-<shortid>` display_name when pg has no row. `resolveUserSummaries` is injected so the module is unit-testable without Hyperdrive.
 
-  > **Rationale (record in a comment in `event-broadcast.ts`):** Contract §6.2's broadcast example shows `payload.message` with `{ message_id, client_message_id, status, created_at }`. The design spec §3.5 says event payload stores actor refs, not UserSummary. For Phase 2 we follow the contract example literally — the event carries the lightweight message projection (id + status + timestamps + sender ref + type + text) so the client can render immediately from the event without a round trip; UserSummary resolution for the sender display name is the client's concern (it has the sender's summary from bootstrap/members). This matches the contract example and avoids Hyperdrive in the hot broadcast path.
+  > **Rationale (record in a comment in `event-broadcast.ts`):** Design spec §3.5 distinguishes the *persisted* payload (actor refs only, no UserSummary — keeps profile out of the event log) from the *live broadcast* projection (UserSummary resolved at output time by UserConnection/Worker). Phase 2 honors both: `events.payload_json` stores `buildMessageCreatedPayload` (ref); the `channel_fanout` outbox carries a frame built from `resolveSenderForLiveBroadcast(...)` so the wire event the client receives already has `sender.user.display_name`/`avatar_url`. Replay (`/internal/replay` + `GET /events`) re-resolves the sender at read time (see Task 4/6) so historical events also show display names, not bare ids. This puts Hyperdrive on the broadcast + replay paths, which the spec explicitly requires; it is NOT deferred.
 
 - [ ] **Step 1: Write failing test for `parseMessageSendCommand` valid input**
 
@@ -167,12 +173,31 @@ describe("parseMessageSendCommand", () => {
     if (!r.ok) expect(r.error.code).toBe("CHANNEL_NOT_FOUND");
   });
 
-  it("allows image type with empty text", () => {
+  it("rejects image type (Phase 2 is text-only; images are Phase 5)", () => {
     const r = parseMessageSendCommand(
       { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { client_message_id: "cm-1", type: "image", text: "", attachment_ids: ["a-1"] } },
       "u-1",
     );
-    expect(r.ok).toBe(true);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
+  });
+
+  it("rejects reply_to_message_id (Phase 2 has no reply snapshot; replies are Phase 4)", () => {
+    const r = parseMessageSendCommand(
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { client_message_id: "cm-1", type: "text", text: "hi", reply_to_message_id: "m-1" } },
+      "u-1",
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
+  });
+
+  it("rejects non-empty attachment_ids (Phase 2 is text-only)", () => {
+    const r = parseMessageSendCommand(
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { client_message_id: "cm-1", type: "text", text: "hi", attachment_ids: ["a-1"] } },
+      "u-1",
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
   });
 });
 
@@ -210,8 +235,6 @@ export function dedupePrincipalKeyForUser(userId: string): string {
   return `user:${userId}`;
 }
 
-const ALLOWED_TYPES = new Set(["text", "image"]);
-
 export function parseMessageSendCommand(frame: CommandFrame, senderUserId: string): ParseResult {
   if (frame.command !== "message.send") {
     return { ok: false, error: { code: "INVALID_COMMAND", message: `unsupported command: ${frame.command}`, retryable: false } };
@@ -224,18 +247,24 @@ export function parseMessageSendCommand(frame: CommandFrame, senderUserId: strin
   if (!client_message_id) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "client_message_id is required", retryable: false } };
   }
+  // Phase 2 is text-only. image messages (Phase 5) and reply_to (Phase 4) are rejected here
+  // so we never persist incomplete rows (no reply_snapshot_json, no attachment owner/finalized check).
   const type = typeof p.type === "string" ? p.type : "text";
-  if (!ALLOWED_TYPES.has(type)) {
-    return { ok: false, error: { code: "INVALID_MESSAGE", message: `unsupported type: ${type}`, retryable: false } };
+  if (type !== "text") {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: `unsupported type: ${type} (Phase 2 supports text only)`, retryable: false } };
   }
   const text = typeof p.text === "string" ? p.text : "";
-  // text type requires non-blank text; image type may have empty text (Phase 5 will validate attachments).
-  if (type === "text" && text.trim() === "") {
+  if (text.trim() === "") {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "message text is empty", retryable: false } };
   }
   const reply_to_message_id = p.reply_to_message_id;
-  const reply_to = typeof reply_to_message_id === "string" && reply_to_message_id.length > 0 ? reply_to_message_id : null;
+  if (typeof reply_to_message_id === "string" && reply_to_message_id.length > 0) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "reply_to_message_id not supported in Phase 2", retryable: false } };
+  }
   const attachment_ids = Array.isArray(p.attachment_ids) ? p.attachment_ids.filter((a): a is string => typeof a === "string") : [];
+  if (attachment_ids.length > 0) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "attachment_ids not supported in Phase 2 (text only)", retryable: false } };
+  }
   const mentionsRaw = Array.isArray(p.mentions) ? p.mentions : [];
   const mentions = mentionsRaw
     .filter((m): m is Record<string, unknown> => typeof m === "object" && m !== null)
@@ -247,14 +276,14 @@ export function parseMessageSendCommand(frame: CommandFrame, senderUserId: strin
     .filter((m) => m.user_id);
 
   void senderUserId; // sender identity comes from the authenticated socket, not the payload
-  return { ok: true, command: { client_message_id, type: type as "text", text, reply_to, attachment_ids, mentions } };
+  return { ok: true, command: { client_message_id, type: "text", text, reply_to: null, attachment_ids: [], mentions } };
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npm run test:once -- test/chat/command.test.ts`
-Expected: PASS (all 7).
+Expected: PASS (all 9: valid, wrong-command, missing client_message_id, empty text, missing channel_id, reject image, reject reply_to, reject attachment_ids, dedupe key).
 
 - [ ] **Step 5: Write failing test for event frame builders**
 
@@ -285,7 +314,7 @@ describe("buildEventFrame", () => {
 });
 
 describe("buildMessageCreatedPayload", () => {
-  it("projects sender as a reference, not a UserSummary", () => {
+  it("projects sender as a reference, not a UserSummary (persisted shape)", () => {
     const p = buildMessageCreatedPayload({
       message_id: "m-1",
       client_message_id: "cm-1",
@@ -307,11 +336,47 @@ describe("buildMessageCreatedPayload", () => {
       created_at: "2026-06-21T05:30:00Z",
       type: "text",
     });
-    // sender is a ref, NOT a resolved UserSummary
+    // PERSISTED payload: sender is a ref, NOT a resolved UserSummary
     expect(p.message).toHaveProperty("sender");
     expect((p.message as Record<string, unknown>).sender).toEqual({ kind: "user", user_id: "u-1", bot_id: null });
-    // no display_name / avatar_url in the event payload
+    // no display_name / avatar_url in the persisted payload
     expect(JSON.stringify(p)).not.toContain("display_name");
+  });
+});
+
+describe("resolveSenderForLiveBroadcast", () => {
+  it("replaces the sender ref with a resolved UserSummary on the live broadcast payload", async () => {
+    // We test against a fake env whose TOOLBEAR_DB resolve returns a known summary.
+    // resolveUserSummaries is sourced from src/profile/resolve; in this unit test we
+    // inject a stub by calling resolveSenderForLiveBroadcast with a resolver function.
+    const persisted = buildMessageCreatedPayload({
+      message_id: "m-1", client_message_id: "cm-1", channel_id: "ch-1",
+      sender_kind: "user", sender_user_id: "u-1", sender_bot_id: null,
+      status: "normal", created_at: "2026-06-21T05:30:00Z", type: "text", format: "plain", text: "hello",
+    });
+    const live = await resolveSenderForLiveBroadcast(
+      persisted,
+      async () => new Map([["u-1", { user_id: "u-1", display_name: "Alice", avatar_url: "https://x/a.png" }]]),
+    );
+    const sender = (live.message as Record<string, unknown>).sender as Record<string, unknown>;
+    expect(sender.kind).toBe("user");
+    expect(sender).toHaveProperty("user");
+    expect((sender.user as Record<string, unknown>).display_name).toBe("Alice");
+    expect((sender.user as Record<string, unknown>).avatar_url).toBe("https://x/a.png");
+  });
+
+  it("falls back to a user-<shortid> summary when the sender is not in pg", async () => {
+    const persisted = buildMessageCreatedPayload({
+      message_id: "m-2", client_message_id: "cm-2", channel_id: "ch-1",
+      sender_kind: "user", sender_user_id: "u-ghost", sender_bot_id: null,
+      status: "normal", created_at: "2026-06-21T05:30:00Z", type: "text", format: "plain", text: "hi",
+    });
+    const live = await resolveSenderForLiveBroadcast(
+      persisted,
+      async () => new Map(), // nothing resolved
+    );
+    const sender = (live.message as Record<string, unknown>).sender as Record<string, unknown>;
+    expect((sender.user as Record<string, unknown>).display_name).toBe("user-u-ghost");
   });
 });
 ```
@@ -344,9 +409,8 @@ export function buildEventFrame(args: {
   };
 }
 
-// Per design spec §3.5: event payloads store actor REFERENCES, not UserSummary.
-// The client resolves the sender's display name from bootstrap/members cache.
-// This keeps Hyperdrive out of the hot broadcast path.
+// Per design spec §3.5: PERSISTED event payloads store actor REFERENCES, not UserSummary.
+// (events.payload_json stores the shape produced below — sender as {kind, user_id, bot_id}.)
 export function buildMessageCreatedPayload(raw: {
   message_id: string;
   client_message_id: string;
@@ -376,6 +440,47 @@ export function buildMessageCreatedPayload(raw: {
       text: raw.text,
       created_at: raw.created_at,
     },
+  };
+}
+
+// Per design spec §3.5: the LIVE broadcast (wire) projection resolves UserSummary at output
+// time. The persisted payload keeps the sender ref; this function takes that persisted payload
+// and returns a NEW payload with sender replaced by { kind:'user', user: UserSummary } so the
+// client never has to render a bare user_id. (For bot senders, resolution is deferred to Phase 7;
+// the bot ref is passed through unchanged here.)
+//
+// `resolveUserSummaries` is injected so this module stays unit-testable without Hyperdrive.
+export interface UserSummary {
+  user_id: string;
+  display_name: string;
+  avatar_url: string | null;
+}
+export type ResolveUserSummaries = (userIds: string[]) => Promise<Map<string, UserSummary>>;
+
+export async function resolveSenderForLiveBroadcast(
+  payload: Record<string, unknown>,
+  resolveUserSummaries: ResolveUserSummaries,
+): Promise<Record<string, unknown>> {
+  const message = (payload.message as { sender?: { kind?: string; user_id?: string | null; bot_id?: string | null } } | undefined);
+  const sender = message?.sender;
+  let resolvedSender: Record<string, unknown>;
+  if (sender?.kind === "user" && sender.user_id) {
+    const map = await resolveUserSummaries([sender.user_id]);
+    const u = map.get(sender.user_id) ?? {
+      user_id: sender.user_id,
+      display_name: `user-${sender.user_id.slice(0, 8)}`,
+      avatar_url: null,
+    };
+    resolvedSender = { kind: "user", user: u };
+  } else if (sender?.kind === "bot") {
+    // Phase 7 will resolve bot display_name/avatar from BotRegistry. Pass through for now.
+    resolvedSender = { kind: "bot", bot_id: sender.bot_id };
+  } else {
+    resolvedSender = (sender as Record<string, unknown>) ?? {};
+  }
+  const baseMessage = (payload.message as Record<string, unknown> | undefined) ?? {};
+  return {
+    message: { ...baseMessage, sender: resolvedSender },
   };
 }
 ```
@@ -706,8 +811,8 @@ export class ChannelFanout extends DurableObject<Env> {
 
     for (const r of rows) {
       const evRow = this.ctx.storage.sql
-        .exec("SELECT event_json FROM fanout_events WHERE channel_id=? AND event_id=?", r.channel_id, r.event_id)
-        .toArray()[0] as { event_json: string } | undefined;
+        .exec("SELECT event_json, membership_version_at_event FROM fanout_events WHERE channel_id=? AND event_id=?", r.channel_id, r.event_id)
+        .toArray()[0] as { event_json: string; membership_version_at_event: number } | undefined;
       if (!evRow) {
         bumpFanoutRetry(this.ctx, r.queue_id, ts, "event_json missing");
         continue;
@@ -717,13 +822,16 @@ export class ChannelFanout extends DurableObject<Env> {
         const res = await uc.fetch(new Request("https://x/deliver", {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-Channel-Id": r.channel_id },
-          body: JSON.stringify({ session_id: r.target_session_id, event_json: evRow.event_json }),
+          body: JSON.stringify({ session_id: r.target_session_id, event_json: evRow.event_json, membership_version_at_event: evRow.membership_version_at_event }),
         }));
         if (!res.ok) {
           const text = await res.text();
           bumpFanoutRetry(this.ctx, r.queue_id, ts, `${res.status}: ${text}`);
           continue;
         }
+        // 200 with {delivered:false} (session gone OR dropped as not-a-member) → mark delivered,
+        // do NOT retry. The dropped-not-member case is the intended outcome of the deliver gate
+        // (design §3.3); the repair path for a rejoined member is replay, not re-delivery.
         this.ctx.storage.sql.exec(
           "UPDATE fanout_queue SET status='delivered', attempts=attempts+1, last_error=NULL WHERE queue_id=?",
           r.queue_id,
@@ -939,7 +1047,12 @@ export interface ConnectionAttachment {
   user_id: string;
   session_id: string;
   per_channel_cursors: Record<string, string>;
-  subscribed_channels: string[];
+  // channelId → membership_version snapshot at subscription time (design §3.3). Used by
+  // /deliver as the cheap gate: an event whose membership_version_at_event > the subscription
+  // version means a member change happened between subscription and the event → re-check
+  // active membership before delivering (design §2.4 / §3.3 two-layer guarantee).
+  subscribed_channels: Record<string, number>;
+  last_deliver?: string;
 }
 
 function parsePerChannelCursors(searchParams: string): Record<string, string> {
@@ -953,25 +1066,65 @@ function parsePerChannelCursors(searchParams: string): Record<string, string> {
   }
 }
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
 export class UserConnection extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
   }
 
+  private findSocketBySession(sessionId: string): WebSocket | null {
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as ConnectionAttachment | null;
+      if (att && att.session_id === sessionId) return ws;
+    }
+    return null;
+  }
+
+  private async registerChannelOnline(userId: string, sessionId: string, channelId: string, membershipVersion: number): Promise<void> {
+    const fanout = this.env.CHANNEL_FANOUT.getByName(channelId);
+    await fanout.fetch(new Request("https://x/register-online", {
+      method: "POST",
+      headers: { "X-Channel-Id": channelId, "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, session_id: sessionId, membership_version: membershipVersion }),
+    }));
+    const ws = this.findSocketBySession(sessionId);
+    if (ws) {
+      const att = ws.deserializeAttachment() as ConnectionAttachment | null;
+      if (att) ws.serializeAttachment({ ...att, subscribed_channels: { ...att.subscribed_channels, [channelId]: membershipVersion } });
+    }
+  }
+
+  // P0-1: ensure this session is subscribed to the channel BEFORE processing a command.
+  // A real client may send message.send immediately on open, before the waitUntil
+  // registerOnlineOnConnect finishes; without this, the sender's own message.created
+  // event would be enqueued to ChannelFanout before the session is registered → the
+  // sender never receives their own event. This method is idempotent: if already
+  // subscribed (recorded in the attachment), it's a no-op; otherwise it resolves the
+  // current membership_version from UserDirectory and registers now.
+  private async ensureSubscribed(att: ConnectionAttachment, ws: WebSocket, channelId: string): Promise<boolean> {
+    if (att.subscribed_channels[channelId] !== undefined) return true;
+    const routeName = await channelRouteNameFor(this.env, att.user_id, channelId);
+    if (routeName === null) return false;
+    // read the membership_version snapshot from UserDirectory (my_channels carries it)
+    const dir = this.env.USER_DIRECTORY.getByName(att.user_id);
+    const dirRes = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": att.user_id } }));
+    if (!dirRes.ok) return false;
+    const myChannels = ((await dirRes.json()) as { items: Array<{ channel_id: string; membership_version: number }> }).items;
+    const mc = myChannels.find((m) => m.channel_id === channelId);
+    if (!mc) return false; // not a member → caller will get FORBIDDEN from ChatChannel
+    await this.registerChannelOnline(att.user_id, att.session_id, channelId, mc.membership_version ?? 0);
+    return true;
+  }
+
   // Read my_channels, register online with each resolvable channel's ChannelFanout,
   // and replay per-channel events after the stored cursor. Phase 2 only resolves
   // the system channel (channelRouteNameFor returns null for others).
-  private async registerOnlineOnConnect(userId: string, sessionId: string, perChannelCursors: Record<string, string>): Promise<string[]> {
+  private async registerOnlineOnConnect(userId: string, sessionId: string, perChannelCursors: Record<string, string>): Promise<Record<string, number>> {
     const dir = this.env.USER_DIRECTORY.getByName(userId);
     const dirRes = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
     const myChannels = dirRes.ok
       ? ((await dirRes.json()) as { items: Array<{ channel_id: string; kind: string; membership_version: number }> }).items
       : [];
-    const subscribed: string[] = [];
+    const subscribed: Record<string, number> = {};
     for (const mc of myChannels) {
       const routeName = await channelRouteNameFor(this.env, userId, mc.channel_id);
       if (routeName === null) continue; // Phase 2: only system channel resolves
@@ -981,7 +1134,7 @@ export class UserConnection extends DurableObject<Env> {
         headers: { "X-Channel-Id": mc.channel_id, "Content-Type": "application/json" },
         body: JSON.stringify({ user_id: userId, session_id: sessionId, membership_version: mc.membership_version ?? 0 }),
       }));
-      subscribed.push(mc.channel_id);
+      subscribed[mc.channel_id] = mc.membership_version ?? 0;
       // replay events after the cursor
       const after = perChannelCursors[mc.channel_id] ?? "";
       const chStub = this.env.CHAT_CHANNEL.getByName(routeName);
@@ -999,15 +1152,31 @@ export class UserConnection extends DurableObject<Env> {
   }
 
   private sendToSession(sessionId: string, text: string): boolean {
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
-      const att = ws.deserializeAttachment() as ConnectionAttachment | null;
-      if (att && att.session_id === sessionId) {
-        ws.send(text);
-        return true;
-      }
-    }
+    const ws = this.findSocketBySession(sessionId);
+    if (ws) { ws.send(text); return true; }
     return false;
+  }
+
+  // P0-4: cheap membership-version gate. Returns true if the event should be delivered.
+  // - event.membership_version_at_event <= subscription version → deliver (no ChatChannel round-trip).
+  // - event.membership_version_at_event > subscription version → a member change happened after
+  //   subscription; re-check active membership in ChatChannel. If still a member, deliver (and
+  //   bump the subscription version). If not, drop (member.left — repair path is replay).
+  private async deliverAllowed(att: ConnectionAttachment, ws: WebSocket, channelId: string, eventMembershipVersion: number): Promise<boolean> {
+    const subVersion = att.subscribed_channels[channelId];
+    if (subVersion === undefined) return true; // not tracked via fanout (e.g. direct replay) → allow
+    if (eventMembershipVersion <= subVersion) return true;
+    // membership changed since subscription → confirm active membership in ChatChannel
+    const routeName = await channelRouteNameFor(this.env, att.user_id, channelId);
+    if (routeName === null) return false;
+    const chStub = this.env.CHAT_CHANNEL.getByName(routeName);
+    const res = await chStub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": att.user_id } }));
+    if (!res.ok) return false;
+    const s = (await res.json()) as { my_role: string | null };
+    if (s.my_role === null) return false; // no longer a member → drop
+    // refresh subscription version upward so subsequent same-version events don't re-query
+    ws.serializeAttachment({ ...att, subscribed_channels: { ...att.subscribed_channels, [channelId]: eventMembershipVersion } });
+    return true;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -1016,9 +1185,8 @@ export class UserConnection extends DurableObject<Env> {
 
     if (url.pathname === "/test-last-deliver") {
       const ch = request.headers.get("X-Channel-Id") ?? "";
-      const sockets = this.ctx.getWebSockets();
-      for (const ws of sockets) {
-        const att = ws.deserializeAttachment() as (ConnectionAttachment & { last_deliver?: string }) | null;
+      for (const ws of this.ctx.getWebSockets()) {
+        const att = ws.deserializeAttachment() as ConnectionAttachment | null;
         if (att && att.last_deliver) {
           return Response.json({ event_json: att.last_deliver, channel_id: ch });
         }
@@ -1027,26 +1195,28 @@ export class UserConnection extends DurableObject<Env> {
     }
 
     if (url.pathname === "/deliver") {
-      const b = (await request.json()) as { session_id: string; event_json: string };
-      const delivered = this.sendToSession(b.session_id, b.event_json);
-      // stash probe on the matching socket's attachment
-      const sockets = this.ctx.getWebSockets();
-      for (const ws of sockets) {
-        const att = ws.deserializeAttachment() as (ConnectionAttachment & { last_deliver?: string }) | null;
-        if (att && att.session_id === b.session_id) {
-          ws.serializeAttachment({ ...att, last_deliver: b.event_json });
-          // advance per-channel cursor using event_id in the frame
-          try {
-            const fr = JSON.parse(b.event_json) as { event_id?: string; channel_id?: string };
-            if (fr.event_id && fr.channel_id) {
-              const cursors = { ...att.per_channel_cursors, [fr.channel_id]: fr.event_id };
-              ws.serializeAttachment({ ...att, last_deliver: b.event_json, per_channel_cursors: cursors });
-            }
-          } catch { /* ignore malformed */ }
-          break;
-        }
+      const b = (await request.json()) as { session_id: string; event_json: string; membership_version_at_event?: number };
+      const ws = this.findSocketBySession(b.session_id);
+      if (!ws) return Response.json({ ok: true, delivered: false }); // session gone → stop retrying; replay is repair
+      const att = ws.deserializeAttachment() as ConnectionAttachment | null;
+      if (!att) return Response.json({ ok: true, delivered: false });
+      let channelId = "";
+      let eventId = "";
+      try {
+        const fr = JSON.parse(b.event_json) as { event_id?: string; channel_id?: string };
+        channelId = fr.channel_id ?? "";
+        eventId = fr.event_id ?? "";
+      } catch { /* malformed */ }
+      // P0-4: gate on membership_version before sending.
+      const allowed = await this.deliverAllowed(att, ws, channelId, b.membership_version_at_event ?? 0);
+      if (!allowed) return Response.json({ ok: true, delivered: false, dropped: "not_member" });
+      ws.send(b.event_json);
+      const nextAtt: ConnectionAttachment = { ...att, last_deliver: b.event_json };
+      if (eventId && channelId) {
+        nextAtt.per_channel_cursors = { ...att.per_channel_cursors, [channelId]: eventId };
       }
-      return Response.json({ ok: true, delivered });
+      ws.serializeAttachment(nextAtt);
+      return Response.json({ ok: true, delivered: true });
     }
 
     // upgrade path
@@ -1060,18 +1230,17 @@ export class UserConnection extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = pair as unknown as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server, [`user-conn:${userId}`]);
-    server.serializeAttachment({ user_id: userId, session_id, per_channel_cursors, subscribed_channels: [] } satisfies ConnectionAttachment);
+    server.serializeAttachment({ user_id: userId, session_id, per_channel_cursors, subscribed_channels: {} } satisfies ConnectionAttachment);
     // register online + replay AFTER returning would block the upgrade; do it fire-and-forget
     // so the 101 returns promptly. The socket is already accepted; late frames are fine.
+    // P0-1: webSocketMessage ALSO calls ensureSubscribed per-channel before any command, so a
+    // client that sends immediately on open is still covered (does not depend on this waitUntil).
     this.ctx.waitUntil((async () => {
       const subscribed = await this.registerOnlineOnConnect(userId, sessionId, per_channel_cursors);
-      const sockets = this.ctx.getWebSockets();
-      for (const ws of sockets) {
+      const ws = this.findSocketBySession(sessionId);
+      if (ws) {
         const att = ws.deserializeAttachment() as ConnectionAttachment | null;
-        if (att && att.session_id === sessionId) {
-          ws.serializeAttachment({ ...att, subscribed_channels: subscribed });
-          break;
-        }
+        if (att) ws.serializeAttachment({ ...att, subscribed_channels: { ...att.subscribed_channels, ...subscribed } });
       }
     })());
     return new Response(null, { status: 101, webSocket: client });
@@ -1098,6 +1267,13 @@ export class UserConnection extends DurableObject<Env> {
       return;
     }
     const channelId = frame.channel_id ?? "";
+    // P0-1: ensure subscribed to this channel before sending, so the sender receives their own
+    // message.created event. (Idempotent no-op if already registered by registerOnlineOnConnect.)
+    const subscribed = await this.ensureSubscribed(att, ws, channelId);
+    if (!subscribed) {
+      ws.send(JSON.stringify({ frame_type: "command_error", command_id: frame.command_id, error: { code: "CHANNEL_NOT_FOUND", message: "channel not found or not a member", retryable: false } } satisfies CommandErrorFrame));
+      return;
+    }
     const routeName = await channelRouteNameFor(this.env, att.user_id, channelId);
     if (routeName === null) {
       ws.send(JSON.stringify({ frame_type: "command_error", command_id: frame.command_id, error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } } satisfies CommandErrorFrame));
@@ -1119,7 +1295,7 @@ export class UserConnection extends DurableObject<Env> {
     }));
     if (!res.ok) {
       const body = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-      ws.send(JSON.stringify({ frame_type: "command_error", command_id: frame.command_id, error: { code: body.error?.code ?? "CHAT_WORKER_UNAVAILABLE", message: body.error?.message ?? "send failed", retryable: true } } satisfies CommandErrorFrame));
+      ws.send(JSON.stringify({ frame_type: "command_error", command_id: frame.command_id, error: { code: body.error?.code ?? "CHAT_WORKER_UNAVAILABLE", message: body.error?.message ?? "send failed", retryable: body.error?.code === "IDEMPOTENCY_CONFLICT" ? false : true } } satisfies CommandErrorFrame));
       return;
     }
     const out = (await res.json()) as { message_id: string; event_id: string };
@@ -1135,7 +1311,7 @@ export class UserConnection extends DurableObject<Env> {
   }
 
   private async unregisterAll(att: ConnectionAttachment): Promise<void> {
-    for (const channelId of att.subscribed_channels) {
+    for (const channelId of Object.keys(att.subscribed_channels)) {
       const fanout = this.env.CHANNEL_FANOUT.getByName(channelId);
       await fanout.fetch(new Request("https://x/unregister-online", {
         method: "POST",
@@ -1248,6 +1424,17 @@ describe("ChatChannel /internal/message-send", () => {
     expect(a.event_id).toBe(b.event_id);
   });
 
+  it("returns IDEMPOTENCY_CONFLICT (409) when same client_message_id but different body", async () => {
+    const { stub, channelId } = await setupSystemAndJoin("u-ms-7");
+    const base = { dedupe_principal_key: "user:u-ms-7", type: "text", reply_to: null, mentions: [], channel_id: channelId };
+    const a = await stub.fetch(new Request("https://x/internal/message-send", { method: "POST", headers: { "X-Verified-User-Id": "u-ms-7", "Content-Type": "application/json" }, body: JSON.stringify({ ...base, client_message_id: "cm-conflict", text: "first" }) }));
+    expect(a.status).toBe(200);
+    const b = await stub.fetch(new Request("https://x/internal/message-send", { method: "POST", headers: { "X-Verified-User-Id": "u-ms-7", "Content-Type": "application/json" }, body: JSON.stringify({ ...base, client_message_id: "cm-conflict", text: "different" }) }));
+    expect(b.status).toBe(409);
+    const bb = (await b.json()) as any;
+    expect(bb.error.code).toBe("IDEMPOTENCY_CONFLICT");
+  });
+
   it("different users, same client_message_id → different messages (namespacing)", async () => {
     const { stub, channelId } = await setupSystemAndJoin("u-ms-4");
     await stub.fetch(new Request("https://x/internal/join", { method: "POST", headers: { "X-Verified-User-Id": "u-ms-5", "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "u-ms-5" }) }));
@@ -1276,7 +1463,8 @@ Expected: FAIL — `/internal/message-send` returns 404.
 
 Add imports at the top of `src/do/chat-channel.ts`:
 ```typescript
-import { buildEventFrame, buildMessageCreatedPayload } from "../chat/event-broadcast";
+import { buildEventFrame, buildMessageCreatedPayload, resolveSenderForLiveBroadcast } from "../chat/event-broadcast";
+import { resolveUserSummaries } from "../profile/resolve";
 ```
 
 Add these two endpoints inside `fetch`, just before the `return new Response("not found", ...)` at the end of `fetch` (after the `/spike-*` blocks):
@@ -1303,41 +1491,45 @@ Add these two endpoints inside `fetch`, just before the `return new Response("no
         .toArray()[0] as { x: number } | undefined;
       if (!member) return new Response(JSON.stringify({ error: { code: "FORBIDDEN", message: "not a member" } }), { status: 403, headers: { "Content-Type": "application/json" } });
 
-      // dedupe (namespaced by dedupe_principal_key + client_message_id)
-      const existing = this.ctx.storage.sql
-        .exec("SELECT message_id FROM messages WHERE channel_id=? AND dedupe_principal_key=? AND client_message_id=?", channelId, b.dedupe_principal_key, b.client_message_id)
-        .toArray()[0] as { message_id: string } | undefined;
-      if (existing) {
-        // find the original message.created event_id for this message (rare scan on dup-hit)
-        const evRows = this.ctx.storage.sql.exec(
-          "SELECT event_id, payload_json FROM events WHERE channel_id=? AND event_type='message.created'",
-          channelId,
-        ).toArray() as Array<{ event_id: string; payload_json: string }>;
-        let eventId = "";
-        for (const r of evRows) {
-          try {
-            const p = JSON.parse(r.payload_json) as { message?: { message_id?: string } };
-            if (p.message?.message_id === existing.message_id) { eventId = r.event_id; break; }
-          } catch { /* skip */ }
+      // Idempotency via idempotency_keys (design §3.6). The client_message_id doubles as the
+      // idempotency_key (operation='message.send', principal_kind='user', principal_id=userId).
+      // request_hash covers the mutable body fields so a same-key/different-body collision
+      // returns IDEMPOTENCY_CONFLICT instead of silently returning the old message.
+      const requestHash = JSON.stringify({ type: b.type, text: b.text, reply_to: b.reply_to, mentions: b.mentions ?? [] });
+      const idemRow = this.ctx.storage.sql
+        .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='message.send' AND idempotency_key=?", userId, b.client_message_id)
+        .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+      if (idemRow) {
+        if (idemRow.request_hash !== requestHash) {
+          return new Response(JSON.stringify({ error: { code: "IDEMPOTENCY_CONFLICT", message: "client_message_id reused with different body", retryable: false } }), { status: 409, headers: { "Content-Type": "application/json" } });
         }
-        return Response.json({ message_id: existing.message_id, event_id: eventId });
+        // exact same key + body → return cached response (carries message_id + event_id)
+        const cached = idemRow.response_json ? (JSON.parse(idemRow.response_json) as { message_id: string; event_id: string }) : { message_id: "", event_id: "" };
+        return Response.json(cached);
       }
 
       const messageId = uuidv7(nowMs);
       const eventId = this.nextEventId(nowMs);
       const mv = meta.membership_version;
-      const payload = buildMessageCreatedPayload({
+      const persistedPayload = buildMessageCreatedPayload({
         message_id: messageId, client_message_id: b.client_message_id, channel_id: channelId,
         sender_kind: "user", sender_user_id: userId, sender_bot_id: null,
         status: "normal", created_at: now, type: b.type, format: "plain", text: b.text,
       });
-      const payloadJson = JSON.stringify(payload);
-      // The full EventFrame envelope is built once here and carried in the fanout outbox
-      // so ChannelFanout forwards the complete frame verbatim. events.payload_json stores
-      // the PAYLOAD only (consistent with /internal/join), so /internal/replay rebuilds the
-      // envelope from (event_id, event_type, occurred_at, payload) — see /internal/replay.
-      const eventFrame = buildEventFrame({ event_id: eventId, type: "message.created", channel_id: channelId, occurred_at: now, payload });
+      const payloadJson = JSON.stringify(persistedPayload);
+
+      // Live broadcast frame: resolve the sender UserSummary NOW (design §3.5: the wire
+      // projection resolves at output time). The persisted payload stays a ref; the outbox
+      // carries the resolved frame so ChannelFanout forwards display_name/avatar to clients.
+      const livePayload = await resolveSenderForLiveBroadcast(
+        persistedPayload,
+        (userIds: string[]) => resolveUserSummaries(userIds, this.env),
+      );
+      const eventFrame = buildEventFrame({ event_id: eventId, type: "message.created", channel_id: channelId, occurred_at: now, payload: livePayload });
       const eventFrameJson = JSON.stringify(eventFrame);
+
+      const responseJson = JSON.stringify({ message_id: messageId, event_id: eventId });
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString(); // 24h
 
       await this.ctx.storage.transaction(async () => {
         this.ctx.storage.sql.exec(
@@ -1356,11 +1548,30 @@ Add these two endpoints inside `fetch`, just before the `return new Response("no
           "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, 'message.created', ?, 'user', ?, ?, ?, ?)",
           eventId, channelId, userId, payloadJson, mv, now,
         );
-        // fanout outbox: ChannelFanout enqueues the event to all online sessions.
+        // idempotency_keys row co-atomic with the business write (status 'completed').
+        this.ctx.storage.sql.exec(
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'message.send', ?, ?, ?, 'completed', ?, ?)",
+          userId, b.client_message_id, requestHash, responseJson, now, idemExpiresAt,
+        );
+        // fanout outbox: ChannelFanout enqueues the event to all online sessions. SYNC helper —
+        // a sql.exec failure here throws synchronously and aborts the transaction (message NOT committed).
         this.insertOutboxRowForFanout(channelId, eventId, eventFrameJson, mv, now);
         // message_index outbox: route /messages/{id} → channel.
-        this.insertOutboxRow("message_index", messageId, { message_id: messageId, channel_id: channelId }, now);
+        this.ctx.storage.sql.exec(
+          "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'message_index', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+          `message_index:${messageId}`,
+          messageId,
+          JSON.stringify({ message_id: messageId, channel_id: channelId }),
+          now, now, now,
+        );
       });
+
+      await this.scheduleOutboxAlarm(now);
+      return Response.json({ message_id: messageId, event_id: eventId });
+    }
+```
+
+> **Why the `message_index` outbox insert is now inline SQL (not `this.insertOutboxRow(...)`):** the existing `insertOutboxRow` is an `async` method called without `await` inside the transaction — a latent swallowed-error bug (P0-3). For Phase 2 we make the fanout helper **synchronous** (below) and write the `message_index` row with inline synchronous SQL so any insert failure throws and rolls the whole transaction back. (The legacy `insertOutboxRow` stays as-is to avoid touching the Phase-1 `/internal/join` path in this task; a later cleanup task can convert it too. The `/internal/join` path is lower-risk because a missed `user_directory` projection is repairable, whereas a missed `channel_fanout` row drops a real-time event.)
 
       await this.scheduleOutboxAlarm(now);
       return Response.json({ message_id: messageId, event_id: eventId });
@@ -1381,6 +1592,18 @@ Add these two endpoints inside `fetch`, just before the `return new Response("no
         "SELECT event_id, event_type, payload_json, occurred_at FROM events WHERE channel_id=? AND event_id > ? ORDER BY event_id",
         meta.channel_id, after,
       ).toArray() as Array<{ event_id: string; event_type: string; payload_json: string; occurred_at: string }>;
+      // Batch-resolve all sender user_ids in the replay window ONCE (design §3.5: replay output
+      // resolves UserSummary at read time). Avoids a Hyperdrive round-trip per event.
+      const allSenderIds: string[] = [];
+      for (const r of rows) {
+        try {
+          const p = JSON.parse(r.payload_json) as { message?: { sender?: { kind?: string; user_id?: string | null } } };
+          if (p.message?.sender?.kind === "user" && p.message.sender.user_id) allSenderIds.push(p.message.sender.user_id);
+        } catch { /* skip */ }
+      }
+      const senderMap = await resolveUserSummaries(allSenderIds, this.env);
+      const resolveFn = async (userIds: string[]) => senderMap; // reuse the pre-fetched batch
+
       const out: Array<{ event_id: string; event_json: string }> = [];
       for (const r of rows) {
         // content-bearing events: skip if the referenced message is deleted/recalled.
@@ -1394,17 +1617,25 @@ Add these two endpoints inside `fetch`, just before the `return new Response("no
             }
           } catch { /* skip malformed */ }
         }
-        // events.payload_json stores the PAYLOAD object (consistent with /internal/join and
-        // /internal/message-send). Rebuild the full EventFrame envelope here at the replay
-        // boundary. (The live broadcast path carries a pre-built frame in the fanout outbox,
-        // so the wire format is identical between live and replay.)
+        // events.payload_json stores the PAYLOAD object (sender as ref). Rebuild the full
+        // EventFrame envelope at the replay boundary, resolving the sender UserSummary so the
+        // replayed wire event matches the live broadcast (display_name/avatar, not bare id).
         let payload: Record<string, unknown> = {};
         try {
           payload = JSON.parse(r.payload_json) as Record<string, unknown>;
         } catch { /* leave empty payload */ }
+        let wirePayload = payload;
+        if (r.event_type === "message.created" || r.event_type === "message.updated") {
+          try {
+            wirePayload = await resolveSenderForLiveBroadcast(
+              payload,
+              resolveFn,
+            );
+          } catch { /* keep ref-only payload on resolve failure */ }
+        }
         const eventJson = JSON.stringify(buildEventFrame({
           event_id: r.event_id, type: r.event_type, channel_id: meta.channel_id,
-          occurred_at: r.occurred_at, payload,
+          occurred_at: r.occurred_at, payload: wirePayload,
         }));
         out.push({ event_id: r.event_id, event_json: eventJson });
       }
@@ -1412,17 +1643,18 @@ Add these two endpoints inside `fetch`, just before the `return new Response("no
     }
 ```
 
-Add the `insertOutboxRowForFanout` helper method to the `ChatChannel` class (near `insertOutboxRow`):
+Add the `insertOutboxRowForFanout` helper method to the `ChatChannel` class (near `insertOutboxRow`). **It MUST be synchronous** (P0-3): a `sql.exec` failure must throw synchronously so the surrounding `ctx.storage.transaction` rolls back the message + event writes — otherwise a dropped fanout outbox row would silently lose the real-time broadcast while the message stays committed.
 ```typescript
-  private async insertOutboxRowForFanout(
+  private insertOutboxRowForFanout(
     channelId: string,
     eventId: string,
     eventFrameJson: string,
     membershipVersionAtEvent: number,
     nowIso: string,
-  ): Promise<void> {
+  ): void {
     // target_key = channelId (ChannelFanout DO is named by channel_id).
-    // payload carries the already-built EventFrame JSON so ChannelFanout forwards it verbatim.
+    // payload carries the already-built (sender-resolved) EventFrame JSON so ChannelFanout
+    // forwards it verbatim to UserConnection.deliver.
     const payload = {
       action: "fanout",
       channel_id: channelId,
@@ -1532,7 +1764,7 @@ In the `alarm()` method, the existing loop only handles `target_kind='user_direc
 - [ ] **Step 6: Run the message-send tests**
 
 Run: `npm run test:once -- test/do/chat-channel-message-send.test.ts`
-Expected: all 5 PASS.
+Expected: all 6 PASS (write, FORBIDDEN, idempotent same-key+body, IDEMPOTENCY_CONFLICT same-key+different-body, namespacing, replay).
 
 - [ ] **Step 7: Run the UserConnection ack tests (should now pass)**
 
@@ -1934,10 +2166,13 @@ git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "test(integration)
 - (No production change expected — `ChatChannel` leave already writes a `user_directory` outbox row in Phase 1; Phase 2 adds that leave ALSO writes a `channel_fanout` `unregister-user` outbox row. **This requires a small production edit** to the Phase-1 `/internal/test-leave` path OR a new `/internal/leave` endpoint. Per the design, `member.left` is a Phase-3 feature (channel/member management), but the *unsubscribe-on-leave* wiring is a Phase-2 acceptance per design §3.3. For Phase 2 we wire it through the existing test-leave path so the acceptance test passes; Phase 3 will add the real HTTP leave endpoint.)
 
 **Interfaces:**
-- Consumes: `ChatChannel /internal/test-leave` (header `X-Test-Only:1`), `ChannelFanout /unregister-user`, `ChatChannel` alarm.
-- Produces: `ChatChannel /internal/test-leave` (when it sets `left_at`) ALSO writes a `channel_fanout` outbox row with payload `{ action: "unregister-user", user_id }` and schedules the alarm. The alarm's `channel_fanout` branch must handle `action: "unregister-user"` (not just `action: "fanout"`).
+- Consumes: `ChatChannel /internal/test-leave` (header `X-Test-Only:1`), `ChannelFanout /unregister-user`, `ChatChannel` alarm, `UserConnection /deliver` (for the gate test).
+- Produces:
+  - A shared `ChatChannel` private method `markMemberLeftAndEnqueueFanoutUnregister(channelId: string, userId: string, nowIso: string): Promise<void>` that runs **in a single `ctx.storage.transaction`**: `UPDATE members SET left_at=...` AND inserts the `channel_fanout` outbox row with `{ action: "unregister-user", channel_id, user_id }`. Both writes are co-atomic — a leave that doesn't enqueue the unregister is impossible. The real Phase-3 leave endpoint will call this same method (P1-3: don't bury the logic in a test-only path).
+  - `ChatChannel /internal/test-leave` calls `markMemberLeftAndEnqueueFanoutUnregister` then `scheduleOutboxAlarm`.
+  - The alarm's `channel_fanout` branch dispatches on `payload.action` (`unregister-user` vs `fanout`) — this replaces the Task-4 simple `channel_fanout` block.
 
-- [ ] **Step 1: Write failing test**
+- [ ] **Step 1: Write failing tests (drop-sessions + deliver-gate)**
 
 `test/integration/member-left-unsubscribe.test.ts`:
 ```typescript
@@ -1960,7 +2195,7 @@ describe("member.left → ChannelFanout drops the user", () => {
       body: JSON.stringify({ user_id: userId, session_id: "s-leave-1", membership_version: 1 }),
     }));
 
-    // leave via the test-leave path
+    // leave via the test-leave path (UPDATE members + channel_fanout unregister outbox, one txn)
     await sysStub.fetch(new Request("https://x/internal/test-leave", {
       method: "POST", headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
       body: JSON.stringify({ user_id: userId }),
@@ -1973,6 +2208,69 @@ describe("member.left → ChannelFanout drops the user", () => {
     const dump = await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": sysId } }))).json() as any;
     expect(dump.sessions.filter((s: any) => s.user_id === userId)).toEqual([]);
   });
+
+  // P0-4: the deliver gate must drop an event when the user has left but the
+  // channel_fanout unregister outbox has NOT been flushed yet (the race window).
+  // Two-layer guarantee: even if the session is still in online_sessions, the
+  // UserConnection /deliver membership_version gate refuses the event.
+  it("deliver gate drops an event for a user who left, even before unregister outbox flushes", async () => {
+    const userId = "u-leave-2";
+    const sysStub = getNamedDo(env.CHAT_CHANNEL, "system-general");
+    await sysStub.fetch(new Request("https://x/internal/maybe-create-system", { method: "POST", body: JSON.stringify({ title: "Lilium" }) }));
+    await sysStub.fetch(new Request("https://x/internal/join", { method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) }));
+    const sysId = (await (await sysStub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }))).json() as any).channel_id;
+
+    // open a real WS so the UserConnection DO has a live socket + subscribed_channels entry
+    const uc = getNamedDo(env.USER_CONNECTION, userId);
+    const up = await uc.fetch(new Request("https://x/ws", { headers: { Upgrade: "websocket", "X-Verified-User-Id": userId } }));
+    const ws = up.webSocket as WebSocket;
+    ws.accept();
+
+    // wait for registerOnlineOnConnect to record the subscription (membership_version = join version)
+    const { runInDurableObject } = await import("cloudflare:test") as any;
+    let subVersion = -1;
+    for (let i = 0; i < 40; i++) {
+      await runInDurableObject(uc, async (_inst: unknown, state: { getWebSockets: () => WebSocket[] }) => {
+        const att = (state.getWebSockets()[0] as WebSocket).deserializeAttachment() as any;
+        subVersion = att?.subscribed_channels?.[sysId] ?? -1;
+      });
+      if (subVersion >= 0) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(subVersion).toBeGreaterThanOrEqual(0);
+
+    // leave — this bumps channel membership_version (join wrote mv=1; leave → mv=2 via the
+    // test-leave path which we make also bump membership_version; see Step 3). We do NOT flush
+    // the unregister outbox, so the session is still in ChannelFanout online_sessions.
+    await sysStub.fetch(new Request("https://x/internal/test-leave", {
+      method: "POST", headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId }),
+    }));
+
+    // a later event arrives with membership_version_at_event > subscription version.
+    // Deliver directly to UserConnection (bypassing ChannelFanout) to isolate the gate.
+    const laterEvent = JSON.stringify({ frame_type: "event", api_version: "lilium.chat.v1", event_id: "e-after-leave", type: "message.created", channel_id: sysId, occurred_at: "2026-06-23T00:00:00Z", payload: {} });
+    let sessionId = "";
+    await runInDurableObject(uc, async (_inst: unknown, state: { getWebSockets: () => WebSocket[] }) => {
+      sessionId = ((state.getWebSockets()[0] as WebSocket).deserializeAttachment() as any).session_id;
+    });
+    const deliverRes = await uc.fetch(new Request("https://x/deliver", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Channel-Id": sysId },
+      body: JSON.stringify({ session_id: sessionId, event_json: laterEvent, membership_version_at_event: subVersion + 10 }),
+    }));
+    expect(deliverRes.status).toBe(200);
+    const db = (await deliverRes.json()) as any;
+    expect(db.delivered).toBe(false);
+    expect(db.dropped).toBe("not_member");
+
+    // confirm nothing was sent on the socket: wait a short beat, then check the probe.
+    // (The gate returned delivered:false WITHOUT calling ws.send, so last_deliver is not set
+    // to this event — it still holds whatever registerOnlineOnConnect replay delivered, or null.)
+    await new Promise((r) => setTimeout(r, 150));
+    const probe = await (await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Channel-Id": sysId } }))).json() as any;
+    expect(probe.event_json ?? "").not.toContain('"e-after-leave"');
+    ws.close();
+  });
 });
 ```
 
@@ -1981,20 +2279,51 @@ describe("member.left → ChannelFanout drops the user", () => {
 Run: `npm run test:once -- test/integration/member-left-unsubscribe.test.ts`
 Expected: FAIL — after leave + alarm, the session still exists (no `channel_fanout` unregister outbox row was written).
 
-- [ ] **Step 3: Edit `ChatChannel /internal/test-leave` to write the fanout unregister outbox row**
+- [ ] **Step 3: Add the shared `markMemberLeftAndEnqueueFanoutUnregister` method + rewrite `/internal/test-leave`**
 
-In `src/do/chat-channel.ts`, in the `/internal/test-leave` handler, after the `UPDATE members SET left_at=...` exec, add (still inside the handler, before `return Response.json({ ok: true })`):
+Add a new private method to the `ChatChannel` class. It runs the `UPDATE members` and the `channel_fanout` unregister outbox insert **in one transaction**, and bumps `channel_meta.membership_version` so the deliver gate (which compares `membership_version_at_event` to the subscription snapshot) can detect the leave. This is the single source of truth for "user left this channel"; the Phase-3 real leave endpoint will call it too (P1-3).
+
 ```typescript
-      // Phase 2: notify ChannelFanout to drop this user's sessions (member.left unsubscribe).
-      const fanoutPayload = { action: "unregister-user", channel_id: meta.channel_id, user_id: userId };
+  private async markMemberLeftAndEnqueueFanoutUnregister(channelId: string, userId: string, nowIso: string): Promise<void> {
+    await this.ctx.storage.transaction(async () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE members SET left_at=? WHERE channel_id=? AND user_id=?",
+        nowIso, channelId, userId,
+      );
+      const meta = this.ctx.storage.sql.exec("SELECT membership_version, member_count FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as
+        | { membership_version: number; member_count: number } | undefined;
+      const nextMv = (meta?.membership_version ?? 0) + 1;
+      const nextCount = Math.max(0, (meta?.member_count ?? 1) - 1);
+      this.ctx.storage.sql.exec(
+        "UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?",
+        nextMv, nextCount, nowIso, channelId,
+      );
+      const fanoutPayload = { action: "unregister-user", channel_id: channelId, user_id: userId };
       this.ctx.storage.sql.exec(
         "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'channel_fanout', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
-        `channel_fanout:unregister:${meta.channel_id}:${userId}:${now}`,
-        meta.channel_id,
+        `channel_fanout:unregister:${channelId}:${userId}:${nowIso}`,
+        channelId,
         JSON.stringify(fanoutPayload),
-        now, now, now,
+        nowIso, nowIso, nowIso,
       );
+    });
+  }
+```
+
+Then rewrite the `/internal/test-leave` handler to call it (replace the existing handler body that only does `UPDATE members SET left_at=...`):
+```typescript
+    if (url.pathname === "/internal/test-leave") {
+      const testOnly = request.headers.get("X-Test-Only");
+      if (testOnly !== "1") return new Response("forbidden", { status: 403 });
+      const b = (await request.json()) as { user_id: string };
+      const userId = b.user_id;
+      const meta = this.ctx.storage.sql.exec("SELECT channel_id FROM channel_meta").toArray()[0] as { channel_id: string } | undefined;
+      if (meta === undefined) return new Response("not found", { status: 404 });
+      const now = this.nowIso();
+      await this.markMemberLeftAndEnqueueFanoutUnregister(meta.channel_id, userId, now);
       await this.scheduleOutboxAlarm(now);
+      return Response.json({ ok: true });
+    }
 ```
 
 - [ ] **Step 4: Extend the `alarm()` `channel_fanout` branch to handle `action: "unregister-user"`**
@@ -2071,23 +2400,33 @@ Confirm each by pointing to the test that proves it:
 - [ ] WS endpoint upgrades via Worker (JWT + Origin + subprotocol) → UserConnection DO. → `test/integration/message-send.test.ts`, `src/routes/ws.test.ts`
 - [ ] `message.send` → `committed_ack` (status=committed, channel_id, message_id, event_id). → `test/do/user-connection.test.ts` (ack tests), `test/integration/message-send.test.ts`
 - [ ] `message.created` event broadcast, including to the sender. → `test/integration/message-send.test.ts` (self-receive)
+- [ ] **Sender receives own event even when sending immediately on open (no poll).** → `test/do/user-connection.test.ts` `ensureSubscribed` path is exercised by the ack tests (the ack tests don't poll ChannelFanout first; `webSocketMessage` calls `ensureSubscribed` synchronously before routing). Confirm by removing the poll from a copy of the e2e and checking self-receive still works.
 - [ ] Implicit subscription (my_channels) on connect. → `test/integration/message-send.test.ts` (poll for session row), `test/do/user-connection.test.ts`
 - [ ] Per-channel replay on connect (cursors param) + `GET /api/chat/events`. → `test/integration/hibernation-wake.test.ts`, `test/routes/events.test.ts`
-- [ ] Two-layer idempotency: `client_message_id` UNIQUE + namespaced `dedupe_principal_key`. → `test/do/chat-channel-message-send.test.ts` (idempotent + namespacing tests)
+- [ ] **Idempotency via `idempotency_keys` (not just `messages UNIQUE`):** same key+body → cached response; same key+different body → `409 IDEMPOTENCY_CONFLICT`; namespaced `dedupe_principal_key` keeps different users' same `client_message_id` separate. → `test/do/chat-channel-message-send.test.ts` (idempotent + IDEMPOTENCY_CONFLICT + namespacing tests)
 - [ ] Monotonic `event_id` order. → `ChatChannel.nextEventId` (Phase 0, reused); the e2e test asserts the ack `event_id` equals the received event `event_id`.
 - [ ] Hibernation wake restores cursors + replays missed events. → `test/integration/hibernation-wake.test.ts`
-- [ ] `member.left` drops online sessions (unsubscribe). → `test/integration/member-left-unsubscribe.test.ts`
-- [ ] Event payload stores actor refs, not UserSummary. → `test/chat/event-broadcast.test.ts`
+- [ ] **`member.left` drops online sessions (outbox flush) AND the deliver gate drops events during the unregister race window.** → `test/integration/member-left-unsubscribe.test.ts` (both tests)
+- [ ] **Persisted event payload stores actor refs; live broadcast + replay resolve UserSummary** (no bare user_id on the wire). → `test/chat/event-broadcast.test.ts` (`buildMessageCreatedPayload` ref + `resolveSenderForLiveBroadcast` resolved/fallback tests)
+- [ ] **`insertOutboxRowForFanout` is synchronous** — a fanout-outbox insert failure rolls back the message transaction (no committed message with a dropped broadcast). → code review of `ChatChannel.insertOutboxRowForFanout` (returns `void`, called inside `ctx.storage.transaction`).
+- [ ] **Phase 2 is text-only:** `message.send` rejects `type!=text`, `reply_to_message_id`, and non-empty `attachment_ids` with `INVALID_MESSAGE`. → `test/chat/command.test.ts` (reject image / reject reply / reject attachment tests)
 
-- [ ] **Step 3: Do NOT push or deploy.** Report completion with the final test count and the list of files created/modified. The operator deploys.
+- [ ] **Step 3: Out-of-scope, explicitly NOT done in Phase 2 (record so the operator knows the boundary):**
+- [ ] **No rate limiting.** Design §6.7 specifies per-user/per-channel/per-IP token buckets; Phase 2 does NOT implement them. **This means Phase 2 is NOT production-ready and must not be opened to real clients without Phase-3-or-later rate limiting.** The `rate_buckets` table exists (Phase 0 schema) but is unused.
+- [ ] **No observability metrics.** Design §6.8 (WS connection count, send latency, replay lag, fanout/outbox backlog) is not instrumented in Phase 2.
+- [ ] **`GET /api/chat/events` returns `last_event_id_per_channel`** (contract §10.3 field name). This is distinct from bootstrap's `event_state.per_channel` (contract §4.1) — they are two different endpoints with two different documented shapes. The frontend must read `last_event_id_per_channel` from `/events` and `event_state.per_channel` from `/bootstrap`. No contract change needed; this is already what v2.1 specifies.
+
+- [ ] **Step 4: Do NOT push or deploy.** Report completion with the final test count and the list of files created/modified. The operator deploys.
 
 ---
 
 ## Notes for the implementer
 
-- **Timing in e2e tests:** `registerOnlineOnConnect` runs in `ctx.waitUntil` after the 101 returns. Any test that sends a command then expects a fanout-delivered event must ensure registration completed first — use the `ChannelFanout /dump` poll pattern (Task 5 Step 2), not a fixed `setTimeout`.
+- **Timing in e2e tests:** `registerOnlineOnConnect` runs in `ctx.waitUntil` after the 101 returns. The e2e test (Task 5) polls `ChannelFanout /dump` until the session appears before sending — this is a test convenience, NOT a product requirement. The product code does NOT depend on the poll: `webSocketMessage` calls `ensureSubscribed(channel_id)` synchronously before routing `message.send`, so a client that sends immediately on open is still subscribed before the event is enqueued. A real client never needs to wait.
 - **`runDurableObjectAlarm`** is the test API to fire a DO's `alarm()` synchronously. Import from `cloudflare:test` (type added in Task 2 Step 5).
 - **The `/spike-*` endpoints on ChatChannel are untouched.** They remain for the Phase-0 spike tests. Real Phase-2 writes use `/internal/message-send` + `/internal/replay` + the `alarm()`-flushed outbox.
-- **`getByName` vs tests:** production uses `getByName(<id>)` (the wrangler `new_sqite_classes` mapping). Tests must use `getNamedDo(env.BINDING, name)` (which uses `idFromName`+`get`) because the prod name→id mapping isn't available in miniflare. This is already the established Phase-1 convention — follow it everywhere.
-- **Don't call `attachSummaries` in the broadcast path.** The event frame carries the sender ref; UserSummary resolution is the client's job (it has summaries from bootstrap/members). This keeps Hyperdrive out of the hot path and matches design §3.5. If a later phase wants rich sender data in events, that's a contract change, not a Phase-2 silent addition.
-- **`projection_outbox` `event_id` column for fanout rows** is set to the real `event_id` for `fanout` action and `""` for `unregister-user` action (no event). The `OutboxRow` interface in `chat-channel.ts` doesn't include `event_id` but the column exists in the schema; the alarm reads `payload_json` for the event_id, not the column, so this is fine.
+- **`getByName` vs tests:** production uses `getByName(<id>)` (the wrangler `new_sqite_classes` mapping). Tests must use `getNamedDo(env.BINDING, name)` (which uses `idOfName`+`get`) because the prod name→id mapping isn't available in miniflare. This is already the established Phase-1 convention — follow it everywhere.
+- **Live broadcast DOES resolve UserSummary (Hyperdrive is on the hot path).** Per design §3.5, the *persisted* `events.payload_json` stores only the sender ref (`{kind, user_id, bot_id}`), but the *wire* projection (live broadcast frame in the fanout outbox, and the replay output) resolves `sender.user.{display_name, avatar_url}` via `resolveSenderForLiveBroadcast` → `resolveUserSummaries`. This is intentional and spec-required: the client must never render a bare user_id. Fallback is `user-<shortid>` when pg has no row. Do NOT remove the resolve step to "optimize" — that would regress to bare ids.
+- **`insertOutboxRowForFanout` is synchronous** (`void`, not `async`). It runs inside `ctx.storage.transaction`; a `sql.exec` failure throws synchronously and aborts the transaction so the message + event are NOT committed without their fanout row. The legacy `insertOutboxRow` (used by `/internal/join` for `user_directory` projection) is still `async`-without-await — left as-is in Phase 2 because a missed `user_directory` projection is repairable, unlike a missed `channel_fanout` row which drops a real-time event. A future cleanup can convert it too.
+- **`projection_outbox` `event_id` column** is set to the real `event_id` for `fanout` action and `""` for `unregister-user` action (no event). The `OutboxRow` interface in `chat-channel.ts` doesn't include `event_id` but the column exists in the schema; the alarm reads `payload_json` for the event_id, not the column, so this is fine.
+- **`idempotency_keys` expiry:** the row is written with `expires_at = now + 24h` and `status='completed'`. Phase 2 does not GC expired rows (no alarm sweep for `idempotency_keys`); a future task can add one. Correctness is unaffected — an expired row just means a same-key retry after 24h would re-create the message (acceptable; the client_message_id window of interest is short).
