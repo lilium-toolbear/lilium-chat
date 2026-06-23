@@ -1,6 +1,6 @@
 # ToolBear Chat Browser/Bot API Contract
 
-状态：实现前 API contract（v2.2，基于 2026-06-21 v1 + backend 设计 v3.3 delta + 2026-06-23 成员精确读补丁 + 2026-06-24 前端缺口收口）
+状态：实现前 API contract（v2.3，基于 2026-06-21 v1 + backend 设计 v3.3 delta + 2026-06-23 成员精确读补丁 + 2026-06-24 前端缺口收口 + 2026-06-24 幂等冲突语义收口）
 日期：2026-06-22
 范围：lilium-chat 后端（Cloudflare Worker + Durable Object）的 browser/bot-facing wire shape
 权威来源：
@@ -26,6 +26,8 @@
 | 系统弱提示行 | 前端消费 `system.notice`，contract 未列事件 | **`system.notice`** 作为服务端生成的 timeline notice event (v2.2 delta) |
 | Not found 错误 | 资源级 not found 不完整 | 不定义通用 `NOT_FOUND`；使用 `CHANNEL_NOT_FOUND` / `MESSAGE_NOT_FOUND` / `MEMBER_NOT_FOUND` / `INVITE_NOT_FOUND` (v2.2 delta) |
 | 前端占位设置 | 未声明 | 群聊标签无 Browser API；免打扰是 browser local-only non-server state (v2.2 delta) |
+| 幂等冲突语义 | `IDEMPOTENCY_CONFLICT` 列于错误表但未点明 WS `message.send` 触发条件 | **`message.send` 同 `client_message_id` 异请求体 → `409 IDEMPOTENCY_CONFLICT`**；幂等响应来自 `idempotency_keys` 缓存的 `response_json`，不扫 `events` (v2.3 delta) |
+| `system.notice` payload | 列出 `actor.display_name`/`avatar_url` 但未区分 storage 与 wire | 明确该 payload 为 **Browser projection**；storage 只存 actor/target refs + `notice_kind` (v2.3 delta) |
 
 > 幂等章节的修订结论：幂等机制必须有，但普通 WS 发消息不需要两个幂等字段。保留 `client_message_id`，把 `command_id` 降级为 ack 关联 ID；bot command / interaction / HTTP mutation 继续保留独立幂等 key。
 
@@ -35,6 +37,7 @@
 - **v2 (2026-06-22)**：基于 backend 设计 v3.2 的重定向 + delta。per-channel cursor、committed_ack、`message.send` 幂等简化、`ROUTE_INDEX_PENDING`、`chat.kuma.homes` 跨域、附件 public-read risk acceptance。见上方差异摘要表。
 - **v2.1 (2026-06-23)**：补 `GET /api/chat/channels/{channel_id}/members/{user_id}`（§7.1b）按 user_id 精确读单成员资料。原因：前端 profile sheet（`useChatUserProfile`）cache miss 需按 user_id 精确读 role/joined_at，现有 `GET /members?query=` 是模糊搜索不可靠命中。实现时机 Phase 3。差异摘要表同步加一行。
 - **v2.2 (2026-06-24)**：按前端 spec 缺口收口：补 `POST /api/chat/channels/{channel_id}/dissolve`、`channel.dissolved`、`system.notice`、`CHANNEL_DISSOLVED`、`INVITE_NOT_FOUND`；明确不定义通用 `NOT_FOUND`；将群聊标签列为 v1 无 Browser API 占位，将免打扰列为 browser local-only non-server state。
+- **v2.3 (2026-06-24)**：幂等冲突语义收口（与 backend 设计 v3.3 §3.6 + Phase 2 plan 对齐）：§2.5 明确 `message.send` 同 `client_message_id` 异请求体 → `409 IDEMPOTENCY_CONFLICT`，幂等响应来自 `idempotency_keys` 缓存（不扫 `events`）；§6.2 补 committed_ack 的幂等命中/冲突行为；`system.notice` payload 标注为 Browser projection（storage 只存 actor/target refs + `notice_kind`）。
 
 ## 1. 边界
 
@@ -141,6 +144,14 @@ WebSocket command 的幂等按 command 类型区分（v2 delta）：
 - `command.invoke` / `interaction.submit`：保留 `idempotency_key`，或使用 `client_invocation_id` / `client_interaction_id` 作为业务幂等键。
 
 同一 principal、同一操作、同一 key、同一请求体必须返回同一业务结果。幂等按 principal 命名空间化：同一频道内不同用户使用相同 `client_message_id` 各自独立，互不挡；服务端不信任 client-provided ID 在频道内全局唯一 (v2 delta)。
+
+幂等响应与冲突语义（v2.3 delta）：
+
+- 服务端在 `idempotency_keys` 表记录 `(principal_kind, principal_id, operation, idempotency_key)` → `request_hash` + `response_json`，与业务写同事务落 SQLite（HTTP mutation 落路由到的 DO；WS `message.send` 落 ChatChannel DO）。命中幂等键时不重新执行业务，直接返回缓存的 `response_json`。
+- `request_hash` 覆盖该操作的可变请求体字段（`message.send` 取 `{ type, text, reply_to, mentions }`；`client_message_id` 本身是键，不进 hash）。
+- **同一 principal + 同一操作 + 同一 key + 同一 `request_hash`** → 返回缓存的 `response_json`（即同一条 message / 同一个 `event_id`）。
+- **同一 principal + 同一操作 + 同一 key + 不同 `request_hash`** → `409 IDEMPOTENCY_CONFLICT`（HTTP 错误 envelope；WS 走 `command_error`，`code=IDEMPOTENCY_CONFLICT`，`retryable=false`）。客户端复用 `client_message_id` 却改了 text/reply/mentions 等字段即触发此冲突。
+- 幂等判定**不扫描 `events` 表**；`message.send` 的 `{message_id, event_id}` 来自首次成功时写入的 `idempotency_keys.response_json`。`messages` 的 `UNIQUE(channel_id, dedupe_principal_key, client_message_id)` 仅为二级防御，不作为幂等响应来源。
 
 ### 2.6 错误 envelope
 
@@ -760,6 +771,12 @@ Worker 接受 command 并在事务提交后返回 committed_ack (v2 delta)：
 ```
 
 前端收到 committed_ack 后即可把本地 pending 绑定到 server `message_id`，即使 event frame 延迟也能正确渲染占位。event frame 仍是最终 timeline 状态来源。
+
+幂等行为（v2.3 delta）：
+
+- 客户端用同一 `client_message_id` 重发 `message.send`（重试、丢包重传）且请求体一致 → 服务端命中 `idempotency_keys` 缓存，返回与首次**相同的 `message_id` + `event_id`** 的 `committed_ack`，不创建新消息、不广播新 event。
+- 客户端用同一 `client_message_id` 但改了 `text`/`reply_to`/`mentions` 等字段 → `command_error`，`code=IDEMPOTENCY_CONFLICT`，`retryable=false`。前端应视为编程错误（复用 key 改 body），不应自动重试。
+- `message.created` event payload 的 `sender` 是 Browser projection（实时 `resolveUserSummaries`），不持久化 UserSummary；详见 §10.3 与 §10.4。
 
 随后广播：
 
@@ -1691,6 +1708,8 @@ GET /api/chat/events?cursors=<base64url(JSON {channel_id: after_event_id})>
 - `target_user`: 成员相关 notice 的目标用户，其余为 `null`。
 - `message_id`: `message.deleted` notice 的目标消息，其余为 `null`。
 - `channel_changes`: `channel.updated` 的字段级变更摘要，其余为 `null`。形状为 `{ "<field>": { "before": <old>, "after": <new> } }`，`field` 仅允许 `title`、`topic`、`avatar_url`、`visibility`。
+
+> **Storage vs wire projection（v2.3 delta）**：以上 `system.notice` payload 是 **Browser projection**。`events.payload_json`（DO storage）**不持久化 UserSummary**，只存 `actor_user_id` / `target_user_id` / `notice_kind` / `message_id` / `channel_changes` 等引用与结构字段。`actor.display_name` / `actor.avatar_url` / `target_user` 的 UserSummary 在输出时（live broadcast + replay）由 `resolveUserSummaries` 实时回填，与 `message.created` 的 sender 解析规则一致（§10.3）。实现时切勿把 display_name/avatar_url 落进 DO storage。
 
 前端规则 (v2 delta)：
 
