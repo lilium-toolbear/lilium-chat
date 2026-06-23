@@ -72,7 +72,10 @@ describe("member.left → ChannelFanout drops the user", () => {
 
     const { runInDurableObject } = await import("cloudflare:test") as any;
     let subVersion = -1;
-    for (let i = 0; i < 40; i++) {
+    // registerOnlineOnConnect runs in ctx.waitUntil; poll until it records the subscription.
+    // 120×50ms = 6s ceiling — generous because the machine is under heavy load and the
+    // waitUntil can be delayed when the full suite runs concurrently.
+    for (let i = 0; i < 120; i++) {
       await runInDurableObject(uc, async (_inst: unknown, state: { getWebSockets: () => WebSocket[] }) => {
         const att = (state.getWebSockets()[0] as WebSocket).deserializeAttachment() as {
           subscribed_channels?: Record<string, number>;
