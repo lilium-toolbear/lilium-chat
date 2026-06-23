@@ -2,6 +2,11 @@ import { SignJWT } from "jose";
 
 export const TEST_SECRET = "test-jwt-secret-do-not-use-in-prod";
 
+export function getNamedDo(binding: DurableObjectNamespace, name: string): DurableObjectStub {
+  // prod uses getByName; tests use idFromName+get. Works in both environments.
+  return binding.get(binding.idFromName(name));
+}
+
 export interface JwtClaims {
   sub: string;
   exp?: number; // unix seconds
