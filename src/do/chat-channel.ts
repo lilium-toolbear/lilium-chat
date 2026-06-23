@@ -117,6 +117,66 @@ interface OutboxRow {
   payload_json: string;
 }
 
+interface MessageRow {
+  message_id: string;
+  client_message_id: string;
+  channel_id: string;
+  sender_kind: string;
+  sender_user_id: string | null;
+  sender_bot_id: string | null;
+  type: string;
+  format: string;
+  status: string;
+  text: string | null;
+  reply_to: string | null;
+  reply_snapshot_json: string | null;
+  stream_state: string;
+  created_at: string;
+  updated_at: string;
+  edited_at: string | null;
+  deleted_at: string | null;
+  deleted_by: string | null;
+  recalled_at: string | null;
+}
+
+function rowToMessage(r: MessageRow): Record<string, unknown> {
+  let replySnapshot: unknown = null;
+  if (r.reply_snapshot_json) {
+    try {
+      replySnapshot = JSON.parse(r.reply_snapshot_json);
+    } catch {
+      replySnapshot = null;
+    }
+  }
+
+  return {
+    message_id: r.message_id,
+    client_message_id: r.client_message_id,
+    channel_id: r.channel_id,
+    sender: {
+      kind: r.sender_kind,
+      user_id: r.sender_user_id,
+      bot_id: r.sender_bot_id,
+    },
+    type: r.type,
+    format: r.format,
+    status: r.status,
+    text: r.text,
+    reply_to: r.reply_to,
+    reply_snapshot: replySnapshot,
+    stream_state: r.stream_state,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    edited_at: r.edited_at,
+    deleted_at: r.deleted_at,
+    deleted_by: r.deleted_by,
+    recalled_at: r.recalled_at,
+    attachments: [],
+    components: [],
+    mentions: [],
+  };
+}
+
 export class ChatChannel extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -384,6 +444,120 @@ export class ChatChannel extends DurableObject<Env> {
       const row = rows.toArray()[0] as { count: number | bigint } | undefined;
       const count = Number(row?.count ?? 0);
       return Response.json({ count });
+    }
+
+    if (url.pathname === "/internal/summary") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+
+      const meta = this.ctx.storage.sql
+        .exec(
+          "SELECT channel_id, kind, visibility, title, topic, avatar_url, status, created_at, updated_at, member_count FROM channel_meta LIMIT 1",
+        )
+        .toArray()[0] as
+        | {
+            channel_id: string;
+            kind: string;
+            visibility: string;
+            title: string;
+            topic: string | null;
+            avatar_url: string | null;
+            status: string;
+            created_at: string;
+            updated_at: string;
+            member_count: number;
+          }
+        | undefined;
+
+      if (meta === undefined) {
+        return new Response("channel not created", { status: 409 });
+      }
+
+      const member = userId
+        ? (this.ctx.storage.sql
+            .exec("SELECT role FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", meta.channel_id, userId)
+            .toArray()[0] as { role: string } | undefined)
+        : undefined;
+      if (!member && meta.visibility === "private") {
+        return new Response("forbidden", { status: 403 });
+      }
+
+      const lastEvent = this.ctx.storage.sql
+        .exec("SELECT event_id FROM events WHERE channel_id=? ORDER BY event_id DESC LIMIT 1", meta.channel_id)
+        .toArray()[0] as { event_id: string } | undefined;
+      const lastMsg = this.ctx.storage.sql
+        .exec(
+          "SELECT message_id, sender_user_id, sender_bot_id, text, created_at FROM messages WHERE channel_id=? AND status NOT IN ('deleted','recalled') ORDER BY message_id DESC LIMIT 1",
+          meta.channel_id,
+        )
+        .toArray()[0] as
+        | {
+            message_id: string;
+            sender_user_id: string | null;
+            sender_bot_id: string | null;
+            text: string | null;
+            created_at: string;
+          }
+        | undefined;
+
+      return Response.json({
+        channel_id: meta.channel_id,
+        kind: meta.kind,
+        visibility: meta.visibility,
+        title: meta.title,
+        topic: meta.topic,
+        avatar_url: meta.avatar_url,
+        member_count: meta.member_count,
+        status: meta.status,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+        last_message_at: lastMsg?.created_at ?? null,
+        last_message_preview: lastMsg?.text ?? null,
+        last_message_sender_id: lastMsg?.sender_user_id ?? lastMsg?.sender_bot_id ?? null,
+        last_event_id: lastEvent?.event_id ?? null,
+        my_role: member?.role ?? null,
+      });
+    }
+
+    if (url.pathname === "/internal/messages") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      const rawLimit = Number(url.searchParams.get("limit") ?? "50");
+      const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.floor(rawLimit))) : 50;
+      const before = url.searchParams.get("before");
+
+      const meta = this.ctx.storage.sql.exec("SELECT channel_id, visibility FROM channel_meta LIMIT 1").toArray()[0] as
+        | { channel_id: string; visibility: string }
+        | undefined;
+      if (meta === undefined) {
+        return new Response("channel not created", { status: 409 });
+      }
+
+      const member = userId
+        ? (this.ctx.storage.sql
+            .exec("SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", meta.channel_id, userId)
+            .toArray()[0] as { x: number } | undefined)
+        : undefined;
+      if (!member && meta.visibility === "private") {
+        return new Response("forbidden", { status: 403 });
+      }
+
+      const query = before === null
+        ?
+          "SELECT message_id, client_message_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE channel_id=? AND status NOT IN ('deleted','recalled') ORDER BY message_id DESC LIMIT ?"
+        : "SELECT message_id, client_message_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE channel_id=? AND status NOT IN ('deleted','recalled') AND message_id < ? ORDER BY message_id DESC LIMIT ?";
+
+      const rows = (before === null
+        ? this.ctx.storage.sql.exec(query, meta.channel_id, limit + 1)
+        : this.ctx.storage.sql.exec(query, meta.channel_id, before, limit + 1)
+      ).toArray() as unknown as MessageRow[];
+
+      const hasMore = rows.length > limit;
+      const page = hasMore ? rows.slice(0, limit) : rows;
+      const nextCursor = hasMore && page.length > 0 ? page[page.length - 1]!.message_id : null;
+
+      return Response.json({
+        items: page.map((r) => rowToMessage(r)),
+        next_cursor: nextCursor,
+      });
     }
 
     if (url.pathname === "/internal/test-leave") {
