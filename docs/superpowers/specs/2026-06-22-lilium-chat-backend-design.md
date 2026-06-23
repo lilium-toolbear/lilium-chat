@@ -1036,6 +1036,7 @@ GitHub Actions：`typecheck` + `test`，scripts 跟 game-worker 一致。
 - read-state floor（my_channels `status='active'` row）+ cursor 单调。
 - unread 计算。
 - in-DO HTTP 幂等（统一 `idempotency_keys` 表）。
+- **新增 `GET /api/chat/channels/{channel_id}/members/{user_id}`**：按 user_id 精确读单成员资料（role / joined_at / 离开状态）。现有 `GET /channels/{id}/members?query=` 是 display_name 模糊搜索，不可靠地按 user_id 命中。该精确读接口供前端 profile sheet 点开任意 mention 时拉取该用户在频道的 role/joined_at（前端 `useChatUserProfile(user_id, channel_id)` cache miss 回源到此）。contract §7 需相应补这个端点。
 
 验收：contract 12.4。
 
