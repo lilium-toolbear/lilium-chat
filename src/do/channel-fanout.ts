@@ -94,7 +94,7 @@ export class ChannelFanout extends DurableObject<Env> {
         body.user_id ?? "",
       );
       this.ctx.storage.sql.exec(
-        "UPDATE fanout_queue SET status='failed', last_error='member_left' WHERE channel_id=? AND target_user_id=? AND status='pending'",
+        "UPDATE fanout_queue SET status='dead_letter', last_error='member_left' WHERE channel_id=? AND target_user_id=? AND status='pending'",
         channelId,
         body.user_id ?? "",
       );

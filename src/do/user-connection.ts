@@ -269,11 +269,8 @@ export class UserConnection extends DurableObject<Env> {
   async alarm(): Promise<void> {}
 
   private findSocketBySession(sessionId: string): WebSocket | null {
+    if (!sessionId) return null;
     const sockets = this.ctx.getWebSockets() as WebSocket[];
-    if (sessionId.length === 0) {
-      const attached = sockets.find((ws) => ws.deserializeAttachment() as ConnectionAttachment | null);
-      return (attached ?? sockets[0]) ?? null;
-    }
 
     for (const ws of sockets) {
       const att = ws.deserializeAttachment() as ConnectionAttachment | null;
@@ -452,19 +449,17 @@ export class UserConnection extends DurableObject<Env> {
     const allowed = await this.canDeliver(att, ws, parsed.channel_id, membershipVersionAtEvent);
     if (!allowed) return { delivered: false, dropped: "not_member" };
 
-    this.ctx.waitUntil(
-      new Promise<void>((resolve) => {
-        setTimeout(() => {
-          ws.send(eventJson);
-          ws.serializeAttachment({
-            ...att,
-            last_deliver: eventJson,
-            per_channel_cursors: { ...att.per_channel_cursors, [parsed.channel_id]: parsed.event_id },
-          });
-          resolve();
-        }, 0);
-      }),
-    );
+    // Send synchronously: ChannelFanout marks the queue row 'delivered' on our 200 response,
+    // so the bytes MUST be on the wire (or buffered by the hibernating socket) before we return.
+    // Re-read attachment after canDeliver (it may have bumped the subscription version).
+    const current = ws.deserializeAttachment() as ConnectionAttachment | null;
+    const base = current ?? att;
+    ws.send(eventJson);
+    ws.serializeAttachment({
+      ...base,
+      last_deliver: eventJson,
+      per_channel_cursors: { ...base.per_channel_cursors, [parsed.channel_id]: parsed.event_id },
+    });
     return { delivered: true };
   }
 

@@ -242,7 +242,7 @@ export class ChatChannel extends DurableObject<Env> {
     };
     this.ctx.storage.sql.exec(
       "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'channel_fanout', ?, ?, ?, 'pending', ?, ?, ?, 0, 5)",
-      `${channelId}:${eventId}:${Math.random()}`,
+      `channel_fanout:${channelId}:${eventId}`,
       channelId,
       eventId,
       JSON.stringify(payload),

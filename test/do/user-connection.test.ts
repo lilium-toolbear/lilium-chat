@@ -55,6 +55,9 @@ describe("UserConnection DO", () => {
       occurred_at: "2026-06-23T00:00:00Z",
       payload: {},
     });
+    // Attach the listener BEFORE /deliver: handleDeliver now sends synchronously on the 200
+    // path, so the frame is dispatched during the fetch — a listener attached after would miss it.
+    const receivedPromise = nextMessage(ws);
     const deliverRes = await stub.fetch(new Request("https://x/deliver", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -62,7 +65,7 @@ describe("UserConnection DO", () => {
     }));
     expect(deliverRes.status).toBe(200);
 
-    const received = await nextMessage(ws);
+    const received = await receivedPromise;
     expect(JSON.parse(received).event_id).toBe("e-d1");
 
     const probe = await (await stub.fetch(new Request("https://x/test-last-deliver"))).json() as { event_json: string | null };
