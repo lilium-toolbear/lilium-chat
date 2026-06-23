@@ -33,8 +33,13 @@ export class UserDirectory extends DurableObject<Env> {
     if (url.pathname === "/my-channels") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       const rows = this.ctx.storage.sql
-        .exec("SELECT channel_id, kind, last_read_event_id FROM my_channels WHERE user_id = ? AND status = 'active'", userId)
-        .toArray() as { channel_id: string; kind: string; last_read_event_id: string | null }[];
+        .exec("SELECT channel_id, kind, last_read_event_id, membership_version FROM my_channels WHERE user_id = ? AND status = 'active'", userId)
+        .toArray() as {
+          channel_id: string;
+          kind: string;
+          last_read_event_id: string | null;
+          membership_version: number;
+        }[];
       return Response.json({ items: rows });
     }
 
@@ -44,48 +49,69 @@ export class UserDirectory extends DurableObject<Env> {
       const now = new Date().toISOString();
 
       const body = (await request.json()) as {
-        action: string;
+        action: "join" | "leave";
         channel_id: string;
         kind: string;
         membership_version: number;
       };
-      if (body.action !== "join") {
-        return Response.json({ error: "unsupported action" }, { status: 400 });
-      }
 
       if (!body.channel_id || !body.kind) {
         return Response.json({ error: "invalid payload" }, { status: 400 });
       }
-
-      const existing = this.ctx.storage.sql
-        .exec("SELECT status, left_at FROM my_channels WHERE user_id = ? AND channel_id = ?", userId, body.channel_id)
-        .toArray()[0] as { status: string; left_at: string | null } | undefined;
-
-      if (existing?.status === "active" && existing.left_at === null) {
-        return Response.json({ ok: true });
+      if (body.action !== "join" && body.action !== "leave") {
+        return Response.json({ error: "unsupported action" }, { status: 400 });
       }
 
-      if (existing === undefined) {
-        this.ctx.storage.sql.exec(
-          "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, status, membership_version) VALUES (?, ?, ?, ?, 'active', ?)",
-          userId,
-          body.channel_id,
-          body.kind,
-          now,
-          body.membership_version,
-        );
-        return Response.json({ ok: true });
-      }
+      return await this.ctx.storage.transaction(async () => {
+        const existing = this.ctx.storage.sql
+          .exec(
+            "SELECT status, left_at, membership_version FROM my_channels WHERE user_id = ? AND channel_id = ?",
+            userId,
+            body.channel_id,
+          )
+          .toArray()[0] as
+          | { status: string; left_at: string | null; membership_version: number }
+          | undefined;
 
-      this.ctx.storage.sql.exec(
-        "UPDATE my_channels SET status='active', left_at=NULL, joined_at=?, kind=?, membership_version=? WHERE user_id=? AND channel_id=?",
-        now,
-        body.kind,
-        body.membership_version,
-        userId,
-        body.channel_id,
-      );
-      return Response.json({ ok: true });
+        if (existing && existing.membership_version >= body.membership_version) {
+          return Response.json({ ok: true });
+        }
+
+        if (body.action === "join") {
+          if (existing === undefined) {
+            this.ctx.storage.sql.exec(
+              "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, left_at, removed_at, status, membership_version, last_read_event_id) VALUES (?, ?, ?, ?, NULL, NULL, 'active', ?, NULL)",
+              userId,
+              body.channel_id,
+              body.kind,
+              now,
+              body.membership_version,
+            );
+            return Response.json({ ok: true });
+          }
+
+          this.ctx.storage.sql.exec(
+            "UPDATE my_channels SET status='active', left_at=NULL, removed_at=NULL, membership_version=?, joined_at=COALESCE(joined_at, ?), kind=? WHERE user_id=? AND channel_id=?",
+            body.membership_version,
+            now,
+            body.kind,
+            userId,
+            body.channel_id,
+          );
+          return Response.json({ ok: true });
+        }
+
+        if (existing) {
+          this.ctx.storage.sql.exec(
+            "UPDATE my_channels SET status='left', left_at=?, membership_version=? WHERE user_id=? AND channel_id=?",
+            now,
+            body.membership_version,
+            userId,
+            body.channel_id,
+          );
+        }
+        return Response.json({ ok: true });
+      });
     }
 
     return new Response("not found", { status: 404 });
