@@ -44,6 +44,7 @@ A. **Profile 来源**：Worker 通过 Hyperdrive 直读 ToolBear 生产 Postgres
 B. **Origin 关系**：ToolBear SPA（`lilium.kuma.homes`）跨域调用 `chat.kuma.homes`，lilium-chat 仓库纯后端。
 C. **附件存储**：自建 SeaweedFS（`s3.kuma.homes`，S3 兼容），不用 R2。附件 public read，读请求不签名（产品方显式接受 private 频道附件也公开，见第 5.4 节 risk acceptance）。
 D. **默认频道**：所有用户共享一个系统公共频道。
+System public channel is a single ChatChannel DO in Phase 1-3 (name `system-general`). All users + messages land there → single-DO write serialization hot spot. Acceptable for small communities; splitting (`system-general-0..N` by user hash, or read-only announce channel model) is explicit later work, not a Phase 1 blocker.
 E. **事件 cursor**：per-channel cursor（v2 新增，相应修订 contract API 形状，见第 3.5 节）。
 
 **v2 确认的技术选择：**
@@ -1128,4 +1129,3 @@ per-channel cursor 是产品方确认的 contract API 形状修订（见第 0.2 
 - 新增错误码 `409 ROUTE_INDEX_PENDING`（`retryable: true`）：`/messages/{id}`、`/invites/{code}` 在索引 outbox lag 窗口内返回此码而非 `404`。
 
 权威 contract v2 已落本仓库 `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（含 per-channel cursor + committed_ack + 幂等简化 + ROUTE_INDEX_PENDING + 风险登记 delta）。前端开工前须按此 v2 contract 接入，并与前端 `chatConnectionStore` 重构同步（`last_event_id` → per-channel map）。后端阶段 1/2 实现按 v2 contract 形状，不实现原 2026-06-21 contract 的单全局 cursor 与 accepted-only ack。
-
