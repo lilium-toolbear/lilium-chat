@@ -6,6 +6,7 @@ import { uuidv7 } from "./ids/uuidv7";
 import { bootstrapHandler } from "./routes/bootstrap";
 import { wsUpgradeHandler } from "./routes/ws";
 import { listChannelsHandler, channelDetailHandler } from "./routes/channels";
+import { listMessagesHandler } from "./routes/messages";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -42,6 +43,7 @@ app.onError((err, c) => {
 app.get("/api/chat/bootstrap", (c) => bootstrapHandler(c));
 app.get("/api/chat/ws", (c) => wsUpgradeHandler(c));
 app.get("/api/chat/channels", (c) => listChannelsHandler(c));
+app.get("/api/chat/channels/:channel_id/messages", (c) => listMessagesHandler(c));
 app.get("/api/chat/channels/:channel_id", (c) => channelDetailHandler(c));
 app.all("/api/chat/*", (c) => {
   throw new ApiError("CHANNEL_NOT_FOUND", "not implemented in phase 0", { httpStatus: 404 });
