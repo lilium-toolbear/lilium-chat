@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { execSchema } from "./sql";
-import { monotonicUuidV7, type EventSeq } from "../ids/uuidv7";
+import { uuidv7, monotonicUuidV7, type EventSeq } from "../ids/uuidv7";
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS channel_meta (
@@ -110,16 +110,104 @@ const SCHEMA = [
   )`,
 ];
 
+interface OutboxRow {
+  outbox_id: string;
+  target_kind: string;
+  target_key: string;
+  payload_json: string;
+}
+
 export class ChatChannel extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     execSchema(this.ctx, SCHEMA);
   }
 
+  private nowIso(): string {
+    return new Date().toISOString();
+  }
+
+  private async insertOutboxRow(
+    targetKind: string,
+    targetKey: string,
+    payload: Record<string, unknown>,
+    nowIso: string,
+  ): Promise<void> {
+    const payloadOut = { ...payload } as Record<string, unknown>;
+    const eventId = this.nextEventId(Date.parse(nowIso));
+    this.ctx.storage.sql.exec(
+      "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, 0, 5)",
+      `${targetKind}:${targetKey}:${eventId}:${Math.random()}`,
+      targetKind,
+      targetKey,
+      eventId,
+      JSON.stringify(payloadOut),
+      nowIso,
+      nowIso,
+      nowIso,
+    );
+  }
+
+  private async scheduleOutboxAlarm(nowIso: string): Promise<void> {
+    const row = this.ctx.storage.sql
+      .exec("SELECT MIN(next_attempt_at) AS due FROM projection_outbox WHERE status='pending'")
+      .toArray()[0] as { due: string | null } | undefined;
+    const due = row?.due ?? null;
+    if (due === null) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+
+    const dueMs = Date.parse(due);
+    if (Number.isNaN(dueMs)) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+
+    const currentAlarm = await this.ctx.storage.getAlarm();
+    if (currentAlarm === null || dueMs < currentAlarm) {
+      await this.ctx.storage.setAlarm(dueMs);
+      return;
+    }
+
+    // Keep the existing alarm if it is already earlier/equal.
+    void nowIso;
+  }
+
+  private async bumpOutboxRetry(outboxId: string, nowIso: string, error: string): Promise<void> {
+    const row = this.ctx.storage.sql
+      .exec("SELECT attempts, max_attempts FROM projection_outbox WHERE outbox_id=?", outboxId)
+      .toArray()[0] as { attempts: number | null; max_attempts: number | null } | undefined;
+    const attempts = row?.attempts ?? 0;
+    const maxAttempts = row?.max_attempts ?? 5;
+    const nextAttempts = attempts + 1;
+
+    if (nextAttempts >= maxAttempts) {
+      this.ctx.storage.sql.exec(
+        "UPDATE projection_outbox SET status='dead_letter', attempts=?, last_error=?, failed_at=?, updated_at=? WHERE outbox_id=?",
+        nextAttempts,
+        error,
+        nowIso,
+        nowIso,
+        outboxId,
+      );
+      return;
+    }
+
+    const backoffMs = 1000 * Math.pow(2, attempts);
+    this.ctx.storage.sql.exec(
+      "UPDATE projection_outbox SET status='pending', attempts=?, last_error=?, next_attempt_at=?, updated_at=? WHERE outbox_id=?",
+      nextAttempts,
+      error,
+      new Date(Date.parse(nowIso) + backoffMs).toISOString(),
+      nowIso,
+      outboxId,
+    );
+  }
+
   nextEventId(nowMs: number = Date.now()): string {
-    const row = this.ctx.storage.sql.exec("SELECT last_ms, counter FROM event_seq WHERE id=1").toArray()[0] as
-      | { last_ms: number; counter: number }
-      | undefined;
+    const rows = this.ctx.storage.sql.exec("SELECT last_ms, counter FROM event_seq WHERE id=1").toArray();
+    const row = rows[0] as { last_ms: number; counter: number } | undefined;
     const seq: EventSeq = row ?? { last_ms: 0, counter: 0 };
     const { id, seq: next } = monotonicUuidV7(seq, nowMs);
     this.ctx.storage.sql.exec("UPDATE event_seq SET last_ms=?, counter=? WHERE id=1", next.last_ms, next.counter);
@@ -136,28 +224,29 @@ export class ChatChannel extends DurableObject<Env> {
         target_key: string;
         payload: Record<string, unknown>;
       };
+      const now = this.nowIso();
       this.ctx.storage.sql.exec(
         "INSERT OR REPLACE INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at) VALUES (?, 'message_index', ?, '', ?, 'pending', ?, ?, ?)",
         b.outbox_id,
         b.target_key,
         JSON.stringify(b.payload),
-        new Date().toISOString(),
-        new Date().toISOString(),
-        new Date().toISOString(),
+        now,
+        now,
+        now,
       );
       return new Response("ok");
     }
 
     if (url.pathname === "/outbox-flush") {
-      const rows = this.ctx.storage.sql.exec(
-        "SELECT outbox_id, target_key, payload_json FROM projection_outbox WHERE status='pending'",
-      ).toArray() as Array<{ outbox_id: string; target_key: string; payload_json: string }>;
+      const rows = this.ctx.storage.sql
+        .exec("SELECT outbox_id, target_key, payload_json FROM projection_outbox WHERE status='pending'")
+        .toArray() as Array<{ outbox_id: string; target_key: string; payload_json: string }>;
       for (const r of rows) {
         const target = this.env.MESSAGE_INDEX.getByName(r.target_key);
         await target.fetch(new Request("https://x/upsert", { method: "POST", body: r.payload_json }));
         this.ctx.storage.sql.exec(
           "UPDATE projection_outbox SET status='delivered', updated_at=? WHERE outbox_id=?",
-          new Date().toISOString(),
+          this.nowIso(),
           r.outbox_id,
         );
       }
@@ -177,9 +266,149 @@ export class ChatChannel extends DurableObject<Env> {
       return Response.json({ ids });
     }
 
+    if (url.pathname === "/internal/maybe-create-system") {
+      const b = (await request.json()) as { title: string };
+      const now = this.nowIso();
+
+      const existing = this.ctx.storage.sql
+        .exec("SELECT channel_id FROM channel_meta")
+        .toArray()[0] as { channel_id: string } | undefined;
+      if (existing !== undefined) {
+        return Response.json({ channel_id: existing.channel_id });
+      }
+
+      const channelId = uuidv7();
+      const title = b?.title?.trim() ?? "Lilium";
+      this.ctx.storage.sql.exec(
+        `INSERT INTO channel_meta (
+          channel_id, kind, visibility, title, topic, avatar_url, status,
+          created_by, created_at, updated_at, member_count, membership_version
+        ) VALUES (?, 'channel', 'public_listed', ?, NULL, NULL, 'active', 'system', ?, ?, 0, 0)`,
+        channelId,
+        title,
+        now,
+        now,
+      );
+      return Response.json({ channel_id: channelId });
+    }
+
+    if (url.pathname === "/internal/join") {
+      const b = (await request.json()) as { user_id: string };
+      const userId = b.user_id;
+      const now = this.nowIso();
+      let channelId = "";
+      let membershipVersion = 0;
+      let joinedAt = now;
+      let writeProjection = false;
+
+      const meta = this.ctx.storage.sql.exec("SELECT channel_id, kind, membership_version, member_count FROM channel_meta").toArray()[0] as
+        | { channel_id: string; kind: string; membership_version: number; member_count: number }
+        | undefined;
+      if (meta === undefined) {
+        return new Response("not found", { status: 404 });
+      }
+      channelId = meta.channel_id;
+
+      const m = this.ctx.storage.sql
+        .exec("SELECT joined_at, left_at FROM members WHERE channel_id=? AND user_id=?", channelId, userId)
+        .toArray()[0] as { joined_at: string; left_at: string | null } | undefined;
+
+      if (m && m.left_at === null) {
+        membershipVersion = meta.membership_version;
+        joinedAt = m.joined_at;
+      } else {
+        membershipVersion = meta.membership_version + 1;
+        joinedAt = now;
+        if (m === undefined) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, 'member', ?, NULL)",
+            channelId,
+            userId,
+            joinedAt,
+          );
+        } else {
+          this.ctx.storage.sql.exec(
+            "UPDATE members SET joined_at=?, left_at=NULL, role='member' WHERE channel_id=? AND user_id=?",
+            joinedAt,
+            channelId,
+            userId,
+          );
+        }
+
+        const nextCount = (meta.member_count ?? 0) + 1;
+        this.ctx.storage.sql.exec(
+          "UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?",
+          membershipVersion,
+          nextCount,
+          now,
+          channelId,
+        );
+
+        const eventId = this.nextEventId(Date.parse(now));
+        this.ctx.storage.sql.exec(
+          "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, 'member.joined', ?, 'system', 'system', ?, ?, ?)",
+          eventId,
+          channelId,
+          JSON.stringify({
+            channel_id: channelId,
+            user_id: userId,
+            membership_version: membershipVersion,
+          }),
+          membershipVersion,
+          now,
+        );
+
+        await this.insertOutboxRow(
+          "user_directory",
+          userId,
+          {
+            action: "join",
+            channel_id: channelId,
+            kind: meta.kind,
+            membership_version: membershipVersion,
+          },
+          now,
+        );
+        writeProjection = true;
+      }
+
+      if (writeProjection) await this.scheduleOutboxAlarm(now);
+      return Response.json({ channel_id: channelId, membership_version: membershipVersion, joined_at: joinedAt });
+    }
+
+    if (url.pathname === "/internal/outbox-pending") {
+      const targetKind = url.searchParams.get("target_kind");
+      const rows = targetKind === null
+        ? this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM projection_outbox WHERE status='pending'")
+        : this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM projection_outbox WHERE status='pending' AND target_kind=?", targetKind);
+      const row = rows.toArray()[0] as { count: number | bigint } | undefined;
+      const count = Number(row?.count ?? 0);
+      return Response.json({ count });
+    }
+
+    if (url.pathname === "/internal/test-leave") {
+      const testOnly = request.headers.get("X-Test-Only");
+      if (testOnly !== "1") return new Response("forbidden", { status: 403 });
+
+      const b = (await request.json()) as { user_id: string };
+      const userId = b.user_id;
+      const meta = this.ctx.storage.sql.exec("SELECT channel_id FROM channel_meta").toArray()[0] as { channel_id: string } | undefined;
+      if (meta === undefined) {
+        return new Response("not found", { status: 404 });
+      }
+      const now = this.nowIso();
+      this.ctx.storage.sql.exec(
+        "UPDATE members SET left_at=? WHERE channel_id=? AND user_id=?",
+        now,
+        meta.channel_id,
+        userId,
+      );
+      return Response.json({ ok: true });
+    }
+
     if (url.pathname === "/spike-create") {
       const b = (await request.json()) as { message_id: string; event_id: string; text: string };
-      const now = new Date().toISOString();
+      const now = this.nowIso();
       this.ctx.storage.sql.exec(
         "INSERT OR REPLACE INTO messages (message_id, client_message_id, dedupe_principal_key, channel_id, sender_kind, type, status, text, created_at, updated_at) VALUES (?, 'c', 'user:x', 'replay-1', 'user', 'text', 'normal', ?, ?, ?)",
         b.message_id,
@@ -198,7 +427,7 @@ export class ChatChannel extends DurableObject<Env> {
 
     if (url.pathname === "/spike-delete") {
       const b = (await request.json()) as { message_id: string };
-      const now = new Date().toISOString();
+      const now = this.nowIso();
       this.ctx.storage.sql.exec("UPDATE messages SET status='deleted', deleted_at=? WHERE message_id=?", now, b.message_id);
       this.ctx.storage.sql.exec(
         "INSERT INTO events (event_id, event_type, channel_id, payload_json, occurred_at) VALUES (?, 'message.deleted', 'replay-1', ?, ?)",
@@ -235,6 +464,47 @@ export class ChatChannel extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    // Phase 0: no due tables yet.
+    const nowIso = this.nowIso();
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT outbox_id, target_kind, target_key, payload_json FROM projection_outbox WHERE status='pending' AND next_attempt_at <= ? ORDER BY next_attempt_at ASC",
+        nowIso,
+      )
+      .toArray() as unknown as Array<OutboxRow>;
+
+    for (const r of rows) {
+      if (r.target_kind !== "user_directory") {
+        await this.bumpOutboxRetry(r.outbox_id, nowIso, `unsupported target_kind=${r.target_kind}`);
+        continue;
+      }
+
+      const req = new Request("https://x/internal/upsert-channel", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Verified-User-Id": r.target_key,
+        },
+        body: r.payload_json,
+      });
+      const target = this.env.USER_DIRECTORY.getByName(r.target_key);
+      try {
+        const res = await target.fetch(req);
+        if (!res.ok) {
+          const text = await res.text();
+          await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
+          continue;
+        }
+        this.ctx.storage.sql.exec(
+          "UPDATE projection_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
+          nowIso,
+          r.outbox_id,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await this.bumpOutboxRetry(r.outbox_id, nowIso, msg);
+      }
+    }
+
+    await this.scheduleOutboxAlarm(nowIso);
   }
 }
