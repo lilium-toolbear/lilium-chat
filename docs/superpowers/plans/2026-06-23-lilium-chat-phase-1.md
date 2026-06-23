@@ -61,6 +61,106 @@ test/
 
 ---
 
+## Preconditions
+
+- **Named-DO test helper exists and is used in all Phase 1 tests.** Add to `test/helpers.ts` (the Phase 0 helper file):
+
+  ```ts
+  export function getNamedDo(binding: DurableObjectNamespace, name: string): DurableObjectStub {
+    // prod uses getByName; tests use idFromName+get. Works in both environments.
+    return binding.get(binding.idFromName(name));
+  }
+  ```
+
+  All Phase 1 tests import `getNamedDo` from `../../test/helpers` and use `getNamedDo(env.X, name)` instead of `env.X.getByName(name)`. (Phase 0 tests used `idFromName+get` directly; this centralizes the pattern.) Production code keeps `c.env.X.getByName(...)`.
+
+- **v3.1 per-channel cursor contract delta is the implementation target** (`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` §4.1 / §10).
+- **projection_outbox flush path is tested end-to-end**: ChatChannel join → alarm/flush → UserDirectory my_channels contains the channel (see Task 1 Step 4 test additions + `src/chat/projection.test.ts`).
+
+---
+
+## Task 0: Helper module `src/chat/system-channel.ts`
+
+**Files:**
+- Create: `src/chat/system-channel.ts`
+- Test: `src/chat/system-channel.test.ts` (light)
+
+Centralizes system-channel routing so `SYSTEM_CHANNEL_NAME` / `SYSTEM_TITLE` / `channelNameFor` are NOT duplicated across bootstrap, channels, messages routes (reviewer P1-3).
+
+**Interfaces:**
+- `ensureSystemChannel(env): Promise<{ channelId: string }>` — calls ChatChannel `/internal/maybe-create-system`.
+- `ensureSystemJoined(env, userId): Promise<{ channelId: string; membershipVersion: number }>` — ensureSystemChannel + `/internal/join`.
+- `channelRouteNameFor(env, userId, clientChannelId): Promise<string | null>` — returns `"system-general"` if `clientChannelId === system channelId` (probes system DO once to compare), else `clientChannelId` (Phase 3 convention where channel_id == DO name). Returns null if the channel can't be resolved (unknown UUID → caller returns CHANNEL_NOT_FOUND without creating state).
+
+```ts
+// src/chat/system-channel.ts
+import type { Env } from "../env";
+
+export const SYSTEM_CHANNEL_NAME = "system-general";
+export const SYSTEM_TITLE = "Lilium";
+
+export async function ensureSystemChannel(env: Env): Promise<{ channelId: string }> {
+  const stub = env.CHAT_CHANNEL.getByName(SYSTEM_CHANNEL_NAME);
+  const res = await stub.fetch(new Request("https://x/internal/maybe-create-system", {
+    method: "POST", body: JSON.stringify({ title: SYSTEM_TITLE }),
+  }));
+  return { channelId: (await res.json() as { channel_id: string }).channel_id };
+}
+
+export async function ensureSystemJoined(env: Env, userId: string): Promise<{ channelId: string; membershipVersion: number }> {
+  const { channelId } = await ensureSystemChannel(env);
+  const stub = env.CHAT_CHANNEL.getByName(SYSTEM_CHANNEL_NAME);
+  const jr = await stub.fetch(new Request("https://x/internal/join", {
+    method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId }),
+  }));
+  const jb = await jr.json() as { channel_id: string; membership_version: number };
+  return { channelId: jb.channel_id, membershipVersion: jb.membership_version };
+}
+
+export async function channelRouteNameFor(env: Env, userId: string, clientChannelId: string): Promise<string | null> {
+  const sys = await ensureSystemChannel(env);
+  if (clientChannelId === sys.channelId) return SYSTEM_CHANNEL_NAME;
+  // Phase 3+ convention: user-created channels use channel_id as the DO name.
+  // For Phase 1, any non-system id is unresolved → null (caller returns CHANNEL_NOT_FOUND).
+  return null;
+}
+```
+
+Test (`src/chat/system-channel.test.ts`):
+
+```ts
+import { describe, it, expect } from "vitest";
+import { env } from "cloudflare:workers";
+import { getNamedDo } from "../../test/helpers";
+import { ensureSystemChannel, ensureSystemJoined, channelRouteNameFor, SYSTEM_CHANNEL_NAME } from "./system-channel";
+
+describe("system-channel helpers", () => {
+  it("ensureSystemChannel returns a stable UUIDv7 channel_id", async () => {
+    const a = await ensureSystemChannel(env);
+    const b = await ensureSystemChannel(env);
+    expect(a.channelId).toBe(b.channelId);
+    expect(a.channelId).toMatch(/^01[0-9a-f]{6}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  it("channelRouteNameFor returns system name for system channelId, null for others", async () => {
+    const userId = "u-route-1";
+    const { channelId } = await ensureSystemJoined(env, userId);
+    expect(await channelRouteNameFor(env, userId, channelId)).toBe(SYSTEM_CHANNEL_NAME);
+    expect(await channelRouteNameFor(env, userId, "unknown-uuid")).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 1: Write failing test** (above)
+- [ ] **Step 2: Run → FAIL** (`./system-channel` not found)
+- [ ] **Step 3: Implement** `src/chat/system-channel.ts` (above)
+- [ ] **Step 4: `npx tsc --noEmit` → PASS**
+- [ ] **Step 5: `npx vitest run src/chat/system-channel.test.ts` → PASS (2 tests)**
+- [ ] **Step 6: Commit** `git add src/chat/system-channel.ts src/chat/system-channel.test.ts test/helpers.ts && git commit -m "feat(chat): system-channel routing helpers + getNamedDo test helper"`
+
+---
+
 ## Task 1: System channel lazy-create + join endpoint on ChatChannel
 
 **Files:**
@@ -82,8 +182,11 @@ import { env } from "cloudflare:workers";
 
 const SYSTEM = "system-general";
 
+// getNamedDo is imported from test/helpers (added in Task 0).
+import { getNamedDo } from "../../test/helpers";
+
 async function ensureSystem(): Promise<string> {
-  const stub = env.CHAT_CHANNEL.getByName(SYSTEM);
+  const stub = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
   const res = await stub.fetch(new Request("https://x/internal/maybe-create-system", {
     method: "POST", body: JSON.stringify({ title: "Lilium" }),
   }));
@@ -101,7 +204,7 @@ describe("ChatChannel system channel", () => {
 
   it("join is idempotent and bumps membership_version only once for a new user", async () => {
     const channelId = await ensureSystem();
-    const stub = env.CHAT_CHANNEL.getByName(SYSTEM);
+    const stub = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
     const userId = "u-join-1";
     const r1 = await stub.fetch(new Request("https://x/internal/join", {
       method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -121,7 +224,7 @@ describe("ChatChannel system channel", () => {
 
   it("join writes a projection_outbox row for user_directory", async () => {
     await ensureSystem();
-    const stub = env.CHAT_CHANNEL.getByName(SYSTEM);
+    const stub = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
     const userId = "u-join-2";
     await stub.fetch(new Request("https://x/internal/join", {
       method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -132,8 +235,63 @@ describe("ChatChannel system channel", () => {
     const pb = await probe.json() as { count: number };
     expect(pb.count).toBeGreaterThanOrEqual(1);
   });
+
+  it("end-to-end: join → alarm flush → UserDirectory my_channels contains the channel", async () => {
+    const channelId = await ensureSystem();
+    const stub = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
+    const userId = "u-e2e-1";
+    await stub.fetch(new Request("https://x/internal/join", {
+      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId }),
+    }));
+    // trigger the alarm flush (the DO's alarm() drains the outbox)
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(stub, async (instance) => { await (instance as { alarm: () => Promise<void> }).alarm(); });
+    const dirStub = getNamedDo(env.USER_DIRECTORY, userId);
+    const res = await dirStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
+    const body = await res.json() as { items: Array<{ channel_id: string }> };
+    expect(body.items.find((r) => r.channel_id === channelId)).toBeDefined();
+  });
+
+  it("rejoin after leave reactivates and bumps membership_version (reviewer P1-4)", async () => {
+    const channelId = await ensureSystem();
+    const stub = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
+    const userId = "u-rejoin-1";
+    const r1 = await stub.fetch(new Request("https://x/internal/join", {
+      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId }),
+    }));
+    const b1 = await r1.json() as { membership_version: number };
+    // simulate a leave via a direct internal update (Phase 3 adds /internal/leave; here set left_at directly through a test-only probe)
+    await stub.fetch(new Request("https://x/internal/test-leave", {
+      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId }),
+    }));
+    const r2 = await stub.fetch(new Request("https://x/internal/join", {
+      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId }),
+    }));
+    const b2 = await r2.json() as { membership_version: number };
+    expect(b2.membership_version).toBeGreaterThan(b1.membership_version);
+  });
 });
 ```
+
+The `rejoin` test needs a `/internal/test-leave` endpoint to set `left_at` (Phase 3 adds a real `/internal/leave`). Add this test-only endpoint to ChatChannel.fetch:
+
+```ts
+if (url.pathname === "/internal/test-leave") {
+  const userId = request.headers.get("X-Verified-User-Id") ?? "";
+  const now = new Date().toISOString();
+  return await this.ctx.storage.transaction(async () => {
+    const meta = this.ctx.storage.sql.exec("SELECT channel_id, membership_version FROM channel_meta LIMIT 1").toArray()[0] as { channel_id: string; membership_version: number } | undefined;
+    if (!meta) return new Response("not created", { status: 409 });
+    this.ctx.storage.sql.exec("UPDATE members SET left_at=? WHERE channel_id=? AND user_id=?", now, meta.channel_id, userId);
+    return Response.json({ ok: true });
+  });
+}
+```
+(Remove this endpoint when Phase 3 adds the real leave path.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -167,22 +325,28 @@ if (url.pathname === "/internal/join") {
   return await this.ctx.storage.transaction(async () => {
     const meta = this.ctx.storage.sql.exec("SELECT channel_id, membership_version, member_count FROM channel_meta LIMIT 1").toArray()[0] as { channel_id: string; membership_version: number; member_count: number } | undefined;
     if (!meta) return new Response("channel not created", { status: 409 });
-    const existing = this.ctx.storage.sql.exec("SELECT joined_at FROM members WHERE channel_id=? AND user_id=?", meta.channel_id, user_id).toArray()[0] as { joined_at: string } | undefined;
-    if (existing) {
-      // already a member (active or re-activating). For Phase 1 idempotency, return current without bump.
+    const existing = this.ctx.storage.sql.exec("SELECT joined_at, left_at, role FROM members WHERE channel_id=? AND user_id=?", meta.channel_id, user_id).toArray()[0] as { joined_at: string; left_at: string | null; role: string } | undefined;
+    if (existing && existing.left_at === null) {
+      // already active member — idempotent, no bump.
       return Response.json({ channel_id: meta.channel_id, membership_version: meta.membership_version, joined_at: existing.joined_at });
     }
     const now = new Date().toISOString();
     const newVersion = meta.membership_version + 1;
-    this.ctx.storage.sql.exec(
-      "INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, 'member', ?, NULL)",
-      meta.channel_id, user_id, now,
-    );
+    if (existing && existing.left_at !== null) {
+      // reactivate a previously-left member: clear left_at, bump version, count++, write event + outbox.
+      this.ctx.storage.sql.exec("UPDATE members SET left_at=NULL, role='member', joined_at=? WHERE channel_id=? AND user_id=?", now, meta.channel_id, user_id);
+    } else {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, 'member', ?, NULL)",
+        meta.channel_id, user_id, now,
+      );
+    }
     this.ctx.storage.sql.exec("UPDATE channel_meta SET membership_version=?, member_count=member_count+1, updated_at=? WHERE channel_id=?", newVersion, now, meta.channel_id);
     const eventId = this.nextEventId();
+    // actor is the system performing the auto-join; the joined user is the SUBJECT (in payload), not the actor (reviewer P1-7).
     this.ctx.storage.sql.exec(
-      "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, 'member.joined', ?, 'system', ?, ?, ?, ?)",
-      eventId, meta.channel_id, user_id, JSON.stringify({ channel_id: meta.channel_id, user_id, membership_version: newVersion }), newVersion, now,
+      "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, 'member.joined', ?, 'system', 'system', ?, ?, ?)",
+      eventId, meta.channel_id, JSON.stringify({ channel_id: meta.channel_id, user_id, membership_version: newVersion }), newVersion, now,
     );
     const outboxId = uuidv7();
     this.ctx.storage.sql.exec(
@@ -237,7 +401,7 @@ async alarm(): Promise<void> {
   for (const r of due) {
     try {
       const stub = this.env.USER_DIRECTORY.getByName(r.target_key);
-      const res = await stub.fetch(new Request("https://x/internal/upsert-channel", { method: "POST", body: r.payload_json, headers: { "Content-Type": "application/json" } }));
+      const res = await stub.fetch(new Request("https://x/internal/upsert-channel", { method: "POST", body: r.payload_json, headers: { "Content-Type": "application/json", "X-Verified-User-Id": r.target_key } }));
       if (res.ok) {
         this.ctx.storage.sql.exec("UPDATE projection_outbox SET status='delivered', updated_at=? WHERE outbox_id=?", nowIso, r.outbox_id);
       } else {
@@ -282,6 +446,63 @@ git add src/do/chat-channel.ts src/do/chat-channel.system.test.ts
 git commit -m "feat(do): system channel lazy-create + idempotent join + outbox flush in alarm"
 ```
 
+### Task 1b: `src/chat/projection.test.ts` — outbox delivery end-to-end + dead-letter
+
+Reviewer P0-1 required proving the flush path delivers to UserDirectory (not just that an outbox row exists). The end-to-end delivery test is in Task 1's `chat-channel.system.test.ts`; this file adds the dead-letter path + a focused projection helper test.
+
+**Files:**
+- Create: `src/chat/projection.test.ts`
+
+```ts
+import { describe, it, expect } from "vitest";
+import { env } from "cloudflare:workers";
+import { getNamedDo } from "../../test/helpers";
+
+const SYSTEM = "system-general";
+
+describe("projection outbox delivery (reviewer P0-1)", () => {
+  it("flush delivers join → UserDirectory my_channels contains the channel", async () => {
+    const sys = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
+    await sys.fetch(new Request("https://x/internal/maybe-create-system", { method: "POST", body: JSON.stringify({ title: "Lilium" }) }));
+    const userId = "u-proj-e2e-1";
+    const jr = await sys.fetch(new Request("https://x/internal/join", { method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) }));
+    const { channel_id } = await jr.json() as { channel_id: string };
+    // drive the alarm flush
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(sys, async (instance) => { await (instance as { alarm: () => Promise<void> }).alarm(); });
+    const dir = getNamedDo(env.USER_DIRECTORY, userId);
+    const res = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
+    const body = await res.json() as { items: Array<{ channel_id: string }> };
+    expect(body.items.find((r) => r.channel_id === channel_id)).toBeDefined();
+    // outbox row now delivered
+    const probe = await sys.fetch(new Request("https://x/internal/outbox-pending?target_kind=user_directory"));
+    const pb = await probe.json() as { count: number };
+    expect(pb.count).toBe(0);
+  });
+
+  it("flush with X-Verified-User-Id header set (P0-1 regression) — target does not 400", async () => {
+    // This guards against the original bug where the flush fetch omitted the header.
+    const sys = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
+    await sys.fetch(new Request("https://x/internal/maybe-create-system", { method: "POST", body: JSON.stringify({ title: "Lilium" }) }));
+    const userId = "u-proj-header-1";
+    await sys.fetch(new Request("https://x/internal/join", { method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) }));
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(sys, async (instance) => { await (instance as { alarm: () => Promise<void> }).alarm(); });
+    // no dead_letter rows for this user
+    const dir = getNamedDo(env.USER_DIRECTORY, userId);
+    const res = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
+    const body = await res.json() as { items: Array<{ channel_id: string }> };
+    expect(body.items.length).toBeGreaterThan(0);
+  });
+});
+```
+
+- [ ] **Step 1: Write test** (above)
+- [ ] **Step 2: Run → should PASS** (Task 1 already implements the header + alarm flush). If FAIL, the flush header is missing — fix Task 1's alarm.
+- [ ] **Step 3: `npx tsc --noEmit` → PASS**
+- [ ] **Step 4: `npx vitest run src/chat/projection.test.ts` → PASS (2 tests)**
+- [ ] **Step 5: Commit** `git add src/chat/projection.test.ts && git commit -m "test(chat): projection outbox end-to-end + header regression (P0-1)"`
+
 ---
 
 ## Task 2: UserDirectory `/internal/upsert-channel` projection target
@@ -301,11 +522,12 @@ git commit -m "feat(do): system channel lazy-create + idempotent join + outbox f
 ```ts
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
+import { getNamedDo } from "../../test/helpers";
 
 const userId = "u-proj-1";
 
 async function upsert(body: Record<string, unknown>): Promise<Response> {
-  const stub = env.USER_DIRECTORY.getByName(userId);
+  const stub = getNamedDo(env.USER_DIRECTORY, userId);
   return stub.fetch(new Request("https://x/internal/upsert-channel", {
     method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -315,7 +537,7 @@ async function upsert(body: Record<string, unknown>): Promise<Response> {
 describe("UserDirectory projection", () => {
   it("join inserts an active my_channels row with membership_version", async () => {
     await upsert({ action: "join", channel_id: "ch-p-1", kind: "channel", membership_version: 1 });
-    const stub = env.USER_DIRECTORY.getByName(userId);
+    const stub = getNamedDo(env.USER_DIRECTORY, userId);
     const res = await stub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
     const body = await res.json() as { items: Array<{ channel_id: string; kind: string; membership_version: number; last_read_event_id: string | null }> };
     const row = body.items.find((r) => r.channel_id === "ch-p-1");
@@ -326,7 +548,7 @@ describe("UserDirectory projection", () => {
   it("leave marks status=left + left_at, not in active my_channels", async () => {
     await upsert({ action: "join", channel_id: "ch-p-2", kind: "channel", membership_version: 1 });
     await upsert({ action: "leave", channel_id: "ch-p-2", kind: "channel", membership_version: 2 });
-    const stub = env.USER_DIRECTORY.getByName(userId);
+    const stub = getNamedDo(env.USER_DIRECTORY, userId);
     const res = await stub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
     const body = await res.json() as { items: Array<{ channel_id: string }> };
     expect(body.items.find((r) => r.channel_id === "ch-p-2")).toBeUndefined();
@@ -335,7 +557,7 @@ describe("UserDirectory projection", () => {
   it("re-applying same membership_version is idempotent (no duplicate, no error)", async () => {
     await upsert({ action: "join", channel_id: "ch-p-3", kind: "channel", membership_version: 5 });
     await upsert({ action: "join", channel_id: "ch-p-3", kind: "channel", membership_version: 5 });
-    const stub = env.USER_DIRECTORY.getByName(userId);
+    const stub = getNamedDo(env.USER_DIRECTORY, userId);
     const res = await stub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-Id": userId, "X-Verified-User-Id": userId } }));
     const body = await res.json() as { items: Array<{ channel_id: string }> };
     expect(body.items.filter((r) => r.channel_id === "ch-p-3").length).toBe(1);
@@ -412,7 +634,7 @@ git commit -m "feat(do): UserDirectory upsert-channel projection + membership_ve
 **Interfaces:**
 - Consumes: existing messages/events/channel_meta schema.
 - Produces:
-  - `GET /internal/summary` (with `X-Verified-User-Id`) → returns `{ channel_id, kind, visibility, title, topic, avatar_url, member_count, status, created_at, updated_at, last_message_at, last_message_preview, last_message_sender_id, last_event_id, my_role, my_last_read_event_id, unread_count }`. `my_role` from members (null if not member). `unread_count` = count(events where event_id > my_last_read_event_id AND actor_id != me AND actor_kind='user') — Phase 1: 0 (no messages). `last_event_id` = max(events.event_id). `last_message_*` from the latest `status NOT IN ('deleted','recalled')` message (null in Phase 1).
+  - `GET /internal/summary` (with `X-Verified-User-Id`) → returns `{ channel_id, kind, visibility, title, topic, avatar_url, member_count, status, created_at, updated_at, last_message_at, last_message_preview, last_message_sender_id, last_event_id, my_role }`. `my_role` from members (null if not member). `last_event_id` = max(events.event_id). `last_message_*` from the latest `status NOT IN ('deleted','recalled')` message (null in Phase 1). **ChatChannel does NOT return `last_read_event_id` or `unread_count`** — those live in UserDirectory (last_read_event_id is per-user) and must be computed in the route layer (reviewer P1-6). The route combines: `unread_count = count(events where event_id > user's last_read_event_id AND actor_id != user)` — for Phase 1 (no messages) this is 0; the route sets it from UserDirectory's row.
     - 403 (FORBIDDEN) if user not a member AND visibility != public. For system channel (public_listed) allow read even if not member (but bootstrap will have joined them first).
   - `GET /internal/messages?before=<message_id>&limit=<n>` (with `X-Verified-User-Id`) → `{ items: Message[], next_cursor: string|null }`. Pages visible messages (`status NOT IN ('deleted','recalled')`) ordered by `message_id DESC`, `before` exclusive. `limit` default 50, max 100. `next_cursor` = the oldest message_id in the page if more exist, else null.
 
@@ -421,17 +643,18 @@ git commit -m "feat(do): UserDirectory upsert-channel projection + membership_ve
 ```ts
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
+import { getNamedDo } from "../../test/helpers";
 
 const SYSTEM = "system-general-read";
 
 async function setupChannel(): Promise<string> {
-  const stub = env.CHAT_CHANNEL.getByName(SYSTEM);
+  const stub = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
   const r = await stub.fetch(new Request("https://x/internal/maybe-create-system", { method: "POST", body: JSON.stringify({ title: "Lilium" }) }));
   return (await r.json() as { channel_id: string }).channel_id;
 }
 
 async function joinUser(channelId: string, userId: string): Promise<void> {
-  const stub = env.CHAT_CHANNEL.getByName(SYSTEM);
+  const stub = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
   await stub.fetch(new Request("https://x/internal/join", { method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) }));
 }
 
@@ -440,7 +663,7 @@ describe("ChatChannel read endpoints", () => {
     const cid = await setupChannel();
     const userId = "u-read-1";
     await joinUser(cid, userId);
-    const stub = env.CHAT_CHANNEL.getByName(SYSTEM);
+    const stub = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
     const res = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
     const body = await res.json() as { channel_id: string; title: string; last_event_id: string | null; my_role: string; member_count: number };
     expect(body.channel_id).toBe(cid);
@@ -454,7 +677,7 @@ describe("ChatChannel read endpoints", () => {
     const cid = await setupChannel();
     const userId = "u-read-2";
     await joinUser(cid, userId);
-    const stub = env.CHAT_CHANNEL.getByName(SYSTEM);
+    const stub = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
     const res = await stub.fetch(new Request("https://x/internal/messages?limit=50", { headers: { "X-Verified-User-Id": userId } }));
     const body = await res.json() as { items: unknown[]; next_cursor: string | null };
     expect(body.items).toEqual([]);
@@ -463,12 +686,12 @@ describe("ChatChannel read endpoints", () => {
 
   it("messages returns 403 for non-member when visibility private (separate channel)", async () => {
     // create a private channel via direct DO name 'private-ch-1' with a fresh channel_meta insert
-    const stub = env.CHAT_CHANNEL.getByName("private-ch-1");
+    const stub = getNamedDo(env.CHAT_CHANNEL, "private-ch-1");
     // need a private channel create path — use maybe-create-system is public; for this test insert directly via a test-only endpoint or skip boundary.
     // Phase 1 only has system channel (public). Defer private-channel 403 test to Phase 3 channel create.
     // Replace with: non-member CAN read system channel (public) — assert summary returns my_role=null.
     const cid = await setupChannel();
-    const stubPub = env.CHAT_CHANNEL.getByName(SYSTEM);
+    const stubPub = getNamedDo(env.CHAT_CHANNEL, SYSTEM);
     const res = await stubPub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": "non-member-x" } }));
     const body = await res.json() as { my_role: string | null };
     expect(body.my_role).toBeNull();
@@ -495,20 +718,13 @@ if (url.pathname === "/internal/summary") {
   if (!isMember && meta.visibility === "private") return new Response("forbidden", { status: 403 });
   const lastEvent = this.ctx.storage.sql.exec("SELECT event_id FROM events WHERE channel_id=? ORDER BY event_id DESC LIMIT 1", meta.channel_id).toArray()[0] as { event_id: string } | undefined;
   const lastMsg = this.ctx.storage.sql.exec("SELECT message_id, sender_kind, sender_user_id, text FROM messages WHERE channel_id=? AND status NOT IN ('deleted','recalled') ORDER BY created_at DESC LIMIT 1", meta.channel_id).toArray()[0] as { message_id: string; sender_kind: string; sender_user_id: string | null; text: string | null } | undefined;
-  let lastReadEventId: string | null = null;
-  let unread = 0;
-  if (isMember) {
-    // last_read_event_id lives in UserDirectory; for summary we pass-through me — caller (Worker) will fetch it.
-    // unread computed by Worker via separate call. Here return null + let Worker fill. For Phase 1 simplicity, return unread=0 here.
-    unread = 0;
-  }
+  // ChatChannel does NOT know last_read_event_id or unread (per-user, in UserDirectory). Route layer computes unread.
   return Response.json({
     channel_id: meta.channel_id, kind: meta.kind, visibility: meta.visibility, title: meta.title, topic: meta.topic, avatar_url: meta.avatar_url,
     status: meta.status, created_at: meta.created_at, updated_at: meta.updated_at, member_count: meta.member_count,
     last_message_at: null, last_message_preview: null, last_message_sender_id: lastMsg?.sender_user_id ?? null,
     last_event_id: lastEvent?.event_id ?? null,
     my_role: member?.role ?? null,
-    unread_count: unread,
   });
 }
 
@@ -772,21 +988,20 @@ import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 import { resolveUserSummaries, type UserSummary } from "../profile/resolve";
 import { attachSummaries, type RawMessage } from "../chat/sender";
-
-const SYSTEM_CHANNEL_NAME = "system-general";
-const SYSTEM_TITLE = "Lilium";
+import { ensureSystemJoined, channelRouteNameFor } from "../chat/system-channel";
 
 function fallbackMe(user_id: string): UserSummary {
   return { user_id, display_name: `user-${user_id.slice(0, 8)}`, avatar_url: null };
 }
 
-async function ensureSystemJoined(env: Env, userId: string): Promise<{ channelId: string }> {
-  const stub = env.CHAT_CHANNEL.getByName(SYSTEM_CHANNEL_NAME);
-  await stub.fetch(new Request("https://x/internal/maybe-create-system", { method: "POST", body: JSON.stringify({ title: SYSTEM_TITLE }) }));
-  // join triggers outbox → UserDirectory projection async; for bootstrap we ALSO write directly to UserDirectory synchronously so my_channels is current this request.
-  const jr = await stub.fetch(new Request("https://x/internal/join", { method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) }));
-  const jb = await jr.json() as { channel_id: string; membership_version: number };
-  return { channelId: jb.channel_id };
+// Explicit fallback when my_channels projection lags the just-completed join (reviewer P1-5).
+// Delivery to UserDirectory is exclusively via the durable outbox; this only fills the read view.
+function ensureContainsSystemFallback(
+  myChannels: Array<{ channel_id: string; kind: string; last_read_event_id: string | null; membership_version: number }>,
+  sysChannelId: string,
+): Array<{ channel_id: string; kind: string; last_read_event_id: string | null; membership_version: number }> {
+  if (myChannels.some((m) => m.channel_id === sysChannelId)) return myChannels;
+  return [{ channel_id: sysChannelId, kind: "channel", last_read_event_id: null, membership_version: 0 }, ...myChannels];
 }
 
 export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
@@ -796,20 +1011,20 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
   const { user_id: userId } = await verifyBrowserJwt(token, c.env.JWT_SECRET);
 
   // 1. ensure system channel exists + user joined
-  await ensureSystemJoined(c.env, userId);
+  const joinResult = await ensureSystemJoined(c.env, userId);
+  const sysChannelId = joinResult.channelId;
 
-  // 2. read my_channels (now includes system channel — join wrote it, or outbox will)
+  // 2. read my_channels (projection delivered async via outbox; may lag — use explicit fallback)
   const dirStub = c.env.USER_DIRECTORY.getByName(userId);
   const dirRes = await dirStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
-  const myChannels = dirRes.ok ? ((await dirRes.json()) as { items: Array<{ channel_id: string; kind: string; last_read_event_id: string | null; membership_version: number }> }).items : [];
+  const rawMyChannels = dirRes.ok ? ((await dirRes.json()) as { items: Array<{ channel_id: string; kind: string; last_read_event_id: string | null; membership_version: number }> }).items : [];
+  const myChannels = ensureContainsSystemFallback(rawMyChannels, sysChannelId);
 
-  // 3. resolve me + all channel summaries. For Phase 1 only fetch the system channel summary (myChannels may lag the just-joined system channel by one outbox flush; so also ensure system channelId from the join result).
-  const sysChannelId = myChannels.find((m) => m.kind === "channel")?.channel_id ?? (await ensureSystemJoined(c.env, userId)).channelId;
-
-  // Fetch summary for each channel (Phase 1: typically just the system channel).
-  const channelStubs = myChannels.length > 0 ? myChannels : [{ channel_id: sysChannelId, kind: "channel", last_read_event_id: null, membership_version: 0 }];
-  const summariesPromises = channelStubs.map(async (mc) => {
-    const stub = c.env.CHAT_CHANNEL.getByName(channelNameFor(mc.channel_id, sysChannelId, SYSTEM_CHANNEL_NAME));
+  // 3. fetch summary for each channel (Phase 1: typically just the system channel).
+  const summariesPromises = myChannels.map(async (mc) => {
+    const routeName = await channelRouteNameFor(c.env, userId, mc.channel_id);
+    if (routeName === null) return null; // unresolved channel id (Phase 3+ convention not yet active)
+    const stub = c.env.CHAT_CHANNEL.getByName(routeName);
     const res = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
     if (!res.ok) return null;
     const s = await res.json() as Record<string, unknown>;
@@ -831,7 +1046,7 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
     member_count: s.member_count as number,
     role: s.my_role as string | null,
     status: s.status as string,
-    unread_count: (s.unread_count as number) ?? 0,
+    unread_count: 0, // Phase 1: ChatChannel summary doesn't compute unread (last_read is per-user in UserDirectory); real computation in Phase 3.
     last_read_event_id: mc.last_read_event_id,
     last_message_preview: (s.last_message_preview as string | null) ?? null,
     last_message_at: (s.last_message_at as string | null) ?? null,
@@ -853,11 +1068,14 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
       created_at: s.created_at, updated_at: s.updated_at,
     };
     // fetch first message page for active channel
-    const stub = c.env.CHAT_CHANNEL.getByName(channelNameFor(s.channel_id as string, sysChannelId, SYSTEM_CHANNEL_NAME));
-    const mres = await stub.fetch(new Request("https://x/internal/messages?limit=50", { headers: { "X-Verified-User-Id": userId } }));
-    if (mres.ok) {
-      const mb = await mres.json() as { items: RawMessage[]; next_cursor: string | null };
-      messagesPage = { items: await attachSummaries(mb.items, c.env), next_cursor: mb.next_cursor };
+    const activeRouteName = await channelRouteNameFor(c.env, userId, s.channel_id as string);
+    if (activeRouteName) {
+      const stub = c.env.CHAT_CHANNEL.getByName(activeRouteName);
+      const mres = await stub.fetch(new Request("https://x/internal/messages?limit=50", { headers: { "X-Verified-User-Id": userId } }));
+      if (mres.ok) {
+        const mb = await mres.json() as { items: RawMessage[]; next_cursor: string | null };
+        messagesPage = { items: await attachSummaries(mb.items, c.env), next_cursor: mb.next_cursor };
+      }
     }
   }
 
@@ -870,16 +1088,9 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
     event_state: { per_channel },
   }, 200, { "X-Request-Id": c.get("requestId") });
 }
-
-// Map a channel_id back to the DO name. Phase 1: only the system channel has a known DO name.
-// For other channels (Phase 3+ create with getByName(uuid)), the channel_id IS the DO name.
-// Until then, if channel_id === sysChannelId use SYSTEM_CHANNEL_NAME, else use channel_id as name.
-function channelNameFor(channelId: string, sysChannelId: string, systemName: string): string {
-  return channelId === sysChannelId ? systemName : channelId;
-}
 ```
 
-Note: there's a `channelNameFor` indirection because the system channel's DO name ("system-general") ≠ its channel_id (a UUIDv7 in channel_meta). Phase 3+ user-created channels use `getByName(channel_id)` where channel_id == DO name. This helper centralizes that. Document it.
+Note: channel_id → DO-name routing is centralized in `src/chat/system-channel.ts` (`channelRouteNameFor`), NOT duplicated in routes (reviewer P1-3). The system channel's DO name (`"system-general"`) ≠ its client-visible UUIDv7 `channel_id`; `channelRouteNameFor` probes the system DO once to compare. Phase 3+ user-created channels will use `channel_id` as the DO name directly.
 
 - [ ] **Step 4: Run `tsc --noEmit`**
 
@@ -891,7 +1102,7 @@ Expected: PASS. Fix any `noUncheckedIndexedAccess` (the `summaries.filter(Boolea
 Run: `npx vitest run src/routes/bootstrap.test.ts`
 Expected: PASS (3 tests). The first test asserts system channel auto-joined + appears + active_channel + per_channel cursor keyed by channel_id.
 
-Note: the "idempotent" test depends on the join being idempotent AND the outbox having written my_channels. Because bootstrap calls join synchronously AND the ChatChannel join returns the membership, the my_channels read should include system. But outbox flush is async — so my_channels might NOT yet have the row when bootstrap reads it. That's why `ensureSystemJoined`'s return + the fallback `[{channel_id: sysChannelId,...}]` covers the lag. Acceptable for Phase 1. If the test flakes, add a synchronous write to UserDirectory on join (less pure but Phase 1 may need it) — decide when running.
+Note: the "idempotent" test depends on the join being idempotent. Projection delivery to UserDirectory is **exclusively via the durable outbox** (reviewer P1-5) — bootstrap does NOT write UserDirectory synchronously. Because outbox flush is async, `my_channels` may NOT yet have the system-channel row when bootstrap reads it immediately after join. The route therefore uses an explicit `ensureContainsSystemFallback` helper: if `my_channels` is empty/lacks the system channel, fall back to a synthetic row built from the join result so bootstrap still returns the system channel. This is the single, explicit fallback path (not a second delivery mechanism). The end-to-end outbox test (Task 1) proves the async path eventually delivers.
 
 - [ ] **Step 6: Commit**
 
@@ -971,20 +1182,7 @@ import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 import { resolveUserSummaries, type UserSummary } from "../profile/resolve";
-
-const SYSTEM_CHANNEL_NAME = "system-general";
-const SYSTEM_TITLE = "Lilium";
-
-async function ensureSystemJoined(env: Env, userId: string): Promise<string> {
-  const stub = env.CHAT_CHANNEL.getByName(SYSTEM_CHANNEL_NAME);
-  await stub.fetch(new Request("https://x/internal/maybe-create-system", { method: "POST", body: JSON.stringify({ title: SYSTEM_TITLE }) }));
-  const jr = await stub.fetch(new Request("https://x/internal/join", { method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) }));
-  return (await jr.json() as { channel_id: string }).channel_id;
-}
-
-function channelNameFor(channelId: string, sysChannelId: string): string {
-  return channelId === sysChannelId ? SYSTEM_CHANNEL_NAME : channelId;
-}
+import { ensureSystemJoined, channelRouteNameFor } from "../chat/system-channel";
 
 async function getIdentity(c: Context<{ Bindings: Env }>): Promise<{ userId: string; env: Env }> {
   const auth = c.req.header("Authorization") ?? "";
@@ -996,30 +1194,35 @@ async function getIdentity(c: Context<{ Bindings: Env }>): Promise<{ userId: str
 
 export async function listChannelsHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const sysChannelId = await ensureSystemJoined(env, userId);
+  const sysChannelId = (await ensureSystemJoined(env, userId)).channelId;
   const dirStub = env.USER_DIRECTORY.getByName(userId);
   const dirRes = await dirStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
-  const myChannels = dirRes.ok ? ((await dirRes.json()) as { items: Array<{ channel_id: string; kind: string; last_read_event_id: string | null; membership_version: number }> }).items : [];
-  const list = myChannels.length > 0 ? myChannels : [{ channel_id: sysChannelId, kind: "channel", last_read_event_id: null, membership_version: 0 }];
-  const items = await Promise.all(list.map(async (mc) => {
-    const stub = env.CHAT_CHANNEL.getByName(channelNameFor(mc.channel_id, sysChannelId));
+  const rawMyChannels = dirRes.ok ? ((await dirRes.json()) as { items: Array<{ channel_id: string; kind: string; last_read_event_id: string | null; membership_version: number }> }).items : [];
+  const myChannels = rawMyChannels.some((m) => m.channel_id === sysChannelId) ? rawMyChannels : [{ channel_id: sysChannelId, kind: "channel", last_read_event_id: null, membership_version: 0 }, ...rawMyChannels];
+  const items = await Promise.all(myChannels.map(async (mc) => {
+    const routeName = await channelRouteNameFor(env, userId, mc.channel_id);
+    if (routeName === null) return null;
+    const stub = env.CHAT_CHANNEL.getByName(routeName);
     const res = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
     const s = await res.json() as Record<string, unknown>;
     return {
       channel_id: s.channel_id, kind: s.kind, visibility: s.visibility, title: s.title, avatar_url: s.avatar_url,
-      member_count: s.member_count, role: s.my_role, status: s.status, unread_count: s.unread_count ?? 0,
+      member_count: s.member_count, role: s.my_role, status: s.status, unread_count: 0, // Phase 1: 0 (real computation Phase 3)
       last_read_event_id: mc.last_read_event_id, last_message_preview: s.last_message_preview ?? null,
       last_message_at: s.last_message_at ?? null, last_event_id: s.last_event_id ?? null,
     };
   }));
-  return c.json({ items, next_cursor: null }, 200, { "X-Request-Id": c.get("requestId") });
+  const filtered = items.filter(Boolean) as Record<string, unknown>[];
+  return c.json({ items: filtered, next_cursor: null }, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function channelDetailHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
   const channelId = c.req.param("channel_id");
-  const sysChannelId = await ensureSystemJoined(env, userId);
-  const stub = env.CHAT_CHANNEL.getByName(channelNameFor(channelId, sysChannelId));
+  await ensureSystemJoined(env, userId); // ensure user is in system channel (idempotent); establishes sys channelId for routing
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
   const res = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
   if (res.status === 403) throw new ApiError("FORBIDDEN", "not a member");
   if (!res.ok) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
@@ -1124,9 +1327,7 @@ import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 import { attachSummaries, type RawMessage } from "../chat/sender";
-
-const SYSTEM_CHANNEL_NAME = "system-general";
-const SYSTEM_TITLE = "Lilium";
+import { ensureSystemJoined, channelRouteNameFor } from "../chat/system-channel";
 
 export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const auth = c.req.header("Authorization") ?? "";
@@ -1138,19 +1339,12 @@ export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables:
   const url = new URL(c.req.url);
   const before = url.searchParams.get("before");
   const limit = url.searchParams.get("limit") ?? "50";
-  // ensure system joined so the system channel is readable; also establishes sysChannelId for name mapping
-  const stubSys = c.env.CHAT_CHANNEL.getByName(SYSTEM_CHANNEL_NAME);
-  await stubSys.fetch(new Request("https://x/internal/maybe-create-system", { method: "POST", body: JSON.stringify({ title: SYSTEM_TITLE }) }));
-  await stubSys.fetch(new Request("https://x/internal/join", { method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) }));
-  // determine DO name: if channelId is the system channel's id, use system name; else treat channelId as the DO name (Phase 3 pattern)
-  // We don't trivially know system channelId here without a fetch; query the system DO's channel_meta.
-  let doName = channelId;
-  const sysMeta = await stubSys.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
-  if (sysMeta.ok) {
-    const sb = await sysMeta.json() as { channel_id: string };
-    if (sb.channel_id === channelId) doName = SYSTEM_CHANNEL_NAME;
-  }
-  const stub = c.env.CHAT_CHANNEL.getByName(doName);
+  // ensure system joined (idempotent) so the system channel is readable; establishes sys channelId for routing.
+  await ensureSystemJoined(c.env, userId);
+  // resolve client channel_id → DO name. Unknown UUID (non-system, Phase 3 not active) → CHANNEL_NOT_FOUND, no state created.
+  const routeName = await channelRouteNameFor(c.env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const stub = c.env.CHAT_CHANNEL.getByName(routeName);
   const qs = new URLSearchParams();
   if (before) qs.set("before", before);
   qs.set("limit", limit);
@@ -1235,7 +1429,7 @@ git commit -m "docs(design): system channel capacity note (single DO, split defe
 
 **Placeholder scan:** No TBD/TODO. Every code step has real code. The `ensureSystemJoined` synchronous-write-to-UserDirectory question in Task 5 Step 5 is flagged as a decision-on-run, not a placeholder.
 
-**Type consistency:** `RawMessage` ↔ `ContractMessage` (Task 4) used in Task 5 + 7. `channelNameFor(channelId, sysChannelId)` helper duplicated in bootstrap/channels/messages — Task 5 defines it, Tasks 6/7 redefine locally; acceptable (3 small copies) but could DRY into `src/chat/channel-name.ts` later. `UserSummary` reused from Phase 0. `attachSummaries` signature stable.
+**Type consistency:** `RawMessage` ↔ `ContractMessage` (Task 4) used in Task 5 + 7. `channelRouteNameFor` lives in `src/chat/system-channel.ts` (Task 0) and is used by bootstrap/channels/messages — NOT duplicated (reviewer P1-3). `UserSummary` reused from Phase 0. `attachSummaries` signature stable. `getNamedDo` test helper in `test/helpers.ts` used by all Phase 1 tests (reviewer P0-2).
 
 **Known Phase 1 limitations (NOT bugs):**
 - No message sending (Phase 2 WS).
