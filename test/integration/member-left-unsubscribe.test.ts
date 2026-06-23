@@ -131,4 +131,50 @@ describe("member.left → ChannelFanout drops the user", () => {
     expect(probe.event_json ?? "").not.toContain('"e-after-leave"');
     ws.close();
   });
+
+  // Reviewer hardening: a stale ChannelFanout online_sessions/fanout_queue row targets an OLD
+  // session that is gone. The user reconnects with a NEW socket (different session_id, no
+  // subscription attachment for this channel yet). /deliver targeting the OLD session must NOT
+  // fall back to the NEW socket — fail-closed (not_connected), the event is dropped, and the
+  // new socket receives nothing. (Repair path is cursor-based replay on reconnect.)
+  it("stale fanout row targeting a gone session does NOT deliver to the user's new socket", async () => {
+    const userId = "u-leave-3";
+    const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
+    await sysStub.fetch(new Request("https://x/internal/maybe-create-system", {
+      method: "POST", body: JSON.stringify({ title: "Lilium" }),
+    }));
+    await sysStub.fetch(new Request("https://x/internal/join", {
+      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId }),
+    }));
+    const sysId = ((await (await sysStub.fetch(new Request("https://x/internal/summary", {
+      headers: { "X-Verified-User-Id": userId },
+    }))).json()) as { channel_id: string }).channel_id;
+
+    // The user's current live socket (new session).
+    const uc = getNamedDo(env.USER_CONNECTION as unknown as Parameters<typeof getNamedDo>[0], userId);
+    const up = await uc.fetch(new Request("https://x/ws", { headers: { Upgrade: "websocket", "X-Verified-User-Id": userId } }));
+    const ws = up.webSocket as WebSocket;
+    ws.accept();
+
+    // A stale fanout row would target a session_id that no longer exists.
+    const staleEvent = JSON.stringify({
+      frame_type: "event", api_version: "lilium.chat.v1", event_id: "e-stale-session", type: "message.created",
+      channel_id: sysId, occurred_at: "2026-06-23T00:00:00Z", payload: {},
+    });
+    const deliverRes = await uc.fetch(new Request("https://x/deliver", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Channel-Id": sysId },
+      body: JSON.stringify({ session_id: "old-session-gone", event_json: staleEvent, membership_version_at_event: 0 }),
+    }));
+    expect(deliverRes.status).toBe(200);
+    const db = (await deliverRes.json()) as { delivered: boolean; dropped?: string };
+    expect(db.delivered).toBe(false);
+    expect(db.dropped).toBe("not_connected");
+
+    // The new socket must not have received the stale event.
+    await new Promise((r) => setTimeout(r, 150));
+    const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Channel-Id": sysId } }))).json()) as { event_json?: string };
+    expect(probe.event_json ?? "").not.toContain('"e-stale-session"');
+    ws.close();
+  });
 });

@@ -277,8 +277,13 @@ export class UserConnection extends DurableObject<Env> {
       if (att?.session_id === sessionId) return ws;
     }
 
-    const attached = sockets.find((ws) => (ws.deserializeAttachment() as ConnectionAttachment | null) !== null);
-    return (attached ?? sockets[0]) ?? null;
+    // Fail closed: no exact session_id match. ChannelFanout always passes a real
+    // target_session_id; a miss means the session is gone (closed/hibernated away). Returning
+    // null → /deliver reports not_connected → ChannelFanout marks the queue row delivered and
+    // stops retrying; the repair path for a rejoined session is cursor-based replay on reconnect.
+    // DO NOT fall back to an arbitrary socket — that could deliver a stale-session's event to a
+    // different live socket of the same user (access-control fail-open).
+    return null;
   }
 
   private async getChannelReplayAfterCursor(userId: string, routeName: string, fallbackCursor: string): Promise<string> {
@@ -415,9 +420,25 @@ export class UserConnection extends DurableObject<Env> {
     membershipVersionAtEvent: number,
   ): Promise<boolean> {
     const subscribedVersion = attachment.subscribed_channels[channelId];
+    // subscribedVersion === undefined: the socket has no subscription record for this channel
+    // (e.g. registerOnlineOnConnect's waitUntil hasn't recorded it yet, or this is a direct
+    // replay-style deliver). findSocketBySession already guaranteed we're on the EXACT session
+    // ChannelFanout targeted, so delivering to this socket is not a cross-session leak; the
+    // user is a member (ChannelFanout only has an online_sessions row for members). Allow.
     if (subscribedVersion === undefined) return true;
     if (membershipVersionAtEvent <= subscribedVersion) return true;
 
+    // Event version exceeds the subscription snapshot — a member change happened after
+    // subscription. Re-check active membership before delivering; drop if no longer a member.
+    return this.confirmActiveMembershipAndBumpSubscription(attachment, ws, channelId, membershipVersionAtEvent);
+  }
+
+  private async confirmActiveMembershipAndBumpSubscription(
+    attachment: ConnectionAttachment,
+    ws: WebSocket,
+    channelId: string,
+    membershipVersionAtEvent: number,
+  ): Promise<boolean> {
     const routeName = await channelRouteNameFor(this.env, attachment.user_id, channelId);
     if (routeName === null) return false;
 
@@ -430,6 +451,8 @@ export class UserConnection extends DurableObject<Env> {
     const body = await res.json() as { my_role?: string | null };
     if (body.my_role == null) return false;
 
+    // Still an active member — record the subscription version so subsequent same-version
+    // events take the cheap path.
     ws.serializeAttachment({ ...attachment, subscribed_channels: { ...attachment.subscribed_channels, [channelId]: membershipVersionAtEvent } });
     return true;
   }

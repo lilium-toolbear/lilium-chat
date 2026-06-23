@@ -73,6 +73,33 @@ describe("UserConnection DO", () => {
     ws.close();
   });
 
+  it("/deliver with a non-existent session_id does NOT deliver to another socket of the same user (fail-closed)", async () => {
+    const userId = "u-uc-failclosed";
+    const { ws, stub } = await upgradeUserConnection(userId);
+    ws.accept();
+
+    // A stale fanout row would target a session_id that no longer exists. /deliver must report
+    // not_connected and NOT fall back to the live socket of the same user.
+    const eventJson = JSON.stringify({
+      frame_type: "event", api_version: "lilium.chat.v1", event_id: "e-stale", type: "message.created",
+      channel_id: "ch-failclosed", occurred_at: "2026-06-23T00:00:00Z", payload: {},
+    });
+    const deliverRes = await stub.fetch(new Request("https://x/deliver", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "session-that-does-not-exist", event_json: eventJson, membership_version_at_event: 0 }),
+    }));
+    expect(deliverRes.status).toBe(200);
+    const body = (await deliverRes.json()) as { delivered: boolean; dropped?: string };
+    expect(body.delivered).toBe(false);
+    expect(body.dropped).toBe("not_connected");
+
+    // Confirm nothing was sent on the live socket: the probe must not hold the stale event.
+    const probe = await (await stub.fetch(new Request("https://x/test-last-deliver"))).json() as { event_json: string | null };
+    expect(probe.event_json ?? "").not.toContain('"e-stale"');
+    ws.close();
+  });
+
   it("webSocketMessage routes message.send to ChatChannel and returns committed_ack", async () => {
     const userId = "u-uc-send";
     const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
