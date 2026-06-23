@@ -21,7 +21,7 @@ Phase 1-specific:
 - **Projection outbox (first real use):** ChatChannel membership writes (join here; leave/role in Phase 3) write a `projection_outbox` row `target_kind='user_directory'`, `target_key=<user_id>`, payload `{action:'join'|'leave', channel_id, kind, membership_version}`. The ChatChannel DO's `alarm()` flushes pending outbox rows (same pattern as Phase 0's `/outbox-flush` spike endpoint, now in `alarm()` + `runDueJobs`). Target DO (UserDirectory) upserts my_channels idempotently.
 - **Events written but not broadcast:** `message.created` and `member.joined` events are written to ChatChannel's `events` table (with `membership_version_at_event` + monotonic event_id) so `last_event_id` cursor is real. NO WebSocket delivery in Phase 1 (fanout is Phase 2). Bootstrap's `last_event_id`/`event_state.per_channel` reads the max event_id per channel.
 - **No message SENDING in Phase 1:** `message.send` is a WS command (Phase 2). Phase 1 is read-only: bootstrap + history pagination. The system channel starts empty; Phase 2 populates it. (Bootstrap still returns the correct shape with empty messages.)
-- **read-state floor:** `POST /api/chat/channels/:channel_id/read-state` is Phase 3 (with read-state mutation). Phase 1 bootstrap computes `unread_count`/`last_read_event_id` from UserDirectory.my_channels (which has the columns from Phase 0). `unread_count = count(events where event_id > last_read_event_id AND actor != me)` — for the system channel in Phase 1 this is 0 (no messages yet), but the computation path is real.
+- **read-state floor:** `POST /api/chat/channels/:channel_id/read-state` is Phase 3 (with read-state mutation). Phase 1 carries `last_read_event_id` through UserDirectory rows when present, but does **not** compute real unread counts — routes return `unread_count: 0`. Real unread calculation (`events where event_id > last_read_event_id`, excluding self-authored content-bearing events) is Phase 3.
 - **Profile resolve:** batch-resolve senders in messages list + the channel's last_message sender. Reuse Phase 0 `resolveUserSummaries`.
 - **`last_message_preview` / `last_message_at` / `member_count` / `last_event_id`:** read from ChatChannel (`channel_meta` row + last message + max event_id). These are real columns now (Phase 0 schema has `channel_meta.member_count`, `first_message_at`, `last_message_at`; Phase 1 maintains `member_count` on join, `last_message_at` on message — but no messages in Phase 1 so it stays null).
 - **ROUTE_INDEX_PENDING:** not needed in Phase 1 (no message_id-scoped routes called yet — `/messages/{id}` edit/delete is Phase 4). Skip.
@@ -262,9 +262,9 @@ describe("ChatChannel system channel", () => {
       body: JSON.stringify({ user_id: userId }),
     }));
     const b1 = await r1.json() as { membership_version: number };
-    // simulate a leave via a direct internal update (Phase 3 adds /internal/leave; here set left_at directly through a test-only probe)
+    // simulate a leave via the test-only probe (guarded by X-Test-Only: 1). Phase 3 adds /internal/leave.
     await stub.fetch(new Request("https://x/internal/test-leave", {
-      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      method: "POST", headers: { "X-Verified-User-Id": userId, "X-Test-Only": "1", "Content-Type": "application/json" },
       body: JSON.stringify({ user_id: userId }),
     }));
     const r2 = await stub.fetch(new Request("https://x/internal/join", {
@@ -281,6 +281,10 @@ The `rejoin` test needs a `/internal/test-leave` endpoint to set `left_at` (Phas
 
 ```ts
 if (url.pathname === "/internal/test-leave") {
+  // TEST-ONLY: set left_at to exercise rejoin-after-leave. Phase 3 adds a real
+  // /internal/leave; remove this endpoint then. Guard: reject unless a test-only
+  // header is present so production traffic can never trigger it.
+  if (request.headers.get("X-Test-Only") !== "1") return new Response("forbidden", { status: 403 });
   const userId = request.headers.get("X-Verified-User-Id") ?? "";
   const now = new Date().toISOString();
   return await this.ctx.storage.transaction(async () => {
@@ -291,7 +295,7 @@ if (url.pathname === "/internal/test-leave") {
   });
 }
 ```
-(Remove this endpoint when Phase 3 adds the real leave path.)
+The rejoin test must send `X-Test-Only: 1` on this call. Prefer `runInDurableObject` (from `cloudflare:test`) to mutate state directly if the test harness allows; this HTTP endpoint is the fallback. Remove when Phase 3 adds the real leave path.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -634,7 +638,7 @@ git commit -m "feat(do): UserDirectory upsert-channel projection + membership_ve
 **Interfaces:**
 - Consumes: existing messages/events/channel_meta schema.
 - Produces:
-  - `GET /internal/summary` (with `X-Verified-User-Id`) → returns `{ channel_id, kind, visibility, title, topic, avatar_url, member_count, status, created_at, updated_at, last_message_at, last_message_preview, last_message_sender_id, last_event_id, my_role }`. `my_role` from members (null if not member). `last_event_id` = max(events.event_id). `last_message_*` from the latest `status NOT IN ('deleted','recalled')` message (null in Phase 1). **ChatChannel does NOT return `last_read_event_id` or `unread_count`** — those live in UserDirectory (last_read_event_id is per-user) and must be computed in the route layer (reviewer P1-6). The route combines: `unread_count = count(events where event_id > user's last_read_event_id AND actor_id != user)` — for Phase 1 (no messages) this is 0; the route sets it from UserDirectory's row.
+  - `GET /internal/summary` (with `X-Verified-User-Id`) → returns `{ channel_id, kind, visibility, title, topic, avatar_url, member_count, status, created_at, updated_at, last_message_at, last_message_preview, last_message_sender_id, last_event_id, my_role }`. `my_role` from members (null if not member). `last_event_id` = max(events.event_id). `last_message_*` from the latest `status NOT IN ('deleted','recalled')` message (null in Phase 1). **ChatChannel does NOT return `last_read_event_id` or `unread_count`** — those live in UserDirectory (last_read_event_id is per-user). Phase 1 routes return `unread_count: 0` (real calculation `count(events where event_id > user's last_read_event_id AND actor_id != user)` is Phase 3).
     - 403 (FORBIDDEN) if user not a member AND visibility != public. For system channel (public_listed) allow read even if not member (but bootstrap will have joined them first).
   - `GET /internal/messages?before=<message_id>&limit=<n>` (with `X-Verified-User-Id`) → `{ items: Message[], next_cursor: string|null }`. Pages visible messages (`status NOT IN ('deleted','recalled')`) ordered by `message_id DESC`, `before` exclusive. `limit` default 50, max 100. `next_cursor` = the oldest message_id in the page if more exist, else null.
 
@@ -718,7 +722,7 @@ if (url.pathname === "/internal/summary") {
   if (!isMember && meta.visibility === "private") return new Response("forbidden", { status: 403 });
   const lastEvent = this.ctx.storage.sql.exec("SELECT event_id FROM events WHERE channel_id=? ORDER BY event_id DESC LIMIT 1", meta.channel_id).toArray()[0] as { event_id: string } | undefined;
   const lastMsg = this.ctx.storage.sql.exec("SELECT message_id, sender_kind, sender_user_id, text FROM messages WHERE channel_id=? AND status NOT IN ('deleted','recalled') ORDER BY created_at DESC LIMIT 1", meta.channel_id).toArray()[0] as { message_id: string; sender_kind: string; sender_user_id: string | null; text: string | null } | undefined;
-  // ChatChannel does NOT know last_read_event_id or unread (per-user, in UserDirectory). Route layer computes unread.
+  // ChatChannel does NOT know last_read_event_id or unread (per-user, in UserDirectory). Phase 1 routes return unread_count: 0; real computation is Phase 3.
   return Response.json({
     channel_id: meta.channel_id, kind: meta.kind, visibility: meta.visibility, title: meta.title, topic: meta.topic, avatar_url: meta.avatar_url,
     status: meta.status, created_at: meta.created_at, updated_at: meta.updated_at, member_count: meta.member_count,
@@ -1433,6 +1437,6 @@ git commit -m "docs(design): system channel capacity note (single DO, split defe
 
 **Known Phase 1 limitations (NOT bugs):**
 - No message sending (Phase 2 WS).
-- unread computation returns 0 in ChatChannel summary (last_read_event_id is in UserDirectory, not ChatChannel) — real computation is Phase 3 (read-state mutation). Bootstrap's `unread_count` is 0 for system channel (no messages). Acceptable.
+- unread_count is 0 across all Phase 1 routes (last_read_event_id is per-user in UserDirectory; real computation is Phase 3). Consistent: Global Constraints, Task 3 summary doc, route code, self-review all say Phase 1 = 0.
 - System channel single-DO hot spot (capacity note Task 8).
 - outbox flush for join is async; bootstrap compensates by reading join result directly. A flake window where my_channels lags is acceptable for read-only Phase 1.
