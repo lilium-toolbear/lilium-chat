@@ -1573,12 +1573,6 @@ Add these two endpoints inside `fetch`, just before the `return new Response("no
       });
 
       await this.scheduleOutboxAlarm(now);
-      return Response.json({ message_id: messageId, event_id: eventId });
-    }
-```
-
-> **Why the `message_index` outbox insert is now inline SQL (not `this.insertOutboxRow(...)`):** the existing `insertOutboxRow` is an `async` method called without `await` inside the transaction — a latent swallowed-error bug (P0-3). For Phase 2 we make the fanout helper **synchronous** (below) and write the `message_index` row with inline synchronous SQL so any insert failure throws and rolls the whole transaction back. (The legacy `insertOutboxRow` stays as-is to avoid touching the Phase-1 `/internal/join` path in this task; a later cleanup task can convert it too. The `/internal/join` path is lower-risk because a missed `user_directory` projection is repairable, whereas a missed `channel_fanout` row drops a real-time event.)
-
       await this.scheduleOutboxAlarm(now);
       return Response.json({ message_id: messageId, event_id: eventId });
     }
@@ -1648,6 +1642,8 @@ Add these two endpoints inside `fetch`, just before the `return new Response("no
       return Response.json({ events: out });
     }
 ```
+
+> **Why the `message_index` outbox insert is inline SQL (not `this.insertOutboxRow(...)`):** the existing `insertOutboxRow` is an `async` method called without `await` inside the transaction — a latent swallowed-error bug (P0-3). For Phase 2 we make the fanout helper **synchronous** (below) and write the `message_index` row with inline synchronous SQL so any insert failure throws and rolls the whole transaction back. (The legacy `insertOutboxRow` stays as-is to avoid touching the Phase-1 `/internal/join` path in this task; a later cleanup task can convert it too. The `/internal/join` path is lower-risk because a missed `user_directory` projection is repairable, whereas a missed `channel_fanout` row drops a real-time event.)
 
 Add the `insertOutboxRowForFanout` helper method to the `ChatChannel` class (near `insertOutboxRow`). **It MUST be synchronous** (P0-3): a `sql.exec` failure must throw synchronously so the surrounding `ctx.storage.transaction` rolls back the message + event writes — otherwise a dropped fanout outbox row would silently lose the real-time broadcast while the message stays committed.
 ```typescript
