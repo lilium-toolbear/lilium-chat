@@ -227,6 +227,43 @@ export class ChatChannel extends DurableObject<Env> {
     );
   }
 
+  private async markMemberLeftAndEnqueueFanoutUnregister(
+    channelId: string,
+    userId: string,
+    nowIso: string,
+  ): Promise<void> {
+    await this.ctx.storage.transaction(async () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE members SET left_at=? WHERE channel_id=? AND user_id=?",
+        nowIso,
+        channelId,
+        userId,
+      );
+      const meta = this.ctx.storage.sql
+        .exec("SELECT membership_version, member_count FROM channel_meta WHERE channel_id=?", channelId)
+        .toArray()[0] as { membership_version: number; member_count: number } | undefined;
+      const nextMv = (meta?.membership_version ?? 0) + 1;
+      const nextCount = Math.max(0, (meta?.member_count ?? 1) - 1);
+      this.ctx.storage.sql.exec(
+        "UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?",
+        nextMv,
+        nextCount,
+        nowIso,
+        channelId,
+      );
+      const fanoutPayload = { action: "unregister-user", channel_id: channelId, user_id: userId };
+      this.ctx.storage.sql.exec(
+        "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'channel_fanout', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+        `channel_fanout:unregister:${channelId}:${userId}:${nowIso}`,
+        channelId,
+        JSON.stringify(fanoutPayload),
+        nowIso,
+        nowIso,
+        nowIso,
+      );
+    });
+  }
+
   private insertOutboxRowForFanout(
     channelId: string,
     eventId: string,
@@ -615,12 +652,8 @@ export class ChatChannel extends DurableObject<Env> {
         return new Response("not found", { status: 404 });
       }
       const now = this.nowIso();
-      this.ctx.storage.sql.exec(
-        "UPDATE members SET left_at=? WHERE channel_id=? AND user_id=?",
-        now,
-        meta.channel_id,
-        userId,
-      );
+      await this.markMemberLeftAndEnqueueFanoutUnregister(meta.channel_id, userId, now);
+      await this.scheduleOutboxAlarm(now);
       return Response.json({ ok: true });
     }
 
