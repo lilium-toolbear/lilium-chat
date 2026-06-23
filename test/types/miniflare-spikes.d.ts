@@ -16,4 +16,5 @@ declare module "cloudflare:test" {
     stub: unknown,
     callback: (instance: unknown, state: { getWebSockets: () => WebSocket[] }) => Promise<void>,
   ): Promise<void>;
+  export function runDurableObjectAlarm(stub: unknown): Promise<void>;
 }

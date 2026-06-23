@@ -2,6 +2,13 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { execSchema } from "./sql";
 import { uuidv7, monotonicUuidV7, type EventSeq } from "../ids/uuidv7";
+import {
+  buildEventFrame,
+  buildMessageCreatedPayload,
+  resolveSenderForLiveBroadcast,
+  type UserSummary as LiveUserSummary,
+} from "../chat/event-broadcast";
+import { resolveUserSummaries } from "../profile/resolve";
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS channel_meta (
@@ -139,6 +146,18 @@ interface MessageRow {
   recalled_at: string | null;
 }
 
+interface ReplayEventRow {
+  event_id: string;
+  event_type: string;
+  payload_json: string;
+  occurred_at: string;
+}
+
+interface ReplayEnvelope {
+  event_id: string;
+  event_json: string;
+}
+
 function rowToMessage(r: MessageRow): Record<string, unknown> {
   let replySnapshot: unknown = null;
   if (r.reply_snapshot_json) {
@@ -202,6 +221,31 @@ export class ChatChannel extends DurableObject<Env> {
       targetKey,
       eventId,
       JSON.stringify(payloadOut),
+      nowIso,
+      nowIso,
+      nowIso,
+    );
+  }
+
+  private insertOutboxRowForFanout(
+    channelId: string,
+    eventId: string,
+    eventFrameJson: string,
+    membershipVersionAtEvent: number,
+    nowIso: string,
+  ): void {
+    const payload = {
+      action: "fanout",
+      event_id: eventId,
+      event_json: eventFrameJson,
+      membership_version_at_event: membershipVersionAtEvent,
+    };
+    this.ctx.storage.sql.exec(
+      "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'channel_fanout', ?, ?, ?, 'pending', ?, ?, ?, 0, 5)",
+      `${channelId}:${eventId}:${Math.random()}`,
+      channelId,
+      eventId,
+      JSON.stringify(payload),
       nowIso,
       nowIso,
       nowIso,
@@ -634,6 +678,287 @@ export class ChatChannel extends DurableObject<Env> {
       return Response.json({ events: out });
     }
 
+    if (url.pathname === "/internal/message-send") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as {
+        client_message_id: string;
+        dedupe_principal_key: string;
+        type: string;
+        text: string;
+        reply_to: string | null;
+        mentions: Array<{ user_id: string; start: number; end: number }>;
+        channel_id: string;
+      };
+
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+
+      const meta = this.ctx.storage.sql
+        .exec("SELECT channel_id, membership_version FROM channel_meta LIMIT 1")
+        .toArray()[0] as { channel_id: string; membership_version: number } | undefined;
+      if (meta === undefined) {
+        return new Response("channel not created", { status: 409 });
+      }
+      const channelId = meta.channel_id;
+      const requestedChannelId = b.channel_id ?? "";
+      if (requestedChannelId && requestedChannelId !== channelId) {
+        return Response.json(
+          { error: { code: "CHANNEL_NOT_FOUND", message: "channel_id mismatch", retryable: false } },
+          { status: 404 },
+        );
+      }
+
+      const member = this.ctx.storage.sql
+        .exec("SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", channelId, userId)
+        .toArray()[0] as { x: number } | undefined;
+      if (!member) {
+        return Response.json(
+          { error: { code: "FORBIDDEN", message: "not a member", retryable: false } },
+          { status: 403 },
+        );
+      }
+
+      const requestHash = JSON.stringify({
+        type: b.type,
+        text: b.text,
+        reply_to: b.reply_to,
+        mentions: b.mentions ?? [],
+      });
+
+      const idemRow = this.ctx.storage.sql
+        .exec(
+          "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='message.send' AND idempotency_key=?",
+          userId,
+          b.client_message_id,
+        )
+        .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+      if (idemRow) {
+        if (idemRow.request_hash !== requestHash) {
+          return Response.json(
+            {
+              error: {
+                code: "IDEMPOTENCY_CONFLICT",
+                message: "client_message_id reused with different body",
+                retryable: false,
+              },
+            },
+            { status: 409 },
+          );
+        }
+        const cached = idemRow.response_json
+          ? (JSON.parse(idemRow.response_json) as { message_id: string; event_id: string })
+          : { message_id: "", event_id: "" };
+        return Response.json(cached);
+      }
+
+      const messageId = uuidv7(nowMs);
+      const eventId = this.nextEventId(nowMs);
+      const mv = meta.membership_version;
+      const persistedPayload = buildMessageCreatedPayload({
+        message_id: messageId,
+        client_message_id: b.client_message_id,
+        channel_id: channelId,
+        sender_kind: "user",
+        sender_user_id: userId,
+        sender_bot_id: null,
+        status: "normal",
+        created_at: now,
+        type: b.type,
+        format: "plain",
+        text: b.text,
+      });
+      const payloadJson = JSON.stringify(persistedPayload);
+
+      const livePayload = await resolveSenderForLiveBroadcast(
+        persistedPayload,
+        async (userIds: string[]) => {
+          const raw = await resolveUserSummaries(userIds, this.env);
+          const normalized = new Map<string, LiveUserSummary>();
+          for (const [id, v] of raw) {
+            normalized.set(id, {
+              user_id: v.user_id,
+              display_name: v.display_name ?? `user-${id.slice(0, 8)}`,
+              avatar_url: v.avatar_url,
+            });
+          }
+          return normalized;
+        },
+      );
+      const eventFrame = buildEventFrame({
+        event_id: eventId,
+        type: "message.created",
+        channel_id: channelId,
+        occurred_at: now,
+        payload: livePayload,
+      });
+      const eventFrameJson = JSON.stringify(eventFrame);
+      const responseJson = JSON.stringify({ message_id: messageId, event_id: eventId });
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+
+      await this.ctx.storage.transaction(async () => {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO messages (
+              message_id, client_message_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
+              sender_bot_id, type, format, status, text, reply_to, stream_state, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'user', ?, NULL, ?, 'plain', 'normal', ?, ?, 'none', ?, ?)`,
+          messageId,
+          b.client_message_id,
+          b.dedupe_principal_key,
+          channelId,
+          userId,
+          b.type,
+          b.text,
+          b.reply_to,
+          now,
+          now,
+        );
+        if (Array.isArray(b.mentions)) {
+          for (const m of b.mentions) {
+            this.ctx.storage.sql.exec(
+              "INSERT OR IGNORE INTO mentions (message_id, user_id, start, end_) VALUES (?, ?, ?, ?)",
+              messageId,
+              m.user_id,
+              m.start,
+              m.end,
+            );
+          }
+        }
+        this.ctx.storage.sql.exec(
+          "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, 'message.created', ?, 'user', ?, ?, ?, ?)",
+          eventId,
+          channelId,
+          userId,
+          payloadJson,
+          mv,
+          now,
+        );
+        this.ctx.storage.sql.exec(
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'message.send', ?, ?, ?, 'completed', ?, ?)",
+          userId,
+          b.client_message_id,
+          requestHash,
+          responseJson,
+          now,
+          idemExpiresAt,
+        );
+        this.insertOutboxRowForFanout(channelId, eventId, eventFrameJson, mv, now);
+        this.ctx.storage.sql.exec(
+          "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'message_index', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+          `message_index:${messageId}`,
+          messageId,
+          JSON.stringify({ message_id: messageId, channel_id: channelId }),
+          now,
+          now,
+          now,
+        );
+      });
+
+      await this.scheduleOutboxAlarm(now);
+      return Response.json({ message_id: messageId, event_id: eventId });
+    }
+
+    if (url.pathname === "/internal/replay") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      const after = url.searchParams.get("after") ?? "";
+      const meta = this.ctx.storage.sql.exec("SELECT channel_id, visibility FROM channel_meta LIMIT 1").toArray()[0] as
+        | { channel_id: string; visibility: string }
+        | undefined;
+      if (meta === undefined) return Response.json({ events: [] });
+      const member = userId
+        ? (this.ctx.storage.sql.exec(
+            "SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL",
+            meta.channel_id,
+            userId,
+          ).toArray()[0] as { x: number } | undefined)
+        : undefined;
+      if (!member && meta.visibility === "private") {
+        return new Response("forbidden", { status: 403 });
+      }
+
+      const rows = this.ctx.storage.sql
+        .exec(
+          "SELECT event_id, event_type, payload_json, occurred_at FROM events WHERE channel_id=? AND event_id > ? ORDER BY event_id",
+          meta.channel_id,
+          after,
+        )
+        .toArray() as Array<Record<string, unknown>>;
+      const parsedRows: ReplayEventRow[] = rows.map((row) => ({
+        event_id: typeof row.event_id === "string" ? row.event_id : String(row.event_id ?? ""),
+        event_type: typeof row.event_type === "string" ? row.event_type : String(row.event_type ?? ""),
+        payload_json: typeof row.payload_json === "string" ? row.payload_json : "",
+        occurred_at: typeof row.occurred_at === "string" ? row.occurred_at : "",
+      }));
+      const allSenderIds: string[] = [];
+      for (const r of parsedRows) {
+        if (r.event_type === "message.created" || r.event_type === "message.updated") {
+          try {
+            const p = JSON.parse(r.payload_json) as { message?: { sender?: { kind?: string; user_id?: string | null } } };
+            if (p.message?.sender?.kind === "user" && p.message.sender.user_id) allSenderIds.push(p.message.sender.user_id);
+          } catch {
+            // ignore malformed payload
+          }
+        }
+      }
+
+      const senderMap = await resolveUserSummaries(Array.from(new Set(allSenderIds)), this.env);
+      const liveSenderMap = new Map<string, LiveUserSummary>();
+      for (const [id, summary] of senderMap) {
+        liveSenderMap.set(id, {
+          user_id: summary.user_id,
+          display_name: summary.display_name ?? `user-${id.slice(0, 8)}`,
+          avatar_url: summary.avatar_url,
+        });
+      }
+      const out: Array<ReplayEnvelope> = [];
+
+      for (const r of parsedRows) {
+        if (r.event_type === "message.created" || r.event_type === "message.updated") {
+          try {
+            const p = JSON.parse(r.payload_json) as { message?: { message_id?: string } };
+            const messageId = p.message?.message_id;
+            if (messageId) {
+              const st = this.ctx.storage.sql.exec(
+                "SELECT status FROM messages WHERE message_id=?",
+                messageId,
+              ).toArray()[0] as { status: string } | undefined;
+              if (st && (st.status === "deleted" || st.status === "recalled")) continue;
+            }
+          } catch {
+            // malformed payload or missing payload message_id
+          }
+        }
+
+        let payload: Record<string, unknown> = {};
+        try {
+          payload = JSON.parse(r.payload_json) as Record<string, unknown>;
+        } catch {
+          payload = {};
+        }
+
+        if (r.event_type === "message.created" || r.event_type === "message.updated") {
+          payload = await resolveSenderForLiveBroadcast(
+            payload,
+            async (_userIds: string[]) => liveSenderMap,
+          );
+        }
+
+        out.push({
+          event_id: r.event_id,
+          event_json: JSON.stringify(
+            buildEventFrame({
+              event_id: r.event_id,
+              type: r.event_type,
+              channel_id: meta.channel_id,
+              occurred_at: r.occurred_at,
+              payload,
+            }),
+          ),
+        });
+      }
+      return Response.json({ events: out });
+    }
+
     return new Response("not found", { status: 404 });
   }
 
@@ -647,36 +972,119 @@ export class ChatChannel extends DurableObject<Env> {
       .toArray() as unknown as Array<OutboxRow>;
 
     for (const r of rows) {
-      if (r.target_kind !== "user_directory") {
-        await this.bumpOutboxRetry(r.outbox_id, nowIso, `unsupported target_kind=${r.target_kind}`);
+      if (r.target_kind === "user_directory") {
+        const req = new Request("https://x/internal/upsert-channel", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Verified-User-Id": r.target_key,
+          },
+          body: r.payload_json,
+        });
+        const target = this.env.USER_DIRECTORY.getByName(r.target_key);
+        try {
+          const res = await target.fetch(req);
+          if (!res.ok) {
+            const text = await res.text();
+            await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
+            continue;
+          }
+          this.ctx.storage.sql.exec(
+            "UPDATE projection_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
+            nowIso,
+            r.outbox_id,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.bumpOutboxRetry(r.outbox_id, nowIso, msg);
+        }
         continue;
       }
 
-      const req = new Request("https://x/internal/upsert-channel", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Verified-User-Id": r.target_key,
-        },
-        body: r.payload_json,
-      });
-      const target = this.env.USER_DIRECTORY.getByName(r.target_key);
-      try {
-        const res = await target.fetch(req);
-        if (!res.ok) {
-          const text = await res.text();
-          await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
+      if (r.target_kind === "channel_fanout") {
+        let payload: { action?: string; event_id?: string; event_json?: string; membership_version_at_event?: number; user_id?: string };
+        try {
+          payload = JSON.parse(r.payload_json) as {
+            action?: string;
+            event_id?: string;
+            event_json?: string;
+            membership_version_at_event?: number;
+            user_id?: string;
+          };
+        } catch {
+          await this.bumpOutboxRetry(r.outbox_id, nowIso, "invalid payload_json");
           continue;
         }
-        this.ctx.storage.sql.exec(
-          "UPDATE projection_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
-          nowIso,
-          r.outbox_id,
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await this.bumpOutboxRetry(r.outbox_id, nowIso, msg);
+
+        const target = this.env.CHANNEL_FANOUT.getByName(r.target_key);
+        let res: Response;
+        try {
+          if (payload.action === "unregister-user") {
+            res = await target.fetch(new Request("https://x/unregister-user", {
+              method: "POST",
+              headers: {
+                "X-Channel-Id": r.target_key,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ user_id: payload.user_id ?? "" }),
+            }));
+          } else {
+            res = await target.fetch(new Request("https://x/fanout-enqueue", {
+              method: "POST",
+              headers: {
+                "X-Channel-Id": r.target_key,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                event_id: payload.event_id ?? "",
+                event_json: payload.event_json ?? "",
+                membership_version_at_event: payload.membership_version_at_event ?? 0,
+              }),
+            }));
+          }
+          if (!res.ok) {
+            const text = await res.text();
+            await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
+            continue;
+          }
+          this.ctx.storage.sql.exec(
+            "UPDATE projection_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
+            nowIso,
+            r.outbox_id,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.bumpOutboxRetry(r.outbox_id, nowIso, msg);
+        }
+        continue;
       }
+
+      if (r.target_kind === "message_index") {
+        const target = this.env.MESSAGE_INDEX.getByName(r.target_key);
+        try {
+          const res = await target.fetch(new Request("https://x/upsert", {
+            method: "POST",
+            body: r.payload_json,
+            headers: { "Content-Type": "application/json" },
+          }));
+          if (!res.ok) {
+            const text = await res.text();
+            await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
+            continue;
+          }
+          this.ctx.storage.sql.exec(
+            "UPDATE projection_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
+            nowIso,
+            r.outbox_id,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.bumpOutboxRetry(r.outbox_id, nowIso, msg);
+        }
+        continue;
+      }
+
+      await this.bumpOutboxRetry(r.outbox_id, nowIso, `unsupported target_kind=${r.target_kind}`);
     }
 
     await this.scheduleOutboxAlarm(nowIso);
