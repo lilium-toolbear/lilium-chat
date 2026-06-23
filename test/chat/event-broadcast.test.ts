@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildEventFrame, buildMessageCreatedPayload } from "../../src/chat/event-broadcast";
-import { resolveSenderForLiveBroadcast } from "../../src/chat/event-broadcast";
+import { buildEventFrame, buildMessageCreatedPayload, resolveSenderForLiveBroadcast } from "../../src/chat/event-broadcast";
 
 describe("buildEventFrame", () => {
   it("produces the contract §10.4 envelope shape", () => {
@@ -89,4 +88,3 @@ describe("resolveSenderForLiveBroadcast", () => {
     expect((sender.user as Record<string, unknown>).display_name).toBe("user-u-ghost");
   });
 });
-

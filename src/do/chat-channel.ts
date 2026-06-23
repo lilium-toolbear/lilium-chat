@@ -759,32 +759,6 @@ export class ChatChannel extends DurableObject<Env> {
         mentions: b.mentions ?? [],
       });
 
-      const idemRow = this.ctx.storage.sql
-        .exec(
-          "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='message.send' AND idempotency_key=?",
-          userId,
-          b.client_message_id,
-        )
-        .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
-      if (idemRow) {
-        if (idemRow.request_hash !== requestHash) {
-          return Response.json(
-            {
-              error: {
-                code: "IDEMPOTENCY_CONFLICT",
-                message: "client_message_id reused with different body",
-                retryable: false,
-              },
-            },
-            { status: 409 },
-          );
-        }
-        const cached = idemRow.response_json
-          ? (JSON.parse(idemRow.response_json) as { message_id: string; event_id: string })
-          : { message_id: "", event_id: "" };
-        return Response.json(cached);
-      }
-
       const messageId = uuidv7(nowMs);
       const eventId = this.nextEventId(nowMs);
       const mv = meta.membership_version;
@@ -829,7 +803,29 @@ export class ChatChannel extends DurableObject<Env> {
       const responseJson = JSON.stringify({ message_id: messageId, event_id: eventId });
       const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
 
-      await this.ctx.storage.transaction(async () => {
+      type SendResult =
+        | { kind: "created"; message_id: string; event_id: string }
+        | { kind: "cached"; message_id: string; event_id: string }
+        | { kind: "conflict" };
+
+      const txResult = await this.ctx.storage.transaction(async (): Promise<SendResult> => {
+        const idemRow = this.ctx.storage.sql
+          .exec(
+            "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='message.send' AND idempotency_key=?",
+            userId,
+            b.client_message_id,
+          )
+          .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        if (idemRow) {
+          if (idemRow.request_hash !== requestHash) {
+            return { kind: "conflict" };
+          }
+          const cached = idemRow.response_json
+            ? (JSON.parse(idemRow.response_json) as { message_id: string; event_id: string })
+            : { message_id: "", event_id: "" };
+          return { kind: "cached", message_id: cached.message_id, event_id: cached.event_id };
+        }
+
         this.ctx.storage.sql.exec(
           `INSERT INTO messages (
               message_id, client_message_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
@@ -885,10 +881,25 @@ export class ChatChannel extends DurableObject<Env> {
           now,
           now,
         );
+        return { kind: "created", message_id: messageId, event_id: eventId };
       });
 
-      await this.scheduleOutboxAlarm(now);
-      return Response.json({ message_id: messageId, event_id: eventId });
+      if (txResult.kind === "conflict") {
+        return Response.json(
+          {
+            error: {
+              code: "IDEMPOTENCY_CONFLICT",
+              message: "client_message_id reused with different body",
+              retryable: false,
+            },
+          },
+          { status: 409 },
+        );
+      }
+      if (txResult.kind === "created") {
+        await this.scheduleOutboxAlarm(now);
+      }
+      return Response.json({ message_id: txResult.message_id, event_id: txResult.event_id });
     }
 
     if (url.pathname === "/internal/replay") {
