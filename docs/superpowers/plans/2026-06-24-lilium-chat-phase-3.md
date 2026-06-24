@@ -31,12 +31,6 @@
 ## File Structure
 
 **Create:**
-- `src/chat/channel-events.ts` — pure builders for Phase 3 event payloads: `buildChannelCreatedPayload`, `buildChannelUpdatedPayload`, `buildChannelDissolvedPayload`, `buildMemberJoinedPayload`, `buildMemberRoleUpdatedPayload`, `buildReadStateUpdatedPayload`, `buildSystemNoticePayload` (persisted ref shape — `actor_kind`/`actor_id`/`target_user_id`/`channel_changes`, NO UserSummary). Plus `resolveActorForLiveBroadcast(payload, resolveUserSummaries)` (wire projection: `actor`/`target_user` → UserSummary, fallback `user-<shortid>`). Unit-tested with an injected resolver.
-- `test/chat/channel-events.test.ts` — unit tests for the payload builders + actor resolver.
-- `src/routes/channel-mutations.ts` — Hono route handlers: `createChannelHandler`, `updateChannelHandler`, `dissolveChannelHandler`, `listMembersHandler`, `getMemberHandler`, `addMemberHandler`, `updateMemberRoleHandler`, `removeMemberHandler`, `readStateHandler`. Registered in `src/index.ts`.
-- `test/routes/channel-mutations.test.ts` — HTTP-level tests for all 9 endpoints (auth, success, errors, idempotency, dissolve-gate).
-- `test/do/user-directory-create-coordinate.test.ts` — coordinator state machine (new/cached/conflict/creating-retry).
-**Create:**
 - `src/chat/channel-events.ts` — pure builders for Phase 3 event payloads: `buildChannelCreatedPayload`, `buildChannelUpdatedPayload`, `buildChannelDissolvedPayload`, `buildMemberJoinedPayload`, `buildMemberRoleUpdatedPayload`, `buildMemberLeftPayload`, `buildReadStateUpdatedPayload`, `buildSystemNoticePayload` (persisted ref shape — `actor_kind`/`actor_id`/`target_user_id`/`channel_changes`, NO UserSummary). Plus `resolveActorWithMap` (sync, prod path inside a DO txn) and `resolveActorForLiveBroadcast` (async, injected resolver for unit tests).
 - `test/chat/channel-events.test.ts` — unit tests for the payload builders + actor resolver.
 - `src/routes/channel-mutations.ts` — Hono route handlers: `createChannelHandler`, `updateChannelHandler`, `dissolveChannelHandler`, `listMembersHandler`, `getMemberHandler`, `addMemberHandler`, `updateMemberRoleHandler`, `removeMemberHandler`, `readStateHandler`. Registered in `src/index.ts`.
@@ -865,14 +859,18 @@ describe("ChatChannel /internal/replay actor projection", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { events: Array<{ event_json: string }> };
     const frames = body.events.map((e) => JSON.parse(e.event_json) as { type: string; payload: Record<string, unknown> });
-    // Find the system.notice for member.joined of the initial member (target_user set).
-    const notice = frames.find((f) => f.type === "system.notice" && (f.payload as { notice_kind?: string }).notice_kind === "member.joined");
+    // The create sequence writes: channel.created (actor=creator), member.joined(creator, actor=system),
+    // member.joined(initial member, actor=system), system.notice(notice_kind=channel.created, actor=creator, target_user_id=null).
+    // Assert the channel.created system.notice has its ACTOR resolved + ref stripped on the wire.
+    const notice = frames.find((f) => f.type === "system.notice" && (f.payload as { notice_kind?: string }).notice_kind === "channel.created");
     expect(notice).toBeTruthy();
     const p = notice!.payload as { actor?: unknown; target_user?: unknown; actor_id?: unknown; target_user_id?: unknown };
     expect(p).toHaveProperty("actor");
-    expect(p).toHaveProperty("target_user");
     expect(p.actor_id).toBeUndefined();      // ref stripped on the wire
     expect(p.target_user_id).toBeUndefined(); // ref stripped on the wire
+    // channel.created notice has target_user_id=null → wire target_user is null (not a UserSummary), but the field IS present.
+    expect(p).toHaveProperty("target_user");
+    expect(p.target_user).toBe(null);
   });
 
   it("replays channel.created with resolved actor, not bare actor_id", async () => {
@@ -892,7 +890,7 @@ describe("ChatChannel /internal/replay actor projection", () => {
 });
 ```
 
-> **Note on actor resolution:** the initial creation writes payloads with `actor_kind='user'`/`actor_id=creatorUserId` (channel.created, system.notice) and `actor_kind='system'`/`actor_id='system'` (member.joined). `resolveActorWithMap` turns system actors into `actor: null`. The test asserts the wire shape has `actor`/`target_user` set and the ref fields stripped — it does NOT assert on whether a given user_id resolves to a display_name (Hyperdrive is not seeded in tests; the function falls back to `user-<shortid>`, which still satisfies "actor is a UserSummary object, not a bare id").
+> **Note on actor resolution:** the create sequence writes `channel.created` + `system.notice(notice_kind=channel.created)` with `actor_kind='user'`/`actor_id=creatorUserId`, and `member.joined` (creator + each initial member) with `actor_kind='system'`/`actor_id='system'`. `resolveActorWithMap` turns a user actor into `actor: UserSummary` and a system actor into `actor: null`; when `target_user_id` is null the wire `target_user` is `null` (still present as a field, ref stripped). The test asserts the wire shape has `actor`/`target_user` set and the refs stripped — it does NOT assert on whether a given user_id resolves to a display_name (Hyperdrive is not seeded in tests; the function falls back to `user-<shortid>`, which still satisfies "actor is a UserSummary object, not a bare id").
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2573,14 +2571,16 @@ git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: GET /member
 - Test: `test/routes/channel-mutations.test.ts` (read-state cases, appended)
 
 **Interfaces:**
-- Consumes: `Env.CHAT_CHANNEL` + `Env.USER_DIRECTORY` (both bound on `UserDirectory` — see wrangler configs). `channelRouteNameFor`, `getIdentity`. `buildReadStateUpdatedPayload` from Task 3. `persistEventAndFanout` + `nextEventId` on ChatChannel (Task 4).
+- Consumes: `Env.USER_DIRECTORY` (floor), `Env.CHAT_CHANNEL` (event + unread — accessed by the Worker, not by UserDirectory). `channelRouteNameFor` (Worker routes the DO name), `getIdentity`. `buildReadStateUpdatedPayload` from Task 3. `persistEventAndFanout` + `nextEventId` on ChatChannel (Task 4).
 - Produces:
-  - `POST /internal/read-state` (header `X-Verified-User-Id`, body `{ channel_id, last_read_event_id }`) on `UserDirectory`: this owns the **floor** (the `(user_id, channel_id)` `my_channels` row must exist with `status='active'`, else 403) and the **monotonic advance** (accept `last_read_event_id` only if `>` the stored value; else keep stored). After a successful advance, it calls `ChatChannel(channel_id)./internal/read-state-event` to write the `read_state.updated` event + `channel_fanout` outbox (so cross-device clients of THIS user, subscribed via the channel fanout, sync their unread). Returns `{ channel_id, last_read_event_id, advanced: boolean }` (the Worker computes `unread_count` separately). If the monotonic floor did not advance (equal/earlier cursor), it returns `{ advanced: false }` and does NOT write an event (idempotent re-mark is not state change).
-  - `POST /internal/read-state-event` (header `X-Verified-User-Id`, body `{ user_id, last_read_event_id }`) on `ChatChannel`: writes ONE `read_state.updated` event (persisted payload via `buildReadStateUpdatedPayload` — note: this payload has NO `actor_kind`, so the Task 4b replay projection passes it through unchanged) + a `channel_fanout` outbox row; schedules the alarm. Idempotent on `(principal_kind='user', principal_id=user_id, operation='read_state', idempotency_key=<last_read_event_id>)` so a retried mark-read at the same cursor does not duplicate the event. Returns `{ event_id }`.
-  - `GET /internal/unread-count?after=` on `ChatChannel`: counts `message.created` events after `after` minus the user's own authored-by events (unchanged from draft). Returns `{ unread_count }`.
-  - Worker route `POST /channels/:channel_id/read-state`: auth → `UserDirectory(user_id)./internal/read-state` → fetch unread from `ChatChannel(channel_id)./internal/unread-count` → return `{ channel_id, last_read_event_id, unread_count }`.
+  - `POST /internal/read-state` (header `X-Verified-User-Id`, body `{ channel_id, last_read_event_id }`) on `UserDirectory`: owns ONLY the **floor** — the `(user_id, channel_id)` `my_channels` row must exist with `status='active'` (else 403). Three-state result (P0-2/P0-3): `>` floor → advance + `{ advanced:true, emit:true }`; `==` floor → no change + `{ advanced:false, emit:true }` (repair); `<` floor → no change + `{ advanced:false, emit:false }` (stale). ALWAYS returns the STORED floor as `last_read_event_id` (never the request cursor). Does NOT call ChatChannel (P1: the Worker routes the DO and emits the event).
+  - `POST /internal/read-state-event` (header `X-Verified-User-Id`, body `{ user_id, last_read_event_id }`) on `ChatChannel` (called by the WORKER, not UserDirectory): writes ONE `read_state.updated` event (persisted payload via `buildReadStateUpdatedPayload` — no `actor_kind`, Task 4b passes through unchanged) + `channel_fanout` outbox; schedules the alarm. Idempotent on `(principal_kind='user', principal_id=user_id, operation='read_state', idempotency_key=<last_read_event_id>)` so a same-cursor re-mark returns the cached event_id (dedup OR repair of a prior failed write). Returns `{ event_id }`.
+  - `GET /internal/unread-count?after=` on `ChatChannel`: counts `message.created` events after `after` minus the user's own authored-by events. Returns `{ unread_count }`.
+  - Worker route `POST /channels/:channel_id/read-state`: auth → `UserDirectory./internal/read-state` (floor) → route ChatChannel via `channelRouteNameFor` → if `emit`, call `/internal/read-state-event` (best-effort) → compute unread via `/internal/unread-count` → return `{ channel_id, last_read_event_id, unread_count }`.
 
-> **Decision on `read_state.updated` (P0-2 fix):** the first plan draft only updated `my_channels.last_read_event_id` and never emitted an event — leaving the contract's `read_state.updated` (§10.4, design §8 阶段3) unimplemented. This task emits it via the channel fanout. The event is persisted in the channel event log (so `/internal/replay` serves it) AND fanned out to online channel members (the marking user's other sessions receive it and resync unread). Task 4b's replay projection passes `read_state.updated` through unchanged (no `actor_kind`) — so no actor resolution gap.
+> **Routing boundary (P1 fix):** only the Worker routes the ChatChannel DO (`channelRouteNameFor` → `system-general` for the system channel, `channel_id` for user channels). `UserDirectory` owns only the floor. This fixes the first draft's bug where UserDirectory called `getByName(channel_id)` to write a read-state event — correct for user channels, WRONG for the system channel (whose DO name is `system-general`, not its UUID).
+> **`read_state.updated` (P0-2 fix):** the first draft only updated the floor and never emitted. This task emits it (via the Worker → ChatChannel). The event persists in the channel log (replay serves it) AND fans out to online channel members (the marker's other sessions resync unread). Task 4b passes `read_state.updated` through unchanged (no actor).
+> **Repairability (P0-3 fix):** the `==` case sets `emit:true` so the Worker re-calls `read-state-event`; ChatChannel's idempotency returns the cached event_id if a prior write succeeded, OR writes a fresh event if the prior write failed after the floor committed. A previously-dropped event is repaired by a same-cursor re-mark.
 
 - [ ] **Step 1: Write failing DO test**
 
@@ -2605,7 +2605,7 @@ async function seedMembership() {
 }
 
 describe("UserDirectory /internal/read-state", () => {
-  it("sets last_read_event_id on first mark (advanced: true)", async () => {
+  it("sets last_read_event_id on first mark (advanced: true, emit: true)", async () => {
     const stub = await seedMembership();
     const res = await stub.fetch(new Request("https://x/internal/read-state", {
       method: "POST",
@@ -2613,21 +2613,24 @@ describe("UserDirectory /internal/read-state", () => {
       body: JSON.stringify({ channel_id: CHANNEL, last_read_event_id: "01J00000000000000000000000" }),
     }));
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { last_read_event_id: string; advanced: boolean };
+    const body = (await res.json()) as { last_read_event_id: string; advanced: boolean; emit: boolean };
     expect(body.last_read_event_id).toBe("01J00000000000000000000000");
     expect(body.advanced).toBe(true);
+    expect(body.emit).toBe(true);
   });
 
-  it("returns advanced:false on re-mark of the same cursor (idempotent, no event)", async () => {
+  it("same cursor re-mark → advanced:false, emit:true (repair path)", async () => {
     const stub = await seedMembership();
     const cursor = "01J00000000000000000000010";
     const r1 = await stub.fetch(new Request("https://x/internal/read-state", { method: "POST", headers: { "X-Verified-User-Id": USER, "Content-Type": "application/json" }, body: JSON.stringify({ channel_id: CHANNEL, last_read_event_id: cursor }) }));
     const r2 = await stub.fetch(new Request("https://x/internal/read-state", { method: "POST", headers: { "X-Verified-User-Id": USER, "Content-Type": "application/json" }, body: JSON.stringify({ channel_id: CHANNEL, last_read_event_id: cursor }) }));
-    expect(((await r1.json()) as { advanced: boolean }).advanced).toBe(true);
-    expect(((await r2.json()) as { advanced: boolean }).advanced).toBe(false);
+    const b1 = (await r1.json()) as { advanced: boolean; emit: boolean; last_read_event_id: string };
+    const b2 = (await r2.json()) as { advanced: boolean; emit: boolean; last_read_event_id: string };
+    expect(b1.advanced).toBe(true); expect(b1.emit).toBe(true);
+    expect(b2.advanced).toBe(false); expect(b2.emit).toBe(true); // emit:true so the Worker can repair/dedupe the event
   });
 
-  it("only advances monotonically (earlier cursor rejected)", async () => {
+  it("only advances monotonically: earlier cursor returns the STORED floor (not the request cursor)", async () => {
     const stub = await seedMembership();
     await stub.fetch(new Request("https://x/internal/read-state", { method: "POST", headers: { "X-Verified-User-Id": USER, "Content-Type": "application/json" }, body: JSON.stringify({ channel_id: CHANNEL, last_read_event_id: "01Jzzzzzzzzzzzzzzzzzzzzzz" }) }));
     const res = await stub.fetch(new Request("https://x/internal/read-state", {
@@ -2636,7 +2639,10 @@ describe("UserDirectory /internal/read-state", () => {
       body: JSON.stringify({ channel_id: CHANNEL, last_read_event_id: "01Jaaaaaaaaaaaaaaaaaaaaaaa" }),
     }));
     expect(res.status).toBe(200);
-    expect(((await res.json()) as { last_read_event_id: string }).last_read_event_id).toBe("01Jzzzzzzzzzzzzzzzzzzzzzz");
+    const body = (await res.json()) as { last_read_event_id: string; advanced: boolean; emit: boolean };
+    expect(body.last_read_event_id).toBe("01Jzzzzzzzzzzzzzzzzzzzzzz"); // stored floor, NOT the earlier request cursor
+    expect(body.advanced).toBe(false);
+    expect(body.emit).toBe(false); // stale cursor → no event
   });
 
   it("403 if not an active member of the channel", async () => {
@@ -2656,7 +2662,14 @@ describe("UserDirectory /internal/read-state", () => {
 Run: `npx vitest run test/do/user-directory-read-state.test.ts --no-file-parallelism --test-timeout=60000`
 Expected: FAIL — `/internal/read-state` returns 404.
 
-- [ ] **Step 3: Implement the UserDirectory read-state handler (floor + advance + emit event)**
+- [ ] **Step 3: Implement the UserDirectory read-state handler (floor only — Worker emits the event)**
+
+Per the P1 fix: `UserDirectory /internal/read-state` owns ONLY the floor (the `my_channels` row + monotonic advance). It does NOT call ChatChannel — routing a user-channel vs. the `system-general` system channel is the Worker's job (via `channelRouteNameFor`). The Worker reads the floor result, then calls `ChatChannel /internal/read-state-event` itself.
+
+The floor returns a **three-state result** so the Worker can decide repair:
+- `requested > current` (or current null) → advance the floor, return `advanced: true`, emit the event (Worker).
+- `requested === current` → do NOT touch the floor, return `advanced: false, emit: true` — the Worker still calls `read-state-event` so its idempotency dedupes OR repairs an event that failed on a prior attempt (P0-3 fix).
+- `requested < current` → do NOT touch the floor, return `advanced: false, emit: false` — stale cursor, no event, just return the stored floor.
 
 Add inside `UserDirectory.fetch` before the final 404:
 ```typescript
@@ -2665,45 +2678,40 @@ if (url.pathname === "/internal/read-state") {
   if (userId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
   const b = (await request.json()) as { channel_id: string; last_read_event_id: string };
 
-  // 1) Floor + monotonic advance inside the my_channels txn.
-  const advanced = await this.ctx.storage.transaction(async (): Promise<boolean> => {
+  // Three-state floor result. The Worker decides whether to emit read_state.updated.
+  const floor = await this.ctx.storage.transaction(async (): Promise<
+    | { forbidden: true }
+    | { stored: string; advanced: boolean; emit: boolean }
+  > => {
     const row = this.ctx.storage.sql
       .exec("SELECT last_read_event_id, status FROM my_channels WHERE user_id=? AND channel_id=?", userId, b.channel_id)
       .toArray()[0] as { last_read_event_id: string | null; status: string } | undefined;
-    if (!row || row.status !== "active") return false; // signal 403 to caller
+    if (!row || row.status !== "active") return { forbidden: true };
+
     const current = row.last_read_event_id;
-    const next = current === null || b.last_read_event_id > current ? b.last_read_event_id : current;
-    if (next !== current) {
-      this.ctx.storage.sql.exec("UPDATE my_channels SET last_read_event_id=? WHERE user_id=? AND channel_id=?", next, userId, b.channel_id);
-      return true; // advanced
+    if (current === null || b.last_read_event_id > current) {
+      // advance
+      this.ctx.storage.sql.exec("UPDATE my_channels SET last_read_event_id=? WHERE user_id=? AND channel_id=?", b.last_read_event_id, userId, b.channel_id);
+      return { stored: b.last_read_event_id, advanced: true, emit: true };
     }
-    return false; // floor did not advance — no event
+    if (b.last_read_event_id === current) {
+      // identical cursor — no floor change, but emit so ChatChannel idempotency can repair a prior failed event
+      return { stored: current, advanced: false, emit: true };
+    }
+    // stale (requested < current) — keep stored floor, no event
+    return { stored: current, advanced: false, emit: false };
   });
 
-  if (!advanced) {
-    // Could be (a) not a member → 403, or (b) cursor did not advance → 200 idempotent no-op.
-    const memberRow = this.ctx.storage.sql
-      .exec("SELECT status FROM my_channels WHERE user_id=? AND channel_id=?", userId, b.channel_id)
-      .toArray()[0] as { status: string } | undefined;
-    if (!memberRow || memberRow.status !== "active") return new Response("forbidden", { status: 403 });
-    return Response.json({ channel_id: b.channel_id, last_read_event_id: b.last_read_event_id, advanced: false });
-  }
-
-  // 2) Emit read_state.updated on the ChatChannel (event + channel_fanout outbox). Idempotent on the cursor.
-  const chStub = this.env.CHAT_CHANNEL.getByName(b.channel_id);
-  const evRes = await chStub.fetch(new Request("https://x/internal/read-state-event", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId, last_read_event_id: b.last_read_event_id }),
-  }));
-  // Non-OK here is not fatal to the floor (which already committed); the event is best-effort.
-  // A 409 means the same cursor already emitted — treat as success.
-  const eventId = evRes.ok ? ((await evRes.json()) as { event_id: string }).event_id : "";
-
-  return Response.json({ channel_id: b.channel_id, last_read_event_id: b.last_read_event_id, advanced: true, event_id: eventId });
+  if ("forbidden" in floor) return new Response("forbidden", { status: 403 });
+  return Response.json({
+    channel_id: b.channel_id,
+    last_read_event_id: floor.stored, // ALWAYS the stored floor, never the request cursor (P0-2)
+    advanced: floor.advanced,
+    emit: floor.emit,
+  });
 }
 ```
-> **Cross-DO best-effort:** the `my_channels` advance commits first (inside its transaction); the `read_state.updated` event write is a separate ChatChannel call AFTER. If the ChatChannel call fails (DO unavailable), the floor is still correct (the user's unread floor advanced) — the event is a best-effort notification, repairable by a re-mark. This honors "no cross-DO 2PC": the floor is the SoT, the event is the projection.
+> **Cross-DO best-effort + repairability (P0-3):** the floor commits first (inside its transaction, the SoT). The `read_state.updated` event is a best-effort projection the Worker writes next. The `emit: true` flag covers BOTH `>` (fresh advance) and `==` (re-mark): on `==`, the Worker still calls `read-state-event`, whose `(user, operation='read_state', idempotency_key=<cursor>)` dedup returns the cached event_id if a prior write succeeded, OR writes a fresh event if the prior write failed after the floor committed. So a crashed-then-retried same-cursor mark DOES repair the event — matching the "best-effort event repairable by re-mark" claim. A `<` stale cursor emits nothing.
 
 - [ ] **Step 4: Add the `read-state-event` + `unread-count` endpoints to ChatChannel**
 
@@ -2800,19 +2808,32 @@ export async function readStateHandler(c: Context<{ Bindings: Env; Variables: { 
   }));
   if (rs.status === 403) throw new ApiError("FORBIDDEN", "not an active member");
   if (!rs.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "read-state failed");
-  const rsBody = (await rs.json()) as { last_read_event_id: string; advanced: boolean };
+  const rsBody = (await rs.json()) as { last_read_event_id: string; advanced: boolean; emit: boolean };
 
-  // Fetch unread count from ChatChannel.
+  // Route the ChatChannel correctly (P1 fix): system channel → 'system-general', user channel → channel_id.
   const routeName = await channelRouteNameFor(env, userId, channelId);
   if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
   const chStub = env.CHAT_CHANNEL.getByName(routeName);
+
+  // Emit read_state.updated when the floor says to (advanced OR same-cursor repair). Best-effort:
+  // a failure here does not roll back the floor (SoT). ChatChannel dedupes on (user, cursor).
+  if (rsBody.emit) {
+    await chStub.fetch(new Request("https://x/internal/read-state-event", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, last_read_event_id: rsBody.last_read_event_id }),
+    })).catch(() => undefined);
+  }
+
+  // Compute unread count from the STORED floor (rsBody.last_read_event_id is always the stored floor).
   const uc = await chStub.fetch(new Request(`https://x/internal/unread-count?after=${encodeURIComponent(rsBody.last_read_event_id)}`, { headers: { "X-Verified-User-Id": userId } }));
   const unread = uc.ok ? ((await uc.json()) as { unread_count: number }).unread_count : 0;
 
   return c.json({ channel_id: channelId, last_read_event_id: rsBody.last_read_event_id, unread_count: unread }, 200, { "X-Request-Id": c.get("requestId") });
 }
 ```
-> **Idempotency model (P1-5 fix):** this route does NOT write a Worker-side `idempotency_keys` row. Read-state is inherently monotonic — the floor only advances when `last_read_event_id` strictly increases, and the `read_state.updated` event is itself deduped on `(user, operation='read_state', idempotency_key=<last_read_event_id>)` inside ChatChannel. A client retry with the same cursor returns the same `{ last_read_event_id, unread_count }` and emits no duplicate event. The `Idempotency-Key` header is still REQUIRED (contract §5.5 shows it) and is validated here, but the dedup key is the cursor itself, not the header — that is the contractually-meaningful idempotency surface for monotonic state. Records this design choice so the implementer does not add a redundant `idempotency_keys` row keyed on the header.
+> **Routing boundary (P1 fix):** only the Worker routes the ChatChannel DO (`channelRouteNameFor` → `system-general` for the system channel, `channel_id` for user channels). `UserDirectory /internal/read-state` owns only the floor and returns `{ last_read_event_id (stored), advanced, emit }`. The Worker reads `emit` and calls `ChatChannel /internal/read-state-event` itself. This fixes the system-channel bug where UserDirectory was doing `getByName(channel_id)` on a system-channel UUID (which is NOT the DO name `system-general`).
+> **Idempotency model:** no Worker-side `idempotency_keys` row. The floor is monotonic (the `==` and `<` cases do not advance it); the event is deduped on `(user, operation='read_state', idempotency_key=<cursor>)` inside ChatChannel. `Idempotency-Key` header is still REQUIRED (contract §5.5) and validated, but the dedup surface for monotonic state is the cursor itself.
 Register in `src/index.ts`:
 ```typescript
 import { createChannelHandler, updateChannelHandler, dissolveChannelHandler, addMemberHandler, updateMemberRoleHandler, removeMemberHandler, listMembersHandler, getMemberHandler, readStateHandler } from "./routes/channel-mutations";
@@ -2836,7 +2857,7 @@ describe("POST /api/chat/channels/:id/read-state", () => {
     expect(body.unread_count).toBe(0);
   });
 
-  it("is idempotent: re-marking the same cursor returns the same last_read_event_id with no event duplication", async () => {
+  it("is idempotent: re-marking the same cursor returns the same last_read_event_id and does not duplicate the event", async () => {
     const create = await authedReq("u-rs-route2", "POST", "/api/chat/channels", { title: "RS2", visibility: "private", initial_members: [] }, "ck-rs-create2");
     const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
     const body1 = { last_read_event_id: "01J00000000000000000000001" };
@@ -2844,6 +2865,8 @@ describe("POST /api/chat/channels/:id/read-state", () => {
     const r2 = await authedReq("u-rs-route2", "POST", `/api/chat/channels/${cid}/read-state`, body1, "ck-rs-2b");
     expect(r1.status).toBe(200); expect(r2.status).toBe(200);
     expect(((await r2.json()) as { last_read_event_id: string }).last_read_event_id).toBe("01J00000000000000000000001");
+    // r2 is the same-cursor re-mark; ChatChannel /internal/read-state-event dedupes on (user, cursor)
+    // so no second event row is written. (We assert the HTTP behavior; event dedup is a DO-level concern.)
   });
 });
 ```
@@ -2901,7 +2924,7 @@ Check each contract/design requirement against a task:
 - `POST /channels/{id}/dissolve` (§5.4) + `CHANNEL_DISSOLVED` gate → Task 8. ✅
 - `GET /channels/{id}/members` (§7.1) + `GET /members/{user_id}` (§7.1b) → Task 10. ✅
 - `POST/PATCH/DELETE /channels/{id}/members[/{user_id}]` (§7.2/7.3/7.4) → Task 9. ✅
-- `POST /channels/{id}/read-state` (§5.5) + `read_state.updated` event → Task 11 (floor advance + emit via `ChatChannel /internal/read-state-event`) + Task 4b (replay projects it through unchanged). ✅
+- `POST /channels/{id}/read-state` (§5.5) + `read_state.updated` event → Task 11 (UserDirectory floor 3-state `>`/`==`/`<`; Worker routes + emits via `ChatChannel /internal/read-state-event`) + Task 4b (replay passes it through unchanged). ✅
 - Events `channel.created`/`channel.updated`/`channel.dissolved`/`member.joined`/`member.left`/`member.role_updated`/`read_state.updated`/`system.notice` → Tasks 3 (builders, incl. `buildMemberLeftPayload`) + 4/7/8/9/11 (emit) + 4b (replay actor projection for management events). ✅
 - `MEMBER_NOT_FOUND` (§7.1b, §11) → Task 1 (error code) + Task 9 (target lookup) + Task 10 (members-get). ✅
 - `CHANNEL_DISSOLVED` (§5.4, §11) write-gate → Task 1 (error code) + Task 8 (dissolve + gate on message-send/join). ✅
@@ -2934,7 +2957,7 @@ Report `npm run typecheck` clean + full suite green. (No optional refactor step 
 - **Task-skip dependency order:** Tasks are sequential — 1 (errors + docs) before any route; 2 before 3's tests import; 4 before 5 (coordinator calls `createChannel`); 4b before any task that asserts replay shape (it modifies `/internal/replay`); 5 before 6 (route calls coordinator); 7 before 9 (`cachedResponse` + `activeRole` defined in 7, used in 9); 7/8/9 before their route tests; 10/11 build on `channelRouteNameFor` (Task 2). A subagent per task works; each task ends in a green commit.
 - **No deliberately-broken code remains in the plan.** Every code block is final/correct as written — do not "fix" skeletons that are not there, and do not re-introduce inline ⚠ reminders.
 - **`member.left` payload** uses `buildMemberLeftPayload` (Task 3), not an inline object.
-- **read-state emits a real event.** The UserDirectory floor advances `my_channels.last_read_event_id` (SoT), then calls `ChatChannel /internal/read-state-event` to write `read_state.updated` + channel_fanout outbox (best-effort cross-DO, no 2PC). The event is deduped on `(user, operation='read_state', idempotency_key=<cursor>)`. Re-marking the same cursor returns `{ advanced: false }` and emits nothing.
+- **read-state emits a real event, and is repairable.** `UserDirectory /internal/read-state` owns only the floor (3-state: `>` advance+emit, `==` keep+emit-repair, `<` keep+no-emit) and always returns the STORED floor (never the request cursor). The WORKER routes the ChatChannel DO (`channelRouteNameFor`: system channel → `system-general`, user channel → `channel_id`) and, when `emit`, calls `ChatChannel /internal/read-state-event` (best-effort, `catch(()=>undefined)` so a DO failure does not fail the mark). The event is deduped on `(user, operation='read_state', idempotency_key=<cursor>)`. A same-cursor re-mark (`==`) re-calls the event endpoint so its idempotency dedupes (succeeded) OR repairs (a prior write failed after the floor committed).
 - **`read_state.updated` replay:** Task 4b deliberately passes it through unchanged (no actor). Task 11 emits it WITHOUT an `actor_kind` — confirm `persistEventAndFanout` handles a payload that has no `actor_kind` (it reads `payload.actor_kind` defensively → `null` → falls through; the replay branch skips actor resolution for `read_state.updated`).
 - **No push, no deploy.** Git identity `kuma`. Operator deploys.
 
