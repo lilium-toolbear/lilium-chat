@@ -1,7 +1,7 @@
 import type { CommandFrame } from "../ws/frames";
 
 export interface ParsedMessageSend {
-  client_message_id: string;
+  command_id: string;
   type: "text";
   text: string;
   reply_to: string | null;
@@ -25,9 +25,9 @@ export function parseMessageSendCommand(frame: CommandFrame, senderUserId: strin
     return { ok: false, error: { code: "CHANNEL_NOT_FOUND", message: "missing channel_id", retryable: false } };
   }
   const p = frame.payload as Record<string, unknown>;
-  const client_message_id = typeof p.client_message_id === "string" ? p.client_message_id : "";
-  if (!client_message_id) {
-    return { ok: false, error: { code: "INVALID_MESSAGE", message: "client_message_id is required", retryable: false } };
+  const command_id = typeof p.command_id === "string" ? p.command_id : "";
+  if (!command_id) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
   }
   // Phase 2 is text-only. image messages (Phase 5) and reply_to (Phase 4) are rejected here
   // so we never persist incomplete rows (no reply_snapshot_json, no attachment owner/finalized check).
@@ -58,6 +58,5 @@ export function parseMessageSendCommand(frame: CommandFrame, senderUserId: strin
     .filter((m) => m.user_id);
 
   void senderUserId; // sender identity comes from the authenticated socket, not the payload
-  return { ok: true, command: { client_message_id, type: "text", text, reply_to: null, attachment_ids: [], mentions } };
-}
-
+    return { ok: true, command: { command_id, type: "text", text, reply_to: null, attachment_ids: [], mentions } };
+  }

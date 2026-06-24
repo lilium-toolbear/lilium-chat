@@ -125,7 +125,7 @@ describe("UserConnection DO", () => {
       command_id: "cmd-uc-1",
       channel_id: sysId,
       payload: {
-        client_message_id: "cm-uc-1",
+        command_id: "cm-uc-1",
         type: "text",
         text: "hi from uc",
         reply_to_message_id: null,
@@ -168,7 +168,7 @@ describe("UserConnection DO", () => {
         command_id: "cmd-uc-2",
         channel_id: sysId,
         payload: {
-          client_message_id: "cm-uc-2",
+          command_id: "cm-uc-2",
           type: "text",
           text: "   ",
           reply_to_message_id: null,
@@ -185,7 +185,7 @@ describe("UserConnection DO", () => {
     ws.close();
   });
 
-  it("idempotent: same client_message_id twice → same message_id in both acks", async () => {
+  it("idempotent: same command_id twice → same message_id in both acks", async () => {
     const userId = "u-uc-idem";
     const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
     await sysStub.fetch(
@@ -205,7 +205,7 @@ describe("UserConnection DO", () => {
       command: "message.send",
       channel_id: sysId,
       payload: {
-        client_message_id: "cm-idem",
+        command_id: "cm-idem",
         type: "text",
         text: "dup",
         reply_to_message_id: null,

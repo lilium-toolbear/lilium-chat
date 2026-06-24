@@ -41,7 +41,7 @@ describe("GET /api/chat/events", () => {
           method: "POST",
           headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
           body: JSON.stringify({
-            client_message_id: "cm-ev-1",
+            command_id: "cm-ev-1",
             dedupe_principal_key: `user:${userId}`,
             type: "text",
             text: "hi",
@@ -85,7 +85,7 @@ describe("GET /api/chat/events", () => {
         method: "POST",
         headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
         body: JSON.stringify({
-          client_message_id: "cm-ev-2",
+          command_id: "cm-ev-2",
           dedupe_principal_key: `user:${userId}`,
           type: "text",
           text: "yo",

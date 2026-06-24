@@ -219,7 +219,7 @@ export class UserConnection extends DurableObject<Env> {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          client_message_id: parsed.command.client_message_id,
+          command_id: parsed.command.command_id,
           dedupe_principal_key: dedupePrincipalKeyForUser(attachment.user_id),
           type: parsed.command.type,
           text: parsed.command.text,

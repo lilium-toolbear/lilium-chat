@@ -34,7 +34,7 @@ const SCHEMA = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_members_active ON members(user_id) WHERE left_at IS NULL`,
   `CREATE TABLE IF NOT EXISTS messages (
-    message_id TEXT PRIMARY KEY, client_message_id TEXT NOT NULL,
+    message_id TEXT PRIMARY KEY, command_id TEXT NOT NULL,
     dedupe_principal_key TEXT NOT NULL, channel_id TEXT NOT NULL,
     sender_kind TEXT NOT NULL, -- user | bot | system
     sender_user_id TEXT, sender_bot_id TEXT,
@@ -43,7 +43,7 @@ const SCHEMA = [
     reply_snapshot_json TEXT, stream_state TEXT NOT NULL DEFAULT 'none',
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL, edited_at TEXT,
     deleted_at TEXT, deleted_by TEXT, recalled_at TEXT,
-    UNIQUE (channel_id, dedupe_principal_key, client_message_id)
+    UNIQUE (channel_id, dedupe_principal_key, command_id)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_messages_history ON messages(channel_id, message_id DESC)`,
   `CREATE TABLE IF NOT EXISTS message_edits (
@@ -137,7 +137,7 @@ interface OutboxRow {
 
 export interface MessageRow {
   message_id: string;
-  client_message_id: string;
+  command_id: string;
   channel_id: string;
   sender_kind: string;
   sender_user_id: string | null;
@@ -181,7 +181,7 @@ function rowToMessage(r: MessageRow): Record<string, unknown> {
 
   return {
     message_id: r.message_id,
-    client_message_id: r.client_message_id,
+    command_id: r.command_id,
     channel_id: r.channel_id,
     sender: {
       kind: r.sender_kind,
@@ -704,8 +704,8 @@ export class ChatChannel extends DurableObject<Env> {
 
       const query = before === null
         ?
-          "SELECT message_id, client_message_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE channel_id=? AND status NOT IN ('deleted','recalled') ORDER BY message_id DESC LIMIT ?"
-        : "SELECT message_id, client_message_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE channel_id=? AND status NOT IN ('deleted','recalled') AND message_id < ? ORDER BY message_id DESC LIMIT ?";
+          "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE channel_id=? AND status NOT IN ('deleted','recalled') ORDER BY message_id DESC LIMIT ?"
+        : "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE channel_id=? AND status NOT IN ('deleted','recalled') AND message_id < ? ORDER BY message_id DESC LIMIT ?";
 
       const rows = (before === null
         ? this.ctx.storage.sql.exec(query, meta.channel_id, limit + 1)
@@ -742,7 +742,7 @@ export class ChatChannel extends DurableObject<Env> {
       const b = (await request.json()) as { message_id: string; event_id: string; text: string };
       const now = this.nowIso();
       this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO messages (message_id, client_message_id, dedupe_principal_key, channel_id, sender_kind, type, status, text, created_at, updated_at) VALUES (?, 'c', 'user:x', 'replay-1', 'user', 'text', 'normal', ?, ?, ?)",
+        "INSERT OR REPLACE INTO messages (message_id, command_id, dedupe_principal_key, channel_id, sender_kind, type, status, text, created_at, updated_at) VALUES (?, 'c', 'user:x', 'replay-1', 'user', 'text', 'normal', ?, ?, ?)",
         b.message_id,
         b.text,
         now,
@@ -796,7 +796,7 @@ export class ChatChannel extends DurableObject<Env> {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });
       const b = (await request.json()) as {
-        client_message_id: string;
+        command_id: string;
         dedupe_principal_key: string;
         type: string;
         text: string;
@@ -845,7 +845,7 @@ export class ChatChannel extends DurableObject<Env> {
       const mv = meta.membership_version;
       const persistedPayload = buildMessageCreatedPayload({
         message_id: messageId,
-        client_message_id: b.client_message_id,
+        client_message_id: b.command_id,
         channel_id: channelId,
         sender_kind: "user",
         sender_user_id: userId,
@@ -899,7 +899,7 @@ export class ChatChannel extends DurableObject<Env> {
           .exec(
             "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='message.send' AND idempotency_key=?",
             userId,
-            b.client_message_id,
+            b.command_id,
           )
           .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idemRow) {
@@ -914,11 +914,11 @@ export class ChatChannel extends DurableObject<Env> {
 
         this.ctx.storage.sql.exec(
           `INSERT INTO messages (
-              message_id, client_message_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
+              message_id, command_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
               sender_bot_id, type, format, status, text, reply_to, stream_state, created_at, updated_at
             ) VALUES (?, ?, ?, ?, 'user', ?, NULL, ?, 'plain', 'normal', ?, ?, 'none', ?, ?)`,
           messageId,
-          b.client_message_id,
+          b.command_id,
           b.dedupe_principal_key,
           channelId,
           userId,
@@ -951,7 +951,7 @@ export class ChatChannel extends DurableObject<Env> {
         this.ctx.storage.sql.exec(
           "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'message.send', ?, ?, ?, 'completed', ?, ?)",
           userId,
-          b.client_message_id,
+          b.command_id,
           requestHash,
           responseJson,
           now,
@@ -975,7 +975,7 @@ export class ChatChannel extends DurableObject<Env> {
           {
             error: {
               code: "IDEMPOTENCY_CONFLICT",
-              message: "client_message_id reused with different body",
+              message: "command_id reused with different body",
               retryable: false,
             },
           },

@@ -30,7 +30,7 @@ describe("ChatChannel /internal/message-send", () => {
         method: "POST",
         headers: { "X-Verified-User-Id": "u-ms-1", "Content-Type": "application/json" },
         body: JSON.stringify({
-          client_message_id: "cm-1",
+          command_id: "cm-1",
           dedupe_principal_key: "user:u-ms-1",
           type: "text",
           text: "hello",
@@ -53,7 +53,7 @@ describe("ChatChannel /internal/message-send", () => {
         method: "POST",
         headers: { "X-Verified-User-Id": "u-stranger", "Content-Type": "application/json" },
         body: JSON.stringify({
-          client_message_id: "cm-x",
+          command_id: "cm-x",
           dedupe_principal_key: "user:u-stranger",
           type: "text",
           text: "hi",
@@ -66,7 +66,7 @@ describe("ChatChannel /internal/message-send", () => {
     expect(res.status).toBe(403);
   });
 
-  it("is idempotent on (dedupe_principal_key, client_message_id): same message_id + event_id", async () => {
+  it("is idempotent on (dedupe_principal_key, command_id): same message_id + event_id", async () => {
     const { stub, channelId } = await setupSystemAndJoin("u-ms-3");
     const body = {
       dedupe_principal_key: "user:u-ms-3",
@@ -81,7 +81,7 @@ describe("ChatChannel /internal/message-send", () => {
         new Request("https://x/internal/message-send", {
           method: "POST",
           headers: { "X-Verified-User-Id": "u-ms-3", "Content-Type": "application/json" },
-          body: JSON.stringify({ ...body, client_message_id: "cm-dup" }),
+          body: JSON.stringify({ ...body, command_id: "cm-dup" }),
         }),
       )
     ).json()) as { message_id: string; event_id: string };
@@ -90,7 +90,7 @@ describe("ChatChannel /internal/message-send", () => {
         new Request("https://x/internal/message-send", {
           method: "POST",
           headers: { "X-Verified-User-Id": "u-ms-3", "Content-Type": "application/json" },
-          body: JSON.stringify({ ...body, client_message_id: "cm-dup" }),
+          body: JSON.stringify({ ...body, command_id: "cm-dup" }),
         }),
       )
     ).json()) as { message_id: string; event_id: string };
@@ -99,7 +99,7 @@ describe("ChatChannel /internal/message-send", () => {
     expect(a.event_id).toBe(b.event_id);
   });
 
-  it("returns IDEMPOTENCY_CONFLICT (409) when same client_message_id but different body", async () => {
+  it("returns IDEMPOTENCY_CONFLICT (409) when same command_id but different body", async () => {
     const { stub, channelId } = await setupSystemAndJoin("u-ms-7");
     const base = {
       dedupe_principal_key: "user:u-ms-7",
@@ -113,7 +113,7 @@ describe("ChatChannel /internal/message-send", () => {
       new Request("https://x/internal/message-send", {
         method: "POST",
         headers: { "X-Verified-User-Id": "u-ms-7", "Content-Type": "application/json" },
-        body: JSON.stringify({ ...base, client_message_id: "cm-conflict", text: "first" }),
+        body: JSON.stringify({ ...base, command_id: "cm-conflict", text: "first" }),
       }),
     );
     expect(a.status).toBe(200);
@@ -122,7 +122,7 @@ describe("ChatChannel /internal/message-send", () => {
       new Request("https://x/internal/message-send", {
         method: "POST",
         headers: { "X-Verified-User-Id": "u-ms-7", "Content-Type": "application/json" },
-        body: JSON.stringify({ ...base, client_message_id: "cm-conflict", text: "different" }),
+        body: JSON.stringify({ ...base, command_id: "cm-conflict", text: "different" }),
       }),
     );
     expect(b.status).toBe(409);
@@ -130,7 +130,7 @@ describe("ChatChannel /internal/message-send", () => {
     expect(bb.error.code).toBe("IDEMPOTENCY_CONFLICT");
   });
 
-  it("different users, same client_message_id → different messages (namespacing)", async () => {
+  it("different users, same command_id → different messages (namespacing)", async () => {
     const { stub, channelId } = await setupSystemAndJoin("u-ms-4");
     await stub.fetch(
       new Request("https://x/internal/join", {
@@ -146,7 +146,7 @@ describe("ChatChannel /internal/message-send", () => {
           method: "POST",
           headers: { "X-Verified-User-Id": "u-ms-4", "Content-Type": "application/json" },
           body: JSON.stringify({
-            client_message_id: "shared",
+            command_id: "shared",
             dedupe_principal_key: "user:u-ms-4",
             type: "text",
             text: "a",
@@ -163,7 +163,7 @@ describe("ChatChannel /internal/message-send", () => {
           method: "POST",
           headers: { "X-Verified-User-Id": "u-ms-5", "Content-Type": "application/json" },
           body: JSON.stringify({
-            client_message_id: "shared",
+            command_id: "shared",
             dedupe_principal_key: "user:u-ms-5",
             type: "text",
             text: "b",
@@ -186,7 +186,7 @@ describe("ChatChannel /internal/message-send", () => {
           method: "POST",
           headers: { "X-Verified-User-Id": "u-ms-6", "Content-Type": "application/json" },
           body: JSON.stringify({
-            client_message_id: "cm-r",
+            command_id: "cm-r",
             dedupe_principal_key: "user:u-ms-6",
             type: "text",
             text: "replay me",

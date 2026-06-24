@@ -56,7 +56,7 @@ describe("hibernation wake: cursors restore + replay", () => {
           method: "POST",
           headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
           body: JSON.stringify({
-            client_message_id: "cm-hib-1",
+            command_id: "cm-hib-1",
             dedupe_principal_key: `user:${userId}`,
             type: "text",
             text: "before reconnect",

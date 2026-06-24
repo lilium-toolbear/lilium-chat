@@ -78,7 +78,7 @@ describe("e2e: message.send → committed_ack → message.created self-receive",
       command_id: "cmd-e2e-1",
       channel_id: sysId,
       payload: {
-        client_message_id: "cm-e2e-1",
+        command_id: "cm-e2e-1",
         type: "text",
         text: "hello e2e",
         reply_to_message_id: null,
