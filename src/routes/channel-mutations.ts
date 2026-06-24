@@ -86,3 +86,28 @@ export async function updateChannelHandler(c: Context<{ Bindings: Env; Variables
   const out = await res.json() as Record<string, unknown>;
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
+
+export async function dissolveChannelHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const channelId = c.req.param("channel_id");
+  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const res = await stub.fetch(new Request("https://x/internal/dissolve", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({ idempotency_key: idempotencyKey, channel_id: channelId }),
+  }));
+  if (res.status === 409) {
+    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
+    throw new ApiError(e.error?.code ?? "CHANNEL_DISSOLVED", e.error?.message ?? "conflict");
+  }
+  if (res.status === 403) throw new ApiError("FORBIDDEN", "only owner may dissolve");
+  if (res.status === 404) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "dissolve failed");
+  const out = await res.json() as Record<string, unknown>;
+  return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
+}

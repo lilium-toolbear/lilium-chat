@@ -8,7 +8,7 @@ import { wsUpgradeHandler } from "./routes/ws";
 import { listChannelsHandler, channelDetailHandler } from "./routes/channels";
 import { listMessagesHandler } from "./routes/messages";
 import { eventsHandler } from "./routes/events";
-import { createChannelHandler, updateChannelHandler } from "./routes/channel-mutations";
+import { createChannelHandler, updateChannelHandler, dissolveChannelHandler } from "./routes/channel-mutations";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -47,6 +47,7 @@ app.get("/api/chat/ws", (c) => wsUpgradeHandler(c));
 app.get("/api/chat/channels", (c) => listChannelsHandler(c));
 app.post("/api/chat/channels", (c) => createChannelHandler(c));
 app.patch("/api/chat/channels/:channel_id", (c) => updateChannelHandler(c));
+app.post("/api/chat/channels/:channel_id/dissolve", (c) => dissolveChannelHandler(c));
 app.get("/api/chat/channels/:channel_id/messages", (c) => listMessagesHandler(c));
 app.get("/api/chat/channels/:channel_id", (c) => channelDetailHandler(c));
 app.get("/api/chat/events", (c) => eventsHandler(c));

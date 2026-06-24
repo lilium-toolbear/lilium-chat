@@ -519,13 +519,19 @@ export class ChatChannel extends DurableObject<Env> {
       let joinedAt = now;
       let writeProjection = false;
 
-      const meta = this.ctx.storage.sql.exec("SELECT channel_id, kind, membership_version, member_count FROM channel_meta").toArray()[0] as
-        | { channel_id: string; kind: string; membership_version: number; member_count: number }
+      const meta = this.ctx.storage.sql.exec("SELECT channel_id, kind, status, membership_version, member_count FROM channel_meta").toArray()[0] as
+        | { channel_id: string; kind: string; status: string; membership_version: number; member_count: number }
         | undefined;
       if (meta === undefined) {
         return new Response("not found", { status: 404 });
       }
       channelId = meta.channel_id;
+      if (meta.status === "dissolved") {
+        return Response.json(
+          { error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } },
+          { status: 409 },
+        );
+      }
 
       const m = this.ctx.storage.sql
         .exec("SELECT joined_at, left_at FROM members WHERE channel_id=? AND user_id=?", channelId, userId)
@@ -883,9 +889,14 @@ export class ChatChannel extends DurableObject<Env> {
       type SendResult =
         | { kind: "created"; message_id: string; event_id: string }
         | { kind: "cached"; message_id: string; event_id: string }
-        | { kind: "conflict" };
+        | { kind: "conflict" }
+        | { kind: "dissolved" };
 
       const txResult = await this.ctx.storage.transaction(async (): Promise<SendResult> => {
+        const statusRow = this.ctx.storage.sql.exec("SELECT status FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string } | undefined;
+        if (statusRow?.status === "dissolved") {
+          return { kind: "dissolved" };
+        }
         const idemRow = this.ctx.storage.sql
           .exec(
             "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='message.send' AND idempotency_key=?",
@@ -973,10 +984,83 @@ export class ChatChannel extends DurableObject<Env> {
           { status: 409 },
         );
       }
+      if (txResult.kind === "dissolved") {
+        return Response.json({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }, { status: 409 });
+      }
       if (txResult.kind === "created") {
         await this.scheduleOutboxAlarm(now);
       }
       return Response.json({ message_id: txResult.message_id, event_id: txResult.event_id });
+    }
+
+    if (url.pathname === "/internal/dissolve") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as { idempotency_key: string; channel_id: string };
+      const channelId = b.channel_id;
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+      const requestHash = "{}";
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const actorMap = await this.resolveActorMap([userId]);
+
+      const txResult = await this.ctx.storage.transaction(async (): Promise<
+        | { kind: "conflict" }
+        | { kind: "cached"; responseJson: string }
+        | { kind: "dissolved"; channel: Record<string, unknown> }
+      > => {
+        const idem = this.ctx.storage.sql
+          .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.dissolve' AND idempotency_key=?", userId, b.idempotency_key)
+          .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        if (idem) {
+          if (idem.request_hash !== requestHash) return { kind: "conflict" };
+          return { kind: "cached", responseJson: idem.response_json ?? "{}" };
+        }
+
+        const meta = this.ctx.storage.sql.exec("SELECT status, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; created_by: string } | undefined;
+        if (meta === undefined) return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
+
+        if (meta.status === "dissolved") {
+          // already dissolved — idempotent cached result (no key recorded yet → record now)
+          const responseJson = JSON.stringify({ channel: { channel_id: channelId, status: "dissolved", updated_at: now } });
+          this.ctx.storage.sql.exec(
+            "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.dissolve', ?, ?, ?, 'completed', ?, ?)",
+            userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt,
+          );
+          return { kind: "cached", responseJson };
+        }
+
+        if (meta.created_by !== userId) {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner may dissolve", retryable: false } }) };
+        }
+
+        const mvRow = this.ctx.storage.sql.exec("SELECT membership_version FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { membership_version: number } | undefined;
+        const mv = mvRow?.membership_version ?? 0;
+        this.ctx.storage.sql.exec("UPDATE channel_meta SET status='dissolved', updated_at=? WHERE channel_id=?", now, channelId);
+        const dissolvedId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(dissolvedId, "channel.dissolved", channelId, now,
+          buildChannelDissolvedPayload({ channel_id: channelId, dissolved_at: now, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
+        const noticeId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(noticeId, "system.notice", channelId, now,
+          buildSystemNoticePayload({ notice_kind: "channel.dissolved", actor_kind: "user", actor_id: userId, target_user_id: null, message_id: null, channel_changes: null }), mv, now, actorMap);
+
+        const responseJson = JSON.stringify({ channel: { channel_id: channelId, status: "dissolved", updated_at: now } });
+        this.ctx.storage.sql.exec(
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.dissolve', ?, ?, ?, 'completed', ?, ?)",
+          userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt,
+        );
+        return { kind: "dissolved", channel: { channel_id: channelId, status: "dissolved", updated_at: now } };
+      });
+
+      if (txResult.kind === "conflict") {
+        return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
+      }
+      if (txResult.kind === "dissolved") {
+        await this.scheduleOutboxAlarm(now);
+        return Response.json({ channel: txResult.channel }, { status: 200 });
+      }
+      // cached (already-dissolved cached result OR an error shape encoded inside the txn).
+      return this.cachedResponse(txResult.responseJson);
     }
 
     if (url.pathname === "/internal/replay") {

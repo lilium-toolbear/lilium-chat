@@ -59,3 +59,21 @@ describe("PATCH /api/chat/channels/:id", () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe("POST /api/chat/channels/:id/dissolve", () => {
+  it("owner dissolves → 200 { channel: { status: dissolved } }", async () => {
+    const create = await authedReq("u-dis-1", "POST", "/api/chat/channels", { title: "Bye", visibility: "private", initial_members: [] }, "ck-dis-create");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    const res = await authedReq("u-dis-1", "POST", `/api/chat/channels/${cid}/dissolve`, undefined, "ck-dis-1");
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { channel: { status: string } }).channel.status).toBe("dissolved");
+  });
+
+  it("non-owner cannot dissolve", async () => {
+    const create = await authedReq("u-dis-2", "POST", "/api/chat/channels", { title: "Mine", visibility: "private", initial_members: [] }, "ck-dis-create-2");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    // a different user has no token for the owner's context — but they can call dissolve on cid.
+    const res = await authedReq("u-dis-other", "POST", `/api/chat/channels/${cid}/dissolve`, undefined, "ck-dis-other");
+    expect(res.status).toBe(403);
+  });
+});
