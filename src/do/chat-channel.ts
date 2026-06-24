@@ -8,6 +8,17 @@ import {
   resolveSenderForLiveBroadcast,
   type UserSummary as LiveUserSummary,
 } from "../chat/event-broadcast";
+import {
+  buildChannelCreatedPayload,
+  buildChannelUpdatedPayload,
+  buildChannelDissolvedPayload,
+  buildMemberJoinedPayload,
+  buildMemberRoleUpdatedPayload,
+  buildMemberLeftPayload,
+  buildReadStateUpdatedPayload,
+  buildSystemNoticePayload,
+  resolveActorWithMap,
+} from "../chat/channel-events";
 import { resolveUserSummaries } from "../profile/resolve";
 
 const SCHEMA = [
@@ -287,6 +298,42 @@ export class ChatChannel extends DurableObject<Env> {
       nowIso,
       nowIso,
     );
+  }
+
+  private async resolveActorMap(userIds: string[]): Promise<Map<string, import("../chat/event-broadcast").UserSummary>> {
+    const raw = await resolveUserSummaries(userIds, this.env);
+    const m = new Map<string, import("../chat/event-broadcast").UserSummary>();
+    for (const [id, v] of raw) {
+      m.set(id, { user_id: id, display_name: v.display_name ?? `user-${id.slice(0, 8)}`, avatar_url: v.avatar_url });
+    }
+    return m;
+  }
+
+  // Sync: persists the event (ref payload) + writes a channel_fanout outbox row with the
+  // LIVE-resolved frame. MUST run inside ctx.storage.transaction. The actor map is pre-resolved
+  // BEFORE the txn (Hyperdrive is a network call). For read_state.updated (no actor_kind) the
+  // caller passes an empty map and the payload is passed through unchanged.
+  private persistEventAndFanout(
+    eventId: string,
+    type: string,
+    channelId: string,
+    occurredAt: string,
+    persistedPayload: Record<string, unknown>,
+    membershipVersion: number,
+    nowIso: string,
+    actorMap: Map<string, import("../chat/event-broadcast").UserSummary>,
+  ): void {
+    const actorKind = typeof persistedPayload.actor_kind === "string" ? persistedPayload.actor_kind : null;
+    const actorId = typeof persistedPayload.actor_id === "string" ? persistedPayload.actor_id : null;
+    this.ctx.storage.sql.exec(
+      "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      eventId, type, channelId, actorKind, actorId, JSON.stringify(persistedPayload), membershipVersion, occurredAt,
+    );
+    const livePayload = type === "read_state.updated"
+      ? persistedPayload
+      : resolveActorWithMap(persistedPayload, actorMap);
+    const frame = buildEventFrame({ event_id: eventId, type, channel_id: channelId, occurred_at: occurredAt, payload: livePayload });
+    this.insertOutboxRowForFanout(channelId, eventId, JSON.stringify(frame), membershipVersion, nowIso);
   }
 
   private async scheduleOutboxAlarm(nowIso: string): Promise<void> {
@@ -1001,6 +1048,122 @@ export class ChatChannel extends DurableObject<Env> {
         });
       }
       return Response.json({ events: out });
+    }
+
+    if (url.pathname === "/internal/create-channel") {
+      const creatorUserId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!creatorUserId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as {
+        channel_id: string; creator_user_id: string; title: string; topic: string | null;
+        avatar_attachment_id: string | null; visibility: string;
+        initial_members: Array<{ user_id: string; role: string }>;
+      };
+      const channelId = b.channel_id;
+      if (!channelId) return Response.json({ error: { code: "INVALID_MESSAGE", message: "channel_id required", retryable: false } }, { status: 422 });
+      const title = typeof b.title === "string" ? b.title.trim() : "";
+      if (title === "") return Response.json({ error: { code: "INVALID_MESSAGE", message: "title is required", retryable: false } }, { status: 422 });
+      if (b.avatar_attachment_id !== null && b.avatar_attachment_id !== undefined) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "avatar_attachment_id not supported in Phase 3", retryable: false } }, { status: 422 });
+      }
+      const visibility = b.visibility ?? "private";
+      if (!["private", "public_unlisted", "public_listed"].includes(visibility)) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "invalid visibility", retryable: false } }, { status: 422 });
+      }
+      const initialMembers = Array.isArray(b.initial_members) ? b.initial_members : [];
+      for (const im of initialMembers) {
+        if (im.role !== "member" && im.role !== "admin") {
+          return Response.json({ error: { code: "INVALID_MESSAGE", message: "initial_members role must be member or admin", retryable: false } }, { status: 422 });
+        }
+        if (im.user_id === creatorUserId) {
+          return Response.json({ error: { code: "INVALID_MESSAGE", message: "creator must not be in initial_members", retryable: false } }, { status: 422 });
+        }
+      }
+
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+
+      // Pre-resolve actor UserSummary BEFORE the txn (Hyperdrive is a network call).
+      const actorMap = await this.resolveActorMap([creatorUserId]);
+
+      // Build all persisted payloads + event ids + live frames up front (sync), then write in one txn.
+      const ownerMv = 1;
+      const events: Array<{ id: string; type: string; payload: Record<string, unknown>; mv: number }> = [];
+      const channelCreatedId = this.nextEventId(nowMs);
+      events.push({ id: channelCreatedId, type: "channel.created", payload: buildChannelCreatedPayload({ channel_id: channelId, kind: "channel", visibility, title, actor_kind: "user", actor_id: creatorUserId }), mv: ownerMv });
+      const memberJoinedCreatorId = this.nextEventId(nowMs);
+      events.push({ id: memberJoinedCreatorId, type: "member.joined", payload: buildMemberJoinedPayload({ channel_id: channelId, user_id: creatorUserId, role: "owner", membership_version: ownerMv, actor_kind: "system", actor_id: "system" }), mv: ownerMv });
+
+      let mv = ownerMv;
+      for (const im of initialMembers) {
+        mv += 1;
+        const eid = this.nextEventId(nowMs);
+        events.push({ id: eid, type: "member.joined", payload: buildMemberJoinedPayload({ channel_id: channelId, user_id: im.user_id, role: im.role, membership_version: mv, actor_kind: "system", actor_id: "system" }), mv });
+      }
+      const noticeId = this.nextEventId(nowMs);
+      events.push({ id: noticeId, type: "system.notice", payload: buildSystemNoticePayload({ notice_kind: "channel.created", actor_kind: "user", actor_id: creatorUserId, target_user_id: null, message_id: null, channel_changes: null }), mv });
+
+      const finalMv = mv;
+      const memberCount = 1 + initialMembers.length;
+
+      const result = await this.ctx.storage.transaction(async (): Promise<
+        | { kind: "cached"; channel: Record<string, unknown>; joinedAt: string }
+        | { kind: "created"; channel: Record<string, unknown>; joinedAt: string }
+      > => {
+        const existing = this.ctx.storage.sql.exec("SELECT channel_id FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { channel_id: string } | undefined;
+        if (existing !== undefined) {
+          // Idempotent re-call (coordinator crashed after create committed, before marking completed).
+          // Return the channel FROM THE DB, not from the request body — the re-call may carry a
+          // different body shape than the original committed row.
+          const meta = this.ctx.storage.sql.exec("SELECT channel_id, kind, visibility, title, topic, avatar_url, member_count, status, created_at, updated_at FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { channel_id: string; kind: string; visibility: string; title: string; topic: string | null; avatar_url: string | null; member_count: number; status: string; created_at: string; updated_at: string };
+          const owner = this.ctx.storage.sql.exec("SELECT joined_at FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", channelId, creatorUserId).toArray()[0] as { joined_at: string } | undefined;
+          const cachedChannel = { channel_id: meta.channel_id, kind: meta.kind, visibility: meta.visibility, title: meta.title, topic: meta.topic, avatar_url: meta.avatar_url, member_count: meta.member_count, status: meta.status, created_at: meta.created_at, updated_at: meta.updated_at };
+          return { kind: "cached" as const, channel: cachedChannel, joinedAt: owner?.joined_at ?? meta.created_at };
+        }
+
+        this.ctx.storage.sql.exec(
+          `INSERT INTO channel_meta (channel_id, kind, visibility, title, topic, avatar_url, status, created_by, created_at, updated_at, member_count, membership_version) VALUES (?, 'channel', ?, ?, ?, NULL, 'active', ?, ?, ?, ?, ?)`,
+          channelId, visibility, title, b.topic ?? null, creatorUserId, now, now, memberCount, finalMv,
+        );
+        this.ctx.storage.sql.exec(
+          "INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, 'owner', ?, NULL)",
+          channelId, creatorUserId, now,
+        );
+        for (const im of initialMembers) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, ?, ?, NULL)",
+            channelId, im.user_id, im.role, now,
+          );
+        }
+        for (const ev of events) {
+          this.persistEventAndFanout(ev.id, ev.type, channelId, now, ev.payload, ev.mv, now, actorMap);
+        }
+        // user_directory join projections (creator + each initial member)
+        this.ctx.storage.sql.exec(
+          "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+          `user_directory:join:${channelId}:${creatorUserId}:${now}`,
+          creatorUserId,
+          JSON.stringify({ action: "join", channel_id: channelId, kind: "channel", membership_version: ownerMv }),
+          now, now, now,
+        );
+        for (const im of initialMembers) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+            `user_directory:join:${channelId}:${im.user_id}:${now}`,
+            im.user_id,
+            JSON.stringify({ action: "join", channel_id: channelId, kind: "channel", membership_version: finalMv }),
+            now, now, now,
+          );
+        }
+        return { kind: "created" as const, channel: { channel_id: channelId, kind: "channel", visibility, title, topic: b.topic ?? null, avatar_url: null, member_count: memberCount, status: "active", created_at: now, updated_at: now }, joinedAt: now };
+      });
+
+      if (result.kind === "created") await this.scheduleOutboxAlarm(now);
+
+      return Response.json({
+        channel: result.channel,
+        membership: { role: "owner", joined_at: result.joinedAt },
+        event_ids: result.kind === "created" ? events.map((e) => e.id) : [],
+      });
     }
 
     return new Response("not found", { status: 404 });
