@@ -135,7 +135,7 @@ interface OutboxRow {
   payload_json: string;
 }
 
-interface MessageRow {
+export interface MessageRow {
   message_id: string;
   client_message_id: string;
   channel_id: string;
