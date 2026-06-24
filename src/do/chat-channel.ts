@@ -980,26 +980,52 @@ export class ChatChannel extends DurableObject<Env> {
         payload_json: typeof row.payload_json === "string" ? row.payload_json : "",
         occurred_at: typeof row.occurred_at === "string" ? row.occurred_at : "",
       }));
-      const allSenderIds: string[] = [];
+      const managementTypes = new Set([
+        "channel.created",
+        "channel.updated",
+        "channel.dissolved",
+        "member.joined",
+        "member.left",
+        "member.role_updated",
+        "system.notice",
+      ]);
+      const userIdsToResolve: string[] = [];
       for (const r of parsedRows) {
         if (r.event_type === "message.created" || r.event_type === "message.updated") {
           try {
             const p = JSON.parse(r.payload_json) as { message?: { sender?: { kind?: string; user_id?: string | null } } };
-            if (p.message?.sender?.kind === "user" && p.message.sender.user_id) allSenderIds.push(p.message.sender.user_id);
+            if (p.message?.sender?.kind === "user" && p.message.sender.user_id) userIdsToResolve.push(p.message.sender.user_id);
+          } catch {
+            // ignore malformed payload
+          }
+          continue;
+        }
+        if (managementTypes.has(r.event_type)) {
+          try {
+            const p = JSON.parse(r.payload_json) as {
+              actor_kind?: string;
+              actor_id?: string;
+              target_user_id?: string | null;
+            };
+            if (p.actor_kind === "user" && typeof p.actor_id === "string" && p.actor_id) userIdsToResolve.push(p.actor_id);
+            if (typeof p.target_user_id === "string" && p.target_user_id) userIdsToResolve.push(p.target_user_id);
           } catch {
             // ignore malformed payload
           }
         }
       }
 
-      const senderMap = await resolveUserSummaries(Array.from(new Set(allSenderIds)), this.env);
+      const rawMap = await resolveUserSummaries(Array.from(new Set(userIdsToResolve)), this.env);
       const liveSenderMap = new Map<string, LiveUserSummary>();
-      for (const [id, summary] of senderMap) {
-        liveSenderMap.set(id, {
+      const liveMap = new Map<string, LiveUserSummary>();
+      for (const [id, summary] of rawMap) {
+        const resolved = {
           user_id: summary.user_id,
           display_name: summary.display_name ?? `user-${id.slice(0, 8)}`,
           avatar_url: summary.avatar_url,
-        });
+        };
+        liveMap.set(id, resolved);
+        liveSenderMap.set(id, resolved);
       }
       const out: Array<ReplayEnvelope> = [];
 
@@ -1032,6 +1058,9 @@ export class ChatChannel extends DurableObject<Env> {
             payload,
             async (_userIds: string[]) => liveSenderMap,
           );
+        }
+        if (managementTypes.has(r.event_type) && r.event_type !== "read_state.updated") {
+          payload = resolveActorWithMap(payload, liveMap);
         }
 
         out.push({
