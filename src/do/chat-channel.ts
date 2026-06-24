@@ -309,6 +309,36 @@ export class ChatChannel extends DurableObject<Env> {
     return m;
   }
 
+  private assertNotDissolved(status: string): { code: string; message: string } | null {
+    if (status === "dissolved") return { code: "CHANNEL_DISSOLVED", message: "channel is dissolved" };
+    return null;
+  }
+
+  // The caller's role if they are an ACTIVE member (left_at IS NULL), else null.
+  private activeRole(channelId: string, userId: string): string | null {
+    const row = this.ctx.storage.sql
+      .exec("SELECT role FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", channelId, userId)
+      .toArray()[0] as { role: string } | undefined;
+    return row?.role ?? null;
+  }
+
+  // Maps a cached `{channel|member|error}` JSON (encoded inside a txn that cannot write business rows)
+  // to the right HTTP status. Shared by all write handlers' cached branches (Tasks 7/8/9/11).
+  private cachedResponse(j: string): Response {
+    const cached = JSON.parse(j) as { channel?: unknown; member?: unknown; error?: { code?: string; message?: string } };
+    if (cached.error) {
+      const code = cached.error.code ?? "CHAT_WORKER_UNAVAILABLE";
+      const status = code === "FORBIDDEN" ? 403
+        : code === "CHANNEL_NOT_FOUND" ? 404
+        : code === "MEMBER_NOT_FOUND" ? 404
+        : code === "CHANNEL_DISSOLVED" ? 409
+        : code === "INVALID_MESSAGE" ? 422
+        : 503;
+      return Response.json({ error: { code, message: cached.error.message ?? "error", retryable: false } }, { status });
+    }
+    return new Response(j, { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+
   // Sync: persists the event (ref payload) + writes a channel_fanout outbox row with the
   // LIVE-resolved frame. MUST run inside ctx.storage.transaction. The actor map is pre-resolved
   // BEFORE the txn (Hyperdrive is a network call). For read_state.updated (no actor_kind) the
@@ -1193,6 +1223,104 @@ export class ChatChannel extends DurableObject<Env> {
         membership: { role: "owner", joined_at: result.joinedAt },
         event_ids: result.kind === "created" ? events.map((e) => e.id) : [],
       });
+    }
+
+    if (url.pathname === "/internal/update-channel") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as {
+        idempotency_key: string; channel_id: string;
+        title?: string; topic?: string | null; avatar_attachment_id?: string | null; visibility?: string;
+      };
+      const channelId = b.channel_id;
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+
+      // Presence-aware canonical request body: omitted field vs explicit null are DISTINCT.
+      // `title:"x"` (only title set) must hash differently from `title:"x", topic:null`,
+      // otherwise a second request that explicitly nulls `topic` would collide with an omit-topic
+      // request and wrongly register as cached/conflict. Capture exactly the keys the client sent.
+      const present: Record<string, unknown> = {};
+      if (b.title !== undefined) present.title = b.title;
+      if (b.topic !== undefined) present.topic = b.topic;
+      if (b.avatar_attachment_id !== undefined) present.avatar_attachment_id = b.avatar_attachment_id;
+      if (b.visibility !== undefined) present.visibility = b.visibility;
+      const requestHash = JSON.stringify(present);
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+
+      const actorMap = await this.resolveActorMap([userId]);
+
+      const txResult = await this.ctx.storage.transaction(async (): Promise<
+        | { kind: "conflict" }
+        | { kind: "cached"; responseJson: string }
+        | { kind: "ok"; channel: Record<string, unknown> }
+      > => {
+        const idem = this.ctx.storage.sql
+          .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.update' AND idempotency_key=?", userId, b.idempotency_key)
+          .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        if (idem) {
+          if (idem.request_hash !== requestHash) return { kind: "conflict" };
+          return { kind: "cached", responseJson: idem.response_json ?? "{}" };
+        }
+
+        const meta = this.ctx.storage.sql
+          .exec("SELECT kind, visibility, title, topic, avatar_url, status, created_at, member_count, membership_version FROM channel_meta WHERE channel_id=?", channelId)
+          .toArray()[0] as { kind: string; visibility: string; title: string; topic: string | null; avatar_url: string | null; status: string; created_at: string; member_count: number; membership_version: number } | undefined;
+        if (meta === undefined) {
+          // channel gone → 404 CHANNEL_NOT_FOUND (NOT a conflict).
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
+        }
+        const d = this.assertNotDissolved(meta.status);
+        if (d) return { kind: "cached", responseJson: JSON.stringify({ error: { code: d.code, message: d.message, retryable: false } }) };
+
+        const role = this.activeRole(channelId, userId);
+        if (role !== "owner" && role !== "admin") {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "FORBIDDEN", message: "not authorized to update channel", retryable: false } }) };
+        }
+
+        const changes: Record<string, { before: unknown; after: unknown }> = {};
+        const newTitle = b.title !== undefined ? b.title : meta.title;
+        const newTopic = b.topic !== undefined ? b.topic : meta.topic;
+        const newVisibility = b.visibility !== undefined ? b.visibility : meta.visibility;
+        const newAvatarUrl = meta.avatar_url; // avatar_attachment_id processed in Phase 5
+        if (b.title !== undefined && b.title !== meta.title) changes.title = { before: meta.title, after: b.title };
+        if (b.topic !== undefined && b.topic !== meta.topic) changes.topic = { before: meta.topic, after: b.topic };
+        if (b.visibility !== undefined && b.visibility !== meta.visibility) {
+          if (!["private", "public_unlisted", "public_listed"].includes(b.visibility)) return { kind: "cached", responseJson: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "invalid visibility", retryable: false } }) };
+          changes.visibility = { before: meta.visibility, after: b.visibility };
+        }
+
+        this.ctx.storage.sql.exec(
+          "UPDATE channel_meta SET title=?, topic=?, visibility=?, avatar_url=?, updated_at=? WHERE channel_id=?",
+          newTitle, newTopic, newVisibility, newAvatarUrl, now, channelId,
+        );
+
+        const mv = meta.membership_version;
+        const updatedId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(updatedId, "channel.updated", channelId, now,
+          buildChannelUpdatedPayload({ channel_id: channelId, channel_changes: changes, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
+        const noticeId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(noticeId, "system.notice", channelId, now,
+          buildSystemNoticePayload({ notice_kind: "channel.updated", actor_kind: "user", actor_id: userId, target_user_id: null, message_id: null, channel_changes: changes }), mv, now, actorMap);
+
+        const channel = { channel_id: channelId, kind: meta.kind, visibility: newVisibility, title: newTitle, topic: newTopic, avatar_url: newAvatarUrl, member_count: meta.member_count, status: meta.status, created_at: meta.created_at, updated_at: now };
+        const responseJson = JSON.stringify({ channel });
+        this.ctx.storage.sql.exec(
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.update', ?, ?, ?, 'completed', ?, ?)",
+          userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt,
+        );
+        return { kind: "ok", channel };
+      });
+
+      if (txResult.kind === "conflict") {
+        return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
+      }
+      if (txResult.kind === "ok") {
+        await this.scheduleOutboxAlarm(now);
+        return Response.json({ channel: txResult.channel }, { status: 200 });
+      }
+      // cached branch (success cached OR an error shape encoded inside the txn).
+      return this.cachedResponse(txResult.responseJson);
     }
 
     return new Response("not found", { status: 404 });

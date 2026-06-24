@@ -44,3 +44,18 @@ describe("POST /api/chat/channels", () => {
     expect(res.status).toBe(422);
   });
 });
+
+describe("PATCH /api/chat/channels/:id", () => {
+  it("updates a channel the caller owns", async () => {
+    const create = await authedReq("u-patch-1", "POST", "/api/chat/channels", { title: "Before", visibility: "private", initial_members: [] }, "ck-patch-create");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    const res = await authedReq("u-patch-1", "PATCH", `/api/chat/channels/${cid}`, { title: "After" }, "ck-patch-1");
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { channel: { title: string } }).channel.title).toBe("After");
+  });
+
+  it("returns 404 CHANNEL_NOT_FOUND for a random channel_id", async () => {
+    const res = await authedReq("u-patch-2", "PATCH", "/api/chat/channels/0199eeee-0000-7000-8000-000000000001", { title: "X" }, "ck-patch-2");
+    expect(res.status).toBe(404);
+  });
+});
