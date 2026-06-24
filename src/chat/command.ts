@@ -25,7 +25,11 @@ export function parseMessageSendCommand(frame: CommandFrame, senderUserId: strin
     return { ok: false, error: { code: "CHANNEL_NOT_FOUND", message: "missing channel_id", retryable: false } };
   }
   const p = frame.payload as Record<string, unknown>;
-  const command_id = typeof p.command_id === "string" ? p.command_id : "";
+  // v4.0: command_id is a TOP-LEVEL frame field (the durable operation id), NOT a payload field.
+  // A v2.6-compliant client sends {command_id: "op-1", payload: {type, text, ...}}; it must NOT
+  // put command_id in the payload. Read the operation id from the frame; ignore any payload
+  // command_id (do not use it, do not reject for its presence).
+  const command_id = typeof frame.command_id === "string" ? frame.command_id : "";
   if (!command_id) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
   }

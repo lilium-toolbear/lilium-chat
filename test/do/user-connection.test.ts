@@ -31,6 +31,28 @@ function nextMessage(ws: WebSocket, timeoutMs = 2000): Promise<string> {
   });
 }
 
+// Reads frames until a command_ack arrives — skips replay event frames that registerOnlineOnConnect
+// may deliver on the same socket. Resolves with the ack's command_id (asserted) to disambiguate.
+function nextAck(ws: WebSocket, timeoutMs = 2000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout waiting for command_ack")), timeoutMs);
+    const handler = (ev: MessageEvent) => {
+      const data = typeof ev.data === "string" ? ev.data : "";
+      try {
+        const f = JSON.parse(data) as { frame_type?: string };
+        if (f.frame_type === "command_ack") {
+          clearTimeout(t);
+          ws.removeEventListener("message", handler);
+          resolve(data);
+        }
+      } catch {
+        // ignore non-JSON / non-ack frames
+      }
+    };
+    ws.addEventListener("message", handler as EventListener);
+  });
+}
+
 describe("UserConnection DO", () => {
   it("/deliver sends an event frame on the live socket and stores a probe", async () => {
     const userId = "u-uc-deliver";
@@ -125,7 +147,6 @@ describe("UserConnection DO", () => {
       command_id: "cmd-uc-1",
       channel_id: sysId,
       payload: {
-        command_id: "cm-uc-1",
         type: "text",
         text: "hi from uc",
         reply_to_message_id: null,
@@ -169,7 +190,6 @@ describe("UserConnection DO", () => {
         command_id: "cmd-uc-2",
         channel_id: sysId,
         payload: {
-          command_id: "cm-uc-2",
           type: "text",
           text: "   ",
           reply_to_message_id: null,
@@ -206,7 +226,6 @@ describe("UserConnection DO", () => {
       command: "message.send",
       channel_id: sysId,
       payload: {
-        command_id: "cm-idem",
         type: "text",
         text: "dup",
         reply_to_message_id: null,
@@ -215,12 +234,17 @@ describe("UserConnection DO", () => {
       },
     };
 
-    ws.send(JSON.stringify({ ...base, command_id: "c-1" }));
-    const ack1 = JSON.parse(await nextMessage(ws));
-    ws.send(JSON.stringify({ ...base, command_id: "c-2" }));
-    const ack2 = JSON.parse(await nextMessage(ws));
+    // v4.0: command_id is the top-level durable operation id. Same command_id + same body → same message.
+    ws.send(JSON.stringify({ ...base, command_id: "c-same" }));
+    const ack1 = JSON.parse(await nextAck(ws));
+    ws.send(JSON.stringify({ ...base, command_id: "c-same" }));
+    const ack1Retry = JSON.parse(await nextAck(ws));
+    expect(ack1Retry.payload.message.message_id).toBe(ack1.payload.message.message_id);
 
-    expect(ack1.payload.message.message_id).toBe(ack2.payload.message.message_id);
+    // A different command_id (new operation) + same body → a DIFFERENT message.
+    ws.send(JSON.stringify({ ...base, command_id: "c-different" }));
+    const ack2 = JSON.parse(await nextAck(ws));
+    expect(ack2.payload.message.message_id).not.toBe(ack1.payload.message.message_id);
     ws.close();
   });
 });

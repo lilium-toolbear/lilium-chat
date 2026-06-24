@@ -829,6 +829,49 @@ export class ChatChannel extends DurableObject<Env> {
         deleted_by: null,
         recalled_at: null,
       };
+      // v4.0 P0-2: resolve sender BEFORE the transaction (Hyperdrive is a network call). The live
+      // projection built from this resolution is written INTO the transaction (response_json + the
+      // channel_fanout outbox event_json), so the cached ack is stable+complete with no crash window.
+      // A failed/missing resolution falls back to user-<shortid> (contract K: stale display data on
+      // idempotent replay is acceptable).
+      let resolvedSender: LiveUserSummary = {
+        user_id: userId,
+        display_name: `user-${userId.slice(0, 8)}`,
+        avatar_url: null,
+      };
+      try {
+        const raw = await resolveUserSummaries([userId], this.env);
+        const normalized = raw.get(userId);
+        if (normalized) {
+          resolvedSender = {
+            user_id: normalized.user_id,
+            display_name: normalized.display_name ?? `user-${userId.slice(0, 8)}`,
+            avatar_url: normalized.avatar_url,
+          };
+        }
+      } catch {
+        // fallback handled by the projection builder
+      }
+
+      // Build the LIVE message projection once (used by BOTH the committed-ack response_json AND
+      // the channel_fanout outbox event_json — v4.0 addendum I/J: ack and event carry the same
+      // Browser-visible projection from the one shared builder).
+      const liveMessage = projectMessageForBrowser(messageRowForProjection, { senderSummary: resolvedSender });
+      const liveEventFrame = buildEventFrame({
+        event_id: eventId,
+        type: "message.created",
+        channel_id: channelId,
+        occurred_at: now,
+        payload: { message: liveMessage },
+      });
+      const liveEventFrameJson = JSON.stringify(liveEventFrame);
+      const fullAckJson = JSON.stringify({
+        frame_type: "command_ack",
+        command: "message.send",
+        command_id: b.command_id,
+        status: "committed",
+        payload: { channel_id: channelId, event_id: eventId, message: liveMessage },
+      });
       const persistedPayload = buildMessageCreatedPayload({
         message_id: messageRowForProjection.message_id,
         command_id: messageRowForProjection.command_id,
@@ -854,7 +897,7 @@ export class ChatChannel extends DurableObject<Env> {
       const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
 
       type SendResult =
-        | { kind: "created"; message_id: string; event_id: string }
+        | { kind: "created"; response_json: string }
         | { kind: "cached"; response_json: string }
         | { kind: "conflict" }
         | { kind: "dissolved" };
@@ -875,7 +918,7 @@ export class ChatChannel extends DurableObject<Env> {
           if (idemRow.request_hash !== requestHash) {
             return { kind: "conflict" };
           }
-          return { kind: "cached", response_json: idemRow.response_json ?? JSON.stringify({ payload: { channel_id: channelId, event_id: "", message: null } }) };
+          return { kind: "cached", response_json: idemRow.response_json ?? "" };
         }
 
         this.ctx.storage.sql.exec(
@@ -914,24 +957,22 @@ export class ChatChannel extends DurableObject<Env> {
           mv,
           now,
         );
-        const fallbackEvent = buildEventFrame({
-          event_id: eventId,
-          type: "message.created",
-          channel_id: channelId,
-          occurred_at: now,
-          payload: { message: projectMessageForBrowser(messageRowForProjection, { senderSummary: { user_id: userId, display_name: `user-${userId.slice(0, 8)}`, avatar_url: null } }) },
-        });
+        // idempotency_keys.response_json stores the FULL committed ack payload (v4.0 addendum K),
+        // written co-atomically with the business rows — no crash window. The cached branch returns
+        // this exact payload on a duplicate retry.
         this.ctx.storage.sql.exec(
           "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'message.send', ?, ?, ?, 'completed', ?, ?)",
           userId,
           b.command_id,
           requestHash,
-          "{}",
+          fullAckJson,
           now,
           idemExpiresAt,
         );
-        this.insertOutboxRowForFanout(channelId, eventId, JSON.stringify(fallbackEvent), mv, now);
-        return { kind: "created", message_id: messageId, event_id: eventId };
+        // channel_fanout outbox carries the LIVE (sender-resolved) event frame — same projection as
+        // the ack (addendum I). Written in-txn so a crash after commit leaves a deliverable event.
+        this.insertOutboxRowForFanout(channelId, eventId, liveEventFrameJson, mv, now);
+        return { kind: "created", response_json: fullAckJson };
       });
 
       if (txResult.kind === "conflict") {
@@ -950,97 +991,19 @@ export class ChatChannel extends DurableObject<Env> {
         return Response.json({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }, { status: 409 });
       }
       if (txResult.kind === "created") {
-        let resolvedSender: LiveUserSummary = {
-          user_id: userId,
-          display_name: `user-${userId.slice(0, 8)}`,
-          avatar_url: null,
-        };
-        try {
-          const raw = await resolveUserSummaries([userId], this.env);
-          const normalized = raw.get(userId);
-          if (normalized) {
-            resolvedSender = {
-              user_id: normalized.user_id,
-              display_name: normalized.display_name ?? `user-${userId.slice(0, 8)}`,
-              avatar_url: normalized.avatar_url,
-            };
-          }
-        } catch {
-          // fallback handled by the projection builder
-        }
-        const messageRow = this.ctx.storage.sql.exec(
-          "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE message_id=?",
-          txResult.message_id,
-        ).toArray()[0] as MessageRow | undefined;
-        const row = messageRow ?? messageRowForProjection;
-        const message = projectMessageForBrowser(row, { senderSummary: resolvedSender });
-        const responsePayload = {
-          channel_id: channelId,
-          event_id: txResult.event_id,
-          message,
-        };
-        const responseJson = JSON.stringify({
-          frame_type: "command_ack",
-          command: "message.send",
-          command_id: b.command_id,
-          status: "committed",
-          payload: responsePayload,
-        });
-        this.ctx.storage.sql.exec(
-          "UPDATE idempotency_keys SET response_json=? WHERE principal_kind='user' AND principal_id=? AND operation='message.send' AND operation_id=?",
-          responseJson,
-          userId,
-          b.command_id,
-        );
-        const fullEvent = buildEventFrame({
-          event_id: txResult.event_id,
-          type: "message.created",
-          channel_id: channelId,
-          occurred_at: now,
-          payload: { message },
-        });
-        this.ctx.storage.sql.exec(
-          "UPDATE projection_outbox SET payload_json=? WHERE outbox_id=?",
-          JSON.stringify({ action: "fanout", event_id: txResult.event_id, event_json: JSON.stringify(fullEvent), membership_version_at_event: mv }),
-          `channel_fanout:${channelId}:${txResult.event_id}`,
-        );
         await this.scheduleOutboxAlarm(now);
-        return Response.json(responsePayload);
+        // Return the same projection committed to idempotency_keys + the outbox — no post-txn recompute.
+        const ackPayload = JSON.parse(txResult.response_json) as { payload: { channel_id: string; event_id: string; message: Record<string, unknown> } };
+        return Response.json(ackPayload.payload);
       }
-      if (txResult.kind === "cached") {
-        type CachedAck = {
-          payload?: {
-            channel_id?: string;
-            event_id?: string;
-            message?: Record<string, unknown> | null;
-          };
-          frame_type?: string;
-          command?: string;
-          status?: string;
-          command_id?: string;
-        };
-        let cachedPayload: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } = {};
-        try {
-          const parsed = JSON.parse(txResult.response_json) as CachedAck;
-          if (parsed.payload && typeof parsed.payload === "object") {
-            cachedPayload = parsed.payload;
-          }
-        } catch {
-          cachedPayload = { channel_id: channelId, event_id: "", message: null };
-        }
-        return Response.json({
-          channel_id: cachedPayload.channel_id ?? channelId,
-          event_id: cachedPayload.event_id ?? "",
-          message: cachedPayload.message ?? null,
-        });
-      }
-      await this.scheduleOutboxAlarm(now);
+      // cached: return the stored full ack payload exactly (addendum K). It was written complete in
+      // the original transaction, so event_id is never "" and message is never null here.
+      const cached = JSON.parse(txResult.response_json) as { payload?: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } };
       return Response.json({
-        channel_id: channelId,
-        event_id: "",
-        message: null,
+        channel_id: cached.payload?.channel_id ?? channelId,
+        event_id: cached.payload?.event_id ?? "",
+        message: cached.payload?.message ?? null,
       });
-      
     }
 
     if (url.pathname === "/internal/dissolve") {

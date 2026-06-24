@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { parseMessageSendCommand, dedupePrincipalKeyForUser } from "../../src/chat/command";
 
 describe("parseMessageSendCommand", () => {
-  it("parses a valid text message.send", () => {
+  it("parses a valid text message.send (command_id is top-level, NOT in payload)", () => {
     const r = parseMessageSendCommand(
       {
         frame_type: "command",
@@ -10,7 +10,6 @@ describe("parseMessageSendCommand", () => {
         command_id: "cmd-1",
         channel_id: "ch-1",
         payload: {
-          command_id: "cm-1",
           type: "text",
           text: "hello",
           reply_to_message_id: null,
@@ -22,7 +21,7 @@ describe("parseMessageSendCommand", () => {
     );
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.command.command_id).toBe("cm-1");
+      expect(r.command.command_id).toBe("cmd-1"); // v4.0: the frame-level command_id
       expect(r.command.type).toBe("text");
       expect(r.command.text).toBe("hello");
       expect(r.command.reply_to).toBe(null);
@@ -40,18 +39,28 @@ describe("parseMessageSendCommand", () => {
     if (!r.ok) expect(r.error.code).toBe("INVALID_COMMAND");
   });
 
-  it("rejects missing command_id", () => {
+  it("rejects missing top-level command_id", () => {
     const r = parseMessageSendCommand(
-      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "text", text: "hi" } },
+      { frame_type: "command", command: "message.send", command_id: "", channel_id: "ch-1", payload: { type: "text", text: "hi" } },
       "u-1",
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
   });
 
+  it("ignores a payload command_id (v4.0: only the top-level command_id is the operation id)", () => {
+    // A v2.6-compliant client does NOT send payload.command_id; if one does, it is ignored, not rejected.
+    const r = parseMessageSendCommand(
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { command_id: "stray-payload-id", type: "text", text: "hi" } },
+      "u-1",
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.command.command_id).toBe("cmd-1");
+  });
+
   it("rejects empty text for type=text", () => {
     const r = parseMessageSendCommand(
-      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { command_id: "cm-1", type: "text", text: "  " } },
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "text", text: "  " } },
       "u-1",
     );
     expect(r.ok).toBe(false);
@@ -60,34 +69,34 @@ describe("parseMessageSendCommand", () => {
 
   it("rejects missing channel_id", () => {
     const r = parseMessageSendCommand(
-      { frame_type: "command", command: "message.send", command_id: "cmd-1", payload: { command_id: "cm-1", type: "text", text: "hi" } },
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", payload: { type: "text", text: "hi" } },
       "u-1",
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe("CHANNEL_NOT_FOUND");
   });
 
-  it("rejects image type (Phase 2 is text-only; images are Phase 5)", () => {
+  it("rejects image type (text-only; images are Phase 5)", () => {
     const r = parseMessageSendCommand(
-      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { command_id: "cm-1", type: "image", text: "", attachment_ids: ["a-1"] } },
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "image", text: "", attachment_ids: ["a-1"] } },
       "u-1",
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
   });
 
-  it("rejects reply_to_message_id (Phase 2 has no reply snapshot; replies are Phase 4)", () => {
+  it("rejects reply_to_message_id (reply snapshot is Phase 4)", () => {
     const r = parseMessageSendCommand(
-      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { command_id: "cm-1", type: "text", text: "hi", reply_to_message_id: "m-1" } },
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "text", text: "hi", reply_to_message_id: "m-1" } },
       "u-1",
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
   });
 
-  it("rejects non-empty attachment_ids (Phase 2 is text-only)", () => {
+  it("rejects non-empty attachment_ids (text-only)", () => {
     const r = parseMessageSendCommand(
-      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { command_id: "cm-1", type: "text", text: "hi", attachment_ids: ["a-1"] } },
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "text", text: "hi", attachment_ids: ["a-1"] } },
       "u-1",
     );
     expect(r.ok).toBe(false);
@@ -100,4 +109,3 @@ describe("dedupePrincipalKeyForUser", () => {
     expect(dedupePrincipalKeyForUser("u-1")).toBe("user:u-1");
   });
 });
-

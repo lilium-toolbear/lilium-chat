@@ -210,4 +210,38 @@ describe("ChatChannel /internal/message-send", () => {
     expect(found).toBeDefined();
     expect(found?.event_json).toContain('"message.created"');
   });
+
+  // P0-2 regression: idempotency_keys.response_json must store the FULL committed ack payload,
+  // written co-atomically with the business rows — no crash window where response_json is "{}" and a
+  // duplicate retry returns event_id:"" / message:null. We can't crash the DO mid-txn, but we assert
+  // a duplicate retry returns the SAME complete ack (event_id + message present, not degraded).
+  it("P0-2: duplicate retry returns the same complete ack (response_json is full, not {})", async () => {
+    const { stub, channelId } = await setupSystemAndJoin("u-ms-7");
+    const body = {
+      command_id: "cm-p02",
+      dedupe_principal_key: "user:u-ms-7",
+      type: "text",
+      text: "p0-2 ack integrity",
+      reply_to: null,
+      mentions: [],
+      channel_id: channelId,
+    };
+    const r1 = await (await stub.fetch(new Request("https://x/internal/message-send", {
+      method: "POST", headers: { "X-Verified-User-Id": "u-ms-7", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }))).json() as { event_id: string; message: { message_id: string } };
+    expect(r1.event_id).toBeTruthy();
+    expect(r1.message.message_id).toBeTruthy();
+
+    // Duplicate retry (same operation_id + same body) must return the SAME committed ack —
+    // event_id present, message present (NOT the degraded {event_id:"",message:null} fallback
+    // that an empty response_json would produce).
+    const r2 = await (await stub.fetch(new Request("https://x/internal/message-send", {
+      method: "POST", headers: { "X-Verified-User-Id": "u-ms-7", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }))).json() as { event_id: string; message: { message_id: string } | null };
+    expect(r2.event_id).toBe(r1.event_id);
+    expect(r2.message).not.toBeNull();
+    expect(r2.message!.message_id).toBe(r1.message.message_id);
+  });
 });
