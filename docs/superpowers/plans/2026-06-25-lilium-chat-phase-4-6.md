@@ -834,3 +834,117 @@ git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: POST /invit
 - **Invite index lag:** Task C2's create route should flush the ChatChannel alarm (invite_directory outbox) before returning so preview (C3) is reliable; keep `ROUTE_INDEX_PENDING` 409 as the load-path fallback.
 - **`MESSAGE_NOT_EDITABLE`** (409) — add to `src/errors.ts` (A2 Step 3).
 - **Do NOT push or deploy.** Git identity `kuma`.
+
+---
+
+# Revision Appendix (2026-06-25 — static-review P0/P1 fixes)
+
+This appendix OVERRIDES the task text above where they conflict. The reviewer ran a static pass and flagged 8 P0 + 4 P1. The task bodies above were written first; the corrections below are the spec of record. **An executor MUST apply both the task body AND its correction here** — where they differ, this appendix wins.
+
+## A2 corrections (message lifecycle handler)
+
+### A2-corr-1: request body MUST include `channel_id` (P0-1)
+
+The `/internal/message-edit|recall|delete` handlers read `b.channel_id`. The A2 DO-direct tests MUST send `channel_id` in the body. Update the A2 test `setupSystemAndSend` payloads and every `/internal/message-edit|recall|delete` fetch body to include `channel_id`. Also: the existing internal endpoints (`/internal/dissolve`, `/internal/members-add|update-role|remove`) read a TS body field named `idempotency_key` (which holds the HTTP `Idempotency-Key` value) and bind it to the SQL `operation_id` column — they are correct as-shipped; the lifecycle handlers use a body field named `operation_id` for consistency with message-send. BOTH names are fine (they hold the same value); just be consistent within each handler. The lifecycle handlers use `operation_id` (matching message-send's internal body field name `command_id`-as-operation_id).
+
+### A2-corr-2: recall/delete MUST NOT clear `messages.text` (P0-2)
+
+The row's `text` is the original message text and is the audit/source-of-truth. recall/delete change `status` + timestamps ONLY. The Browser leak defense lives in `projectMessageForBrowser` (already nulls text/attachments/components/mentions for `deleted`/`recalled`). So:
+
+- recall `mutate`: `{ status: "recalled", recalled_at: now }` — do NOT set `text`.
+- delete `mutate`: `{ status: "deleted", deleted_at: now, deleted_by: userId }` — do NOT set `text`.
+
+`projectMessageForBrowser(updatedRow, ...)` returns `text: null` for hidden status regardless, so the ack/event projection is safe.
+
+### A2-corr-3: lifecycle state matrix (P0-3)
+
+`applyMessageMutation` rejects `row.status === "deleted"` only. Define the full matrix and reject illegal transitions with `MESSAGE_NOT_EDITABLE`:
+
+- **edit**: sender only; `row.type === "text"`; `row.status in ("normal", "edited")`. Reject `recalled`/`deleted` → `MESSAGE_NOT_EDITABLE`.
+- **recall**: sender only; `row.status in ("normal", "edited")`. Reject `recalled`/`deleted` → `MESSAGE_NOT_EDITABLE`.
+- **delete**: sender OR owner/admin; `row.status in ("normal", "edited", "recalled")` (a recalled message can still be deleted — both are tombstones; deleted is terminal). Reject `deleted` → `MESSAGE_NOT_EDITABLE` (idempotent retry hits the cached branch, not this). `type` is unrestricted for delete (delete a sticker/image too).
+- hidden (`deleted`/`recalled`) is terminal for edit/recall; only delete may act on a `recalled` row (to escalate to deleted).
+
+Add tests: "edit a recalled message → 409 MESSAGE_NOT_EDITABLE", "recall a recalled message → 409", "edit a non-text (image) message → 409" (image not built yet; skip this one or stub — out of scope; just ensure the matrix rejects `type !== "text"` for edit).
+
+### A2-corr-4: persisted payload shape + replay event set (P0-4)
+
+The A2 `persistedPayload` must be wrapped `{ message: { ... } }` (NOT flat top-level fields), matching `buildMessageCreatedPayload`'s shape so the existing replay re-projection path works. Add a shared builder `buildMessageLifecyclePayload(row)` (or generalize `buildMessageCreatedPayload` to take the row + produce `{ message: {...refs} }`) and use it for edit/recall/delete persisted payloads.
+
+Replay (`/internal/replay`): the message-event re-projection set is currently `message.created | message.updated`. Extend it to `message.created | message.updated | message.recalled | message.deleted`:
+- For all four: re-read the `messages` row by `payload.message.message_id` (the existing pattern at replay line ~1157-1180), apply current `projectMessageForBrowser` with resolved sender.
+- If the row is now `deleted`/`recalled`, the projection is the safe tombstone (text null) — emit that. A `message.created` event whose row is now deleted is already skipped by the existing status filter (line ~1118); keep that. An explicit `message.recalled`/`message.deleted` event MUST be emitted with the tombstone projection (do NOT skip it even though the row is hidden — it's the lifecycle tombstone the client needs).
+
+### A2-corr-5: resolve the MESSAGE SENDER, not the actor (P0-5)
+
+`applyMessageMutation` currently resolves only `input.userId` (the actor) and projects with that. For admin-delete of another's message, `row.sender_user_id !== input.userId` and the projection's `sender.user` would wrongly show the admin. Fix:
+
+- Before the txn, do a **read-only preflight** `SELECT sender_user_id FROM messages WHERE message_id=? AND channel_id=?` to get the sender id (or resolve a set of up to 2 ids: actor + sender).
+- `resolveActorMap([input.userId, senderUserId])` (dedupes).
+- Project with `projectMessageForBrowser(updatedRow, { senderSummary: actorMap.get(updatedRow.sender_user_id) ?? null })` — use the ROW's sender, not the actor.
+
+Re-read the row inside the txn (it already does) and re-validate sender matches the preflight (handle a race where the message was deleted between preflight and txn — re-read returns the row; the txn status check covers it).
+
+Add a test: "admin deletes another member's message → ack/event `message.sender.user.user_id` is the ORIGINAL author, not the admin". The B1/A2 tests currently only delete the owner's own message, masking this. Fix the A2 delete test to add a second member + have the owner delete that member's message, asserting sender.
+
+### A2-corr-6: audit_logs for recall/delete + system.notice for admin-delete (P0-6)
+
+- edit: append `message_edits` (already in A2).
+- recall: INSERT `audit_logs(actor_kind='user', actor_id=userId, action='message.recall', target_type='message', target_id=message_id, before_json, after_json)`.
+- delete: INSERT `audit_logs(action='message.delete', ...)` + if the deleter is NOT the sender (admin delete of another's message), ALSO emit a `system.notice(notice_kind='message.deleted', actor=deleter, target_user=original_sender, message_id)` event in the same txn (via `persistEventAndFanout` after the `message.deleted` event). Self-delete: no notice (or a quieter one — the contract issue #1028 says "admin delete of others' message appends system.notice"; self-delete is implied silent).
+
+### A2-corr-7: `cachedResponse` error-code coverage (P1)
+
+Extend `cachedResponse` (Phase 3) to map `MESSAGE_NOT_FOUND` → 404, `MESSAGE_NOT_EDITABLE` → 409, `INVITE_NOT_FOUND` → 404, `ROUTE_INDEX_PENDING` → 409, `INVALID_MEMBER_ROLE` → 422. Add `INVALID_MEMBER_ROLE` (422) + `ROUTE_INDEX_PENDING` (409, already) to `src/errors.ts` if missing.
+
+---
+
+## B1 corrections (owner transfer)
+
+### B1-corr: single-owner + event/replay invariant testing (P1-2)
+
+B1's tests only assert the response. Add:
+- A DO-direct assertion (after transfer) that `channel_meta.created_by === target_user_id` AND exactly one `members` row has `role='owner'` with `left_at IS NULL` (query via a `/internal/dump` or a new `/internal/members-list` with role filter — or just the existing `/internal/members-list` returning the target as owner, old owner as `previous_owner_role`).
+- A replay assertion: `member.role_updated` events for both old + new owner were emitted (replay after transfer; assert two `member.role_updated` events with the expected before/after roles).
+- The old owner, after transfer, is NOT owner: a follow-up `/internal/dissolve` by the old owner must now 403 (only owner may dissolve; old owner is now admin).
+
+---
+
+## C corrections (invites)
+
+### C-corr-1: ChatChannel.alarm invite_directory branch (P0-7)
+
+Before C2, add an `invite_directory` branch to `ChatChannel.alarm()` (after `channel_fanout`): `const target = this.env.INVITE_DIRECTORY.getByName("shared"); target.fetch(/upsert)`. Without this, the C2 outbox row dead-letters. The `InviteDirectory` DO is a single shared instance (`getByName("shared")` or whatever the shipped `/upsert` caller uses — confirm the name; the shell uses a global name). On success mark `delivered`; on failure `bumpOutboxRetry`.
+
+### C-corr-2: contract-aligned create/accept shapes (P0-8)
+
+- **Create** (`POST /channels/{id}/invites`): request includes `expires_in_seconds` (TTL) + `max_uses` (nullable). Handler: `expires_at = now + expires_in_seconds` (server default if omitted, e.g. 7d). Response: `{ invite_code, invite_url, expires_at, max_uses }` (the contract shape — NOT just `{invite_code, expires_at}`). `invite_url` is the Browser-visible accept URL built from the origin + invite_code.
+- **Accept** (`POST /invites/{code}/accept`): response is `{ channel: {...channel summary...}, membership: { role, joined_at, status } }` (the contract shape). `role` is `member` (invite join); `joined_at` server-set; `status: "active"`. The plan's `{ channel_id, membership: { status } }` is WRONG — fix the C4 test + route output.
+
+Update the C2/C4 tests to assert these shapes (request `expires_in_seconds` + `max_uses`; response `{invite_code, invite_url, expires_at, max_uses}` for create; `{channel, membership:{role, joined_at, status}}` for accept).
+
+### C-corr-3: invite accept `used_count` semantics (P1-3)
+
+- A user already active (re-accept) → do NOT increment `used_count`; return the existing membership (idempotent at the membership level, separate from the Idempotency-Key operation_id dedup).
+- Same `operation_id` retry → do NOT re-increment `used_count` (the cached ack path returns before any write).
+- A `left` user re-accepting → increment `used_count` (they're re-joining). Document this in the handler.
+- Nonexistent / revoked / expired invite → `404 INVITE_NOT_FOUND`; index lag → `409 ROUTE_INDEX_PENDING` (re-flush or 409 per C-corr-4).
+
+Add tests covering each.
+
+### C-corr-4: create-route sync flush (P1-4)
+
+"Create route flushes the alarm before returning" is too hand-wavy. Concretely: in `ChatChannel /internal/invites-create`, AFTER the txn commits (which writes the `invite_directory` outbox row), synchronously flush that one outbox row to `InviteDirectory /upsert` inside the handler (await it), mark it `delivered`, then schedule the alarm as a repair fallback. This makes preview reliable immediately without depending on alarm timing. If the sync flush fails, leave the row `pending` (the alarm will retry per C-corr-1).
+
+---
+
+## Summary of task-body edits the executor makes
+
+When executing, the executor edits the plan's task code blocks to reflect this appendix (or applies the appendix as the spec). Specifically:
+- A2 Step 1 test: add `channel_id` to bodies; add the edit-recalled/non-text + admin-delete-sender tests.
+- A2 Step 3 helper: state matrix (A2-corr-3); don't clear text (A2-corr-2); `{ message: {...} }` persisted payload via `buildMessageLifecyclePayload` (A2-corr-4); preflight sender resolve (A2-corr-5); audit_logs + system.notice (A2-corr-6).
+- A2/elsewhere: extend `cachedResponse` + `errors.ts` (A2-corr-7).
+- Replay handler: add `message.recalled`/`message.deleted` to the re-projection set (A2-corr-4).
+- B1 tests: single-owner + event/replay + old-owner-loses-dissolve assertions (B1-corr).
+- C1 (alarm): add `invite_directory` alarm branch (C-corr-1) — do this as C1 or a pre-C1 step.
+- C2/C4: contract shapes + `expires_in_seconds`/`invite_url`/`channel`/`membership` (C-corr-2); used_count semantics (C-corr-3); sync flush in invites-create (C-corr-4).
