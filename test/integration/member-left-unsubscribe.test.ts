@@ -65,6 +65,13 @@ describe("member.left → ChannelFanout drops the user", () => {
       channel_id: string;
     }).channel_id;
 
+    // /internal/join wrote a user_directory outbox row; flush it via the ChatChannel alarm so
+    // UserDirectory.my_channels has the row BEFORE we upgrade the WS. registerOnlineOnConnect
+    // reads my_channels once on connect — if the row is not yet flushed it subscribes to nothing
+    // and the deliver-gate assertion below can never hold. This is setup, not the behavior under test.
+    const { runDurableObjectAlarm } = await import("cloudflare:test") as any;
+    await runDurableObjectAlarm(sysStub);
+
     const uc = getNamedDo(env.USER_CONNECTION as unknown as Parameters<typeof getNamedDo>[0], userId);
     const up = await uc.fetch(new Request("https://x/ws", { headers: { Upgrade: "websocket", "X-Verified-User-Id": userId } }));
     const ws = up.webSocket as WebSocket;
