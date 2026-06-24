@@ -187,6 +187,55 @@ export class UserConnection extends DurableObject<Env> {
       return;
     }
 
+    if (frame.command === "channel.mark_read") {
+      const channelId = frame.channel_id ?? "";
+      if (!channelId) {
+        sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "missing channel_id"));
+        return;
+      }
+      const payload = (frame as { payload?: { last_read_event_id?: string } }).payload ?? {};
+      const lastReadEventId = typeof payload.last_read_event_id === "string" ? payload.last_read_event_id : "";
+      if (!lastReadEventId) {
+        sendCommandError(ws, frame.command_id, responseError("INVALID_MESSAGE", "last_read_event_id required"));
+        return;
+      }
+      // floor in UserDirectory
+      const dir = this.env.USER_DIRECTORY.getByName(attachment.user_id);
+      const rsRes = await dir.fetch(new Request("https://x/internal/read-state", {
+        method: "POST", headers: { "X-Verified-User-Id": attachment.user_id, "Content-Type": "application/json" },
+        body: JSON.stringify({ channel_id: channelId, last_read_event_id: lastReadEventId }),
+      }));
+      if (rsRes.status === 403) { sendCommandError(ws, frame.command_id, responseError("FORBIDDEN", "not an active member")); return; }
+      if (!rsRes.ok) { sendCommandError(ws, frame.command_id, responseError("CHAT_WORKER_UNAVAILABLE", "read-state failed")); return; }
+      const floor = (await rsRes.json()) as { last_read_event_id: string; advanced: boolean };
+      // unread count from ChatChannel (best-effort)
+      const routeName = await channelRouteNameFor(this.env, attachment.user_id, channelId);
+      if (routeName === null) {
+        sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found"));
+        return;
+      }
+      const chStub = this.env.CHAT_CHANNEL.getByName(routeName);
+      const ucRes = await chStub.fetch(new Request(`https://x/internal/unread-count?after=${encodeURIComponent(floor.last_read_event_id)}`, { headers: { "X-Verified-User-Id": attachment.user_id } }));
+      const unreadCount = ucRes.ok ? ((await ucRes.json()) as { unread_count: number }).unread_count : 0;
+      // ack (NO event_id)
+      ws.send(JSON.stringify({ frame_type: "command_ack", command_id: frame.command_id, status: "committed", payload: { channel_id: channelId, last_read_event_id: floor.last_read_event_id, unread_count: unreadCount } }));
+      // best-effort broadcast a user-local read_state_updated frame to the user's OTHER sessions
+      if (floor.advanced) {
+        for (const other of this.ctx.getWebSockets(`user-conn:${attachment.user_id}`)) {
+          if (other === ws) continue;
+          try {
+            other.send(JSON.stringify({ frame_type: "read_state_updated", channel_id: channelId, last_read_event_id: floor.last_read_event_id, unread_count: unreadCount }));
+          } catch { /* session gone */ }
+        }
+      }
+      return;
+    }
+
+    if (frame.command !== "message.send") {
+      sendCommandError(ws, frame.command_id, responseError("INVALID_MESSAGE", "unsupported command"));
+      return;
+    }
+
     const parsed = parseMessageSendCommand(frame, attachment.user_id);
     if (!parsed.ok) {
       sendCommandError(ws, frame.command_id, parsed.error);

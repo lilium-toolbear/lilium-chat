@@ -210,7 +210,7 @@ export class UserDirectory extends DurableObject<Env> {
       // Three-state floor result. The Worker decides whether to emit read_state.updated.
       const floor = await this.ctx.storage.transaction(async (): Promise<
         | { forbidden: true }
-        | { stored: string; advanced: boolean; emit: boolean }
+        | { stored: string; advanced: boolean }
       > => {
         const row = this.ctx.storage.sql
           .exec("SELECT last_read_event_id, status FROM my_channels WHERE user_id=? AND channel_id=?", userId, b.channel_id)
@@ -221,14 +221,14 @@ export class UserDirectory extends DurableObject<Env> {
         if (current === null || b.last_read_event_id > current) {
           // advance
           this.ctx.storage.sql.exec("UPDATE my_channels SET last_read_event_id=? WHERE user_id=? AND channel_id=?", b.last_read_event_id, userId, b.channel_id);
-          return { stored: b.last_read_event_id, advanced: true, emit: true };
+          return { stored: b.last_read_event_id, advanced: true };
         }
         if (b.last_read_event_id === current) {
-          // identical cursor — no floor change, but emit so ChatChannel idempotency can repair a prior failed event
-          return { stored: current, advanced: false, emit: true };
+          // identical cursor — no floor change, but no emit anymore: UserConnection handles sync fanout.
+          return { stored: current, advanced: false };
         }
         // stale (requested < current) — keep stored floor, no event
-        return { stored: current, advanced: false, emit: false };
+        return { stored: current, advanced: false };
       });
 
       if ("forbidden" in floor) return new Response("forbidden", { status: 403 });
@@ -236,7 +236,6 @@ export class UserDirectory extends DurableObject<Env> {
         channel_id: b.channel_id,
         last_read_event_id: floor.stored, // ALWAYS the stored floor, never the request cursor (P0-2)
         advanced: floor.advanced,
-        emit: floor.emit,
       });
     }
 

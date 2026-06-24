@@ -1,11 +1,10 @@
-export type Frame = CommandFrame | CommandAckFrame | CommandErrorFrame | EventFrame;
+export type Frame = CommandFrame | CommandAckFrame | CommandErrorFrame | EventFrame | ReadStateUpdatedFrame;
 
 export interface CommandFrame {
   frame_type: "command";
   command: string;
   command_id: string;
   channel_id?: string;
-  idempotency_key?: string;
   payload: Record<string, unknown>;
 }
 
@@ -24,6 +23,13 @@ export interface CommandErrorFrame {
   frame_type: "command_error";
   command_id: string;
   error: { code: string; message: string; retryable: boolean };
+}
+
+export interface ReadStateUpdatedFrame {
+  frame_type: "read_state_updated";
+  channel_id: string;
+  last_read_event_id: string;
+  unread_count: number;
 }
 
 export interface EventFrame {
