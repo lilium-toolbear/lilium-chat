@@ -36,15 +36,25 @@
 - `src/routes/channel-mutations.ts` — Hono route handlers: `createChannelHandler`, `updateChannelHandler`, `dissolveChannelHandler`, `listMembersHandler`, `getMemberHandler`, `addMemberHandler`, `updateMemberRoleHandler`, `removeMemberHandler`, `readStateHandler`. Registered in `src/index.ts`.
 - `test/routes/channel-mutations.test.ts` — HTTP-level tests for all 9 endpoints (auth, success, errors, idempotency, dissolve-gate).
 - `test/do/user-directory-create-coordinate.test.ts` — coordinator state machine (new/cached/conflict/creating-retry).
-- `test/do/chat-channel-create.test.ts` — `createChannel` atomic create + idempotent re-call.
-- `test/do/chat-channel-mutations.test.ts` — update/dissolve/members/read-state DO internals + dissolved-gate.
+**Create:**
+- `src/chat/channel-events.ts` — pure builders for Phase 3 event payloads: `buildChannelCreatedPayload`, `buildChannelUpdatedPayload`, `buildChannelDissolvedPayload`, `buildMemberJoinedPayload`, `buildMemberRoleUpdatedPayload`, `buildMemberLeftPayload`, `buildReadStateUpdatedPayload`, `buildSystemNoticePayload` (persisted ref shape — `actor_kind`/`actor_id`/`target_user_id`/`channel_changes`, NO UserSummary). Plus `resolveActorWithMap` (sync, prod path inside a DO txn) and `resolveActorForLiveBroadcast` (async, injected resolver for unit tests).
+- `test/chat/channel-events.test.ts` — unit tests for the payload builders + actor resolver.
+- `src/routes/channel-mutations.ts` — Hono route handlers: `createChannelHandler`, `updateChannelHandler`, `dissolveChannelHandler`, `listMembersHandler`, `getMemberHandler`, `addMemberHandler`, `updateMemberRoleHandler`, `removeMemberHandler`, `readStateHandler`. Registered in `src/index.ts`.
+- `test/routes/channel-mutations.test.ts` — HTTP-level tests for all 9 endpoints (auth, success, errors, idempotency, dissolve-gate, owner invariant, cursor pagination).
+- `test/errors.test.ts` — `MEMBER_NOT_FOUND`/`CHANNEL_DISSOLVED`/`INVITE_NOT_FOUND` → HTTP status mapping.
+- `test/do/user-directory-create-coordinate.test.ts` — coordinator state machine (new/cached/conflict/creating-retry).
+- `test/do/user-directory-read-state.test.ts` — read-state floor advance + monotonic + `advanced` flag.
+- `test/do/chat-channel-create.test.ts` — `createChannel` atomic create + idempotent re-call returning DB-sourced channel.
+- `test/do/chat-channel-replay-projection.test.ts` — `/internal/replay` resolves management-event actors (storage-vs-wire).
+- `test/do/chat-channel-mutations.test.ts` — update/dissolve/members CRUD + members-read DO internals + dissolved-gate + owner invariant + member state machine.
 
 **Modify:**
 - `src/chat/system-channel.ts` — `channelRouteNameFor`: non-system `channel_id` returns the `channel_id` itself as the DO name (optimistic routing; DO self-validates), with a guard so the literal string `system-general` is never treated as a user channel id.
-- `src/do/user-directory.ts` — add `idempotency_keys` table (create coordinator) + `POST /internal/channel-create-coordinate` (state machine: SELECT inside txn → cached / conflict / mint+`creating` / `creating`-re-call) + `POST /internal/read-state` (monotonic `last_read_event_id` floor) + extend `/my-channels` is unchanged (already returns `last_read_event_id`).
-- `src/do/chat-channel.ts` — add the 9 `/internal/*` handlers above + a private `assertNotDissolved` gate used by every write handler (including existing `/internal/message-send` and `/internal/join`) + reuse `markMemberLeftAndEnqueueFanoutUnregister` for member remove/leave. Add `buildEventFrame` import (already used) + the new payload builders.
+- `src/errors.ts` — add `MEMBER_NOT_FOUND: 404`, `INVITE_NOT_FOUND: 404`, `CHANNEL_DISSOLVED: 409` to `HTTP_STATUS_BY_CODE` (Task 1, P0-1).
+- `src/do/user-directory.ts` — add `idempotency_keys` table (create coordinator) + `POST /internal/channel-create-coordinate` (state machine: SELECT inside txn → cached / conflict / mint+`creating` / `creating`-re-call) + `POST /internal/read-state` (monotonic `last_read_event_id` floor + advance flag + emit `read_state.updated` via ChatChannel) + extend `/my-channels` is unchanged (already returns `last_read_event_id`).
+- `src/do/chat-channel.ts` — add `/internal/create-channel`, `/internal/update-channel`, `/internal/dissolve`, `/internal/members-add`, `/internal/members-update-role`, `/internal/members-remove`, `/internal/members-list`, `/internal/members-get`, `/internal/read-state-event`, `/internal/unread-count`; add private helpers `assertNotDissolved`, `activeRole`, `cachedResponse`, `persistEventAndFanout`, `resolveActorMap`; extract `markMemberLeftAndEnqueueFanoutUnregisterSync` (sync core) + reframing the Phase 2 async helper as a thin wrapper; add the dissolved write-gate to `/internal/message-send` and `/internal/join`; refactor `/internal/replay` to resolve management-event actors (Task 4b). Add the new payload-builder imports.
 - `src/index.ts` — register the 9 new routes.
-- `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` — §5.2b: add the create-coordinator rule (v2.5 delta note). §11: confirm `MEMBER_NOT_FOUND` row exists (it does). Revision record: add v2.5 line.
+- `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` — §5.2b: add the create-coordinator rule (v2.5 delta note). Revision record: add v2.5 line.
 - `docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` — §8 阶段3 / §3.5a: record the create-coordinator rule + the `UserDirectory.idempotency_keys` table. §0.6: add v3.5 revision entry.
 
 **Do NOT touch:** `src/do/channel-fanout.ts` (register/unregister/fanout already correct), `src/do/user-connection.ts`, `src/routes/ws.ts`, `src/routes/events.ts`, `src/routes/channels.ts` / `messages.ts`, `src/auth/jwt.ts`, `src/ids/uuidv7.ts`, `src/profile/resolve.ts`, wrangler configs.
@@ -78,15 +88,21 @@ Expected: `1263a4a` (Phase 3 prep close). Note it; subsequent task commits build
 
 ---
 
-## Task 1: Align contract + design docs to the create-coordinator rule
+## Task 1: Align docs to the create-coordinator rule + add Phase 3 error codes
 
 **Files:**
 - Modify: `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` (§5.2b, revision record)
 - Modify: `docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` (§8 阶段3, §3.5a, §0.6)
+- Modify: `src/errors.ts` (add `MEMBER_NOT_FOUND`, `CHANNEL_DISSOLVED`, `INVITE_NOT_FOUND`)
+- Test: `test/errors.test.ts` (Create)
+
+**Why `errors.ts` first:** the Worker route handlers (Tasks 6-11) `throw new ApiError("MEMBER_NOT_FOUND", ...)` and pass `CHANNEL_DISSOLVED` through. Today `HTTP_STATUS_BY_CODE` has neither code, so `ApiError.httpStatus` falls back to `500`. Without this task, a precise-member-read-not-found renders as `500 CHAT_WORKER_UNAVAILABLE` and the route tests in Task 10/11 assert `404`/`409` — they would fail. This is a P0 spec/infra alignment that must land before any route.
 
 **Interfaces:**
 - Consumes: the create-coordinator design decided pre-plan.
-- Produces: docs that the remaining tasks derive from. No code, no test — this is the spec the implementer reads.
+- Produces:
+  - docs that the remaining tasks derive from.
+  - `HTTP_STATUS_BY_CODE["MEMBER_NOT_FOUND"] === 404`, `HTTP_STATUS_BY_CODE["CHANNEL_DISSOLVED"] === 409`, `HTTP_STATUS_BY_CODE["INVITE_NOT_FOUND"] === 404` (INVITE_NOT_FOUND added for completeness though Phase 6 uses it). `RETRYABLE_CODES` unchanged (none of these three are retryable).
 
 - [ ] **Step 1: Amend contract §5.2b**
 
@@ -116,11 +132,62 @@ In the same design file, find the §0.6 revision entries (the `v3.4` entry). Aft
 - **v3.5 (2026-06-24)**：补 create 幂等协调规则。`POST /api/chat/channels` 幂等归 `UserDirectory(creator_user_id)`（新增 `idempotency_keys` 表，状态机 `creating`→`completed`，持久化 `channel_id`），`ChatChannel.createChannel` 单事务原子写入。原因：create 端点无 URL `channel_id`，Worker 现场 mint 会使重试路由到不同 DO，Phase 2 in-DO 幂等模式对 create 结构性失效。
 ```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Write failing test for the error-code HTTP status mapping**
+
+`test/errors.test.ts`:
+```typescript
+import { describe, it, expect } from "vitest";
+import { ApiError } from "../src/errors";
+
+describe("ApiError HTTP status mapping (Phase 3 codes)", () => {
+  it("MEMBER_NOT_FOUND → 404", () => {
+    expect(new ApiError("MEMBER_NOT_FOUND", "x").httpStatus).toBe(404);
+    expect(new ApiError("MEMBER_NOT_FOUND", "x").retryable).toBe(false);
+  });
+  it("CHANNEL_DISSOLVED → 409", () => {
+    expect(new ApiError("CHANNEL_DISSOLVED", "x").httpStatus).toBe(409);
+    expect(new ApiError("CHANNEL_DISSOLVED", "x").retryable).toBe(false);
+  });
+  it("INVITE_NOT_FOUND → 404 (forward-compat for Phase 6)", () => {
+    expect(new ApiError("INVITE_NOT_FOUND", "x").httpStatus).toBe(404);
+  });
+});
+```
+
+- [ ] **Step 6: Run test to verify it fails**
+
+Run: `npx vitest run test/errors.test.ts --no-file-parallelism --test-timeout=60000`
+Expected: FAIL — `MEMBER_NOT_FOUND`/`CHANNEL_DISSOLVED` fall back to `500` (code not in `HTTP_STATUS_BY_CODE`).
+
+- [ ] **Step 7: Add the three codes to `src/errors.ts`**
+
+In `src/errors.ts`, in the `HTTP_STATUS_BY_CODE` record, the codes already present include `MESSAGE_NOT_FOUND: 404`. Add `MEMBER_NOT_FOUND`, `INVITE_NOT_FOUND`, and `CHANNEL_DISSOLVED`. Replace the block:
+```typescript
+  CHANNEL_NOT_FOUND: 404,
+  MESSAGE_NOT_FOUND: 404,
+  CHANNEL_ARCHIVED: 409,
+```
+with:
+```typescript
+  CHANNEL_NOT_FOUND: 404,
+  MESSAGE_NOT_FOUND: 404,
+  MEMBER_NOT_FOUND: 404,
+  INVITE_NOT_FOUND: 404,
+  CHANNEL_ARCHIVED: 409,
+  CHANNEL_DISSOLVED: 409,
+```
+`RETRYABLE_CODES` stays unchanged — none of the three new codes are retryable.
+
+- [ ] **Step 8: Run test to verify it passes + typecheck**
+
+Run: `npx vitest run test/errors.test.ts --no-file-parallelism --test-timeout=60000 && npm run typecheck`
+Expected: all 3 PASS; typecheck clean.
+
+- [ ] **Step 9: Commit**
 
 ```bash
-git add docs/api-contract/2026-06-22-toolbear-chat-api-contract.md docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md
-git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "docs: v2.5/v3.5 — POST /channels create idempotency coordinated by UserDirectory"
+git add docs/api-contract/2026-06-22-toolbear-chat-api-contract.md docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md src/errors.ts test/errors.test.ts
+git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "docs+errors: v2.5/v3.5 create-coordinator rule + MEMBER_NOT_FOUND/CHANNEL_DISSOLVED/INVITE_NOT_FOUND codes"
 ```
 
 ---
@@ -221,6 +288,7 @@ git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat(chat): chann
   - `buildMemberJoinedPayload(raw: { channel_id: string; user_id: string; role: string; membership_version: number; actor_kind: string; actor_id: string }): Record<string, unknown>` → `{ channel_id, user_id, role, membership_version, actor_kind, actor_id }`.
   - `buildMemberRoleUpdatedPayload(raw: { channel_id: string; user_id: string; before_role: string; after_role: string; membership_version: number; actor_kind: string; actor_id: string }): Record<string, unknown>`.
   - `buildReadStateUpdatedPayload(raw: { channel_id: string; user_id: string; last_read_event_id: string }): Record<string, unknown>` → `{ channel_id, user_id, last_read_event_id }`.
+  - `buildMemberLeftPayload(raw: { channel_id: string; user_id: string; role: string; membership_version: number; actor_kind: string; actor_id: string }): Record<string, unknown>` → mirrors `buildMemberJoinedPayload`'s shape (Task 9 uses this instead of an inline payload).
   - `buildSystemNoticePayload(raw: { notice_kind: string; actor_kind: string; actor_id: string; target_user_id: string | null; message_id: string | null; channel_changes: Record<string, { before: unknown; after: unknown }> | null }): Record<string, unknown>` → persisted ref shape (design §3.5a).
   - `resolveActorForLiveBroadcast(payload: Record<string, unknown>, resolveUserSummaries: ResolveUserSummaries): Promise<Record<string, unknown>>` — async, injected-resolver variant for unit tests. Replaces `actor_id` (when `actor_kind==='user'`) with `actor: UserSummary`, and `target_user_id` with `target_user: UserSummary` (if present). Falls back to `user-<shortid>`.
   - `resolveActorWithMap(payload: Record<string, unknown>, map: Map<string, UserSummary>): Record<string, unknown>` — **sync** variant for prod use inside a DO transaction (the Hyperdrive resolution happens BEFORE the txn, the map is passed in). Same projection as the async variant. `read_state.updated` payloads (no `actor_kind`) are passed through unchanged by the caller, not by this function.
@@ -236,9 +304,11 @@ import {
   buildChannelDissolvedPayload,
   buildMemberJoinedPayload,
   buildMemberRoleUpdatedPayload,
+  buildMemberLeftPayload,
   buildReadStateUpdatedPayload,
   buildSystemNoticePayload,
   resolveActorForLiveBroadcast,
+  resolveActorWithMap,
 } from "../../src/chat/channel-events";
 
 describe("persisted payloads store actor refs, not UserSummary", () => {
@@ -267,6 +337,11 @@ describe("persisted payloads store actor refs, not UserSummary", () => {
   it("member.role_updated", () => {
     const p = buildMemberRoleUpdatedPayload({ channel_id: "c1", user_id: "u2", before_role: "member", after_role: "admin", membership_version: 4, actor_kind: "user", actor_id: "u1" });
     expect(p).toMatchObject({ before_role: "member", after_role: "admin", membership_version: 4 });
+  });
+
+  it("member.left mirrors member.joined shape", () => {
+    const p = buildMemberLeftPayload({ channel_id: "c1", user_id: "u2", role: "member", membership_version: 4, actor_kind: "user", actor_id: "u1" });
+    expect(p).toMatchObject({ channel_id: "c1", user_id: "u2", role: "member", membership_version: 4, actor_kind: "user", actor_id: "u1" });
   });
 
   it("read_state.updated", () => {
@@ -376,6 +451,13 @@ export function buildMemberRoleUpdatedPayload(raw: {
   actor_kind: string; actor_id: string;
 }): Record<string, unknown> {
   return { channel_id: raw.channel_id, user_id: raw.user_id, before_role: raw.before_role, after_role: raw.after_role, membership_version: raw.membership_version, actor_kind: raw.actor_kind, actor_id: raw.actor_id };
+}
+
+export function buildMemberLeftPayload(raw: {
+  channel_id: string; user_id: string; role: string; membership_version: number;
+  actor_kind: string; actor_id: string;
+}): Record<string, unknown> {
+  return { channel_id: raw.channel_id, user_id: raw.user_id, role: raw.role, membership_version: raw.membership_version, actor_kind: raw.actor_kind, actor_id: raw.actor_id };
 }
 
 export function buildReadStateUpdatedPayload(raw: {
@@ -530,6 +612,8 @@ import {
   buildChannelDissolvedPayload,
   buildMemberJoinedPayload,
   buildMemberRoleUpdatedPayload,
+  buildMemberLeftPayload,
+  buildReadStateUpdatedPayload,
   buildSystemNoticePayload,
   resolveActorWithMap,
 } from "../chat/channel-events";
@@ -668,13 +752,19 @@ if (url.pathname === "/internal/create-channel") {
   const finalMv = mv;
   const memberCount = 1 + initialMembers.length;
 
-  const result = await this.ctx.storage.transaction(async () => {
+  const result = await this.ctx.storage.transaction(async (): Promise<
+    | { kind: "cached"; channel: Record<string, unknown>; joinedAt: string }
+    | { kind: "created"; channel: Record<string, unknown>; joinedAt: string }
+  > => {
     const existing = this.ctx.storage.sql.exec("SELECT channel_id FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { channel_id: string } | undefined;
     if (existing !== undefined) {
       // Idempotent re-call (coordinator crashed after create committed, before marking completed).
-      const meta = this.ctx.storage.sql.exec("SELECT channel_id, kind, visibility, title, topic, avatar_url, member_count, status, created_at, updated_at FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as Record<string, unknown>;
+      // Return the channel FROM THE DB, not from the request body — the re-call may carry a
+      // different body shape than the original committed row.
+      const meta = this.ctx.storage.sql.exec("SELECT channel_id, kind, visibility, title, topic, avatar_url, member_count, status, created_at, updated_at FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { channel_id: string; kind: string; visibility: string; title: string; topic: string | null; avatar_url: string | null; member_count: number; status: string; created_at: string; updated_at: string };
       const owner = this.ctx.storage.sql.exec("SELECT joined_at FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", channelId, creatorUserId).toArray()[0] as { joined_at: string } | undefined;
-      return { kind: "cached" as const, channel: meta, joinedAt: owner?.joined_at ?? now };
+      const cachedChannel = { channel_id: meta.channel_id, kind: meta.kind, visibility: meta.visibility, title: meta.title, topic: meta.topic, avatar_url: meta.avatar_url, member_count: meta.member_count, status: meta.status, created_at: meta.created_at, updated_at: meta.updated_at };
+      return { kind: "cached" as const, channel: cachedChannel, joinedAt: owner?.joined_at ?? meta.created_at };
     }
 
     this.ctx.storage.sql.exec(
@@ -711,18 +801,13 @@ if (url.pathname === "/internal/create-channel") {
         now, now, now,
       );
     }
-    return { kind: "created" as const, joinedAt: now };
+    return { kind: "created" as const, channel: { channel_id: channelId, kind: "channel", visibility, title, topic: b.topic ?? null, avatar_url: null, member_count: memberCount, status: "active", created_at: now, updated_at: now }, joinedAt: now };
   });
 
   if (result.kind === "created") await this.scheduleOutboxAlarm(now);
 
-  const channel = {
-    channel_id: channelId, kind: "channel", visibility, title, topic: b.topic ?? null,
-    avatar_url: null, member_count: memberCount, status: "active",
-    created_at: now, updated_at: now,
-  };
   return Response.json({
-    channel,
+    channel: result.channel,
     membership: { role: "owner", joined_at: result.joinedAt },
     event_ids: result.kind === "created" ? events.map((e) => e.id) : [],
   });
@@ -741,6 +826,133 @@ Expected: all 4 PASS; typecheck clean.
 ```bash
 git add src/do/chat-channel.ts test/do/chat-channel-create.test.ts
 git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat(do): ChatChannel /internal/create-channel atomic create + idempotent re-call"
+```
+
+---
+
+## Task 4b: `/internal/replay` resolves Phase 3 management-event actors (storage-vs-wire)
+
+**Why this task is P0:** the persisted payloads for `channel.updated`, `channel.dissolved`, `member.*`, `system.notice`, `read_state.updated` store `actor_kind`/`actor_id` (and `target_user_id`) REFS. The WIRE replay projection must resolve them to `actor`/`target_user` UserSummaries (contract §10 `system.notice` wire shape has `actor`/`target_user`; design §3.5a storage-vs-wire rule). Today `/internal/replay` only resolves the sender for `message.created`/`message.updated` — Phase 3 management events would be replayed with bare `actor_id`, violating the contract. This was a P0 gap in the first plan draft.
+
+**Files:**
+- Modify: `src/do/chat-channel.ts` (`/internal/replay` handler)
+- Test: `test/do/chat-channel-replay-projection.test.ts` (Create)
+
+**Interfaces:**
+- Consumes: `resolveUserSummaries` (already imported), `resolveActorWithMap` from `../chat/channel-events`.
+- Produces: `/internal/replay` now, BEFORE building output frames, scans every event's parsed `payload_json` for `actor_kind==='user'` + `actor_id` and for `target_user_id`, collects them into one batched `resolveUserSummaries`, and rewrites each event's payload via `resolveActorWithMap(payload, map)` for the management-event types — exactly as it already does for `message.created`/`message.updated` senders. `read_state.updated` payloads (no actor) pass through unchanged.
+
+- [ ] **Step 1: Write failing test**
+
+`test/do/chat-channel-replay-projection.test.ts`:
+```typescript
+import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:workers";
+import { getNamedDo } from "../helpers";
+
+describe("ChatChannel /internal/replay actor projection", () => {
+  it("replays system.notice with resolved actor + target_user (not bare ids)", async () => {
+    const cid = "0198aaaa-0000-7000-8000-000000000001";
+    const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], cid);
+    // Create the channel (owner=u-replay-owner), which writes channel.created + member.joined
+    // + system.notice(notice_kind=channel.created, actor=owner). These payloads store actor_id=owner.
+    await stub.fetch(new Request("https://x/internal/create-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-replay-owner", "Content-Type": "application/json" },
+      body: JSON.stringify({ channel_id: cid, creator_user_id: "u-replay-owner", title: "R", topic: null, avatar_attachment_id: null, visibility: "private", initial_members: [{ user_id: "u-replay-target", role: "member" }] }),
+    }));
+    const res = await stub.fetch(new Request("https://x/internal/replay?after=", { headers: { "X-Verified-User-Id": "u-replay-owner" } }));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { events: Array<{ event_json: string }> };
+    const frames = body.events.map((e) => JSON.parse(e.event_json) as { type: string; payload: Record<string, unknown> });
+    // Find the system.notice for member.joined of the initial member (target_user set).
+    const notice = frames.find((f) => f.type === "system.notice" && (f.payload as { notice_kind?: string }).notice_kind === "member.joined");
+    expect(notice).toBeTruthy();
+    const p = notice!.payload as { actor?: unknown; target_user?: unknown; actor_id?: unknown; target_user_id?: unknown };
+    expect(p).toHaveProperty("actor");
+    expect(p).toHaveProperty("target_user");
+    expect(p.actor_id).toBeUndefined();      // ref stripped on the wire
+    expect(p.target_user_id).toBeUndefined(); // ref stripped on the wire
+  });
+
+  it("replays channel.created with resolved actor, not bare actor_id", async () => {
+    const cid = "0198bbbb-0000-7000-8000-000000000001";
+    const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], cid);
+    await stub.fetch(new Request("https://x/internal/create-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-replay-owner2", "Content-Type": "application/json" },
+      body: JSON.stringify({ channel_id: cid, creator_user_id: "u-replay-owner2", title: "R2", topic: null, avatar_attachment_id: null, visibility: "private", initial_members: [] }),
+    }));
+    const res = await stub.fetch(new Request("https://x/internal/replay?after=", { headers: { "X-Verified-User-Id": "u-replay-owner2" } }));
+    const frames = ((await res.json()) as { events: Array<{ event_json: string }> }).events.map((e) => JSON.parse(e.event_json) as { type: string; payload: Record<string, unknown> });
+    const created = frames.find((f) => f.type === "channel.created")!;
+    expect(created.payload).toHaveProperty("actor");
+    expect(created.payload).not.toHaveProperty("actor_id");
+  });
+});
+```
+
+> **Note on actor resolution:** the initial creation writes payloads with `actor_kind='user'`/`actor_id=creatorUserId` (channel.created, system.notice) and `actor_kind='system'`/`actor_id='system'` (member.joined). `resolveActorWithMap` turns system actors into `actor: null`. The test asserts the wire shape has `actor`/`target_user` set and the ref fields stripped — it does NOT assert on whether a given user_id resolves to a display_name (Hyperdrive is not seeded in tests; the function falls back to `user-<shortid>`, which still satisfies "actor is a UserSummary object, not a bare id").
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run test/do/chat-channel-replay-projection.test.ts --no-file-parallelism --test-timeout=60000`
+Expected: FAIL — the replayed frames still carry `actor_id`/`target_user_id` (current code only resolves message senders).
+
+- [ ] **Step 3: Refactor `/internal/replay` to collect + resolve management-event actors**
+
+In `src/do/chat-channel.ts`, the `/internal/replay` handler has two loops over `parsedRows`: a first to collect `message.created`/`message.updated` sender ids, and a second to build the output. Replace BOTH so they also collect management-event actor/target ids and apply `resolveActorWithMap`. Concretely:
+
+1. Add the import for `resolveActorWithMap` (it is already added in Task 4 Step 1's import block — confirm it's present).
+2. In the **first** collection loop, generalize: for `message.created`/`message.updated`, collect `payload.message.sender.user_id` (unchanged); for `channel.created`/`channel.updated`/`channel.dissolved`/`member.joined`/`member.left`/`member.role_updated`/`system.notice`, parse `payload_json` and if `actor_kind==='user'` and `actor_id` is a string, collect it; also collect `payload.target_user_id` when it's a non-empty string. Replace the existing first loop (the one that builds `allSenderIds` for `message.*`) with:
+```typescript
+const managementTypes = new Set(["channel.created", "channel.updated", "channel.dissolved", "member.joined", "member.left", "member.role_updated", "system.notice"]);
+const userIdsToResolve: string[] = [];
+for (const r of parsedRows) {
+  if (r.event_type === "message.created" || r.event_type === "message.updated") {
+    try {
+      const p = JSON.parse(r.payload_json) as { message?: { sender?: { kind?: string; user_id?: string | null } } };
+      if (p.message?.sender?.kind === "user" && p.message.sender.user_id) userIdsToResolve.push(p.message.sender.user_id);
+    } catch { /* ignore malformed */ }
+    continue;
+  }
+  if (managementTypes.has(r.event_type)) {
+    try {
+      const p = JSON.parse(r.payload_json) as { actor_kind?: string; actor_id?: string; target_user_id?: string | null };
+      if (p.actor_kind === "user" && typeof p.actor_id === "string" && p.actor_id) userIdsToResolve.push(p.actor_id);
+      if (typeof p.target_user_id === "string" && p.target_user_id) userIdsToResolve.push(p.target_user_id);
+    } catch { /* ignore malformed */ }
+  }
+}
+```
+3. Replace the batched-resolve block (currently `resolveUserSummaries(Array.from(new Set(allSenderIds)), ...)` building `liveSenderMap`) — build a single `liveMap` covering sender ids AND management-event actor/target ids, then derive `liveSenderMap` from it (so the existing `message.*` `resolveSenderForLiveBroadcast` call still works). Concretely:
+```typescript
+const liveMap = await resolveUserSummaries(Array.from(new Set(userIdsToResolve)), this.env);
+const liveSenderMap = new Map<string, LiveUserSummary>();
+for (const [id, summary] of liveMap) {
+  liveSenderMap.set(id, { user_id: summary.user_id, display_name: summary.display_name ?? `user-${id.slice(0, 8)}`, avatar_url: summary.avatar_url });
+}
+```
+4. In the **second** (build) loop, the existing `message.*` branch calls `resolveSenderForLiveBroadcast(payload, ...)` (keep it). Add, right after that branch, a management-event branch that applies `resolveActorWithMap` using `liveMap`:
+```typescript
+if (managementTypes.has(r.event_type) && r.event_type !== "read_state.updated") {
+  payload = resolveActorWithMap(payload, liveMap);
+}
+```
+> `read_state.updated` has no actor (produced by Task 11); leave it unchanged — but the handler in Task 11 will NOT emit it via events at all (see Task 11: read-state is `my_channels`-only, no event). So this branch covers the real management types. If Task 11 is later changed to emit `read_state.updated`, re-evaluate.
+
+> **Implementation note:** keep the `managementTypes` `Set` (a `const` outside the loop). Use the same variable name `liveMap` in the build loop closure so the management branch sees it. Do NOT introduce a second `resolveUserSummaries` call — one batched call covers senders + actors + targets.
+
+- [ ] **Step 4: Run the replay-projection tests + the existing replay-dependent suites**
+
+Run: `npx vitest run test/do/chat-channel-replay-projection.test.ts test/routes/events.test.ts test/do/chat-channel-message-send.test.ts test/integration/message-send.test.ts --no-file-parallelism --test-timeout=60000 && npm run typecheck`
+Expected: new tests PASS; existing `events`/`message-send` tests still green (the `message.*` path is unchanged); typecheck clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/do/chat-channel.ts test/do/chat-channel-replay-projection.test.ts
+git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "fix(do): /internal/replay resolves Phase 3 management-event actors (storage-vs-wire)"
 ```
 
 ---
@@ -822,10 +1034,11 @@ describe("UserDirectory /internal/channel-create-coordinate", () => {
   });
 
   it("same key + same body returns the SAME channel_id (cached)", async () => {
-    const { body: b1 } = await coordinate({ idempotency_key: "key-dup" });
+    const r1 = await coordinate({ idempotency_key: "key-dup" });
+    const b1 = (await r1.res.json()) as { channel: { channel_id: string } };
     const r2 = await coordinate({ idempotency_key: "key-dup" });
-    const body2 = (await r2.res.json()) as { channel: { channel_id: string } };
-    expect(body2.channel.channel_id).toBe(b1.channel.channel_id);
+    const b2 = (await r2.res.json()) as { channel: { channel_id: string } };
+    expect(b2.channel.channel_id).toBe(b1.channel.channel_id);
   });
 
   it("same key + different body returns 409 IDEMPOTENCY_CONFLICT", async () => {
@@ -1109,31 +1322,38 @@ git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat(routes): POS
   - `PATCH /api/chat/channels/{channel_id}` (Worker route): auth → route → `/internal/update-channel` → `{ channel }`.
 - **Permission:** owner or admin may update (design §8: "owner/admin 可改"). Active member alone is not enough.
 
-- [ ] **Step 1: Add `assertNotDissolved` + `assertMemberRole` helpers to ChatChannel**
+- [ ] **Step 1: Add `assertNotDissolved` + `activeRole` + `cachedResponse` helpers to ChatChannel**
 
-Add near the other private helpers in `src/do/chat-channel.ts`:
+Add near the other private helpers in `src/do/chat-channel.ts` (these are shared by Tasks 7/8/9):
 ```typescript
 private assertNotDissolved(status: string): { code: string; message: string } | null {
   if (status === "dissolved") return { code: "CHANNEL_DISSOLVED", message: "channel is dissolved" };
   return null;
 }
 
-// introspect membership; returns role or null. `channelId`+$ channelStatus read by caller.
-private memberStatus(channelId: string, userId: string): { status: string; role: string | null } | undefined {
-  const row = this.ctx.storage.sql
-    .exec("SELECT role FROM members WHERE channel_id=? AND user_id=?", channelId, userId)
-    .toArray()[0] as { role: string } | undefined;
-  if (row === undefined) return undefined; // never joined
-  return row; // role present even if left_at set — see member row: left_at not selected here
-}
-```
-> Note: `members` row keeps `role` after `left_at`; membership *active* check needs `left_at IS NULL`. Add a dedicated getter:
-```typescript
+// The caller's role if they are an ACTIVE member (left_at IS NULL), else null.
 private activeRole(channelId: string, userId: string): string | null {
   const row = this.ctx.storage.sql
     .exec("SELECT role FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", channelId, userId)
     .toArray()[0] as { role: string } | undefined;
   return row?.role ?? null;
+}
+
+// Maps a cached `{channel|member|error}` JSON (encoded inside a txn that cannot write business rows)
+// to the right HTTP status. Shared by all write handlers' cached branches (Tasks 7/8/9/11).
+private cachedResponse(j: string): Response {
+  const cached = JSON.parse(j) as { channel?: unknown; member?: unknown; error?: { code?: string; message?: string } };
+  if (cached.error) {
+    const code = cached.error.code ?? "CHAT_WORKER_UNAVAILABLE";
+    const status = code === "FORBIDDEN" ? 403
+      : code === "CHANNEL_NOT_FOUND" ? 404
+      : code === "MEMBER_NOT_FOUND" ? 404
+      : code === "CHANNEL_DISSOLVED" ? 409
+      : code === "INVALID_MESSAGE" ? 422
+      : 503;
+    return Response.json({ error: { code, message: cached.error.message ?? "error", retryable: false } }, { status });
+  }
+  return new Response(j, { status: 200, headers: { "Content-Type": "application/json" } });
 }
 ```
 
@@ -1219,7 +1439,16 @@ if (url.pathname === "/internal/update-channel") {
   const now = this.nowIso();
   const nowMs = Date.parse(now);
 
-  const requestHash = JSON.stringify({ title: b.title ?? null, topic: b.topic ?? null, avatar_attachment_id: b.avatar_attachment_id ?? null, visibility: b.visibility ?? null });
+  // Presence-aware canonical request body: omitted field vs explicit null are DISTINCT.
+  // `title:"x"` (only title set) must hash differently from `title:"x", topic:null`,
+  // otherwise a second request that explicitly nulls `topic` would collide with an omit-topic
+  // request and wrongly register as cached/conflict. Capture exactly the keys the client sent.
+  const present: Record<string, unknown> = {};
+  if (b.title !== undefined) present.title = b.title;
+  if (b.topic !== undefined) present.topic = b.topic;
+  if (b.avatar_attachment_id !== undefined) present.avatar_attachment_id = b.avatar_attachment_id;
+  if (b.visibility !== undefined) present.visibility = b.visibility;
+  const requestHash = JSON.stringify(present);
   const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
 
   const actorMap = await this.resolveActorMap([userId]);
@@ -1238,16 +1467,17 @@ if (url.pathname === "/internal/update-channel") {
     }
 
     const meta = this.ctx.storage.sql.exec(
-      "SELECT channel_id, kind, visibility, title, topic, avatar_url, status, created_by, created_at, member_count, membership_version FROM channel_meta WHERE channel_id=?", channelId,
-    ).toArray()[0] as { kind: string; visibility: string; title: string; topic: string | null; avatar_url: string | null; status: string; created_by: string; created_at: string; member_count: number; membership_version: number } | undefined;
-    if (meta === undefined) return { kind: "conflict" }; // channel gone → treat as not-found upstream
+      "SELECT kind, visibility, title, topic, avatar_url, status, created_at, member_count, membership_version FROM channel_meta WHERE channel_id=?", channelId,
+    ).toArray()[0] as { kind: string; visibility: string; title: string; topic: string | null; avatar_url: string | null; status: string; created_at: string; member_count: number; membership_version: number } | undefined;
+    if (meta === undefined) {
+      // channel gone → 404 CHANNEL_NOT_FOUND (NOT a conflict).
+      return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
+    }
     const d = this.assertNotDissolved(meta.status);
     if (d) return { kind: "cached", responseJson: JSON.stringify({ error: { code: d.code, message: d.message, retryable: false } }) };
 
     const role = this.activeRole(channelId, userId);
     if (role !== "owner" && role !== "admin") {
-      // not authorized — encode as FORBIDDEN; caller (worker) maps status.
-      void role;
       return { kind: "cached", responseJson: JSON.stringify({ error: { code: "FORBIDDEN", message: "not authorized to update channel", retryable: false } }) };
     }
 
@@ -1288,23 +1518,14 @@ if (url.pathname === "/internal/update-channel") {
   if (txResult.kind === "conflict") {
     return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
   }
-  // cached response may carry an error shape (FORBIDDEN / CHANNEL_DISSOLVED / channel-gone).
-  const cached = JSON.parse(txResult.kind === "cached" ? txResult.responseJson : (txResult.kind === "ok" ? JSON.stringify({ channel: (await Promise.resolve(txResult as { channel: Record<string, unknown> }).channel) ?? {} }) : "{}")) as { channel?: Record<string, unknown>; error?: { code?: string; message?: string } };
   if (txResult.kind === "ok") {
     await this.scheduleOutboxAlarm(now);
-    return Response.json({ channel: cached.channel ?? txResult.channel }, { status: 200 });
+    return Response.json({ channel: txResult.channel }, { status: 200 });
   }
-  // cached branch
-  if (cached.error) {
-    const code = cached.error.code ?? "CHAT_WORKER_UNAVAILABLE";
-    const status = code === "FORBIDDEN" ? 403 : code === "CHANNEL_DISSOLVED" ? 409 : code === "CHANNEL_NOT_FOUND" ? 404 : 503;
-    return Response.json({ error: { code, message: cached.error.message ?? "error", retryable: false } }, { status });
-  }
-  return new Response(txResult.responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
+  // cached branch (success cached OR an error shape encoded inside the txn).
+  return this.cachedResponse(txResult.responseJson);
 }
 ```
-
-> **Cached-error handling:** the transaction has to encode FORBIDDEN/DISSOLVED/missing-channel as a "cached" JSON so it can return outside the txn without writing business rows. The branch above maps `{error.code}` → HTTP status. The `channel-gone` case (meta undefined) returns 404 `CHANNEL_NOT_FOUND`.
 
 - [ ] **Step 5: Run the DO update tests**
 
@@ -1332,7 +1553,7 @@ export async function updateChannelHandler(c: Context<{ Bindings: Env; Variables
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
     body: JSON.stringify({
-      idempotency_key: idempotency_key,
+      idempotency_key: idempotencyKey,
       channel_id: channelId,
       title: body.title, topic: body.topic, avatar_attachment_id: body.avatar_attachment_id, visibility: body.visibility,
     }),
@@ -1353,7 +1574,6 @@ Add the import at the top of `src/routes/channel-mutations.ts`:
 ```typescript
 import { channelRouteNameFor } from "../chat/system-channel";
 ```
-> **⚠ Fix the typo above before writing the file:** the `body:` JSON uses `idempotency_key: idempotency_key` (self-reference). Write it as `idempotency_key: idempotencyKey,`.
 
 Register in `src/index.ts`:
 ```typescript
@@ -1541,34 +1761,46 @@ if (url.pathname === "/internal/dissolve") {
     await this.scheduleOutboxAlarm(now);
     return Response.json({ channel: txResult.channel }, { status: 200 });
   }
-  // cached
-  const cached = JSON.parse(txResult.responseJson) as { channel?: Record<string, unknown>; error?: { code?: string; message?: string } };
-  if (cached.error) {
-    const code = cached.error.code ?? "CHAT_WORKER_UNAVAILABLE";
-    const status = code === "FORBIDDEN" ? 403 : code === "CHANNEL_NOT_FOUND" ? 404 : 503;
-    return Response.json({ error: { code, message: cached.error.message ?? "error", retryable: false } }, { status });
-  }
-  return new Response(txResult.responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
+  // cached (already-dissolved cached result OR an error shape encoded inside the txn).
+  return this.cachedResponse(txResult.responseJson);
 }
 ```
 
 - [ ] **Step 4: Add the dissolved write-gate to `/internal/message-send` and `/internal/join`**
 
-In `src/do/chat-channel.ts`, at the top of the `message-send` transaction (right after `const txResult = await this.ctx.storage.transaction(async (): Promise<SendResult> => {`), add a dissolved check that aborts before writing. The cleanest minimal change: inside the transaction, before the idempotency SELECT, add:
+The gate must reject writes to a dissolved channel with `409 CHANNEL_DISSOLVED`. Do this by adding a `dissolved` variant to the existing `SendResult` union (so the transaction can short-circuit without writing business rows) and handling it after the transaction.
+
+**For `/internal/message-send`:** the handler already declares `type SendResult = { kind: "created"; ... } | { kind: "cached"; ... } | { kind: "conflict" };`. Add a `dissolved` variant and a gate at the top of the transaction body (before the idempotency SELECT):
+
+```typescript
+type SendResult =
+  | { kind: "created"; message_id: string; event_id: string }
+  | { kind: "cached"; message_id: string; event_id: string }
+  | { kind: "conflict" }
+  | { kind: "dissolved" };
+```
+and inside `this.ctx.storage.transaction(async (): Promise<SendResult> => { ... })`, as the first statement:
 ```typescript
 const statusRow = this.ctx.storage.sql.exec("SELECT status FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string } | undefined;
 if (statusRow?.status === "dissolved") {
-  return { kind: "created" as const, message_id: "", event_id: "" }; // sentinel — see below
+  return { kind: "dissolved" };
 }
 ```
-> **⚠ Sentinel approach is awkward — prefer the explicit form.** Instead, change `SendResult` to include a `dissolved` variant: add `| { kind: "dissolved" }` to the `SendResult` type, return `{ kind: "dissolved" }` from the gate, and in the post-txn block handle it:
+Then, in the post-transaction handling (after the `conflict` branch), add:
 ```typescript
 if (txResult.kind === "dissolved") {
   return Response.json({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }, { status: 409 });
 }
 ```
-> Add the same `{ kind: "dissolved" }` return-ahead at the top of the `/internal/join` transaction (after reading `meta`), returning a 409 from the `/internal/join` handler when the channel is dissolved (join into a dissolved channel is a write).
-> **Note for the implementer:** the `/internal/join` handler currently returns plain `Response.json`/`new Response` — add the dissolved check right after `channelId = meta.channel_id;` and `return Response.json({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }, { status: 409 });` when `meta.status === 'dissolved'`. This requires adding `status` to the existing `meta` SELECT in `/internal/join` (add `status` to the column list).
+Because `scheduleOutboxAlarm` only runs for `kind === "created"`, the `dissolved` branch writes nothing and schedules nothing — correct.
+
+**For `/internal/join`:** the handler reads `meta` already (`SELECT channel_id, kind, membership_version, member_count FROM channel_meta`). Add `status` to that SELECT's column list, then immediately after `channelId = meta.channel_id;` add:
+```typescript
+if (meta.status === "dissolved") {
+  return Response.json({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }, { status: 409 });
+}
+```
+Joining a dissolved channel is a write (it mutates `members`/`channel_meta`), so it must be gated.
 
 - [ ] **Step 5: Run the DO dissolve tests**
 
@@ -1656,12 +1888,19 @@ git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: POST /chann
 - Test: `test/routes/channel-mutations.test.ts` (members cases, appended)
 
 **Interfaces:**
-- Consumes: `persistEventAndFanout` + `resolveActorMap`, `buildMemberJoinedPayload` + `buildMemberRoleUpdatedPayload` + `buildSystemNoticePayload`, `markMemberLeftAndEnqueueFanoutUnregister` (Phase 2), `activeRole`, `assertNotDissolved`.
+- Consumes: `persistEventAndFanout` + `resolveActorMap`, `buildMemberJoinedPayload` + `buildMemberRoleUpdatedPayload` + `buildMemberLeftPayload` + `buildSystemNoticePayload` (Task 3), `activeRole`, `assertNotDissolved`, `cachedResponse` (Task 7).
 - Produces (all on `ChatChannel`):
-  - `POST /internal/members-add` body `{ idempotency_key, channel_id, user_id, role }`. Idempotency `(operation='members.add')` SELECT-inside-txn; dissolved-gate; gate: caller must be active `owner`/`admin`; role ∈ `member`/`admin` (not `owner`); insert/reactivate `members` row (treat rejoin like `/internal/join`: clear `left_at`, restore role); bump `membership_version`; write `member.joined` (actor=user=caller) + `system.notice` (notice_kind=`member.joined`, target_user=add_user); `user_directory` join outbox. Returns `{ member }`.
-  - `POST /internal/members-update-role` body `{ idempotency_key, channel_id, user_id, role }`. Idempotency `(operation='members.role')`; dissolved-gate; gate: caller `owner` only; target must be an active member; role ∈ `member`/`admin`; record `before_role`; UPDATE; bump mv; write `member.role_updated` (actor=user=caller) + `system.notice` (notice_kind=`member.role_updated`, target_user). Returns `{ member }`.
-  - `POST /internal/members-remove` body `{ idempotency_key, channel_id, user_id }`. Idempotency `(operation='members.remove')`; dissolved-gate; gate: caller `owner` (can remove others) OR `user_id === caller` (self-leave); target must be active member; reuse `markMemberLeftAndEnqueueFanoutUnregister` (co-atomic leave + fanout unregister outbox); write `member.left` (actor=user=caller) + `system.notice` (notice_kind=`member.left`, target_user). Returns `{ channel_id, user_id, removed: true }`.
+  - A **sync leave helper** `markMemberLeftAndEnqueueFanoutUnregisterSync(channelId, userId, nowIso): void` — extracted from the Phase 2 async `markMemberLeftAndEnqueueFanoutUnregister`. Same writes (UPDATE `members.left_at` + membership_version/count bump + `channel_fanout` unregister-user outbox row), but synchronous so it can run INSIDE a `ctx.storage.transaction` alongside the `member.left` event + outbox. The Phase 2 async method (`markMemberLeftAndEnqueueFanoutUnregister`, used by `/internal/test-leave`) is reframed to a thin async wrapper that opens its own transaction and calls the sync core — so there is ONE leave implementation, not two (P0-6 fix).
+  - `POST /internal/members-add` body `{ idempotency_key, channel_id, user_id, role }`. Idempotency `(operation='members.add')` SELECT-inside-txn; dissolved-gate; gate: caller active `owner`/`admin`; role ∈ `member`/`admin` (not `owner`); no self-add. **Member state machine (P0-5 fix):**
+    - never joined → INSERT + count +1 + emit `member.joined`;
+    - left → reactivate (`left_at=NULL`, set role) + count +1 + emit `member.joined` (re-join);
+    - **active (already a member) → WITHOUT a role change**: idempotent cached `{ member }`, no event, no count change.
+    - **active + different requested role → `422 INVALID_MESSAGE`** ("use PATCH /members/{user_id} to change role"). This closes the admin-can-change-role-via-add bypass: adding is NOT a path to mutate an active member's role.
+    bump `membership_version` only when a real state change happens (join or rejoin). Returns `{ member }`.
+  - `POST /internal/members-update-role` body `{ idempotency_key, channel_id, user_id, role }`. Idempotency `(operation='members.role')`; dissolved-gate; gate: caller `owner` only; target must be an **active** member; role ∈ `member`/`admin`; record `before_role`; UPDATE; bump mv; write `member.role_updated` + `system.notice`. Returns `{ member }`.
+  - `POST /internal/members-remove` body `{ idempotency_key, channel_id, user_id }`. Idempotency `(operation='members.remove')`; dissolved-gate; gate: caller `owner` (can remove others) OR `user_id === caller` (self-leave). **Owner invariant (P1-6 fix):** the owner (`role='owner'`, i.e. `channel_meta.created_by`) CANNOT self-leave (a channel must always have exactly one active owner). Self-leave by the owner → `422 INVALID_MESSAGE` ("owner cannot leave; transfer ownership in a future phase"). Removed-by-owner of any member (including a left owner re-removal, though left owners shouldn't exist) is allowed. target must be an active member (else `404 MEMBER_NOT_FOUND`). Reuse `markMemberLeftAndEnqueueFanoutUnregisterSync` for the co-atomic leave + unregister; then write `member.left` (via `buildMemberLeftPayload`) + `system.notice` + `user_directory` leave outbox. Returns `{ channel_id, user_id, removed: true }`.
   - Worker routes: `POST /channels/:id/members` → add; `PATCH /channels/:id/members/:member_user_id` → update-role; `DELETE /channels/:id/members/:member_user_id` → remove.
+- **Owner invariant (whole-task):** the channel always has exactly one active owner (`created_by`, `role='owner'`). Dissolve (Task 8) is the owner's exit path; Phase 3 has no owner-transfer, so owner self-leave and demoting the owner are both rejected. Other members (admin/member) may leave freely. Left/removed members stay in `members` (with `left_at`); dissolved channels keep everyone as a tombstone.
 
 - [ ] **Step 1: Write failing DO tests**
 
@@ -1721,6 +1960,46 @@ describe("ChatChannel members CRUD", () => {
     const res = await stub.fetch(new Request("https://x/internal/members-remove", { method: "POST", headers: { "X-Verified-User-Id": "u-self-leave", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-rem-2", channel_id: cid, user_id: "u-self-leave" }) }));
     expect(res.status).toBe(200);
   });
+
+  it("add with a DIFFERENT role on an active member → 422 (no role-change-via-add bypass)", async () => {
+    const cid = "0195ffff-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-6", channel_id: cid, user_id: "u-bypass", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-6b", channel_id: cid, user_id: "u-bypass", role: "admin" }) }));
+    expect(res.status).toBe(422);
+  });
+
+  it("add same role on an active member → 200 idempotent (no event, no count bump)", async () => {
+    const cid = "01950000-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-7", channel_id: cid, user_id: "u-idem-add", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-7b", channel_id: cid, user_id: "u-idem-add", role: "member" }) }));
+    expect(res.status).toBe(200);
+  });
+
+  it("reactivates a LEFT member (+1 count) → member.joined", async () => {
+    const cid = "01950001-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-8", channel_id: cid, user_id: "u-rejoin", role: "member" }) }));
+    await stub.fetch(new Request("https://x/internal/members-remove", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-rem-rejoin", channel_id: cid, user_id: "u-rejoin" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-8b", channel_id: cid, user_id: "u-rejoin", role: "admin" }) }));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { member: { role: string } }).member.role).toBe("admin");
+  });
+
+  it("owner cannot self-leave (owner invariant) → 422", async () => {
+    const cid = "01950002-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid); // owner = u-up-owner
+    const res = await stub.fetch(new Request("https://x/internal/members-remove", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-rem-owner", channel_id: cid, user_id: "u-up-owner" }) }));
+    expect(res.status).toBe(422);
+  });
+
+  it("owner cannot demote self via role-update → 422", async () => {
+    const cid = "01950003-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    const res = await stub.fetch(new Request("https://x/internal/members-update-role", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-role-owner", channel_id: cid, user_id: "u-up-owner", role: "member" }) }));
+    expect(res.status).toBe(422);
+  });
 });
 ```
 
@@ -1729,9 +2008,45 @@ describe("ChatChannel members CRUD", () => {
 Run: `npx vitest run test/do/chat-channel-mutations.test.ts --no-file-parallelism --test-timeout=60000`
 Expected: FAIL — members-* handlers return 404.
 
-- [ ] **Step 3: Implement the three members handlers**
+- [ ] **Step 3: Extract the sync leave core + implement the three members handlers**
 
-Add inside `ChatChannel.fetch` before the final 404. Share a small dissolution gate closure:
+`cachedResponse` was added in Task 7 Step 1 — reuse it (do not re-declare it). First, extract the sync leave core from the Phase 2 async helper. In `src/do/chat-channel.ts`, replace the existing `private async markMemberLeftAndEnqueueFanoutUnregister(...)` with a sync core + thin async wrapper:
+
+```typescript
+// SYNC core: co-atomic leave + fanout unregister outbox. Runs inside a caller transaction.
+// (P0-6: single leave implementation — /internal/test-leave and members-remove share this.)
+private markMemberLeftAndEnqueueFanoutUnregisterSync(channelId: string, userId: string, nowIso: string): void {
+  this.ctx.storage.sql.exec(
+    "UPDATE members SET left_at=? WHERE channel_id=? AND user_id=?",
+    nowIso, channelId, userId,
+  );
+  const meta = this.ctx.storage.sql
+    .exec("SELECT membership_version, member_count FROM channel_meta WHERE channel_id=?", channelId)
+    .toArray()[0] as { membership_version: number; member_count: number } | undefined;
+  const nextMv = (meta?.membership_version ?? 0) + 1;
+  const nextCount = Math.max(0, (meta?.member_count ?? 1) - 1);
+  this.ctx.storage.sql.exec(
+    "UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?",
+    nextMv, nextCount, nowIso, channelId,
+  );
+  this.ctx.storage.sql.exec(
+    "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'channel_fanout', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+    `channel_fanout:unregister:${channelId}:${userId}:${nowIso}`,
+    channelId,
+    JSON.stringify({ action: "unregister-user", channel_id: channelId, user_id: userId }),
+    nowIso, nowIso, nowIso,
+  );
+}
+
+// Phase 2 path (test-leave): wraps the sync core in its own transaction.
+private async markMemberLeftAndEnqueueFanoutUnregister(channelId: string, userId: string, nowIso: string): Promise<void> {
+  await this.ctx.storage.transaction(async () => {
+    this.markMemberLeftAndEnqueueFanoutUnregisterSync(channelId, userId, nowIso);
+  });
+}
+```
+
+Then add the three handlers inside `ChatChannel.fetch` before the final 404:
 
 ```typescript
 if (url.pathname === "/internal/members-add") {
@@ -1739,31 +2054,47 @@ if (url.pathname === "/internal/members-add") {
   if (!userId) return new Response("missing verified user", { status: 401 });
   const b = (await request.json()) as { idempotency_key: string; channel_id: string; user_id: string; role: string };
   const channelId = b.channel_id;
-  const now = this.nowIso(); const nowMs = Date.parse(now);
+  const now = this.nowIso();
+  const nowMs = Date.parse(now);
   const requestHash = JSON.stringify({ user_id: b.user_id, role: b.role });
-  const idemExpiresAt = new Date(nowMs + 24*60*60*1000).toISOString();
+  const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
   const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
   const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "cached"; j: string } | { kind: "conflict" } | { kind: "ok"; member: Record<string, unknown> }> => {
     const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.add' AND idempotency_key=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
     if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
-    const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, member_count, kind FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; member_count: number; kind: string } | undefined;
+    const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, member_count, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; member_count: number; kind: string; created_by: string } | undefined;
     if (!meta) return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
     if (meta.status === "dissolved") return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
     const callerRole = this.activeRole(channelId, userId);
     if (callerRole !== "owner" && callerRole !== "admin") return { kind: "cached", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "not authorized to add members", retryable: false } }) };
     if (b.role !== "member" && b.role !== "admin") return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "role must be member or admin", retryable: false } }) };
     if (b.user_id === userId) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "cannot add self", retryable: false } }) };
+    if (b.user_id === meta.created_by) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "owner is fixed; cannot add the owner", retryable: false } }) };
+
+    // Member state machine (P0-5): distinguish never-joined / left / active.
+    const existing = this.ctx.storage.sql.exec("SELECT role, left_at FROM members WHERE channel_id=? AND user_id=?", channelId, b.user_id).toArray()[0] as { role: string; left_at: string | null } | undefined;
+
+    if (existing !== undefined && existing.left_at === null) {
+      // Already an ACTIVE member — adding must NOT mutate role (that's PATCH /members/{user_id}).
+      if (existing.role !== b.role) {
+        return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "member already active; use PATCH /members/{user_id} to change role", retryable: false } }) };
+      }
+      // Idempotent re-add, no state change.
+      const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: existing.role } });
+      this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.add', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
+      return { kind: "cached", j: responseJson };
+    }
 
     const mv = meta.membership_version + 1;
-    const existing = this.ctx.storage.sql.exec("SELECT joined_at FROM members WHERE channel_id=? AND user_id=?", channelId, b.user_id).toArray()[0] as { joined_at: string } | undefined;
+    // never joined → INSERT; left → reactivate (clear left_at, set role). Count +1 either way.
     if (existing === undefined) {
       this.ctx.storage.sql.exec("INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, ?, ?, NULL)", channelId, b.user_id, b.role, now);
     } else {
       this.ctx.storage.sql.exec("UPDATE members SET role=?, joined_at=?, left_at=NULL WHERE channel_id=? AND user_id=?", b.role, now, channelId, b.user_id);
     }
-    this.ctx.storage.sql.exec("UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?", mv, meta.member_count + (existing === undefined ? 1 : 0), now, channelId);
+    this.ctx.storage.sql.exec("UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?", mv, meta.member_count + 1, now, channelId);
 
     const joinedId = this.nextEventId(nowMs);
     this.persistEventAndFanout(joinedId, "member.joined", channelId, now, buildMemberJoinedPayload({ channel_id: channelId, user_id: b.user_id, role: b.role, membership_version: mv, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
@@ -1776,7 +2107,7 @@ if (url.pathname === "/internal/members-add") {
     return { kind: "ok", member: { channel_id: channelId, user_id: b.user_id, role: b.role, joined_at: now } };
   });
   if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
-  await this.scheduleOutboxAlarm(now);
+  if (tx.kind === "ok") await this.scheduleOutboxAlarm(now);
   return tx.kind === "ok" ? Response.json({ member: tx.member }, { status: 200 }) : this.cachedResponse(tx.j);
 }
 
@@ -1784,16 +2115,18 @@ if (url.pathname === "/internal/members-update-role") {
   const userId = request.headers.get("X-Verified-User-Id") ?? "";
   if (!userId) return new Response("missing verified user", { status: 401 });
   const b = (await request.json()) as { idempotency_key: string; channel_id: string; user_id: string; role: string };
-  const channelId = b.channel_id; const now = this.nowIso(); const nowMs = Date.parse(now);
+  const channelId = b.channel_id;
+  const now = this.nowIso();
+  const nowMs = Date.parse(now);
   const requestHash = JSON.stringify({ user_id: b.user_id, role: b.role });
-  const idemExpiresAt = new Date(nowMs + 24*60*60*1000).toISOString();
+  const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
   const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
   const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "conflict" } | { kind: "cached"; j: string } | { kind: "ok"; member: Record<string, unknown> }> => {
     const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.role' AND idempotency_key=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
     if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
-    const meta = this.ctx.storage.sql.exec("SELECT status, membership_version FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number } | undefined;
+    const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; created_by: string } | undefined;
     if (!meta) return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
     if (meta.status === "dissolved") return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
     const callerRole = this.activeRole(channelId, userId);
@@ -1801,12 +2134,11 @@ if (url.pathname === "/internal/members-update-role") {
     if (b.role !== "member" && b.role !== "admin") return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "role must be member or admin", retryable: false } }) };
     const target = this.ctx.storage.sql.exec("SELECT role FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", channelId, b.user_id).toArray()[0] as { role: string } | undefined;
     if (!target) return { kind: "cached", j: JSON.stringify({ error: { code: "MEMBER_NOT_FOUND", message: "target not an active member", retryable: false } }) };
+    if (b.user_id === meta.created_by) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "cannot change the owner's role (owner is fixed)", retryable: false } }) };
     if (b.user_id === userId) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "owner cannot change own role", retryable: false } }) };
 
     const mv = meta.membership_version + 1;
     const beforeRole = target.role;
-    this.ctx.storage.sql.exec("UPDATE members SET role=?, WHERE channel_id=? AND user_id=?", b.role, channelId, b.user_id).catch?.(() => {});
-    // NOTE: the SQL above is malformed (trailing comma). Use the correct statement:
     this.ctx.storage.sql.exec("UPDATE members SET role=? WHERE channel_id=? AND user_id=?", b.role, channelId, b.user_id);
     this.ctx.storage.sql.exec("UPDATE channel_meta SET membership_version=?, updated_at=? WHERE channel_id=?", mv, now, channelId);
 
@@ -1820,7 +2152,7 @@ if (url.pathname === "/internal/members-update-role") {
     return { kind: "ok", member: { channel_id: channelId, user_id: b.user_id, role: b.role } };
   });
   if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
-  await this.scheduleOutboxAlarm(now);
+  if (tx.kind === "ok") await this.scheduleOutboxAlarm(now);
   return tx.kind === "ok" ? Response.json({ member: tx.member }, { status: 200 }) : this.cachedResponse(tx.j);
 }
 
@@ -1828,63 +2160,53 @@ if (url.pathname === "/internal/members-remove") {
   const userId = request.headers.get("X-Verified-User-Id") ?? "";
   if (!userId) return new Response("missing verified user", { status: 401 });
   const b = (await request.json()) as { idempotency_key: string; channel_id: string; user_id: string };
-  const channelId = b.channel_id; const now = this.nowIso(); const nowMs = Date.parse(now);
+  const channelId = b.channel_id;
+  const now = this.nowIso();
+  const nowMs = Date.parse(now);
   const requestHash = JSON.stringify({ user_id: b.user_id });
-  const idemExpiresAt = new Date(nowMs + 24*60*60*1000).toISOString();
+  const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
   const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
   const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "conflict" } | { kind: "cached"; j: string } | { kind: "ok" }> => {
     const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.remove' AND idempotency_key=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
     if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
-    const meta = this.ctx.storage.sql.exec("SELECT status, membership_version FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number } | undefined;
+    const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; kind: string; created_by: string } | undefined;
     if (!meta) return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
     if (meta.status === "dissolved") return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
     const callerRole = this.activeRole(channelId, userId);
-    if (b.user_id !== userId && callerRole !== "owner") return { kind: "cached", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner may remove others", retryable: false } }) };
+    const isSelf = b.user_id === userId;
+    if (!isSelf && callerRole !== "owner") return { kind: "cached", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner may remove others", retryable: false } }) };
+    // Owner invariant (P1-6): the owner cannot self-leave (no owner-transfer in Phase 3; dissolve is the owner exit).
+    if (isSelf && b.user_id === meta.created_by) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "owner cannot leave; dissolve the channel or transfer ownership in a future phase", retryable: false } }) };
     const target = this.ctx.storage.sql.exec("SELECT role FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", channelId, b.user_id).toArray()[0] as { role: string } | undefined;
     if (!target) return { kind: "cached", j: JSON.stringify({ error: { code: "MEMBER_NOT_FOUND", message: "target not an active member", retryable: false } }) };
 
     const mv = meta.membership_version + 1;
-    // Phase 2 helper: co-atomic leave + fanout unregister outbox. It updates members.left_at +
-    // channel_meta mv/counts + a channel_fanout unregister-user outbox row. We additionally write
-    // member.left + system.notice events below (the helper does NOT write events).
-    // To keep it one transaction, inline the leave writes here instead of calling the async helper:
-    this.ctx.storage.sql.exec("UPDATE members SET left_at=? WHERE channel_id=? AND user_id=?", now, channelId, b.user_id);
-    this.ctx.storage.sql.exec("UPDATE channel_meta SET membership_version=?, member_count=MAX(0, member_count-1), updated_at=? WHERE channel_id=?", mv, now, channelId);
-    this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'channel_fanout', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `channel_fanout:unregister:${channelId}:${b.user_id}:${now}`, channelId, JSON.stringify({ action: "unregister-user", channel_id: channelId, user_id: b.user_id }), now, now, now);
+    // Reuse the SINGLE sync leave implementation (P0-6): co-atomic left_at + count + fanout unregister outbox.
+    this.markMemberLeftAndEnqueueFanoutUnregisterSync(channelId, b.user_id, now);
+    // Re-read the bumped mv/counts the sync core wrote, so the events below carry the authoritative mv.
+    const mvAfter = (this.ctx.storage.sql.exec("SELECT membership_version FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { membership_version: number }).membership_version;
 
     const leftId = this.nextEventId(nowMs);
-    this.persistEventAndFanout(leftId, "member.left", channelId, now, { channel_id: channelId, user_id: b.user_id, role: target.role, membership_version: mv, actor_kind: "user", actor_id: userId }, mv, now, actorMap);
+    this.persistEventAndFanout(leftId, "member.left", channelId, now, buildMemberLeftPayload({ channel_id: channelId, user_id: b.user_id, role: target.role, membership_version: mvAfter, actor_kind: "user", actor_id: userId }), mvAfter, now, actorMap);
     const noticeId = this.nextEventId(nowMs);
-    this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.left", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mv, now, actorMap);
+    this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.left", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mvAfter, now, actorMap);
     // user_directory leave projection (so my_channels reflects status='left')
-    this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:leave:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "leave", channel_id: channelId, kind: "channel", membership_version: mv }), now, now, now);
+    this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:leave:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "leave", channel_id: channelId, kind: meta.kind, membership_version: mvAfter }), now, now, now);
 
     const responseJson = JSON.stringify({ channel_id: channelId, user_id: b.user_id, removed: true });
     this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.remove', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
     return { kind: "ok" };
   });
   if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
-  await this.scheduleOutboxAlarm(now);
+  if (tx.kind === "ok") await this.scheduleOutboxAlarm(now);
   if (tx.kind === "ok") return Response.json({ channel_id: channelId, user_id: b.user_id, removed: true }, { status: 200 });
   return this.cachedResponse((tx as { j: string }).j);
 }
 ```
 
-Add the `cachedResponse` helper to the class (mirrors the cached-error mapping used in Task 7/8):
-```typescript
-private cachedResponse(j: string): Response {
-  const cached = JSON.parse(j) as { channel?: Record<string, unknown>; member?: Record<string, unknown>; error?: { code?: string; message?: string } };
-  if (cached.error) {
-    const code = cached.error.code ?? "CHAT_WORKER_UNAVAILABLE";
-    const status = code === "FORBIDDEN" ? 403 : code === "CHANNEL_NOT_FOUND" ? 404 : code === "CHANNEL_DISSOLVED" ? 409 : code === "MEMBER_NOT_FOUND" ? 404 : code === "INVALID_MESSAGE" ? 422 : 503;
-    return Response.json({ error: { code, message: cached.error.message ?? "error", retryable: false } }, { status });
-  }
-  return new Response(j, { status: 200, headers: { "Content-Type": "application/json" } });
-}
-```
-> **⚠ Cleanup before writing:** the `members-update-role` block contains a deliberately-broken SQL line (`SET role=?, WHERE...`) immediately followed by the correct one, plus a stray `.catch?.(() => {})`. Delete BOTH the broken line and the `.catch?.()` line; keep only the correct `UPDATE members SET role=? WHERE...`. This was left inline to make the fix obvious; the implementer must not ship the broken statement.
+> **mv consistency note:** `markMemberLeftAndEnqueueFanoutUnregisterSync` bumps `channel_meta.membership_version` itself; the handler then re-reads it so the `member.left`/`system.notice` events carry the post-leave membership version (the version at which the leave is visible). Do NOT separately bump mv in the handler.
 
 - [ ] **Step 4: Run the DO members tests**
 
@@ -2088,20 +2410,23 @@ Expected: FAIL — members-list / members-get return 404.
 
 - [ ] **Step 4: Implement the two read handlers**
 
-Add inside `ChatChannel.fetch` before the final 404:
+Add inside `ChatChannel.fetch` before the final 404. **Access rule (P1-3 fix):** per contract §7.1b, the caller must be an ACTIVE member of this channel — including for dissolved channels. A non-member reading a dissolved channel's member list would leak who was in it; block it (403). Do NOT carve out "dissolved channels are readable by non-members."
+
 ```typescript
 if (url.pathname === "/internal/members-list") {
   const userId = request.headers.get("X-Verified-User-Id") ?? "";
-  const meta = this.ctx.storage.sql.exec("SELECT channel_id, visibility, status FROM channel_meta WHERE channel_id=?", url.searchParams.get("channel_id") ?? "").toArray()[0] as { channel_id: string; visibility: string; status: string } | undefined;
-  // NOTE: channel_id must be passed by the Worker in the query string (the DO is named by channel_id, but the handler reads it explicitly to be safe).
-  const channelId = url.searchParams.get("channel_id") ?? "";
   const realMeta = this.ctx.storage.sql.exec("SELECT channel_id, status FROM channel_meta LIMIT 1").toArray()[0] as { channel_id: string; status: string } | undefined;
   if (!realMeta) return new Response("channel not created", { status: 409 });
+  // Must be an ACTIVE member (even dissolved channels require it — no leaking member lists to ex-members).
   const activeMember = userId ? (this.ctx.storage.sql.exec("SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", realMeta.channel_id, userId).toArray()[0] as { x: number } | undefined) : undefined;
-  if (!activeMember && realMeta.status !== "dissolved") return new Response("forbidden", { status: 403 });
-  const rows = this.ctx.storage.sql.exec("SELECT user_id, role, joined_at FROM members WHERE channel_id=? AND left_at IS NULL ORDER BY joined_at", realMeta.channel_id).toArray() as Array<{ user_id: string; role: string; joined_at: string }>;
-  // status tombstone: dissolved channels still return their members to members.
-  void meta; void channelId;
+  if (!activeMember) return new Response("forbidden", { status: 403 });
+  // Cursor is the last user_id of the previous page; members-list pages by joined_at ASC (tiebreak user_id).
+  const cursorUserId = url.searchParams.get("cursor") ?? "";
+  const rows = this.ctx.storage.sql.exec(
+    "SELECT user_id, role, joined_at FROM members WHERE channel_id=? AND left_at IS NULL AND user_id > ? ORDER BY user_id ASC LIMIT 101",
+    realMeta.channel_id, cursorUserId,
+  ).toArray() as Array<{ user_id: string; role: string; joined_at: string }>;
+  // Return raw active members (the Worker resolves UserSummaries + applies the query filter).
   return Response.json({ items: rows.map((r) => ({ user_id: r.user_id, role: r.role, joined_at: r.joined_at })) });
 }
 
@@ -2110,8 +2435,9 @@ if (url.pathname === "/internal/members-get") {
   const targetUserId = url.searchParams.get("user_id") ?? "";
   const realMeta = this.ctx.storage.sql.exec("SELECT channel_id, status FROM channel_meta LIMIT 1").toArray()[0] as { channel_id: string; status: string } | undefined;
   if (!realMeta) return new Response("channel not created", { status: 409 });
+  // Must be an ACTIVE member (P1-3): no member read for non-members, dissolved or not.
   const activeMember = userId ? (this.ctx.storage.sql.exec("SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", realMeta.channel_id, userId).toArray()[0] as { x: number } | undefined) : undefined;
-  if (!activeMember && realMeta.status !== "dissolved") return new Response("forbidden", { status: 403 });
+  if (!activeMember) return new Response("forbidden", { status: 403 });
 
   const row = this.ctx.storage.sql.exec("SELECT role, joined_at, left_at FROM members WHERE channel_id=? AND user_id=?", realMeta.channel_id, targetUserId).toArray()[0] as { role: string; joined_at: string; left_at: string | null } | undefined;
   if (!row) return Response.json({ error: { code: "MEMBER_NOT_FOUND", message: "user is not a member of this channel", retryable: false } }, { status: 404 });
@@ -2119,7 +2445,7 @@ if (url.pathname === "/internal/members-get") {
   return Response.json({ user_id: targetUserId, role: row.role, joined_at: row.joined_at, status });
 }
 ```
-> **Note:** both handlers read the single `channel_meta` row (this DO serves exactly one channel). `visibility`/`status` govern member access (private → must be active member; dissolved → tombstone still readable). `removed` status (contract §7.1b lists `left`/`removed`): Phase 3 only writes `left_at`, so both "removed" and "left" surface as `status: "left"`. That satisfies the contract's "已离开/被移除的成员仍可读" since both map to a left row. (If a distinct `removed_at` is later needed, `members` lacks the column — out of Phase 3 scope.)
+> **Note:** both handlers read the single `channel_meta` row (this DO serves exactly one channel). `removed` status (contract §7.1b lists `left`/`removed`): Phase 3 only writes `left_at`, so both "removed" and "left" surface as `status: "left"` — the contract's "已离开/被移除的成员仍可读" is satisfied (an active member can read a left member's profile for history). (If a distinct `removed_at` is later needed, `members` lacks the column — out of Phase 3 scope.) The members-list pages by `user_id` ASC with a `cursor` = previous page's last `user_id`; the DO fetches `LIMIT 101` so the Worker can detect `hasMore` without a second round-trip.
 
 - [ ] **Step 5: Run the DO members-read tests**
 
@@ -2139,25 +2465,33 @@ export async function listMembersHandler(c: Context<{ Bindings: Env; Variables: 
   const url = new URL(c.req.url);
   const query = (url.searchParams.get("query") ?? "").toLowerCase();
   const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") ?? "50")));
+  const cursor = url.searchParams.get("cursor") ?? "";
   const routeName = await channelRouteNameFor(env, userId, channelId);
   if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
   const stub = env.CHAT_CHANNEL.getByName(routeName);
-  const res = await stub.fetch(new Request(`https://x/internal/members-list?channel_id=${encodeURIComponent(channelId)}`, { headers: { "X-Verified-User-Id": userId } }));
+  // Push cursor + a limit+1 fetch into the DO so it can signal hasMore without a 2nd round-trip.
+  const res = await stub.fetch(new Request(`https://x/internal/members-list?cursor=${encodeURIComponent(cursor)}`, { headers: { "X-Verified-User-Id": userId } }));
   if (res.status === 403) throw new ApiError("FORBIDDEN", "not a member");
   if (res.status === 404 || res.status === 409) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "member list failed");
   const raw = (await res.json()) as { items: Array<{ user_id: string; role: string; joined_at: string }> };
 
   const map = await resolveUserSummaries(raw.items.map((m) => m.user_id), env);
-  const filtered = raw.items
-    .map((m) => {
-      const u = map.get(m.user_id) ?? { user_id: m.user_id, display_name: `user-${m.user_id.slice(0, 8)}`, avatar_url: null };
-      return { user: u, role: m.role, joined_at: m.joined_at };
-    })
-    .filter((m) => query === "" || (m.user.display_name ?? "").toLowerCase().startsWith(query) || m.user.user_id.toLowerCase().startsWith(query));
-  const page = filtered.slice(0, limit);
-  const nextCursor = filtered.length > limit ? page[page.length - 1]?.user.user_id ?? null : null;
-  return c.json({ items: page, next_cursor: nextCursor }, 200, { "X-Request-Id": c.get("requestId") });
+  const resolved = raw.items.map((m) => {
+    const u = map.get(m.user_id) ?? { user_id: m.user_id, display_name: `user-${m.user_id.slice(0, 8)}`, avatar_url: null };
+    return { user: u, role: m.role, joined_at: m.joined_at };
+  });
+  // With NO query filter: stable cursor pagination (DO already over-fetched so we can detect hasMore).
+  if (query === "") {
+    const hasMore = resolved.length > limit;
+    const page = resolved.slice(0, limit);
+    const nextCursor = hasMore ? page[page.length - 1]?.user.user_id ?? null : null;
+    return c.json({ items: page, next_cursor: nextCursor }, 200, { "X-Request-Id": c.get("requestId") });
+  }
+  // WITH a query filter: filter the page, no stable continuation cursor (Phase 3 member-list query
+  // is a typeahead aid, not a paged search). Clients re-fetch with a refined query.
+  const filtered = resolved.filter((m) => (m.user.display_name ?? "").toLowerCase().startsWith(query) || m.user.user_id.toLowerCase().startsWith(query));
+  return c.json({ items: filtered.slice(0, limit), next_cursor: null }, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function getMemberHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
@@ -2239,10 +2573,14 @@ git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: GET /member
 - Test: `test/routes/channel-mutations.test.ts` (read-state cases, appended)
 
 **Interfaces:**
-- Consumes: `Env.CHAT_CHANNEL` (for unread count), `Env.USER_DIRECTORY`. `channelRouteNameFor`, `getIdentity`, `resolveUserSummaries`.
+- Consumes: `Env.CHAT_CHANNEL` + `Env.USER_DIRECTORY` (both bound on `UserDirectory` — see wrangler configs). `channelRouteNameFor`, `getIdentity`. `buildReadStateUpdatedPayload` from Task 3. `persistEventAndFanout` + `nextEventId` on ChatChannel (Task 4).
 - Produces:
-  - `POST /internal/read-state` (header `X-Verified-User-Id`, body `{ channel_id, last_read_event_id }`) on `UserDirectory`: gate floor — the `(user_id, channel_id)` `my_channels` row must exist with `status='active'`; monotonic floor — accept `last_read_event_id` only if it is `>` the stored `last_read_event_id` (lexicographic UUIDv7), else keep the stored value. UPDATE `my_channels.last_read_event_id`. Returns `{ channel_id, last_read_event_id, unread_count: <to be filled> }`. The DO does NOT compute unread — that needs ChatChannel event count. The Worker computes `unread_count` by asking `ChatChannel(channel_id)` how many `event_id > last_read_event_id` events exist that are not the user's own (the Worker has the user_id).
-  - Worker route `POST /channels/:channel_id/read-state`: auth → `UserDirectory(user_id)./internal/read-state` → if accepted, fetch unread count from `ChatChannel(channel_id)./internal/unread-count?user_id=&after=` → return `{ channel_id, last_read_event_id, unread_count }`.
+  - `POST /internal/read-state` (header `X-Verified-User-Id`, body `{ channel_id, last_read_event_id }`) on `UserDirectory`: this owns the **floor** (the `(user_id, channel_id)` `my_channels` row must exist with `status='active'`, else 403) and the **monotonic advance** (accept `last_read_event_id` only if `>` the stored value; else keep stored). After a successful advance, it calls `ChatChannel(channel_id)./internal/read-state-event` to write the `read_state.updated` event + `channel_fanout` outbox (so cross-device clients of THIS user, subscribed via the channel fanout, sync their unread). Returns `{ channel_id, last_read_event_id, advanced: boolean }` (the Worker computes `unread_count` separately). If the monotonic floor did not advance (equal/earlier cursor), it returns `{ advanced: false }` and does NOT write an event (idempotent re-mark is not state change).
+  - `POST /internal/read-state-event` (header `X-Verified-User-Id`, body `{ user_id, last_read_event_id }`) on `ChatChannel`: writes ONE `read_state.updated` event (persisted payload via `buildReadStateUpdatedPayload` — note: this payload has NO `actor_kind`, so the Task 4b replay projection passes it through unchanged) + a `channel_fanout` outbox row; schedules the alarm. Idempotent on `(principal_kind='user', principal_id=user_id, operation='read_state', idempotency_key=<last_read_event_id>)` so a retried mark-read at the same cursor does not duplicate the event. Returns `{ event_id }`.
+  - `GET /internal/unread-count?after=` on `ChatChannel`: counts `message.created` events after `after` minus the user's own authored-by events (unchanged from draft). Returns `{ unread_count }`.
+  - Worker route `POST /channels/:channel_id/read-state`: auth → `UserDirectory(user_id)./internal/read-state` → fetch unread from `ChatChannel(channel_id)./internal/unread-count` → return `{ channel_id, last_read_event_id, unread_count }`.
+
+> **Decision on `read_state.updated` (P0-2 fix):** the first plan draft only updated `my_channels.last_read_event_id` and never emitted an event — leaving the contract's `read_state.updated` (§10.4, design §8 阶段3) unimplemented. This task emits it via the channel fanout. The event is persisted in the channel event log (so `/internal/replay` serves it) AND fanned out to online channel members (the marking user's other sessions receive it and resync unread). Task 4b's replay projection passes `read_state.updated` through unchanged (no `actor_kind`) — so no actor resolution gap.
 
 - [ ] **Step 1: Write failing DO test**
 
@@ -2267,7 +2605,7 @@ async function seedMembership() {
 }
 
 describe("UserDirectory /internal/read-state", () => {
-  it("sets last_read_event_id on first mark", async () => {
+  it("sets last_read_event_id on first mark (advanced: true)", async () => {
     const stub = await seedMembership();
     const res = await stub.fetch(new Request("https://x/internal/read-state", {
       method: "POST",
@@ -2275,7 +2613,18 @@ describe("UserDirectory /internal/read-state", () => {
       body: JSON.stringify({ channel_id: CHANNEL, last_read_event_id: "01J00000000000000000000000" }),
     }));
     expect(res.status).toBe(200);
-    expect(((await res.json()) as { last_read_event_id: string }).last_read_event_id).toBe("01J00000000000000000000000");
+    const body = (await res.json()) as { last_read_event_id: string; advanced: boolean };
+    expect(body.last_read_event_id).toBe("01J00000000000000000000000");
+    expect(body.advanced).toBe(true);
+  });
+
+  it("returns advanced:false on re-mark of the same cursor (idempotent, no event)", async () => {
+    const stub = await seedMembership();
+    const cursor = "01J00000000000000000000010";
+    const r1 = await stub.fetch(new Request("https://x/internal/read-state", { method: "POST", headers: { "X-Verified-User-Id": USER, "Content-Type": "application/json" }, body: JSON.stringify({ channel_id: CHANNEL, last_read_event_id: cursor }) }));
+    const r2 = await stub.fetch(new Request("https://x/internal/read-state", { method: "POST", headers: { "X-Verified-User-Id": USER, "Content-Type": "application/json" }, body: JSON.stringify({ channel_id: CHANNEL, last_read_event_id: cursor }) }));
+    expect(((await r1.json()) as { advanced: boolean }).advanced).toBe(true);
+    expect(((await r2.json()) as { advanced: boolean }).advanced).toBe(false);
   });
 
   it("only advances monotonically (earlier cursor rejected)", async () => {
@@ -2307,7 +2656,7 @@ describe("UserDirectory /internal/read-state", () => {
 Run: `npx vitest run test/do/user-directory-read-state.test.ts --no-file-parallelism --test-timeout=60000`
 Expected: FAIL — `/internal/read-state` returns 404.
 
-- [ ] **Step 3: Implement the UserDirectory read-state handler**
+- [ ] **Step 3: Implement the UserDirectory read-state handler (floor + advance + emit event)**
 
 Add inside `UserDirectory.fetch` before the final 404:
 ```typescript
@@ -2315,29 +2664,99 @@ if (url.pathname === "/internal/read-state") {
   const userId = request.headers.get("X-Verified-User-Id");
   if (userId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
   const b = (await request.json()) as { channel_id: string; last_read_event_id: string };
-  const now = new Date().toISOString();
 
-  return await this.ctx.storage.transaction(async () => {
+  // 1) Floor + monotonic advance inside the my_channels txn.
+  const advanced = await this.ctx.storage.transaction(async (): Promise<boolean> => {
     const row = this.ctx.storage.sql
       .exec("SELECT last_read_event_id, status FROM my_channels WHERE user_id=? AND channel_id=?", userId, b.channel_id)
       .toArray()[0] as { last_read_event_id: string | null; status: string } | undefined;
-    if (!row || row.status !== "active") {
-      return new Response("forbidden", { status: 403 });
-    }
+    if (!row || row.status !== "active") return false; // signal 403 to caller
     const current = row.last_read_event_id;
     const next = current === null || b.last_read_event_id > current ? b.last_read_event_id : current;
     if (next !== current) {
       this.ctx.storage.sql.exec("UPDATE my_channels SET last_read_event_id=? WHERE user_id=? AND channel_id=?", next, userId, b.channel_id);
+      return true; // advanced
     }
-    return Response.json({ channel_id: b.channel_id, last_read_event_id: next });
+    return false; // floor did not advance — no event
   });
+
+  if (!advanced) {
+    // Could be (a) not a member → 403, or (b) cursor did not advance → 200 idempotent no-op.
+    const memberRow = this.ctx.storage.sql
+      .exec("SELECT status FROM my_channels WHERE user_id=? AND channel_id=?", userId, b.channel_id)
+      .toArray()[0] as { status: string } | undefined;
+    if (!memberRow || memberRow.status !== "active") return new Response("forbidden", { status: 403 });
+    return Response.json({ channel_id: b.channel_id, last_read_event_id: b.last_read_event_id, advanced: false });
+  }
+
+  // 2) Emit read_state.updated on the ChatChannel (event + channel_fanout outbox). Idempotent on the cursor.
+  const chStub = this.env.CHAT_CHANNEL.getByName(b.channel_id);
+  const evRes = await chStub.fetch(new Request("https://x/internal/read-state-event", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, last_read_event_id: b.last_read_event_id }),
+  }));
+  // Non-OK here is not fatal to the floor (which already committed); the event is best-effort.
+  // A 409 means the same cursor already emitted — treat as success.
+  const eventId = evRes.ok ? ((await evRes.json()) as { event_id: string }).event_id : "";
+
+  return Response.json({ channel_id: b.channel_id, last_read_event_id: b.last_read_event_id, advanced: true, event_id: eventId });
 }
 ```
+> **Cross-DO best-effort:** the `my_channels` advance commits first (inside its transaction); the `read_state.updated` event write is a separate ChatChannel call AFTER. If the ChatChannel call fails (DO unavailable), the floor is still correct (the user's unread floor advanced) — the event is a best-effort notification, repairable by a re-mark. This honors "no cross-DO 2PC": the floor is the SoT, the event is the projection.
 
-- [ ] **Step 4: Add the unread-count endpoint to ChatChannel**
+- [ ] **Step 4: Add the `read-state-event` + `unread-count` endpoints to ChatChannel**
 
 Add inside `ChatChannel.fetch` before the final 404:
 ```typescript
+if (url.pathname === "/internal/read-state-event") {
+  const userId = request.headers.get("X-Verified-User-Id") ?? "";
+  if (!userId) return new Response("missing verified user", { status: 401 });
+  const b = (await request.json()) as { user_id: string; last_read_event_id: string };
+  const now = this.nowIso();
+  const nowMs = Date.parse(now);
+  const requestHash = JSON.stringify({ user_id: b.user_id, last_read_event_id: b.last_read_event_id });
+  const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+  // read_state.updated has no actor — pass an empty map so persistEventAndFanout skips actor resolution.
+  const emptyMap = new Map<string, import("../chat/event-broadcast").UserSummary>();
+
+  const tx = await this.ctx.storage.transaction(async (): Promise<
+    | { kind: "conflict" }
+    | { kind: "cached"; eventId: string }
+    | { kind: "ok"; eventId: string }
+  > => {
+    const realMeta = this.ctx.storage.sql.exec("SELECT channel_id, status, membership_version FROM channel_meta LIMIT 1").toArray()[0] as { channel_id: string; status: string; membership_version: number } | undefined;
+    if (!realMeta) return { kind: "cached", eventId: "" }; // channel gone — best-effort no event
+    if (realMeta.status === "dissolved") return { kind: "cached", eventId: "" }; // dissolved: no read events
+
+    const idem = this.ctx.storage.sql.exec(
+      "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='read_state' AND idempotency_key=?",
+      b.user_id, b.last_read_event_id,
+    ).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+    if (idem) {
+      if (idem.request_hash !== requestHash) return { kind: "conflict" };
+      return { kind: "cached", eventId: (idem.response_json ? (JSON.parse(idem.response_json) as { event_id: string }).event_id : "") };
+    }
+
+    const mv = realMeta.membership_version;
+    const eventId = this.nextEventId(nowMs);
+    // read_state.updated payload has no actor_kind → resolveActorWithMap/persistEventAndFanout treat it as a
+    // pass-through (Task 4b replay projection skips actor resolution for read_state.updated).
+    this.persistEventAndFanout(eventId, "read_state.updated", realMeta.channel_id, now,
+      buildReadStateUpdatedPayload({ channel_id: realMeta.channel_id, user_id: b.user_id, last_read_event_id: b.last_read_event_id }),
+      mv, now, emptyMap);
+    this.ctx.storage.sql.exec(
+      "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'read_state', ?, ?, ?, 'completed', ?, ?)",
+      b.user_id, b.last_read_event_id, requestHash, JSON.stringify({ event_id: eventId }), now, idemExpiresAt,
+    );
+    return { kind: "ok", eventId };
+  });
+
+  if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "last_read_event_id reused with different user", retryable: false } }, { status: 409 });
+  await this.scheduleOutboxAlarm(now);
+  return Response.json({ event_id: tx.eventId }, { status: 200 });
+}
+
 if (url.pathname === "/internal/unread-count") {
   const userId = request.headers.get("X-Verified-User-Id") ?? "";
   const after = url.searchParams.get("after") ?? "";
@@ -2381,7 +2800,7 @@ export async function readStateHandler(c: Context<{ Bindings: Env; Variables: { 
   }));
   if (rs.status === 403) throw new ApiError("FORBIDDEN", "not an active member");
   if (!rs.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "read-state failed");
-  const rsBody = (await rs.json()) as { last_read_event_id: string };
+  const rsBody = (await rs.json()) as { last_read_event_id: string; advanced: boolean };
 
   // Fetch unread count from ChatChannel.
   const routeName = await channelRouteNameFor(env, userId, channelId);
@@ -2393,6 +2812,7 @@ export async function readStateHandler(c: Context<{ Bindings: Env; Variables: { 
   return c.json({ channel_id: channelId, last_read_event_id: rsBody.last_read_event_id, unread_count: unread }, 200, { "X-Request-Id": c.get("requestId") });
 }
 ```
+> **Idempotency model (P1-5 fix):** this route does NOT write a Worker-side `idempotency_keys` row. Read-state is inherently monotonic — the floor only advances when `last_read_event_id` strictly increases, and the `read_state.updated` event is itself deduped on `(user, operation='read_state', idempotency_key=<last_read_event_id>)` inside ChatChannel. A client retry with the same cursor returns the same `{ last_read_event_id, unread_count }` and emits no duplicate event. The `Idempotency-Key` header is still REQUIRED (contract §5.5 shows it) and is validated here, but the dedup key is the cursor itself, not the header — that is the contractually-meaningful idempotency surface for monotonic state. Records this design choice so the implementer does not add a redundant `idempotency_keys` row keyed on the header.
 Register in `src/index.ts`:
 ```typescript
 import { createChannelHandler, updateChannelHandler, dissolveChannelHandler, addMemberHandler, updateMemberRoleHandler, removeMemberHandler, listMembersHandler, getMemberHandler, readStateHandler } from "./routes/channel-mutations";
@@ -2415,8 +2835,20 @@ describe("POST /api/chat/channels/:id/read-state", () => {
     // owner just created the channel: no messages → unread 0
     expect(body.unread_count).toBe(0);
   });
+
+  it("is idempotent: re-marking the same cursor returns the same last_read_event_id with no event duplication", async () => {
+    const create = await authedReq("u-rs-route2", "POST", "/api/chat/channels", { title: "RS2", visibility: "private", initial_members: [] }, "ck-rs-create2");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    const body1 = { last_read_event_id: "01J00000000000000000000001" };
+    const r1 = await authedReq("u-rs-route2", "POST", `/api/chat/channels/${cid}/read-state`, body1, "ck-rs-2a");
+    const r2 = await authedReq("u-rs-route2", "POST", `/api/chat/channels/${cid}/read-state`, body1, "ck-rs-2b");
+    expect(r1.status).toBe(200); expect(r2.status).toBe(200);
+    expect(((await r2.json()) as { last_read_event_id: string }).last_read_event_id).toBe("01J00000000000000000000001");
+  });
 });
 ```
+
+Also append a DO-level assertion to `test/do/user-directory-read-state.test.ts` that the advance returns `advanced: true` on first mark and `advanced: false` on re-mark of the same cursor (see the Step 1 seed test — add one more `it("returns advanced:false on re-mark of same cursor", ...)`).
 
 Run: `npx vitest run test/do/user-directory-read-state.test.ts test/routes/channel-mutations.test.ts --no-file-parallelism --test-timeout=60000 && npm run typecheck`
 Expected: all PASS; typecheck clean.
@@ -2425,7 +2857,7 @@ Expected: all PASS; typecheck clean.
 
 ```bash
 git add src/do/user-directory.ts src/do/chat-channel.ts src/routes/channel-mutations.ts src/index.ts test/do/user-directory-read-state.test.ts test/routes/channel-mutations.test.ts
-git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: POST /channels/{id}/read-state (monotonic floor + unread count)"
+git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: POST /channels/{id}/read-state (monotonic floor + read_state.updated event + unread count)"
 ```
 
 ---
@@ -2469,38 +2901,40 @@ Check each contract/design requirement against a task:
 - `POST /channels/{id}/dissolve` (§5.4) + `CHANNEL_DISSOLVED` gate → Task 8. ✅
 - `GET /channels/{id}/members` (§7.1) + `GET /members/{user_id}` (§7.1b) → Task 10. ✅
 - `POST/PATCH/DELETE /channels/{id}/members[/{user_id}]` (§7.2/7.3/7.4) → Task 9. ✅
-- `POST /channels/{id}/read-state` (§5.5) → Task 11. ✅
-- Events `channel.created`/`channel.updated`/`channel.dissolved`/`member.joined`/`member.left`/`member.role_updated`/`read_state.updated`/`system.notice` → Tasks 3 (builders) + 4/7/8/9/11 (emit). ✅
-- `MEMBER_NOT_FOUND` (§7.1b, §11) → Task 9 (target lookup) + Task 10 (members-get). ✅
+- `POST /channels/{id}/read-state` (§5.5) + `read_state.updated` event → Task 11 (floor advance + emit via `ChatChannel /internal/read-state-event`) + Task 4b (replay projects it through unchanged). ✅
+- Events `channel.created`/`channel.updated`/`channel.dissolved`/`member.joined`/`member.left`/`member.role_updated`/`read_state.updated`/`system.notice` → Tasks 3 (builders, incl. `buildMemberLeftPayload`) + 4/7/8/9/11 (emit) + 4b (replay actor projection for management events). ✅
+- `MEMBER_NOT_FOUND` (§7.1b, §11) → Task 1 (error code) + Task 9 (target lookup) + Task 10 (members-get). ✅
+- `CHANNEL_DISSOLVED` (§5.4, §11) write-gate → Task 1 (error code) + Task 8 (dissolve + gate on message-send/join). ✅
+- Owner invariant (cannot self-leave / self-demote) → Task 9 (422). ✅
 - Out-of-scope confirmed NOT implemented: directory (§5.6), join (§5.7), invites (§5.8/5.9), DM, bot commands. ✅ (no routes registered for them.)
 
 - [ ] **Step 5: Self-review — placeholder scan**
 
-Scan the plan for `TODO`/`TBD`/`implement later`/`Similar to Task`. The Task 7/8/9 inline **⚠ warnings** (the malformed `UPDATE members SET role=?, WHERE` line in Task 9 Step 3 and the `idempotency_key: idempotency_key` self-reference in Task 7 Step 6) are explicit fix-this-before-shipping flags — confirmed intentional and surfaced, NOT placeholders. No other placeholders.
+Scan the plan for `TODO`/`TBD`/`implement later`/`Similar to Task`. **None present** — the prior draft's deliberately-broken code (the malformed `UPDATE members SET role=?, WHERE` line, the `idempotency_key: idempotency_key` self-reference, the stray `.catch?.(() => {})`) was removed in the P0-7 rewrite. Every code block is the final correct code.
 
 - [ ] **Step 6: Self-review — type consistency**
 
-- `persistEventAndFanot(eventId, type, channelId, occurredAt, persistedPayload, membershipVersion, nowIso, actorMap)` — defined Task 4 Step 1, called identically in Tasks 4/7/8/9. ✅
+- `persistEventAndFanout(eventId, type, channelId, occurredAt, persistedPayload, membershipVersion, nowIso, actorMap)` — defined Task 4 Step 1, called identically in Tasks 4/7/8/9 + 11 (read-state-event, empty actorMap). ✅
 - `resolveActorMap(userIds)` → `Map<string, UserSummary>` — defined Task 4, used in 4/7/8/9. ✅
 - `activeRole(channelId, userId)` → `string | null` — defined Task 7 Step 1, used in 7/8/9. ✅
-- `cachedResponse(j)` — defined Task 9 Step 3, used in Tasks 7 (logical equivalent inline), 8, 9. ✅ (Task 7 used an inline cached-error map; Task 9 introduces the shared helper — keep both consistent or refactor 7 to use `cachedResponse`.)
-- `buildMemberJoinedPayload` etc. signatures — defined Task 3, called in 4/9. ✅
+- `cachedResponse(j)` — defined ONCE in Task 7 Step 1, used by Tasks 7/8/9 (and Task 11's read-state-event returns `{ event_id }` directly, no cached branch). ✅ (single definition; the old "Task 9 introduces a second copy" is fixed.)
+- `markMemberLeftAndEnqueueFanoutUnregisterSync(channelId, userId, nowIso)` — defined Task 9 Step 3; `markMemberLeftAndEnqueueFanoutUnregister` is now a thin async wrapper calling it; used by `/internal/test-leave` and `members-remove`. ✅ single leave implementation.
+- `buildMemberJoinedPayload` / `buildMemberLeftPayload` / `buildMemberRoleUpdatedPayload` / `buildChannelUpdatedPayload` / `buildChannelDissolvedPayload` / `buildReadStateUpdatedPayload` / `buildSystemNoticePayload` — all defined Task 3, imported in Task 4+1, called in 4/7/8/9/11. ✅
+- `resolveActorWithMap(payload, map)` — defined Task 3, used in Task 4 (`persistEventAndFanout`) + Task 4b (replay). ✅
 - DO names: `getByName(channelId)` for user channels (Task 2), `system-general` for system. ✅
 
-- [ ] **Step 7: Optional refactor — unify the cached-error return**
+- [ ] **Step 7: Report green**
 
-In Task 7, the cached-error mapping is written inline (the big `const cached = ...` ternary). Task 9 adds `cachedResponse`. For consistency, the implementer MAY refactor Task 7/8's cached branches to call `this.cachedResponse(tx.responseJson)` instead of the inline ternary. This is optional; the inline version is correct. Record the decision in the commit message if done.
-
-- [ ] **Step 8: Commit (if any refactor in Step 7) or report green**
-
-If Step 7 refactor: `git add ... && git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "refactor(do): unify cached-error mapping via cachedResponse"`. Otherwise: report `npm run typecheck` clean + full suite green.
+Report `npm run typecheck` clean + full suite green. (No optional refactor step remains — `cachedResponse` is already single-defined in Task 7 and reused thereafter.)
 
 ---
 
 ## Notes for the executor
 
-- **Task-skip dependency order:** Tasks are sequential — 2 before 3's tests can import, 4 before 5 (coordinator calls `createChannel`), 5 before 6 (route calls coordinator), 7/8/9 before their route tests, 10/11 build on `channelRouteNameFor` (Task 2). A subagent per task works; each task ends in a green commit.
-- **The ⚠ flags in Task 7 Step 6 (`idempotency_key: idempotencyKey`) and Task 9 Step 3 (broken SQL line) are real bugs left inline to be fixed at implementation time.** Do not ship them as-is.
-- **`member.left` payload** (Task 9) is built inline (`{ channel_id, user_id, role, membership_version, actor_kind, actor_id }`) rather than via a dedicated builder, to avoid adding a 7th builder. It mirrors `buildMemberJoinedPayload`'s shape. If consistency is preferred, add `buildMemberLeftPayload` to Task 3 and use it in Task 9 — the test does not assert on the event payload shape, only on `removed: true`.
+- **Task-skip dependency order:** Tasks are sequential — 1 (errors + docs) before any route; 2 before 3's tests import; 4 before 5 (coordinator calls `createChannel`); 4b before any task that asserts replay shape (it modifies `/internal/replay`); 5 before 6 (route calls coordinator); 7 before 9 (`cachedResponse` + `activeRole` defined in 7, used in 9); 7/8/9 before their route tests; 10/11 build on `channelRouteNameFor` (Task 2). A subagent per task works; each task ends in a green commit.
+- **No deliberately-broken code remains in the plan.** Every code block is final/correct as written — do not "fix" skeletons that are not there, and do not re-introduce inline ⚠ reminders.
+- **`member.left` payload** uses `buildMemberLeftPayload` (Task 3), not an inline object.
+- **read-state emits a real event.** The UserDirectory floor advances `my_channels.last_read_event_id` (SoT), then calls `ChatChannel /internal/read-state-event` to write `read_state.updated` + channel_fanout outbox (best-effort cross-DO, no 2PC). The event is deduped on `(user, operation='read_state', idempotency_key=<cursor>)`. Re-marking the same cursor returns `{ advanced: false }` and emits nothing.
+- **`read_state.updated` replay:** Task 4b deliberately passes it through unchanged (no actor). Task 11 emits it WITHOUT an `actor_kind` — confirm `persistEventAndFanout` handles a payload that has no `actor_kind` (it reads `payload.actor_kind` defensively → `null` → falls through; the replay branch skips actor resolution for `read_state.updated`).
 - **No push, no deploy.** Git identity `kuma`. Operator deploys.
 
