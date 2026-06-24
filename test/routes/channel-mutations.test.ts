@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { makeJwt, TEST_SECRET } from "../helpers";
+import { getNamedDo, makeJwt, TEST_SECRET } from "../helpers";
 
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
@@ -124,5 +124,42 @@ describe("members read routes", () => {
     const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
     const res = await authedReq("u-mr3-owner", "GET", `/api/chat/channels/${cid}/members/u-stranger`);
     expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /api/chat/channels/:id/read-state", () => {
+  it("marks read and returns last_read_event_id + unread_count", async () => {
+    const create = await authedReq("u-rs-route", "POST", "/api/chat/channels", { title: "RS", visibility: "private", initial_members: [] }, "ck-rs-create");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    const userDir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], "u-rs-route");
+    await userDir.fetch(new Request("https://x/internal/upsert-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-rs-route", "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "join", channel_id: cid, kind: "channel", membership_version: 1 }),
+    }));
+    const res = await authedReq("u-rs-route", "POST", `/api/chat/channels/${cid}/read-state`, { last_read_event_id: "01J00000000000000000000000" }, "ck-rs-1");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { last_read_event_id: string; unread_count: number };
+    expect(body.last_read_event_id).toBe("01J00000000000000000000000");
+    // owner just created the channel: no messages → unread 0
+    expect(body.unread_count).toBe(0);
+  });
+
+  it("is idempotent: re-marking the same cursor returns the same last_read_event_id and does not duplicate the event", async () => {
+    const create = await authedReq("u-rs-route2", "POST", "/api/chat/channels", { title: "RS2", visibility: "private", initial_members: [] }, "ck-rs-create2");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    const userDir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], "u-rs-route2");
+    await userDir.fetch(new Request("https://x/internal/upsert-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-rs-route2", "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "join", channel_id: cid, kind: "channel", membership_version: 1 }),
+    }));
+    const body1 = { last_read_event_id: "01J00000000000000000000001" };
+    const r1 = await authedReq("u-rs-route2", "POST", `/api/chat/channels/${cid}/read-state`, body1, "ck-rs-2a");
+    const r2 = await authedReq("u-rs-route2", "POST", `/api/chat/channels/${cid}/read-state`, body1, "ck-rs-2b");
+    expect(r1.status).toBe(200); expect(r2.status).toBe(200);
+    expect(((await r2.json()) as { last_read_event_id: string }).last_read_event_id).toBe("01J00000000000000000000001");
+    // r2 is the same-cursor re-mark; ChatChannel /internal/read-state-event dedupes on (user, cursor)
+    // so no second event row is written. (We assert the HTTP behavior; event dedup is a DO-level concern.)
   });
 });

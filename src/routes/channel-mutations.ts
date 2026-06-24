@@ -235,3 +235,44 @@ export async function getMemberHandler(c: Context<{ Bindings: Env; Variables: { 
   const u = map.get(targetUserId) ?? { user_id: targetUserId, display_name: `user-${targetUserId.slice(0, 8)}`, avatar_url: null };
   return c.json({ user: u, role: raw.role, joined_at: raw.joined_at, status: raw.status }, 200, { "X-Request-Id": c.get("requestId") });
 }
+
+export async function readStateHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const channelId = c.req.param("channel_id");
+  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
+  const body = (await c.req.json().catch(() => ({}))) as { last_read_event_id?: string };
+  if (!body.last_read_event_id) throw new ApiError("INVALID_MESSAGE", "last_read_event_id required");
+
+  const dirStub = env.USER_DIRECTORY.getByName(userId);
+  const rs = await dirStub.fetch(new Request("https://x/internal/read-state", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({ channel_id: channelId, last_read_event_id: body.last_read_event_id }),
+  }));
+  if (rs.status === 403) throw new ApiError("FORBIDDEN", "not an active member");
+  if (!rs.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "read-state failed");
+  const rsBody = (await rs.json()) as { last_read_event_id: string; advanced: boolean; emit: boolean };
+
+  // Route the ChatChannel correctly (P1 fix): system channel → 'system-general', user channel → channel_id.
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const chStub = env.CHAT_CHANNEL.getByName(routeName);
+
+  // Emit read_state.updated when the floor says to (advanced OR same-cursor repair). Best-effort:
+  // a failure here does not roll back the floor (SoT). ChatChannel dedupes on (user, cursor).
+  if (rsBody.emit) {
+    await chStub.fetch(new Request("https://x/internal/read-state-event", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, last_read_event_id: rsBody.last_read_event_id }),
+    })).catch(() => undefined);
+  }
+
+  // Compute unread count from the STORED floor (rsBody.last_read_event_id is always the stored floor).
+  const uc = await chStub.fetch(new Request(`https://x/internal/unread-count?after=${encodeURIComponent(rsBody.last_read_event_id)}`, { headers: { "X-Verified-User-Id": userId } }));
+  const unread = uc.ok ? ((await uc.json()) as { unread_count: number }).unread_count : 0;
+
+  return c.json({ channel_id: channelId, last_read_event_id: rsBody.last_read_event_id, unread_count: unread }, 200, { "X-Request-Id": c.get("requestId") });
+}

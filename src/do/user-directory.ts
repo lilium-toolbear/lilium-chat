@@ -202,6 +202,44 @@ export class UserDirectory extends DurableObject<Env> {
       return new Response(createBody, { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
+    if (url.pathname === "/internal/read-state") {
+      const userId = request.headers.get("X-Verified-User-Id");
+      if (userId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
+      const b = (await request.json()) as { channel_id: string; last_read_event_id: string };
+
+      // Three-state floor result. The Worker decides whether to emit read_state.updated.
+      const floor = await this.ctx.storage.transaction(async (): Promise<
+        | { forbidden: true }
+        | { stored: string; advanced: boolean; emit: boolean }
+      > => {
+        const row = this.ctx.storage.sql
+          .exec("SELECT last_read_event_id, status FROM my_channels WHERE user_id=? AND channel_id=?", userId, b.channel_id)
+          .toArray()[0] as { last_read_event_id: string | null; status: string } | undefined;
+        if (!row || row.status !== "active") return { forbidden: true };
+
+        const current = row.last_read_event_id;
+        if (current === null || b.last_read_event_id > current) {
+          // advance
+          this.ctx.storage.sql.exec("UPDATE my_channels SET last_read_event_id=? WHERE user_id=? AND channel_id=?", b.last_read_event_id, userId, b.channel_id);
+          return { stored: b.last_read_event_id, advanced: true, emit: true };
+        }
+        if (b.last_read_event_id === current) {
+          // identical cursor — no floor change, but emit so ChatChannel idempotency can repair a prior failed event
+          return { stored: current, advanced: false, emit: true };
+        }
+        // stale (requested < current) — keep stored floor, no event
+        return { stored: current, advanced: false, emit: false };
+      });
+
+      if ("forbidden" in floor) return new Response("forbidden", { status: 403 });
+      return Response.json({
+        channel_id: b.channel_id,
+        last_read_event_id: floor.stored, // ALWAYS the stored floor, never the request cursor (P0-2)
+        advanced: floor.advanced,
+        emit: floor.emit,
+      });
+    }
+
     return new Response("not found", { status: 404 });
   }
 

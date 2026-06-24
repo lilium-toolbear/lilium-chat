@@ -1595,6 +1595,74 @@ export class ChatChannel extends DurableObject<Env> {
       return Response.json({ user_id: targetUserId, role: row.role, joined_at: row.joined_at, status });
     }
 
+    if (url.pathname === "/internal/read-state-event") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as { user_id: string; last_read_event_id: string };
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+      const requestHash = JSON.stringify({ user_id: b.user_id, last_read_event_id: b.last_read_event_id });
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      // read_state.updated has no actor — pass an empty map so persistEventAndFanout skips actor resolution.
+      const emptyMap = new Map<string, import("../chat/event-broadcast").UserSummary>();
+
+      const tx = await this.ctx.storage.transaction(async (): Promise<
+        | { kind: "conflict" }
+        | { kind: "cached"; eventId: string }
+        | { kind: "ok"; eventId: string }
+      > => {
+        const realMeta = this.ctx.storage.sql.exec("SELECT channel_id, status, membership_version FROM channel_meta LIMIT 1").toArray()[0] as { channel_id: string; status: string; membership_version: number } | undefined;
+        if (!realMeta) return { kind: "cached", eventId: "" }; // channel gone — best-effort no event
+        if (realMeta.status === "dissolved") return { kind: "cached", eventId: "" }; // dissolved: no read events
+
+        const idem = this.ctx.storage.sql.exec(
+          "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='read_state' AND idempotency_key=?",
+          b.user_id, b.last_read_event_id,
+        ).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        if (idem) {
+          if (idem.request_hash !== requestHash) return { kind: "conflict" };
+          return { kind: "cached", eventId: (idem.response_json ? (JSON.parse(idem.response_json) as { event_id: string }).event_id : "") };
+        }
+
+        const mv = realMeta.membership_version;
+        const eventId = this.nextEventId(nowMs);
+        // read_state.updated payload has no actor_kind → resolveActorWithMap/persistEventAndFanout treat it as a
+        // pass-through (Task 4b replay projection skips actor resolution for read_state.updated).
+        this.persistEventAndFanout(eventId, "read_state.updated", realMeta.channel_id, now,
+          buildReadStateUpdatedPayload({ channel_id: realMeta.channel_id, user_id: b.user_id, last_read_event_id: b.last_read_event_id }),
+          mv, now, emptyMap);
+        this.ctx.storage.sql.exec(
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'read_state', ?, ?, ?, 'completed', ?, ?)",
+          b.user_id, b.last_read_event_id, requestHash, JSON.stringify({ event_id: eventId }), now, idemExpiresAt,
+        );
+        return { kind: "ok", eventId };
+      });
+
+      if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "last_read_event_id reused with different user", retryable: false } }, { status: 409 });
+      await this.scheduleOutboxAlarm(now);
+      return Response.json({ event_id: tx.eventId }, { status: 200 });
+    }
+
+    if (url.pathname === "/internal/unread-count") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      const after = url.searchParams.get("after") ?? "";
+      const realMeta = this.ctx.storage.sql.exec("SELECT channel_id FROM channel_meta LIMIT 1").toArray()[0] as { channel_id: string } | undefined;
+      if (!realMeta) return Response.json({ unread_count: 0 });
+      // Count message.created events after the cursor that were not authored by this user.
+      const rows = this.ctx.storage.sql.exec(
+        "SELECT COUNT(*) AS c FROM events WHERE channel_id=? AND event_id > ? AND event_type='message.created'",
+        realMeta.channel_id, after,
+      ).toArray()[0] as { c: number | bigint };
+      // Subtract the user's own messages: count their messages after the cursor.
+      const own = this.ctx.storage.sql.exec(
+        "SELECT COUNT(*) AS c FROM events WHERE channel_id=? AND event_id > ? AND event_type='message.created' AND actor_id=?",
+        realMeta.channel_id, after, userId,
+      ).toArray()[0] as { c: number | bigint };
+      const total = Number(rows.c ?? 0);
+      const ownCount = Number(own.c ?? 0);
+      return Response.json({ unread_count: Math.max(0, total - ownCount) });
+    }
+
     return new Response("not found", { status: 404 });
   }
 
