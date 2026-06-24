@@ -23,7 +23,6 @@
       { "name": "USER_DIRECTORY", "class_name": "UserDirectory" },
       { "name": "USER_CONNECTION", "class_name": "UserConnection" },
       { "name": "CHANNEL_DIRECTORY", "class_name": "ChannelDirectory" },
-      { "name": "MESSAGE_INDEX", "class_name": "MessageIndex" },
       { "name": "INVITE_DIRECTORY", "class_name": "InviteDirectory" },
       { "name": "BOT_REGISTRY", "class_name": "BotRegistry" },
       { "name": "CHANNEL_FANOUT", "class_name": "ChannelFanout" },
@@ -40,7 +39,7 @@
       "tag": "v1",
       "new_sqlite_classes": [
         "ChatChannel", "UserDirectory", "UserConnection", "ChannelDirectory",
-        "MessageIndex", "InviteDirectory", "BotRegistry", "ChannelFanout", "SchedulerProbe"
+        "InviteDirectory", "BotRegistry", "ChannelFanout", "SchedulerProbe"
       ]
     }
   ]

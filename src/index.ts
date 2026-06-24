@@ -65,7 +65,6 @@ export { ChatChannel } from "./do/chat-channel";
 export { UserDirectory } from "./do/user-directory";
 export { UserConnection } from "./do/user-connection";
 export { ChannelDirectory } from "./do/channel-directory";
-export { MessageIndex } from "./do/message-index";
 export { InviteDirectory } from "./do/invite-directory";
 export { BotRegistry } from "./do/bot-registry";
 export { ChannelFanout } from "./do/channel-fanout";

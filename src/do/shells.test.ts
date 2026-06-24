@@ -6,7 +6,6 @@ const DO_BINDINGS = [
   ["USER_DIRECTORY", "UserDirectory"],
   ["USER_CONNECTION", "UserConnection"],
   ["CHANNEL_DIRECTORY", "ChannelDirectory"],
-  ["MESSAGE_INDEX", "MessageIndex"],
   ["INVITE_DIRECTORY", "InviteDirectory"],
   ["BOT_REGISTRY", "BotRegistry"],
   ["CHANNEL_FANOUT", "ChannelFanout"],

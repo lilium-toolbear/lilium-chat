@@ -434,41 +434,6 @@ export class ChatChannel extends DurableObject<Env> {
     const url = new URL(request.url);
     if (url.pathname === "/ping") return Response.json({ ok: true });
 
-    if (url.pathname === "/outbox-insert") {
-      const b = (await request.json()) as {
-        outbox_id: string;
-        target_key: string;
-        payload: Record<string, unknown>;
-      };
-      const now = this.nowIso();
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at) VALUES (?, 'message_index', ?, '', ?, 'pending', ?, ?, ?)",
-        b.outbox_id,
-        b.target_key,
-        JSON.stringify(b.payload),
-        now,
-        now,
-        now,
-      );
-      return new Response("ok");
-    }
-
-    if (url.pathname === "/outbox-flush") {
-      const rows = this.ctx.storage.sql
-        .exec("SELECT outbox_id, target_key, payload_json FROM projection_outbox WHERE status='pending'")
-        .toArray() as Array<{ outbox_id: string; target_key: string; payload_json: string }>;
-      for (const r of rows) {
-        const target = this.env.MESSAGE_INDEX.getByName(r.target_key);
-        await target.fetch(new Request("https://x/upsert", { method: "POST", body: r.payload_json }));
-        this.ctx.storage.sql.exec(
-          "UPDATE projection_outbox SET status='delivered', updated_at=? WHERE outbox_id=?",
-          this.nowIso(),
-          r.outbox_id,
-        );
-      }
-      return new Response("ok");
-    }
-
     if (url.pathname === "/next-event-id") {
       const count = Math.max(0, Number(url.searchParams.get("count") ?? "1"));
       const ms = Number(url.searchParams.get("ms") ?? String(Date.now()));
@@ -966,15 +931,6 @@ export class ChatChannel extends DurableObject<Env> {
           idemExpiresAt,
         );
         this.insertOutboxRowForFanout(channelId, eventId, JSON.stringify(fallbackEvent), mv, now);
-        this.ctx.storage.sql.exec(
-          "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'message_index', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
-          `message_index:${messageId}`,
-          messageId,
-          JSON.stringify({ message_id: messageId, channel_id: channelId }),
-          now,
-          now,
-          now,
-        );
         return { kind: "created", message_id: messageId, event_id: eventId };
       });
 
@@ -1810,31 +1766,6 @@ export class ChatChannel extends DurableObject<Env> {
               }),
             }));
           }
-          if (!res.ok) {
-            const text = await res.text();
-            await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
-            continue;
-          }
-          this.ctx.storage.sql.exec(
-            "UPDATE projection_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
-            nowIso,
-            r.outbox_id,
-          );
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          await this.bumpOutboxRetry(r.outbox_id, nowIso, msg);
-        }
-        continue;
-      }
-
-      if (r.target_kind === "message_index") {
-        const target = this.env.MESSAGE_INDEX.getByName(r.target_key);
-        try {
-          const res = await target.fetch(new Request("https://x/upsert", {
-            method: "POST",
-            body: r.payload_json,
-            headers: { "Content-Type": "application/json" },
-          }));
           if (!res.ok) {
             const text = await res.text();
             await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
