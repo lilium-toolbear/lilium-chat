@@ -41,6 +41,7 @@
 - **v2.2 (2026-06-24)**：按前端 spec 缺口收口：补 `POST /api/chat/channels/{channel_id}/dissolve`、`channel.dissolved`、`system.notice`、`CHANNEL_DISSOLVED`、`INVITE_NOT_FOUND`；明确不定义通用 `NOT_FOUND`；将群聊标签列为 v1 无 Browser API 占位，将免打扰列为 browser local-only non-server state。
 - **v2.3 (2026-06-24)**：幂等冲突语义收口（与 backend 设计 v3.3 §3.6 + Phase 2 plan 对齐）：§2.5 明确 `message.send` 同 `client_message_id` 异请求体 → `409 IDEMPOTENCY_CONFLICT`，幂等响应来自 `idempotency_keys` 缓存（不扫 `events`）；§6.2 补 committed_ack 的幂等命中/冲突行为；`system.notice` payload 标注为 Browser projection（storage 只存 actor/target refs + `notice_kind`）。
 - **v2.4 (2026-06-24)**：Phase 3 范围收口 + 频道创建端点。补 `POST /api/chat/channels`（§5.2b）：创建 `kind="channel"` 频道，创建者自动成为 owner，可带 `initial_members`，同事务发 `channel.created` + `member.joined`（创建者及每个 initial_member）+ `system.notice`；任意已认证 Browser 用户可创建，`kind` 固定 `channel`（DM 不暴露）。§12.4 改为"Channel CRUD + Member Management + Read State"。原因：design §8 阶段 3 写"频道 CRUD"但 contract §5 缺创建端点，admin UI / 初始化工具 / 测试 fixture 无正式入口。
+- **v2.5 (2026-06-24)**：补 `POST /api/chat/channels` 创建幂等规则（§5.2b 路由与幂等段）：create 幂等由 `UserDirectory(creator_user_id)` 协调（状态机 `creating`→`completed` + 持久化 `channel_id`），`ChatChannel(channel_id).createChannel` 单事务原子写入。原因：create 端点 URL 无 `channel_id`，Worker 现场 `uuidv7()` 会使重试路由到不同 DO，in-DO `idempotency_keys` 失效，结构性重复建群。其余 6 个 mutation 端点 `channel_id` 在 URL，DO 地址稳定，沿用 Phase 2 in-DO 幂等。
 
 ## 1. 边界
 
@@ -572,7 +573,7 @@ Idempotency-Key: client-key-channel-create
 - 是否允许普通用户创建频道由 contract 写死：**Phase 3 允许任意已认证 Browser 用户创建 `kind="channel"` 频道**（DM 创建不暴露，见"关于 DM"）。`kind` 固定为 `channel`，请求不接受 `kind` 字段。
 - endpoint 必须存在——后续 admin UI / 初始化工具 / 测试 fixture 都经此正式入口，不靠 `/internal/*` 旁路。
 
-路由：频道 `channel_id`（UUIDv7）即 ChatChannel DO 的 name（系统公共频道例外，DO name 为 `system-general`）。
+路由与幂等（v2.5 delta）：创建频道的幂等由 `UserDirectory(creator_user_id)` 协调，不由 Worker 现场 mint 的 `ChatChannel` DO 承担。Worker 路由到 `UserDirectory(user_id)`，后者在其 `idempotency_keys` 事务内 mint `channel_id`（UUIDv7，即 `ChatChannel` DO name；系统频道例外，DO name=`system-general`），状态机 `creating`→`completed`，持久化 `channel_id`，再调用 `ChatChannel(channel_id).createChannel`（单事务原子写入，`channel_meta` 存在性即幂等 guard）。同一 `(user, operation=channel.create, key)` + 相同 `request_hash` 重试命中同一 `UserDirectory` DO → 同一 `channel_id` → 同一 `ChatChannel` DO → 缓存结果；不同 `request_hash` 返回 `409 IDEMPOTENCY_CONFLICT`。崩溃窗口：`status=creating` 时 retry 重新调用同一 `ChatChannel(channel_id).createChannel`（幂等返回已提交行）后标 `completed`，不重复建群。跨 DO 仍为 best-effort（无 2PC）。
 
 
 
