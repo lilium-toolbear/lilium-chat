@@ -1,83 +1,36 @@
 import type { Env } from "../env";
-import { resolveUserSummaries, type UserSummary } from "../profile/resolve";
+import { resolveUserSummaries } from "../profile/resolve";
+import type { MessageRow } from "../do/chat-channel";
+import { projectMessageForBrowser, type MessageMention } from "./message-projection";
+import type { UserSummary } from "./event-broadcast";
 
-export interface RawMessage {
-  message_id: string;
-  command_id: string;
-  channel_id: string;
-  sender: {
-    kind: string;
-    user_id: string | null;
-    bot_id: string | null;
-  };
-  type: string;
-  format: string;
-  status: string;
-  text: string | null;
-  reply_to: string | null;
-  reply_snapshot: unknown;
-  stream_state: string;
-  created_at: string;
-  updated_at: string;
-  edited_at: string | null;
-  deleted_at: string | null;
-  deleted_by: string | null;
-  recalled_at: string | null;
-  attachments: unknown[];
-  components: unknown[];
-  mentions: unknown[];
-}
+// v4.0: history/bootstrap projection goes through the ONE shared projectMessageForBrowser
+// (addendum J) — same serializer as message.send ack + message.created event + replay. The DO
+// returns raw MessageRows + the page's mentions (grouped by message_id); this helper resolves
+// sender UserSummaries and projects each row. No separate RawMessage/ContractMessage serializer.
+export type ProjectedMessage = ReturnType<typeof projectMessageForBrowser>;
 
-export interface ContractMessage {
-  message_id: string;
-  command_id: string;
-  channel_id: string;
-  sender: {
-    kind: "user";
-    user: UserSummary;
-  } | {
-    kind: "bot";
-    bot: { bot_id: string; display_name: string; avatar_url: string | null };
-  };
-  type: string;
-  format: string;
-  status: string;
-  text: string | null;
-  reply_to: string | null;
-  reply_snapshot: unknown;
-  stream_state: string;
-  created_at: string;
-  updated_at: string;
-  edited_at: string | null;
-  deleted_at: string | null;
-  deleted_by: string | null;
-  recalled_at: string | null;
-  attachments: unknown[];
-  components: unknown[];
-  mentions: unknown[];
-}
+export async function projectMessagesForBrowser(
+  rows: MessageRow[],
+  mentionsByMessage: Record<string, MessageMention[]>,
+  env: Env,
+): Promise<Record<string, unknown>[]> {
+  const senderUserIds = [...new Set(rows.filter((r) => r.sender_kind === "user" && r.sender_user_id).map((r) => r.sender_user_id as string))];
+  const map = await resolveUserSummaries(senderUserIds, env);
 
-function fallbackSummary(uid: string): UserSummary {
-  return {
-    user_id: uid,
-    display_name: `user-${uid.slice(0, 8)}`,
-    avatar_url: null,
-  };
-}
-
-export async function attachSummaries(raw: RawMessage[], env: Env): Promise<ContractMessage[]> {
-  const userIds = [...new Set(raw.filter((m) => m.sender.kind === "user" && m.sender.user_id).map((m) => m.sender.user_id as string))];
-  const map = await resolveUserSummaries(userIds, env);
-
-  return raw.map((m) => {
-    let sender: ContractMessage["sender"];
-    if (m.sender.kind === "bot") {
-      // ponytail: bot resolution deferred to Phase 7; keep phase-1 placeholder stable.
-      sender = { kind: "bot", bot: { bot_id: m.sender.bot_id ?? "", display_name: "bot", avatar_url: null } };
-    } else {
-      const uid = m.sender.user_id ?? "";
-      sender = { kind: "user", user: map.get(uid) ?? fallbackSummary(uid) };
+  return rows.map((row) => {
+    let senderSummary: UserSummary | null = null;
+    if (row.sender_kind === "user" && row.sender_user_id) {
+      const raw = map.get(row.sender_user_id);
+      // profile/resolve UserSummary.display_name is string | null; projectMessageForBrowser's
+      // UserSummary.display_name is string — fall back to user-<shortid> when null.
+      senderSummary = raw
+        ? { user_id: raw.user_id, display_name: raw.display_name ?? `user-${row.sender_user_id.slice(0, 8)}`, avatar_url: raw.avatar_url }
+        : { user_id: row.sender_user_id, display_name: `user-${row.sender_user_id.slice(0, 8)}`, avatar_url: null };
     }
-    return { ...m, sender };
+    return projectMessageForBrowser(row, {
+      senderSummary,
+      mentions: mentionsByMessage[row.message_id] ?? [],
+    });
   });
 }

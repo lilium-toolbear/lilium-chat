@@ -169,44 +169,6 @@ interface ReplayEnvelope {
   event_json: string;
 }
 
-function rowToMessage(r: MessageRow): Record<string, unknown> {
-  let replySnapshot: unknown = null;
-  if (r.reply_snapshot_json) {
-    try {
-      replySnapshot = JSON.parse(r.reply_snapshot_json);
-    } catch {
-      replySnapshot = null;
-    }
-  }
-
-  return {
-    message_id: r.message_id,
-    command_id: r.command_id,
-    channel_id: r.channel_id,
-    sender: {
-      kind: r.sender_kind,
-      user_id: r.sender_user_id,
-      bot_id: r.sender_bot_id,
-    },
-    type: r.type,
-    format: r.format,
-    status: r.status,
-    text: r.text,
-    reply_to: r.reply_to,
-    reply_snapshot: replySnapshot,
-    stream_state: r.stream_state,
-    created_at: r.created_at,
-    updated_at: r.updated_at,
-    edited_at: r.edited_at,
-    deleted_at: r.deleted_at,
-    deleted_by: r.deleted_by,
-    recalled_at: r.recalled_at,
-    attachments: [],
-    components: [],
-    mentions: [],
-  };
-}
-
 export class ChatChannel extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -681,8 +643,24 @@ export class ChatChannel extends DurableObject<Env> {
       const page = hasMore ? rows.slice(0, limit) : rows;
       const nextCursor = hasMore && page.length > 0 ? page[page.length - 1]!.message_id : null;
 
+      // v4.0: return raw MessageRows + the page's mentions (grouped by message_id). The Worker
+      // resolves sender UserSummaries and projects via the shared projectMessageForBrowser — one
+      // serializer across history / ack / event (addendum J). rowToMessage is no longer used here.
+      const messageIds = page.map((r) => r.message_id);
+      const mentionsByMessage: Record<string, Array<{ user_id: string; start: number; end: number }>> = {};
+      if (messageIds.length > 0) {
+        const placeholders = messageIds.map(() => "?").join(",");
+        const mentionRows = this.ctx.storage.sql
+          .exec(`SELECT message_id, user_id, start, end_ AS end FROM mentions WHERE message_id IN (${placeholders})`, ...messageIds)
+          .toArray() as Array<{ message_id: string; user_id: string; start: number; end: number }>;
+        for (const mr of mentionRows) {
+          (mentionsByMessage[mr.message_id] ??= []).push({ user_id: mr.user_id, start: mr.start, end: mr.end });
+        }
+      }
+
       return Response.json({
-        items: page.map((r) => rowToMessage(r)),
+        items: page,
+        mentions: mentionsByMessage,
         next_cursor: nextCursor,
       });
     }
@@ -829,6 +807,25 @@ export class ChatChannel extends DurableObject<Env> {
         deleted_by: null,
         recalled_at: null,
       };
+      // v4.0 cheap pre-check: a duplicate retry (same operation_id + same request_hash) can return
+      // the cached committed ack WITHOUT resolving the sender profile (Hyperdrive wait) or opening a
+      // transaction. The transaction below STILL re-checks idempotency (handles the race where two
+      // concurrent sends interleave). This is a pure latency optimization for the cached path.
+      const preCheck = this.ctx.storage.sql
+        .exec("SELECT response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='message.send' AND operation_id=? AND request_hash=? AND response_json IS NOT NULL AND response_json != ''",
+          userId, b.command_id, requestHash)
+        .toArray()[0] as { response_json: string } | undefined;
+      if (preCheck) {
+        const cached = JSON.parse(preCheck.response_json) as { payload?: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } };
+        if (cached.payload && cached.payload.event_id && cached.payload.message) {
+          return Response.json({
+            channel_id: cached.payload.channel_id ?? channelId,
+            event_id: cached.payload.event_id,
+            message: cached.payload.message,
+          });
+        }
+      }
+
       // v4.0 P0-2: resolve sender BEFORE the transaction (Hyperdrive is a network call). The live
       // projection built from this resolution is written INTO the transaction (response_json + the
       // channel_fanout outbox event_json), so the cached ack is stable+complete with no crash window.
