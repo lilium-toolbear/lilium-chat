@@ -1,6 +1,6 @@
 # Lilium Chat 后端设计
 
-状态：设计稿（v4.0，channel-scoped message API + WS write path + command_id idempotency + simplified DO topology）
+状态：设计稿（v4.1，Phase E：personal stickers + owner transfer + invite preview backend；v4.0 channel-scoped message API + WS write path + command_id idempotency + simplified DO topology）
 日期：2026-06-22
 范围：lilium-chat 仓库（Cloudflare Worker + Durable Object 纯后端）的实现设计
 参考：
@@ -155,6 +155,20 @@ v4.0 收口如下：
 - 实时 fanout 不引入 Queue，继续走 DO→DO：ChatChannel 产生 event → ChannelFanout 维护在线 session 并投递 → UserConnection 接收 deliver 并推送 WebSocket。
 - `projection_outbox` 保留，但只用于必要的跨 DO projection / fanout 补偿，不作为通用 MQ。
 
+### 0.8 v4.1 修订：Phase E personal stickers（DO ownership 收口）
+
+Phase E 引入 personal sticker library，需在落地前明确 DO ownership。v4.1 收口：
+
+- **Personal sticker library 归 `UserDirectory DO(user_id)` 所有**：sticker library 是 user-local 收藏，非 channel timeline state、非 online fanout state、非全局 bot/profile state。listing / save / delete / save 幂等都在 `UserDirectory DO(user_id)`。
+- **`UserDirectory` schema 新增 `personal_stickers` 表**（sticker_id PK + user_id + attachment_id + url/mime/dims + soft delete；`UNIQUE(user_id, attachment_id)`；index on `user_id, created_at DESC WHERE deleted_at IS NULL`）。
+- **`ChatChannel` schema 新增 `message_stickers` 表**（message_id PK + sticker_id + attachment_id + url/mime/dims 快照）；`messages.type` 增加 `sticker` 取值（`text | image | sticker | system`）。快照 url/mime/dims 使历史 sticker 消息在 sender 删除库条目后仍稳定。
+- **新增 ChatChannel 内部 DO-to-DO 方法 `resolveVisibleAttachment({user_id, attachment_id})`**：供 sticker save 流程校验附件可见性 + 返回 canonical projection；拒绝 deleted/recalled 消息附件；不返回 `storage_key`。
+- **新增 UserDirectory 内部 DO-to-DO 方法 `resolveSticker(sticker_id)`**：供 sticker send 流程解析 sender sticker_id → canonical projection；要求属当前用户且未软删；不 mutate state。
+- **`projectMessageForBrowser` 支持 `type="sticker"`**：`sticker={sticker_id, attachment_id, url, mime_type, width, height, size_bytes}`、`text=null`、`attachments=[]`、`format="plain"`；deleted/recalled → `sticker=null`。同一 builder 用于 history / replay / live event / ack。
+- **不引入 `AttachmentDirectory DO`**（Phase E explicit non-goal）：save-sticker 用 `{channel_id, attachment_id}`，UserDirectory 路由可见性校验到源 `ChatChannel DO(channel_id)`。
+- **幂等沿用 v4.0 `operation_id` 语义**：sticker save 幂等 operation = `sticker.save`，归 `UserDirectory(user_id)`；sticker send 幂等 = 现有 `message.send`，归 `ChatChannel(channel_id)`。
+- **owner-transfer 后端实现不在本节范围**：API wire shape 见 contract issue #1028；若后续需后端 DO 实现，另行补丁。
+
 ## 1. 架构总览
 
 Durable Objects:
@@ -219,6 +233,7 @@ External:
 | `POST /api/chat/channels/{channel_id}/invites` | ChatChannel DO |
 | `POST /api/chat/invites/{invite_code}/accept` | InviteDirectory DO → ChatChannel DO |
 | `GET /api/chat/channels/directory` | ChannelDirectory DO |
+| `POST /api/chat/stickers` | UserDirectory DO(user_id) → ChatChannel DO(channel_id).resolveVisibleAttachment（Phase E） |
 | `WS /api/chat/ws` | upgrade 代理到 UserConnection DO |
 | WS command `message.send` | UserConnection DO → ChatChannel DO |
 | WS command `message.edit` | UserConnection DO → ChatChannel DO |
@@ -239,6 +254,31 @@ Browser-facing message writes and read-state writes are WebSocket commands. Publ
 - **时间**：ISO 8601 UTC 字符串（`TEXT`）。
 - **软删除/审计**：deleted/recalled 只改 `status` + 时间戳，不清空原文。普通查询按 `status` 过滤投影。
 - **跨 DO**：无跨 DO 事务；source-of-truth + projection + repair（见第 2.3 节）。
+
+### Phase E: Personal sticker ownership
+
+Personal sticker library is owned by `UserDirectory DO` keyed by `user_id`.
+
+Rationale:
+
+- Sticker library is user-local state.
+- Listing, saving, deleting, and deduping stickers are scoped to the current user.
+- Sticker library is not channel timeline state.
+- Sticker library is not online fanout state.
+- Sticker library is not global bot/profile state.
+
+No standalone `StickerRegistry DO` is introduced in Phase E.
+
+Ownership split:
+
+| State / operation | Owner DO |
+|---|---|
+| Personal sticker library rows | `UserDirectory DO(user_id)` |
+| Sticker list / delete / save idempotency | `UserDirectory DO(user_id)` |
+| Attachment visibility validation for save-from-message | `ChatChannel DO(channel_id)` |
+| Message creation for `type=sticker` | `ChatChannel DO(channel_id)` |
+| Live event fanout for sticker messages | existing `ChannelFanout DO(channel_id)` |
+| WebSocket command routing | existing `UserConnection DO(user_id)` |
 
 ### 2.1 ChatChannel DO（by channel_id）
 
@@ -281,7 +321,7 @@ CREATE TABLE messages (
   sender_kind       TEXT NOT NULL,           -- user | bot | system
   sender_user_id    TEXT,
   sender_bot_id     TEXT,
-  type              TEXT NOT NULL,           -- text | image | system
+  type              TEXT NOT NULL,           -- text | image | sticker | system
   format            TEXT NOT NULL DEFAULT 'plain',
   status            TEXT NOT NULL DEFAULT 'normal',
   text              TEXT,                    -- 原文,deleted/recalled 不清空
@@ -348,6 +388,21 @@ CREATE TABLE message_attachments (
   attachment_id TEXT NOT NULL,
   PRIMARY KEY (message_id, attachment_id)
 );
+
+-- Phase E: sticker 消息快照(sender 个人库条目发送时的 url/mime/dims 快照)
+CREATE TABLE message_stickers (
+  message_id    TEXT PRIMARY KEY,
+  sticker_id    TEXT NOT NULL,  -- sender's personal sticker id at send time
+  attachment_id TEXT NOT NULL,
+  url           TEXT NOT NULL,
+  mime_type     TEXT NOT NULL,
+  width         INTEGER,
+  height        INTEGER,
+  size_bytes    INTEGER
+);
+-- 备选方案: 用 message_attachments + messages.type='sticker',但 v1 首选 message_stickers。
+-- 理由: sticker 消息应投影为 sticker 而非普通 image 附件; attachments=[] 避免重复渲染;
+-- 快照 url/mime/width/height/size 使历史 sticker 消息在 sender 删除库条目后仍稳定。
 
 -- mentions(主键改为 range,允许同一用户多次 mention)
 CREATE TABLE mentions (
@@ -517,7 +572,28 @@ CREATE TABLE pending_attachments (
   created_at      TEXT NOT NULL
 );
 CREATE INDEX idx_pending_expires ON pending_attachments(status, expires_at);
+
+-- Phase E: personal sticker library
+CREATE TABLE personal_stickers (
+  sticker_id    TEXT PRIMARY KEY,        -- UUIDv7, user-local library item id
+  user_id       TEXT NOT NULL,
+  attachment_id TEXT NOT NULL,           -- canonical image attachment id
+  url           TEXT NOT NULL,           -- Browser-visible stable image URL snapshot
+  mime_type     TEXT NOT NULL,
+  width         INTEGER,
+  height        INTEGER,
+  size_bytes    INTEGER,
+  created_at    TEXT NOT NULL,
+  deleted_at    TEXT,
+  UNIQUE (user_id, attachment_id)
+);
+
+CREATE INDEX idx_personal_stickers_user_created
+  ON personal_stickers(user_id, created_at DESC)
+  WHERE deleted_at IS NULL;
 ```
+
+Phase E adds the personal sticker library table `personal_stickers` to `UserDirectory DO`. `sticker_id` is user-local: receivers must not assume another user's `sticker_id` is usable by them. `attachment_id` is the reusable image identity; multiple users may have different `sticker_id` rows pointing to the same `attachment_id`. Deleting a personal sticker only sets `deleted_at`; it does not delete the underlying attachment object and does not affect historical messages.
 
 `last_read_event_id` 唯一存于 `my_channels`，mark-read 单写 UserDirectory，不碰 channel DO。write floor（v3 明确）：要求该 `(user_id, channel_id)` 行存在且 `status='active'`（软状态，不硬删除）；cursor 单调前进（新值 > 旧值才接受）。unread 实时算（去 ChatChannel DO 查 `event_id > last_read_event_id` 且非自己发的条数）。`status='left'/'removed'` 的行保留供 audit/repair/客户端"刚被移除"处理，不参与 unread/read-state。**v4.0 收口：** read-state 写入走 WS command `channel.mark_read`（UserConnection DO → UserDirectory DO），**不写 channel timeline event、不写 `projection_outbox`**；多 session 同步用 user-local `read_state_updated` WS frame（非 channel event）。read-state 是 user-local state，不是 channel timeline state。
 
@@ -880,6 +956,26 @@ function nextEventId(seq) {
 - UserSummary（`display_name`/`avatar_url`）**不持久化进 DO event payload**；持久化 event 只存 sender/actor user_id 引用，live ack/event 投影输出时实时 resolve。bot actor 例外（BotRegistry 是 chat-owned，可随 event 携带）。
 - builder 输出字段集 = §contract §3.4 Message model 全投影（sender UserSummary、type、format、status、stream_state、text、reply_to、reply_snapshot、attachments、components、mentions、created_at、updated_at、edited_at、deleted_at、recalled_at）。
 
+`projectMessageForBrowser` must support `type="sticker"`. Projection rules:
+
+- normal sticker message:
+  - `type="sticker"`
+  - `text=null`
+  - `attachments=[]`
+  - `sticker={ sticker_id, attachment_id, url, mime_type, width, height, size_bytes }`
+  - `components=[]`
+  - `mentions=[]`
+  - `format="plain"`
+- deleted/recalled sticker message:
+  - `type="sticker"`
+  - `text=null`
+  - `sticker=null`
+  - `attachments=[]`
+  - `components=[]`
+  - `mentions=[]`
+
+The same projection builder is used for history, replay, live event frame, and committed_ack payload.
+
 ### 3.5c `system.notice` 与解散事件（v3.3）
 
 - `channel.dissolved` 是频道状态变更 domain event，payload 只含 `channel_id`、`status='dissolved'`、`dissolved_at`、`actor_kind`、`actor_id`。Browser 投影输出时回填 actor UserSummary。
@@ -939,6 +1035,72 @@ function operationIdFromWs(frame: CommandFrame): ClientOperationId {
 ```
 
 Internal idempotency code receives `{principal_kind, principal_id, operation, operation_id, request_hash}` and must not care whether it came from HTTP or WS. Mapping: `HTTP operation_id = Idempotency-Key`; `WS operation_id = command_id`.
+
+### 3.9 Phase E: ChatChannel 内部方法 resolveVisibleAttachment
+
+`ChatChannel DO` exposes an internal method for Phase E sticker save:
+
+```ts
+resolveVisibleAttachment(input: {
+  user_id: string
+  attachment_id: string
+}): AttachmentProjection
+```
+
+Rules:
+
+- The caller is trusted Worker/UserDirectory internal code.
+- `user_id` must be authorized against `members`.
+- The channel must not be invisible to this user.
+- `attachment_id` must exist in this channel's `attachments` table.
+- The attachment must be linked to at least one Browser-visible normal image/sticker message.
+- If the linked message is deleted/recalled, return `INVALID_STICKER_SOURCE` or `MESSAGE_NOT_FOUND` according to API contract.
+- Return only Browser-safe projection:
+  - `attachment_id`
+  - `url`
+  - `mime_type`
+  - `width`
+  - `height`
+  - `size_bytes`
+- Do not return `storage_key`.
+
+### 3.10 Phase E: send sticker message 流程
+
+Browser sends existing WS `message.send` command with `type="sticker"` and current user's `sticker_id`. Command ownership remains unchanged:
+
+```text
+Browser → UserConnection DO(user_id) → ChatChannel DO(channel_id)
+```
+
+`ChatChannel DO` remains the owner of message creation. Flow inside ChatChannel:
+
+```text
+ChatChannel.messageSend(type=sticker)
+  ├─ check message.send idempotency first
+  │    └─ if completed, return cached committed_ack without resolving sticker
+  ├─ validate channel membership / channel status
+  ├─ call UserDirectory DO(user_id).resolveSticker(sticker_id)
+  │    └─ returns canonical attachment projection
+  ├─ create message row type='sticker'
+  ├─ store sticker attachment reference
+  ├─ create message.created event
+  ├─ write projection_outbox(target_kind=channel_fanout)
+  ├─ complete idempotency row with canonical ack payload
+  └─ return committed_ack
+```
+
+Important idempotency rule:
+
+- ChatChannel must check completed idempotency before resolving `sticker_id`.
+- If the original sticker send already committed, retrying the same `command_id` must return cached committed_ack even if the sender later removed that sticker from their personal library.
+- If no committed idempotency entry exists and `sticker_id` no longer exists, return `STICKER_NOT_FOUND`.
+
+`UserDirectory.resolveSticker(sticker_id)`:
+
+- Requires the sticker belongs to the current user.
+- Requires `deleted_at IS NULL`.
+- Returns canonical attachment projection snapshot from `personal_stickers`.
+- Does not mutate state.
 
 ## 4. 认证与 Profile
 
@@ -1064,6 +1226,51 @@ Public read，不签。`url` 长期公开存 DO。**产品方显式风险接受*
 ### 5.6 发送图片消息
 
 finalize 拿到 attachment_id 后，前端发 WS command `{message.send, type:image, attachment_ids}`。Worker 从 UserDirectory 预取 metadata → ChatChannel DO 事务校验 `owner==sender && status==finalized` → 写 message + message_attachments + attachment 副本 + `message.created` event → 广播。
+
+### 5.7 Phase E: save personal sticker 流程
+
+Saving a visible image/sticker into personal sticker library uses `{ channel_id, attachment_id }`. `message_id` is not required and must not be used as the primary source locator. `channel_id` is required so backend can route to `ChatChannel DO(channel_id)` to verify current visibility and obtain canonical attachment projection. `attachment_id` is required so the selected image is unambiguous even if a message contains multiple attachments. Request shape:
+
+```json
+{
+  "channel_id": "00000000-0000-7000-8000-000000000201",
+  "attachment_id": "00000000-0000-7000-8000-000000000501"
+}
+```
+
+No `message_id` is needed in v1. If a future API wants to save by `attachment_id` alone, backend must first introduce an `AttachmentDirectory DO` or another global attachment locator. Phase E does not introduce that DO.
+
+HTTP Browser request:
+
+```text
+POST /api/chat/stickers
+body = { channel_id, attachment_id }
+```
+
+Flow:
+
+```text
+Worker
+  └─ verifies Browser JWT
+  └─ routes to UserDirectory DO(user_id)
+       ├─ idempotency check in UserDirectory(operation=sticker.save)
+       ├─ calls ChatChannel DO(channel_id).resolveVisibleAttachment(user_id, attachment_id)
+       │    ├─ requires user is current active member or otherwise authorized by existing Browser visibility rules
+       │    ├─ requires attachment is currently Browser-visible
+       │    ├─ rejects deleted/recalled message attachments
+       │    └─ returns canonical attachment projection { attachment_id, url, mime_type, width, height, size_bytes }
+       ├─ upserts personal_stickers(user_id, attachment_id)
+       └─ returns PersonalSticker projection
+```
+
+Semantics:
+
+- Save operation is user-local and idempotent in `UserDirectory`.
+- ChatChannel is consulted only for attachment visibility and canonical projection.
+- No channel timeline event is written.
+- No ChannelFanout delivery is produced.
+- The original message is not mutated.
+- Re-saving the same `attachment_id` by the same user returns the existing active sticker row, or restores a soft-deleted row depending on implementation choice. The chosen behavior must be deterministic.
 
 ## 6. 部署与 chat.kuma.homes / CORS / WS Origin
 
@@ -1424,4 +1631,25 @@ per-channel cursor 是产品方确认的 contract API 形状修订（见第 0.2 
 - 不定义通用 `NOT_FOUND`；新增 `INVITE_NOT_FOUND`，并保留 `CHANNEL_NOT_FOUND`、`MESSAGE_NOT_FOUND`、`MEMBER_NOT_FOUND`。
 - 群聊标签列为 Browser API v1 disabled 只读占位；免打扰列为 browser local-only non-server state。
 
-权威 contract v2.2 已落本仓库 `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（含 per-channel cursor + committed_ack + 幂等简化 + ROUTE_INDEX_PENDING（v4.0 仅 invite-code 路由保留）+ dissolve + system.notice + 资源级 not-found code + 风险登记 delta；v4.0 追加 channel-scoped message API + WS write path + command_id/operation_id 幂等）。前端开工前须按此 contract 接入，并与前端 `chatConnectionStore` 重构同步（`last_event_id` → per-channel map）。后端阶段 1/2 实现按 contract 形状，不实现原 2026-06-21 contract 的单全局 cursor 与 accepted-only ack。
+权威 contract v2.2 已落本仓库 `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（含 per-channel cursor + committed_ack + 幂等简化 + ROUTE_INDEX_PENDING（v4.0 仅 invite-code 路由保留）+ dissolve + system.notice + 资源级 not-found code + 风险登记 delta；v4.0 追加 channel-scoped message API + WS write path + command_id/operation_id 幂等；v4.1 追加 Phase E personal stickers + sticker save/send API 形状，详见下方 v4.1 delta）。前端开工前须按此 contract 接入，并与前端 `chatConnectionStore` 重构同步（`last_event_id` → per-channel map）。后端阶段 1/2 实现按 contract 形状，不实现原 2026-06-21 contract 的单全局 cursor 与 accepted-only ack。
+
+**v4.1 追加 delta（Phase E personal stickers）：**
+
+- Personal sticker library 归 `UserDirectory DO(user_id)`（新增 `personal_stickers` 表），不引入 `StickerRegistry DO`。
+- `POST /api/chat/stickers` 请求体为 `{ channel_id, attachment_id }`，不携带 `message_id`；backend 路由 `UserDirectory(user_id)` → `ChatChannel(channel_id).resolveVisibleAttachment` 校验可见性 + 取 canonical projection。
+- WS `message.send` 新增 `type="sticker"` + `sticker_id`；ChatChannel 先查 `message.send` 幂等（命中即返回缓存 ack，不解析 sticker），再 `UserDirectory(user_id).resolveSticker` → 写 `messages(type='sticker')` + `message_stickers` 快照 + `message.created` event + `projection_outbox(channel_fanout)`。
+- `messages.type` 取值改为 `text | image | sticker | system`；新增 `message_stickers` 表（message_id PK + url/mime/dims 快照）。
+- `projectMessageForBrowser` 支持 `type="sticker"`：`sticker={sticker_id, attachment_id, url, mime_type, width, height, size_bytes}`、`text=null`、`attachments=[]`、`format="plain"`；deleted/recalled → `sticker=null`。
+- 幂等沿用 v4.0 `operation_id`：sticker save operation=`sticker.save`（归 `UserDirectory`）；sticker send operation=`message.send`（归 `ChatChannel`）。
+
+**Phase E explicit non-goal：**
+
+Phase E does not add `AttachmentDirectory DO`. Because save-sticker uses `{ channel_id, attachment_id }`, UserDirectory can route visibility validation to the source `ChatChannel DO(channel_id)`. A global attachment locator is unnecessary. If a future API accepts only `attachment_id` without `channel_id`, then a new global attachment index/DO must be designed. Do not implement attachment-id-only routing by scanning channels or by guessing from UUID.
+
+**Phase E required invariants：**
+
+```text
+保存表情：UserDirectory(user_id) owns library; ChatChannel(channel_id) validates attachment visibility.
+发送表情：ChatChannel(channel_id) owns message creation; UserDirectory(user_id) resolves sender sticker_id.
+不新增 AttachmentDirectory：save request 必须带 channel_id + attachment_id。
+```
