@@ -23,9 +23,13 @@ export async function ensureSystemJoined(env: Env, userId: string): Promise<{ ch
 }
 
 export async function channelRouteNameFor(env: Env, userId: string, clientChannelId: string): Promise<string | null> {
+  void userId;
+  // The system channel DO is named system-general; its channel_id is a UUIDv7 minted at bootstrap.
   const sys = await ensureSystemChannel(env);
   if (clientChannelId === sys.channelId) return SYSTEM_CHANNEL_NAME;
-  // Phase 3+ convention: user-created channels use channel_id as the DO name.
-  // For Phase 1, any non-system id is unresolved → null (caller returns CHANNEL_NOT_FOUND).
-  return null;
+  // Defense: the literal DO-name string "system-general" is never a user channel id.
+  if (clientChannelId === SYSTEM_CHANNEL_NAME) return null;
+  // Phase 3: user-created channels use channel_id as the DO name (optimistic routing).
+  // The ChatChannel DO self-validates (404/409 if the channel doesn't exist).
+  return clientChannelId;
 }

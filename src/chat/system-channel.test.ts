@@ -14,10 +14,13 @@ describe("system-channel helpers", () => {
     expect(a.channelId).toMatch(/^01[0-9a-f]{6}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   });
 
-  it("channelRouteNameFor returns system name for system channelId, null for others", async () => {
+  it("channelRouteNameFor returns system name for system channelId, the id itself for user channels", async () => {
     const userId = "u-route-1";
     const { channelId } = await ensureSystemJoined(testEnv, userId);
     expect(await channelRouteNameFor(testEnv, userId, channelId)).toBe(SYSTEM_CHANNEL_NAME);
-    expect(await channelRouteNameFor(testEnv, userId, "unknown-uuid")).toBeNull();
+    // Phase 3: non-system channel ids route optimistically to the DO named by the id itself.
+    expect(await channelRouteNameFor(testEnv, userId, "unknown-uuid")).toBe("unknown-uuid");
+    // Defense: the literal DO-name string 'system-general' is never a user channel id.
+    expect(await channelRouteNameFor(testEnv, userId, SYSTEM_CHANNEL_NAME)).toBeNull();
   });
 });
