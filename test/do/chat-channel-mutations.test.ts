@@ -104,3 +104,99 @@ describe("ChatChannel /internal/dissolve", () => {
     expect(((await send.json()) as { error: { code: string } }).error.code).toBe("CHANNEL_DISSOLVED");
   });
 });
+
+describe("ChatChannel members CRUD", () => {
+  it("admin adds a member → member.joined + system.notice", async () => {
+    const cid = "0195aaaa-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    const res = await stub.fetch(new Request("https://x/internal/members-add", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-add-1", channel_id: cid, user_id: "u-add-1", role: "member" }),
+    }));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { member: { role: string } }).member.role).toBe("member");
+  });
+
+  it("owner updates a member role → member.role_updated", async () => {
+    const cid = "0195bbbb-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-2", channel_id: cid, user_id: "u-add-2", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-update-role", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-role-1", channel_id: cid, user_id: "u-add-2", role: "admin" }),
+    }));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { member: { role: string } }).member.role).toBe("admin");
+  });
+
+  it("non-owner cannot change role (403)", async () => {
+    const cid = "0195cccc-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-3", channel_id: cid, user_id: "u-add-3", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-update-role", { method: "POST", headers: { "X-Verified-User-Id": "u-add-3", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-role-2", channel_id: cid, user_id: "u-add-3", role: "admin" }) }));
+    expect(res.status).toBe(403);
+  });
+
+  it("owner removes a member → member.left + fanout unregister outbox", async () => {
+    const cid = "0195dddd-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-4", channel_id: cid, user_id: "u-add-4", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-remove", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-rem-1", channel_id: cid, user_id: "u-add-4" }),
+    }));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { removed: boolean }).removed).toBe(true);
+  });
+
+  it("member self-leaves (user_id === caller)", async () => {
+    const cid = "0195eeee-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-5", channel_id: cid, user_id: "u-self-leave", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-remove", { method: "POST", headers: { "X-Verified-User-Id": "u-self-leave", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-rem-2", channel_id: cid, user_id: "u-self-leave" }) }));
+    expect(res.status).toBe(200);
+  });
+
+  it("add with a DIFFERENT role on an active member → 422 (no role-change-via-add bypass)", async () => {
+    const cid = "0195ffff-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-6", channel_id: cid, user_id: "u-bypass", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-6b", channel_id: cid, user_id: "u-bypass", role: "admin" }) }));
+    expect(res.status).toBe(422);
+  });
+
+  it("add same role on an active member → 200 idempotent (no event, no count bump)", async () => {
+    const cid = "01950000-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-7", channel_id: cid, user_id: "u-idem-add", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-7b", channel_id: cid, user_id: "u-idem-add", role: "member" }) }));
+    expect(res.status).toBe(200);
+  });
+
+  it("reactivates a LEFT member (+1 count) → member.joined", async () => {
+    const cid = "01950001-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-8", channel_id: cid, user_id: "u-rejoin", role: "member" }) }));
+    await stub.fetch(new Request("https://x/internal/members-remove", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-rem-rejoin", channel_id: cid, user_id: "u-rejoin" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-add-8b", channel_id: cid, user_id: "u-rejoin", role: "admin" }) }));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { member: { role: string } }).member.role).toBe("admin");
+  });
+
+  it("owner cannot self-leave (owner invariant) → 422", async () => {
+    const cid = "01950002-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid); // owner = u-up-owner
+    const res = await stub.fetch(new Request("https://x/internal/members-remove", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-rem-owner", channel_id: cid, user_id: "u-up-owner" }) }));
+    expect(res.status).toBe(422);
+  });
+
+  it("owner cannot demote self via role-update → 422", async () => {
+    const cid = "01950003-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    const res = await stub.fetch(new Request("https://x/internal/members-update-role", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-role-owner", channel_id: cid, user_id: "u-up-owner", role: "member" }) }));
+    expect(res.status).toBe(422);
+  });
+});

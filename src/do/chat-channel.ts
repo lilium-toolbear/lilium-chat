@@ -238,40 +238,38 @@ export class ChatChannel extends DurableObject<Env> {
     );
   }
 
-  private async markMemberLeftAndEnqueueFanoutUnregister(
-    channelId: string,
-    userId: string,
-    nowIso: string,
-  ): Promise<void> {
+  // SYNC core: co-atomic leave + fanout unregister outbox. Runs inside a caller transaction.
+  // (P0-6: single leave implementation — /internal/test-leave and members-remove share this.)
+  private markMemberLeftAndEnqueueFanoutUnregisterSync(channelId: string, userId: string, nowIso: string): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE members SET left_at=? WHERE channel_id=? AND user_id=?",
+      nowIso, channelId, userId,
+    );
+    const meta = this.ctx.storage.sql
+      .exec("SELECT membership_version, member_count FROM channel_meta WHERE channel_id=?", channelId)
+      .toArray()[0] as { membership_version: number; member_count: number } | undefined;
+    const nextMv = (meta?.membership_version ?? 0) + 1;
+    const nextCount = Math.max(0, (meta?.member_count ?? 1) - 1);
+    this.ctx.storage.sql.exec(
+      "UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?",
+      nextMv,
+      nextCount,
+      nowIso,
+      channelId,
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'channel_fanout', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+      `channel_fanout:unregister:${channelId}:${userId}:${nowIso}`,
+      channelId,
+      JSON.stringify({ action: "unregister-user", channel_id: channelId, user_id: userId }),
+      nowIso, nowIso, nowIso,
+    );
+  }
+
+  // Phase 2 path (test-leave): wraps the sync core in its own transaction.
+  private async markMemberLeftAndEnqueueFanoutUnregister(channelId: string, userId: string, nowIso: string): Promise<void> {
     await this.ctx.storage.transaction(async () => {
-      this.ctx.storage.sql.exec(
-        "UPDATE members SET left_at=? WHERE channel_id=? AND user_id=?",
-        nowIso,
-        channelId,
-        userId,
-      );
-      const meta = this.ctx.storage.sql
-        .exec("SELECT membership_version, member_count FROM channel_meta WHERE channel_id=?", channelId)
-        .toArray()[0] as { membership_version: number; member_count: number } | undefined;
-      const nextMv = (meta?.membership_version ?? 0) + 1;
-      const nextCount = Math.max(0, (meta?.member_count ?? 1) - 1);
-      this.ctx.storage.sql.exec(
-        "UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?",
-        nextMv,
-        nextCount,
-        nowIso,
-        channelId,
-      );
-      const fanoutPayload = { action: "unregister-user", channel_id: channelId, user_id: userId };
-      this.ctx.storage.sql.exec(
-        "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'channel_fanout', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
-        `channel_fanout:unregister:${channelId}:${userId}:${nowIso}`,
-        channelId,
-        JSON.stringify(fanoutPayload),
-        nowIso,
-        nowIso,
-        nowIso,
-      );
+      this.markMemberLeftAndEnqueueFanoutUnregisterSync(channelId, userId, nowIso);
     });
   }
 
@@ -1405,6 +1403,162 @@ export class ChatChannel extends DurableObject<Env> {
       }
       // cached branch (success cached OR an error shape encoded inside the txn).
       return this.cachedResponse(txResult.responseJson);
+    }
+
+    if (url.pathname === "/internal/members-add") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as { idempotency_key: string; channel_id: string; user_id: string; role: string };
+      const channelId = b.channel_id;
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+      const requestHash = JSON.stringify({ user_id: b.user_id, role: b.role });
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const actorMap = await this.resolveActorMap([userId, b.user_id]);
+
+      const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "cached"; j: string } | { kind: "conflict" } | { kind: "ok"; member: Record<string, unknown> }> => {
+        const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.add' AND idempotency_key=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
+
+        const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, member_count, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; member_count: number; kind: string; created_by: string } | undefined;
+        if (!meta) return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
+        if (meta.status === "dissolved") return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
+        const callerRole = this.activeRole(channelId, userId);
+        if (callerRole !== "owner" && callerRole !== "admin") return { kind: "cached", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "not authorized to add members", retryable: false } }) };
+        if (b.role !== "member" && b.role !== "admin") return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "role must be member or admin", retryable: false } }) };
+        if (b.user_id === userId) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "cannot add self", retryable: false } }) };
+        if (b.user_id === meta.created_by) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "owner is fixed; cannot add the owner", retryable: false } }) };
+
+        // Member state machine (P0-5): distinguish never-joined / left / active.
+        const existing = this.ctx.storage.sql.exec("SELECT role, left_at FROM members WHERE channel_id=? AND user_id=?", channelId, b.user_id).toArray()[0] as { role: string; left_at: string | null } | undefined;
+
+        if (existing !== undefined && existing.left_at === null) {
+          // Already an ACTIVE member — adding must NOT mutate role (that's PATCH /members/{user_id}).
+          if (existing.role !== b.role) {
+            return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "member already active; use PATCH /members/{user_id} to change role", retryable: false } }) };
+          }
+          // Idempotent re-add, no state change.
+          const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: existing.role } });
+          this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.add', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
+          return { kind: "cached", j: responseJson };
+        }
+
+        const mv = meta.membership_version + 1;
+        // never joined → INSERT; left → reactivate (clear left_at, set role). Count +1 either way.
+        if (existing === undefined) {
+          this.ctx.storage.sql.exec("INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, ?, ?, NULL)", channelId, b.user_id, b.role, now);
+        } else {
+          this.ctx.storage.sql.exec("UPDATE members SET role=?, joined_at=?, left_at=NULL WHERE channel_id=? AND user_id=?", b.role, now, channelId, b.user_id);
+        }
+        this.ctx.storage.sql.exec("UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?", mv, meta.member_count + 1, now, channelId);
+
+        const joinedId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(joinedId, "member.joined", channelId, now, buildMemberJoinedPayload({ channel_id: channelId, user_id: b.user_id, role: b.role, membership_version: mv, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
+        const noticeId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.joined", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mv, now, actorMap);
+        this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:join:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "join", channel_id: channelId, kind: meta.kind, membership_version: mv }), now, now, now);
+
+        const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: b.role, joined_at: now } });
+        this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.add', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
+        return { kind: "ok", member: { channel_id: channelId, user_id: b.user_id, role: b.role, joined_at: now } };
+      });
+      if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
+      if (tx.kind === "ok") await this.scheduleOutboxAlarm(now);
+      return tx.kind === "ok" ? Response.json({ member: tx.member }, { status: 200 }) : this.cachedResponse(tx.j);
+    }
+
+    if (url.pathname === "/internal/members-update-role") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as { idempotency_key: string; channel_id: string; user_id: string; role: string };
+      const channelId = b.channel_id;
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+      const requestHash = JSON.stringify({ user_id: b.user_id, role: b.role });
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const actorMap = await this.resolveActorMap([userId, b.user_id]);
+
+      const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "conflict" } | { kind: "cached"; j: string } | { kind: "ok"; member: Record<string, unknown> }> => {
+        const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.role' AND idempotency_key=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
+
+        const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; created_by: string } | undefined;
+        if (!meta) return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
+        if (meta.status === "dissolved") return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
+        const callerRole = this.activeRole(channelId, userId);
+        if (callerRole !== "owner") return { kind: "cached", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner may change roles", retryable: false } }) };
+        if (b.role !== "member" && b.role !== "admin") return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "role must be member or admin", retryable: false } }) };
+        const target = this.ctx.storage.sql.exec("SELECT role FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", channelId, b.user_id).toArray()[0] as { role: string } | undefined;
+        if (!target) return { kind: "cached", j: JSON.stringify({ error: { code: "MEMBER_NOT_FOUND", message: "target not an active member", retryable: false } }) };
+        if (b.user_id === meta.created_by) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "cannot change the owner's role (owner is fixed)", retryable: false } }) };
+        if (b.user_id === userId) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "owner cannot change own role", retryable: false } }) };
+
+        const mv = meta.membership_version + 1;
+        const beforeRole = target.role;
+        this.ctx.storage.sql.exec("UPDATE members SET role=? WHERE channel_id=? AND user_id=?", b.role, channelId, b.user_id);
+        this.ctx.storage.sql.exec("UPDATE channel_meta SET membership_version=?, updated_at=? WHERE channel_id=?", mv, now, channelId);
+
+        const updatedId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(updatedId, "member.role_updated", channelId, now, buildMemberRoleUpdatedPayload({ channel_id: channelId, user_id: b.user_id, before_role: beforeRole, after_role: b.role, membership_version: mv, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
+        const noticeId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.role_updated", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mv, now, actorMap);
+
+        const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: b.role } });
+        this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.role', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
+        return { kind: "ok", member: { channel_id: channelId, user_id: b.user_id, role: b.role } };
+      });
+      if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
+      if (tx.kind === "ok") await this.scheduleOutboxAlarm(now);
+      return tx.kind === "ok" ? Response.json({ member: tx.member }, { status: 200 }) : this.cachedResponse(tx.j);
+    }
+
+    if (url.pathname === "/internal/members-remove") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as { idempotency_key: string; channel_id: string; user_id: string };
+      const channelId = b.channel_id;
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+      const requestHash = JSON.stringify({ user_id: b.user_id });
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const actorMap = await this.resolveActorMap([userId, b.user_id]);
+
+      const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "conflict" } | { kind: "cached"; j: string } | { kind: "ok" }> => {
+        const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.remove' AND idempotency_key=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
+
+        const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; kind: string; created_by: string } | undefined;
+        if (!meta) return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
+        if (meta.status === "dissolved") return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
+        const callerRole = this.activeRole(channelId, userId);
+        const isSelf = b.user_id === userId;
+        if (!isSelf && callerRole !== "owner") return { kind: "cached", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner may remove others", retryable: false } }) };
+        // Owner invariant (P1-6): the owner cannot self-leave (no owner-transfer in Phase 3; dissolve is the owner exit).
+        if (isSelf && b.user_id === meta.created_by) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "owner cannot leave; dissolve the channel or transfer ownership in a future phase", retryable: false } }) };
+        const target = this.ctx.storage.sql.exec("SELECT role FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", channelId, b.user_id).toArray()[0] as { role: string } | undefined;
+        if (!target) return { kind: "cached", j: JSON.stringify({ error: { code: "MEMBER_NOT_FOUND", message: "target not an active member", retryable: false } }) };
+
+        const mv = meta.membership_version + 1;
+        // Reuse the SINGLE sync leave implementation (P0-6): co-atomic left_at + count + fanout unregister outbox.
+        this.markMemberLeftAndEnqueueFanoutUnregisterSync(channelId, b.user_id, now);
+        // Re-read the bumped mv/counts the sync core wrote, so the events below carry the authoritative mv.
+        const mvAfter = (this.ctx.storage.sql.exec("SELECT membership_version FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { membership_version: number }).membership_version;
+
+        const leftId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(leftId, "member.left", channelId, now, buildMemberLeftPayload({ channel_id: channelId, user_id: b.user_id, role: target.role, membership_version: mvAfter, actor_kind: "user", actor_id: userId }), mvAfter, now, actorMap);
+        const noticeId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.left", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mvAfter, now, actorMap);
+        // user_directory leave projection (so my_channels reflects status='left')
+        this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:leave:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "leave", channel_id: channelId, kind: meta.kind, membership_version: mvAfter }), now, now, now);
+
+        const responseJson = JSON.stringify({ channel_id: channelId, user_id: b.user_id, removed: true });
+        this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.remove', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
+        return { kind: "ok" };
+      });
+      if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
+      if (tx.kind === "ok") await this.scheduleOutboxAlarm(now);
+      if (tx.kind === "ok") return Response.json({ channel_id: channelId, user_id: b.user_id, removed: true }, { status: 200 });
+      return this.cachedResponse((tx as { j: string }).j);
     }
 
     return new Response("not found", { status: 404 });

@@ -77,3 +77,26 @@ describe("POST /api/chat/channels/:id/dissolve", () => {
     expect(res.status).toBe(403);
   });
 });
+
+describe("members routes", () => {
+  it("POST /members adds; PATCH changes role; DELETE removes (owner)", async () => {
+    const create = await authedReq("u-mem-owner", "POST", "/api/chat/channels", { title: "M", visibility: "private", initial_members: [] }, "ck-mem-create");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    const add = await authedReq("u-mem-owner", "POST", `/api/chat/channels/${cid}/members`, { user_id: "u-mem-1", role: "member" }, "ck-mem-add");
+    expect(add.status).toBe(200);
+    const role = await authedReq("u-mem-owner", "PATCH", `/api/chat/channels/${cid}/members/u-mem-1`, { role: "admin" }, "ck-mem-role");
+    expect(role.status).toBe(200);
+    expect(((await role.json()) as { member: { role: string } }).member.role).toBe("admin");
+    const rem = await authedReq("u-mem-owner", "DELETE", `/api/chat/channels/${cid}/members/u-mem-1`, undefined, "ck-mem-rem");
+    expect(rem.status).toBe(200);
+    expect(((await rem.json()) as { removed: boolean }).removed).toBe(true);
+  });
+
+  it("DELETE self (leave) succeeds for a member", async () => {
+    const create = await authedReq("u-leave-owner", "POST", "/api/chat/channels", { title: "L", visibility: "private", initial_members: [] }, "ck-leave-create");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    await authedReq("u-leave-owner", "POST", `/api/chat/channels/${cid}/members`, { user_id: "u-leave-1", role: "member" }, "ck-leave-add");
+    const rem = await authedReq("u-leave-1", "DELETE", `/api/chat/channels/${cid}/members/u-leave-1`, undefined, "ck-leave-self");
+    expect(rem.status).toBe(200);
+  });
+});

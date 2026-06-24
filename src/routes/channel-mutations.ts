@@ -111,3 +111,72 @@ export async function dissolveChannelHandler(c: Context<{ Bindings: Env; Variabl
   const out = await res.json() as Record<string, unknown>;
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
+
+export async function addMemberHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const channelId = c.req.param("channel_id");
+  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
+  const body = (await c.req.json().catch(() => ({}))) as { user_id?: string; role?: string };
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const res = await stub.fetch(new Request("https://x/internal/members-add", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({ idempotency_key: idempotencyKey, channel_id: channelId, user_id: body.user_id ?? "", role: body.role ?? "member" }),
+  }));
+  if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to add members");
+  if (res.status === 404) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  if (res.status === 409) { const e = await res.json().catch(() => ({})) as { error?: { code?: string } }; throw new ApiError(e.error?.code ?? "CHANNEL_DISSOLVED", "conflict"); }
+  if (res.status === 422) throw new ApiError("INVALID_MESSAGE", "invalid member");
+  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "add member failed");
+  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+}
+
+export async function updateMemberRoleHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const channelId = c.req.param("channel_id");
+  const memberUserId = c.req.param("user_id");
+  if (!channelId || !memberUserId) throw new ApiError("CHANNEL_NOT_FOUND", "channel or user not found");
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
+  const body = (await c.req.json().catch(() => ({}))) as { role?: string };
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const res = await stub.fetch(new Request("https://x/internal/members-update-role", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({ idempotency_key: idempotencyKey, channel_id: channelId, user_id: memberUserId, role: body.role ?? "" }),
+  }));
+  if (res.status === 403) throw new ApiError("FORBIDDEN", "only owner may change roles");
+  if (res.status === 404) throw new ApiError("MEMBER_NOT_FOUND", "member not found");
+  if (res.status === 409) { const e = await res.json().catch(() => ({})) as { error?: { code?: string } }; throw new ApiError(e.error?.code ?? "CHANNEL_DISSOLVED", "conflict"); }
+  if (res.status === 422) throw new ApiError("INVALID_MESSAGE", "invalid role");
+  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "role update failed");
+  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+}
+
+export async function removeMemberHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const channelId = c.req.param("channel_id");
+  const memberUserId = c.req.param("user_id");
+  if (!channelId || !memberUserId) throw new ApiError("CHANNEL_NOT_FOUND", "channel or user not found");
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const res = await stub.fetch(new Request("https://x/internal/members-remove", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({ idempotency_key: idempotencyKey, channel_id: channelId, user_id: memberUserId }),
+  }));
+  if (res.status === 403) throw new ApiError("FORBIDDEN", "only owner may remove others");
+  if (res.status === 404) throw new ApiError("MEMBER_NOT_FOUND", "member not found");
+  if (res.status === 409) { const e = await res.json().catch(() => ({})) as { error?: { code?: string } }; throw new ApiError(e.error?.code ?? "CHANNEL_DISSOLVED", "conflict"); }
+  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "remove member failed");
+  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+}
