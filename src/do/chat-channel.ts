@@ -75,7 +75,7 @@ const SCHEMA = [
     bot_id TEXT PRIMARY KEY, installed_by TEXT NOT NULL, scopes TEXT NOT NULL, installed_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS commands (
-    command_id TEXT PRIMARY KEY, bot_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT,
+    bot_command_id TEXT PRIMARY KEY, bot_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT,
     options_json TEXT NOT NULL, default_perm TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL, UNIQUE (bot_id, name)
   )`,
@@ -339,8 +339,8 @@ export class ChatChannel extends DurableObject<Env> {
 
   // Sync: persists the event (ref payload) + writes a channel_fanout outbox row with the
   // LIVE-resolved frame. MUST run inside ctx.storage.transaction. The actor map is pre-resolved
-  // BEFORE the txn (Hyperdrive is a network call). For read_state.updated (no actor_kind) the
-  // caller passes an empty map and the payload is passed through unchanged.
+  // BEFORE the txn (Hyperdrive is a network call). All event types reaching here carry actor_kind
+  // (v4.0: read_state.updated is no longer a channel event — it's a user-local WS frame).
   private persistEventAndFanout(
     eventId: string,
     type: string,
@@ -357,9 +357,9 @@ export class ChatChannel extends DurableObject<Env> {
       "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       eventId, type, channelId, actorKind, actorId, JSON.stringify(persistedPayload), membershipVersion, occurredAt,
     );
-    const livePayload = type === "read_state.updated"
-      ? persistedPayload
-      : resolveActorWithMap(persistedPayload, actorMap);
+    // v4.0: read_state.updated is no longer a channel event (Task 4 moved read-state to a
+    // user-local WS frame), so every event type reaching here carries actor_kind and is resolved.
+    const livePayload = resolveActorWithMap(persistedPayload, actorMap);
     const frame = buildEventFrame({ event_id: eventId, type, channel_id: channelId, occurred_at: occurredAt, payload: livePayload });
     this.insertOutboxRowForFanout(channelId, eventId, JSON.stringify(frame), membershipVersion, nowIso);
   }
@@ -856,7 +856,7 @@ export class ChatChannel extends DurableObject<Env> {
       // Build the LIVE message projection once (used by BOTH the committed-ack response_json AND
       // the channel_fanout outbox event_json — v4.0 addendum I/J: ack and event carry the same
       // Browser-visible projection from the one shared builder).
-      const liveMessage = projectMessageForBrowser(messageRowForProjection, { senderSummary: resolvedSender });
+      const liveMessage = projectMessageForBrowser(messageRowForProjection, { senderSummary: resolvedSender, mentions: Array.isArray(b.mentions) ? b.mentions : [] });
       const liveEventFrame = buildEventFrame({
         event_id: eventId,
         type: "message.created",

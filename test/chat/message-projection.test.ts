@@ -50,6 +50,17 @@ describe("projectMessageForBrowser", () => {
     expect(p.edited_at).toBe("2026-06-24T10:01:00Z");
   });
 
+  it("injects caller-provided mentions on a normal message", () => {
+    const p = projectMessageForBrowser(baseRow(), { mentions: [{ user_id: "u2", start: 0, end: 4 }] });
+    expect(p.mentions).toEqual([{ user_id: "u2", start: 0, end: 4 }]);
+  });
+
+  it("forces mentions/attachments/components empty on recalled even if provided", () => {
+    const p = projectMessageForBrowser(baseRow({ status: "recalled", text: "secret" }), { mentions: [{ user_id: "u2", start: 0, end: 4 }], attachments: [{ id: "a" }] as unknown[] });
+    expect(p.mentions).toEqual([]);
+    expect(p.attachments).toEqual([]);
+  });
+
   it("falls back to user-<shortid> when no summary provided", () => {
     const p = projectMessageForBrowser(baseRow());
     expect((p as any).sender.user.display_name).toBe("user-u1");

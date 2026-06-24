@@ -5,9 +5,26 @@ import type { UserSummary } from "./event-broadcast";
 // Used by history pagination, message.send ack, message.created event,
 // and (Phase 4) edit/recall/delete acks/events + context read.
 // Deleted/recalled safety filtering lives HERE — callers must not re-filter.
+//
+// Caller composes the inputs the builder cannot derive from a single row:
+//   - senderSummary: pre-resolved via resolveUserSummaries (before the txn for in-txn ack/event)
+//   - mentions / attachments / components: the caller already has them (send: from the request body;
+//     history/replay: from the mentions table / attachments table). When Phase 5/7 land, extend
+//     THIS builder's opts — never build a second ad-hoc serializer.
+export interface MessageMention {
+  user_id: string;
+  start: number;
+  end: number;
+}
+
 export function projectMessageForBrowser(
   row: MessageRow,
-  opts: { senderSummary?: UserSummary | null } = {},
+  opts: {
+    senderSummary?: UserSummary | null;
+    mentions?: MessageMention[];
+    attachments?: unknown[];
+    components?: unknown[];
+  } = {},
 ): Record<string, unknown> {
   const hidden = row.status === "deleted" || row.status === "recalled";
 
@@ -44,9 +61,9 @@ export function projectMessageForBrowser(
     text: hidden ? null : row.text,
     reply_to: row.reply_to,
     reply_snapshot: replySnapshot,
-    attachments: [],   // Phase 5
-    components: [],   // Phase 7
-    mentions: hidden ? [] : [],  // mentions resolved per-message at the call site (Phase 2 reads them separately); hidden => []
+    attachments: hidden ? [] : (opts.attachments ?? []),
+    components: hidden ? [] : (opts.components ?? []),
+    mentions: hidden ? [] : (opts.mentions ?? []),
     created_at: row.created_at,
     updated_at: row.updated_at,
     edited_at: row.edited_at,
