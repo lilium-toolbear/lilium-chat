@@ -8,16 +8,25 @@ export interface CommandFrame {
   payload: Record<string, unknown>;
 }
 
-export interface CommandAckFrame {
-  frame_type: "command_ack";
-  command_id: string;
-  status: "committed";
-  channel_id?: string;
-  message_id?: string;
-  invocation_id?: string;
-  interaction_id?: string;
-  event_id?: string;
-}
+// v4.0: command_ack is payload-bearing + discriminated by `command`. The flat
+// {channel_id?, message_id?, event_id?...} shape is gone — clients read the
+// canonical result from `payload` (command-specific). Phase 4 acks (message.edit/
+// recall/delete) extend this union.
+export type CommandAckFrame =
+  | {
+      frame_type: "command_ack";
+      command: "message.send" | "message.edit" | "message.recall" | "message.delete";
+      command_id: string;
+      status: "committed";
+      payload: { channel_id: string; event_id: string; message: Record<string, unknown> };
+    }
+  | {
+      frame_type: "command_ack";
+      command: "channel.mark_read";
+      command_id: string;
+      status: "committed";
+      payload: { channel_id: string; last_read_event_id: string; unread_count: number };
+    };
 
 export interface CommandErrorFrame {
   frame_type: "command_error";

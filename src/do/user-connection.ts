@@ -218,7 +218,7 @@ export class UserConnection extends DurableObject<Env> {
       const ucRes = await chStub.fetch(new Request(`https://x/internal/unread-count?after=${encodeURIComponent(floor.last_read_event_id)}`, { headers: { "X-Verified-User-Id": attachment.user_id } }));
       const unreadCount = ucRes.ok ? ((await ucRes.json()) as { unread_count: number }).unread_count : 0;
       // ack (NO event_id)
-      ws.send(JSON.stringify({ frame_type: "command_ack", command_id: frame.command_id, status: "committed", payload: { channel_id: channelId, last_read_event_id: floor.last_read_event_id, unread_count: unreadCount } }));
+      ws.send(JSON.stringify({ frame_type: "command_ack", command: "channel.mark_read", command_id: frame.command_id, status: "committed", payload: { channel_id: channelId, last_read_event_id: floor.last_read_event_id, unread_count: unreadCount } }));
       // best-effort broadcast a user-local read_state_updated frame to the user's OTHER sessions
       if (floor.advanced) {
         for (const other of this.ctx.getWebSockets(`user-conn:${attachment.user_id}`)) {
