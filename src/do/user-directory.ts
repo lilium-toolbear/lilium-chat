@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import { uuidv7 } from "../ids/uuidv7";
 import { execSchema } from "./sql";
 
 const SCHEMA = [
@@ -18,6 +19,14 @@ const SCHEMA = [
     status TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_pending_expires ON pending_attachments(status, expires_at)`,
+  `CREATE TABLE IF NOT EXISTS idempotency_keys (
+    operation TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL, status TEXT NOT NULL,
+    channel_id TEXT, response_json TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+    PRIMARY KEY (operation, idempotency_key)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_ud_idem_expires ON idempotency_keys(expires_at)`,
 ];
 
 export class UserDirectory extends DurableObject<Env> {
@@ -112,6 +121,85 @@ export class UserDirectory extends DurableObject<Env> {
         }
         return Response.json({ ok: true });
       });
+    }
+
+    if (url.pathname === "/internal/channel-create-coordinate") {
+      const creatorUserId = request.headers.get("X-Verified-User-Id");
+      if (creatorUserId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
+      const b = (await request.json()) as {
+        idempotency_key: string; title: string; topic: string | null;
+        avatar_attachment_id: string | null; visibility: string;
+        initial_members: Array<{ user_id: string; role: string }>;
+      };
+      if (!b.idempotency_key) return Response.json({ error: { code: "INVALID_MESSAGE", message: "idempotency_key required", retryable: false } }, { status: 422 });
+
+      const requestHash = JSON.stringify({
+        title: b.title, topic: b.topic ?? null, avatar_attachment_id: b.avatar_attachment_id ?? null,
+        visibility: b.visibility ?? "private", initial_members: b.initial_members ?? [],
+      });
+      const now = new Date().toISOString();
+      const expiresAt = new Date(Date.parse(now) + 24 * 60 * 60 * 1000).toISOString();
+
+      // Txn 1: resolve idempotency state + mint channel_id (if new).
+      const coord = await this.ctx.storage.transaction(async () => {
+        const row = this.ctx.storage.sql
+          .exec("SELECT request_hash, status, channel_id, response_json FROM idempotency_keys WHERE operation='channel.create' AND idempotency_key=?", b.idempotency_key)
+          .toArray()[0] as { request_hash: string; status: string; channel_id: string | null; response_json: string | null } | undefined;
+
+        if (row) {
+          if (row.request_hash !== requestHash) {
+            return { kind: "conflict" as const };
+          }
+          if (row.status === "completed" && row.response_json) {
+            return { kind: "cached" as const, responseJson: row.response_json };
+          }
+          // status === 'creating' (crash window) — reuse the persisted channel_id.
+          return { kind: "creating" as const, channelId: row.channel_id ?? "" };
+        }
+
+        const channelId = uuidv7();
+        this.ctx.storage.sql.exec(
+          "INSERT INTO idempotency_keys (operation, idempotency_key, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('channel.create', ?, ?, 'creating', ?, NULL, ?, ?, ?)",
+          b.idempotency_key, requestHash, channelId, now, now, expiresAt,
+        );
+        return { kind: "creating" as const, channelId };
+      });
+
+      if (coord.kind === "conflict") {
+        return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
+      }
+      if (coord.kind === "cached") {
+        return new Response(coord.responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      // Call ChatChannel(channel_id).createChannel — idempotent via channel_meta existence.
+      const channelId = coord.channelId;
+      const chStub = this.env.CHAT_CHANNEL.getByName(channelId);
+      const createRes = await chStub.fetch(new Request("https://x/internal/create-channel", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": creatorUserId, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channel_id: channelId, creator_user_id: creatorUserId,
+          title: b.title, topic: b.topic ?? null, avatar_attachment_id: b.avatar_attachment_id ?? null,
+          visibility: b.visibility ?? "private", initial_members: b.initial_members ?? [],
+        }),
+      }));
+      if (!createRes.ok) {
+        // Leave row as 'creating' — client retry re-calls createChannel (idempotent) and recovers.
+        const text = await createRes.text();
+        return new Response(text, { status: createRes.status });
+      }
+      const createBody = await createRes.text();
+
+      // Txn 2: mark completed with the create response.
+      await this.ctx.storage.transaction(async () => {
+        this.ctx.storage.sql.exec(
+          "UPDATE idempotency_keys SET status='completed', response_json=?, updated_at=? WHERE operation='channel.create' AND idempotency_key=?",
+          createBody, now, b.idempotency_key,
+        );
+      });
+
+      return new Response(createBody, { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
     return new Response("not found", { status: 404 });
