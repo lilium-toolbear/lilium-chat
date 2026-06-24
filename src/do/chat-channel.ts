@@ -81,18 +81,18 @@ const SCHEMA = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS uniq_enabled_command_name ON commands(name) WHERE enabled = 1`,
   `CREATE TABLE IF NOT EXISTS invocations (
-    invocation_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, bot_id TEXT NOT NULL,
+    invocation_id TEXT PRIMARY KEY, bot_command_id TEXT NOT NULL, bot_id TEXT NOT NULL,
     invoker_user_id TEXT NOT NULL, dedupe_principal_key TEXT NOT NULL,
-    client_invocation_id TEXT NOT NULL, options_json TEXT NOT NULL,
+    command_id TEXT NOT NULL, options_json TEXT NOT NULL,
     status TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT, error_code TEXT,
-    UNIQUE (command_id, dedupe_principal_key, client_invocation_id)
+    UNIQUE (bot_command_id, dedupe_principal_key, command_id)
   )`,
   `CREATE TABLE IF NOT EXISTS interactions (
     interaction_id TEXT PRIMARY KEY, message_id TEXT NOT NULL, component_id TEXT NOT NULL,
     custom_id TEXT NOT NULL, actor_user_id TEXT NOT NULL, dedupe_principal_key TEXT NOT NULL,
-    client_interaction_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
     value_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
-    UNIQUE (message_id, dedupe_principal_key, client_interaction_id)
+    UNIQUE (message_id, dedupe_principal_key, command_id)
   )`,
   `CREATE TABLE IF NOT EXISTS invites (
     invite_code TEXT PRIMARY KEY, created_by TEXT NOT NULL, expires_at TEXT NOT NULL,
