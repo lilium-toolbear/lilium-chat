@@ -3,7 +3,7 @@ import { resolveUserSummaries, type UserSummary } from "../profile/resolve";
 
 export interface RawMessage {
   message_id: string;
-  client_message_id: string;
+  command_id: string;
   channel_id: string;
   sender: {
     kind: string;
@@ -30,7 +30,7 @@ export interface RawMessage {
 
 export interface ContractMessage {
   message_id: string;
-  client_message_id: string;
+  command_id: string;
   channel_id: string;
   sender: {
     kind: "user";

@@ -27,7 +27,7 @@ describe("attachSummaries", () => {
     const env = makeEnv() as Env;
     const raw = [{
       message_id: "m1",
-      client_message_id: "c1",
+      command_id: "c1",
       channel_id: "ch1",
       sender: { kind: "user", user_id: "u1", bot_id: null },
       type: "text",
@@ -63,7 +63,7 @@ describe("attachSummaries", () => {
     const env = makeEnv() as Env;
     const raw = [{
       message_id: "m2",
-      client_message_id: "c2",
+      command_id: "c2",
       channel_id: "ch1",
       sender: { kind: "user", user_id: "00000000-0000-7000-8000-000000000099", bot_id: null },
       type: "text",

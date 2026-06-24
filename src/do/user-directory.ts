@@ -20,11 +20,11 @@ const SCHEMA = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_pending_expires ON pending_attachments(status, expires_at)`,
   `CREATE TABLE IF NOT EXISTS idempotency_keys (
-    operation TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    operation TEXT NOT NULL, operation_id TEXT NOT NULL, -- HTTP Idempotency-Key or WS command_id
     request_hash TEXT NOT NULL, status TEXT NOT NULL,
     channel_id TEXT, response_json TEXT,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-    PRIMARY KEY (operation, idempotency_key)
+    PRIMARY KEY (operation, operation_id)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_ud_idem_expires ON idempotency_keys(expires_at)`,
 ];
@@ -143,7 +143,7 @@ export class UserDirectory extends DurableObject<Env> {
       // Txn 1: resolve idempotency state + mint channel_id (if new).
       const coord = await this.ctx.storage.transaction(async () => {
         const row = this.ctx.storage.sql
-          .exec("SELECT request_hash, status, channel_id, response_json FROM idempotency_keys WHERE operation='channel.create' AND idempotency_key=?", b.idempotency_key)
+          .exec("SELECT request_hash, status, channel_id, response_json FROM idempotency_keys WHERE operation='channel.create' AND operation_id=?", b.idempotency_key)
           .toArray()[0] as { request_hash: string; status: string; channel_id: string | null; response_json: string | null } | undefined;
 
         if (row) {
@@ -159,7 +159,7 @@ export class UserDirectory extends DurableObject<Env> {
 
         const channelId = uuidv7();
         this.ctx.storage.sql.exec(
-          "INSERT INTO idempotency_keys (operation, idempotency_key, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('channel.create', ?, ?, 'creating', ?, NULL, ?, ?, ?)",
+          "INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('channel.create', ?, ?, 'creating', ?, NULL, ?, ?, ?)",
           b.idempotency_key, requestHash, channelId, now, now, expiresAt,
         );
         return { kind: "creating" as const, channelId };
@@ -194,7 +194,7 @@ export class UserDirectory extends DurableObject<Env> {
       // Txn 2: mark completed with the create response.
       await this.ctx.storage.transaction(async () => {
         this.ctx.storage.sql.exec(
-          "UPDATE idempotency_keys SET status='completed', response_json=?, updated_at=? WHERE operation='channel.create' AND idempotency_key=?",
+          "UPDATE idempotency_keys SET status='completed', response_json=?, updated_at=? WHERE operation='channel.create' AND operation_id=?",
           createBody, now, b.idempotency_key,
         );
       });

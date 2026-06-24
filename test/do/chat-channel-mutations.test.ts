@@ -98,7 +98,7 @@ describe("ChatChannel /internal/dissolve", () => {
     const send = await stub.fetch(new Request("https://x/internal/message-send", {
       method: "POST",
       headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" },
-      body: JSON.stringify({ client_message_id: "cm-dis", dedupe_principal_key: "user:u-up-owner", type: "text", text: "hi", reply_to: null, mentions: [], channel_id: cid }),
+      body: JSON.stringify({ command_id: "cm-dis", dedupe_principal_key: "user:u-up-owner", type: "text", text: "hi", reply_to: null, mentions: [], channel_id: cid }),
     }));
     expect(send.status).toBe(409);
     expect(((await send.json()) as { error: { code: string } }).error.code).toBe("CHANNEL_DISSOLVED");

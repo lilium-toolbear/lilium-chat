@@ -26,7 +26,7 @@ describe("buildMessageCreatedPayload", () => {
   it("projects sender as a reference, not a UserSummary (persisted shape)", () => {
     const p = buildMessageCreatedPayload({
       message_id: "m-1",
-      client_message_id: "cm-1",
+      command_id: "cm-1",
       channel_id: "ch-1",
       sender_kind: "user",
       sender_user_id: "u-1",
@@ -39,7 +39,7 @@ describe("buildMessageCreatedPayload", () => {
     });
     expect(p.message).toMatchObject({
       message_id: "m-1",
-      client_message_id: "cm-1",
+      command_id: "cm-1",
       channel_id: "ch-1",
       status: "normal",
       created_at: "2026-06-21T05:30:00Z",
@@ -59,7 +59,7 @@ describe("resolveSenderForLiveBroadcast", () => {
     // resolveUserSummaries is sourced from src/profile/resolve; in this unit test we
     // inject a stub by calling resolveSenderForLiveBroadcast with a resolver function.
     const persisted = buildMessageCreatedPayload({
-      message_id: "m-1", client_message_id: "cm-1", channel_id: "ch-1",
+      message_id: "m-1", command_id: "cm-1", channel_id: "ch-1",
       sender_kind: "user", sender_user_id: "u-1", sender_bot_id: null,
       status: "normal", created_at: "2026-06-21T05:30:00Z", type: "text", format: "plain", text: "hello",
     });
@@ -76,7 +76,7 @@ describe("resolveSenderForLiveBroadcast", () => {
 
   it("falls back to a user-<shortid> summary when the sender is not in pg", async () => {
     const persisted = buildMessageCreatedPayload({
-      message_id: "m-2", client_message_id: "cm-2", channel_id: "ch-1",
+      message_id: "m-2", command_id: "cm-2", channel_id: "ch-1",
       sender_kind: "user", sender_user_id: "u-ghost", sender_bot_id: null,
       status: "normal", created_at: "2026-06-21T05:30:00Z", type: "text", format: "plain", text: "hi",
     });

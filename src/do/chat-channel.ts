@@ -109,9 +109,10 @@ const SCHEMA = [
   `INSERT OR IGNORE INTO event_seq (id, last_ms, counter) VALUES (1, 0, 0)`,
   `CREATE TABLE IF NOT EXISTS idempotency_keys (
     principal_kind TEXT NOT NULL, principal_id TEXT NOT NULL, operation TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL, request_hash TEXT NOT NULL, response_json TEXT,
+    operation_id TEXT NOT NULL, -- HTTP Idempotency-Key or WS command_id
+    request_hash TEXT NOT NULL, response_json TEXT,
     status TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-    PRIMARY KEY (principal_kind, principal_id, operation, idempotency_key)
+    PRIMARY KEY (principal_kind, principal_id, operation, operation_id)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_idem_expires ON idempotency_keys(expires_at)`,
   `CREATE TABLE IF NOT EXISTS projection_outbox (
@@ -845,7 +846,7 @@ export class ChatChannel extends DurableObject<Env> {
       const mv = meta.membership_version;
       const persistedPayload = buildMessageCreatedPayload({
         message_id: messageId,
-        client_message_id: b.command_id,
+        command_id: b.command_id,
         channel_id: channelId,
         sender_kind: "user",
         sender_user_id: userId,
@@ -897,7 +898,7 @@ export class ChatChannel extends DurableObject<Env> {
         }
         const idemRow = this.ctx.storage.sql
           .exec(
-            "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='message.send' AND idempotency_key=?",
+            "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='message.send' AND operation_id=?",
             userId,
             b.command_id,
           )
@@ -949,7 +950,7 @@ export class ChatChannel extends DurableObject<Env> {
           now,
         );
         this.ctx.storage.sql.exec(
-          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'message.send', ?, ?, ?, 'completed', ?, ?)",
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'message.send', ?, ?, ?, 'completed', ?, ?)",
           userId,
           b.command_id,
           requestHash,
@@ -1008,7 +1009,7 @@ export class ChatChannel extends DurableObject<Env> {
         | { kind: "dissolved"; channel: Record<string, unknown> }
       > => {
         const idem = this.ctx.storage.sql
-          .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.dissolve' AND idempotency_key=?", userId, b.idempotency_key)
+          .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.dissolve' AND operation_id=?", userId, b.idempotency_key)
           .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) {
           if (idem.request_hash !== requestHash) return { kind: "conflict" };
@@ -1022,7 +1023,7 @@ export class ChatChannel extends DurableObject<Env> {
           // already dissolved — idempotent cached result (no key recorded yet → record now)
           const responseJson = JSON.stringify({ channel: { channel_id: channelId, status: "dissolved", updated_at: now } });
           this.ctx.storage.sql.exec(
-            "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.dissolve', ?, ?, ?, 'completed', ?, ?)",
+            "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.dissolve', ?, ?, ?, 'completed', ?, ?)",
             userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt,
           );
           return { kind: "cached", responseJson };
@@ -1044,7 +1045,7 @@ export class ChatChannel extends DurableObject<Env> {
 
         const responseJson = JSON.stringify({ channel: { channel_id: channelId, status: "dissolved", updated_at: now } });
         this.ctx.storage.sql.exec(
-          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.dissolve', ?, ?, ?, 'completed', ?, ?)",
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.dissolve', ?, ?, ?, 'completed', ?, ?)",
           userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt,
         );
         return { kind: "dissolved", channel: { channel_id: channelId, status: "dissolved", updated_at: now } };
@@ -1338,7 +1339,7 @@ export class ChatChannel extends DurableObject<Env> {
         | { kind: "ok"; channel: Record<string, unknown> }
       > => {
         const idem = this.ctx.storage.sql
-          .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.update' AND idempotency_key=?", userId, b.idempotency_key)
+          .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.update' AND operation_id=?", userId, b.idempotency_key)
           .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) {
           if (idem.request_hash !== requestHash) return { kind: "conflict" };
@@ -1388,7 +1389,7 @@ export class ChatChannel extends DurableObject<Env> {
         const channel = { channel_id: channelId, kind: meta.kind, visibility: newVisibility, title: newTitle, topic: newTopic, avatar_url: newAvatarUrl, member_count: meta.member_count, status: meta.status, created_at: meta.created_at, updated_at: now };
         const responseJson = JSON.stringify({ channel });
         this.ctx.storage.sql.exec(
-          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.update', ?, ?, ?, 'completed', ?, ?)",
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.update', ?, ?, ?, 'completed', ?, ?)",
           userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt,
         );
         return { kind: "ok", channel };
@@ -1417,7 +1418,7 @@ export class ChatChannel extends DurableObject<Env> {
       const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
       const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "cached"; j: string } | { kind: "conflict" } | { kind: "ok"; member: Record<string, unknown> }> => {
-        const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.add' AND idempotency_key=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.add' AND operation_id=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
         const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, member_count, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; member_count: number; kind: string; created_by: string } | undefined;
@@ -1439,7 +1440,7 @@ export class ChatChannel extends DurableObject<Env> {
           }
           // Idempotent re-add, no state change.
           const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: existing.role } });
-          this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.add', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
+          this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.add', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
           return { kind: "cached", j: responseJson };
         }
 
@@ -1459,7 +1460,7 @@ export class ChatChannel extends DurableObject<Env> {
         this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:join:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "join", channel_id: channelId, kind: meta.kind, membership_version: mv }), now, now, now);
 
         const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: b.role, joined_at: now } });
-        this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.add', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
+        this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.add', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
         return { kind: "ok", member: { channel_id: channelId, user_id: b.user_id, role: b.role, joined_at: now } };
       });
       if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
@@ -1479,7 +1480,7 @@ export class ChatChannel extends DurableObject<Env> {
       const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
       const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "conflict" } | { kind: "cached"; j: string } | { kind: "ok"; member: Record<string, unknown> }> => {
-        const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.role' AND idempotency_key=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.role' AND operation_id=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
         const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; created_by: string } | undefined;
@@ -1504,7 +1505,7 @@ export class ChatChannel extends DurableObject<Env> {
         this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.role_updated", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mv, now, actorMap);
 
         const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: b.role } });
-        this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.role', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
+        this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.role', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
         return { kind: "ok", member: { channel_id: channelId, user_id: b.user_id, role: b.role } };
       });
       if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
@@ -1524,7 +1525,7 @@ export class ChatChannel extends DurableObject<Env> {
       const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
       const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "conflict" } | { kind: "cached"; j: string } | { kind: "ok" }> => {
-        const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.remove' AND idempotency_key=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.remove' AND operation_id=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
         const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; kind: string; created_by: string } | undefined;
@@ -1552,7 +1553,7 @@ export class ChatChannel extends DurableObject<Env> {
         this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:leave:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "leave", channel_id: channelId, kind: meta.kind, membership_version: mvAfter }), now, now, now);
 
         const responseJson = JSON.stringify({ channel_id: channelId, user_id: b.user_id, removed: true });
-        this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.remove', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
+        this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.remove', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
         return { kind: "ok" };
       });
       if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
@@ -1616,7 +1617,7 @@ export class ChatChannel extends DurableObject<Env> {
         if (realMeta.status === "dissolved") return { kind: "cached", eventId: "" }; // dissolved: no read events
 
         const idem = this.ctx.storage.sql.exec(
-          "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='read_state' AND idempotency_key=?",
+          "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='read_state' AND operation_id=?",
           b.user_id, b.last_read_event_id,
         ).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) {
@@ -1632,7 +1633,7 @@ export class ChatChannel extends DurableObject<Env> {
           buildReadStateUpdatedPayload({ channel_id: realMeta.channel_id, user_id: b.user_id, last_read_event_id: b.last_read_event_id }),
           mv, now, emptyMap);
         this.ctx.storage.sql.exec(
-          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, idempotency_key, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'read_state', ?, ?, ?, 'completed', ?, ?)",
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'read_state', ?, ?, ?, 'completed', ?, ?)",
           b.user_id, b.last_read_event_id, requestHash, JSON.stringify({ event_id: eventId }), now, idemExpiresAt,
         );
         return { kind: "ok", eventId };

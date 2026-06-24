@@ -22,7 +22,7 @@ export function buildEventFrame(args: {
 // (events.payload_json stores the shape produced below — sender as {kind, user_id, bot_id}.)
 export function buildMessageCreatedPayload(raw: {
   message_id: string;
-  client_message_id: string;
+  command_id: string;
   channel_id: string;
   sender_kind: string;
   sender_user_id: string | null;
@@ -36,7 +36,7 @@ export function buildMessageCreatedPayload(raw: {
   return {
     message: {
       message_id: raw.message_id,
-      client_message_id: raw.client_message_id,
+      command_id: raw.command_id,
       channel_id: raw.channel_id,
       sender: {
         kind: raw.sender_kind,
