@@ -100,3 +100,29 @@ describe("members routes", () => {
     expect(rem.status).toBe(200);
   });
 });
+
+describe("members read routes", () => {
+  it("GET /members lists the owner", async () => {
+    const create = await authedReq("u-mr-owner", "POST", "/api/chat/channels", { title: "MR", visibility: "private", initial_members: [] }, "ck-mr-create");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    const res = await authedReq("u-mr-owner", "GET", `/api/chat/channels/${cid}/members`);
+    expect(res.status).toBe(200);
+    const items = ((await res.json()) as { items: Array<{ user: { user_id: string }; role: string }> }).items;
+    expect(items.some((m) => m.user.user_id === "u-mr-owner" && m.role === "owner")).toBe(true);
+  });
+
+  it("GET /members/{user_id} returns role + status", async () => {
+    const create = await authedReq("u-mr2-owner", "POST", "/api/chat/channels", { title: "MR2", visibility: "private", initial_members: [] }, "ck-mr2-create");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    const res = await authedReq("u-mr2-owner", "GET", `/api/chat/channels/${cid}/members/u-mr2-owner`);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { role: string; status: string }).status).toBe("active");
+  });
+
+  it("GET /members/{user_id} returns 404 MEMBER_NOT_FOUND for a stranger", async () => {
+    const create = await authedReq("u-mr3-owner", "POST", "/api/chat/channels", { title: "MR3", visibility: "private", initial_members: [] }, "ck-mr3-create");
+    const cid = ((await create.json()) as { channel: { channel_id: string } }).channel.channel_id;
+    const res = await authedReq("u-mr3-owner", "GET", `/api/chat/channels/${cid}/members/u-stranger`);
+    expect(res.status).toBe(404);
+  });
+});

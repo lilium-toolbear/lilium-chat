@@ -1561,6 +1561,40 @@ export class ChatChannel extends DurableObject<Env> {
       return this.cachedResponse((tx as { j: string }).j);
     }
 
+    if (url.pathname === "/internal/members-list") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      const realMeta = this.ctx.storage.sql.exec("SELECT channel_id, status FROM channel_meta LIMIT 1").toArray()[0] as { channel_id: string; status: string } | undefined;
+      if (!realMeta) return new Response("channel not created", { status: 409 });
+      // Must be an ACTIVE member (even dissolved channels require it — no leaking member lists to ex-members).
+      const activeMember = userId ? (this.ctx.storage.sql.exec("SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", realMeta.channel_id, userId).toArray()[0] as { x: number } | undefined) : undefined;
+      if (!activeMember) return new Response("forbidden", { status: 403 });
+      // Cursor is the last user_id of the previous page; members-list pages by joined_at ASC (tiebreak user_id).
+      const cursorUserId = url.searchParams.get("cursor") ?? "";
+      const rows = this.ctx.storage.sql.exec(
+        "SELECT user_id, role, joined_at FROM members WHERE channel_id=? AND left_at IS NULL AND user_id > ? ORDER BY user_id ASC LIMIT 101",
+        realMeta.channel_id, cursorUserId,
+      ).toArray() as Array<{ user_id: string; role: string; joined_at: string }>;
+      // Return raw active members (the Worker resolves UserSummaries + applies the query filter).
+      return Response.json({ items: rows.map((r) => ({ user_id: r.user_id, role: r.role, joined_at: r.joined_at })) });
+    }
+
+    if (url.pathname === "/internal/members-get") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      const targetUserId = url.searchParams.get("user_id") ?? "";
+      const realMeta = this.ctx.storage.sql.exec("SELECT channel_id, status FROM channel_meta LIMIT 1").toArray()[0] as { channel_id: string; status: string } | undefined;
+      if (!realMeta) return new Response("channel not created", { status: 409 });
+      // Must be an ACTIVE member (P1-3): no member read for non-members, dissolved or not.
+      const activeMember = userId ? (this.ctx.storage.sql.exec("SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", realMeta.channel_id, userId).toArray()[0] as { x: number } | undefined) : undefined;
+      if (!activeMember) return new Response("forbidden", { status: 403 });
+
+      const row = this.ctx.storage.sql.exec("SELECT role, joined_at, left_at FROM members WHERE channel_id=? AND user_id=?", realMeta.channel_id, targetUserId).toArray()[0] as
+        | { role: string; joined_at: string; left_at: string | null }
+        | undefined;
+      if (!row) return Response.json({ error: { code: "MEMBER_NOT_FOUND", message: "user is not a member of this channel", retryable: false } }, { status: 404 });
+      const status = row.left_at === null ? "active" : "left";
+      return Response.json({ user_id: targetUserId, role: row.role, joined_at: row.joined_at, status });
+    }
+
     return new Response("not found", { status: 404 });
   }
 

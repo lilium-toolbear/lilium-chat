@@ -3,6 +3,7 @@ import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 import { channelRouteNameFor } from "../chat/system-channel";
+import { resolveUserSummaries } from "../profile/resolve";
 
 export async function getIdentity(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<{ userId: string; env: Env }> {
   const auth = c.req.header("Authorization") ?? "";
@@ -179,4 +180,58 @@ export async function removeMemberHandler(c: Context<{ Bindings: Env; Variables:
   if (res.status === 409) { const e = await res.json().catch(() => ({})) as { error?: { code?: string } }; throw new ApiError(e.error?.code ?? "CHANNEL_DISSOLVED", "conflict"); }
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "remove member failed");
   return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+}
+
+export async function listMembersHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const channelId = c.req.param("channel_id");
+  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const url = new URL(c.req.url);
+  const query = (url.searchParams.get("query") ?? "").toLowerCase();
+  const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") ?? "50")));
+  const cursor = url.searchParams.get("cursor") ?? "";
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  // Push cursor + a limit+1 fetch into the DO so it can signal hasMore without a 2nd round-trip.
+  const res = await stub.fetch(new Request(`https://x/internal/members-list?cursor=${encodeURIComponent(cursor)}`, { headers: { "X-Verified-User-Id": userId } }));
+  if (res.status === 403) throw new ApiError("FORBIDDEN", "not a member");
+  if (res.status === 404 || res.status === 409) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "member list failed");
+  const raw = (await res.json()) as { items: Array<{ user_id: string; role: string; joined_at: string }> };
+
+  const map = await resolveUserSummaries(raw.items.map((m) => m.user_id), env);
+  const resolved = raw.items.map((m) => {
+    const u = map.get(m.user_id) ?? { user_id: m.user_id, display_name: `user-${m.user_id.slice(0, 8)}`, avatar_url: null };
+    return { user: u, role: m.role, joined_at: m.joined_at };
+  });
+  // With NO query filter: stable cursor pagination (DO already over-fetched so we can detect hasMore).
+  if (query === "") {
+    const hasMore = resolved.length > limit;
+    const page = resolved.slice(0, limit);
+    const nextCursor = hasMore ? page[page.length - 1]?.user.user_id ?? null : null;
+    return c.json({ items: page, next_cursor: nextCursor }, 200, { "X-Request-Id": c.get("requestId") });
+  }
+  // WITH a query filter: filter the page, no stable continuation cursor (Phase 3 member-list query
+  // is a typeahead aid, not a paged search). Clients re-fetch with a refined query.
+  const filtered = resolved.filter((m) => (m.user.display_name ?? "").toLowerCase().startsWith(query) || m.user.user_id.toLowerCase().startsWith(query));
+  return c.json({ items: filtered.slice(0, limit), next_cursor: null }, 200, { "X-Request-Id": c.get("requestId") });
+}
+
+export async function getMemberHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const channelId = c.req.param("channel_id");
+  const targetUserId = c.req.param("user_id");
+  if (!channelId || !targetUserId) throw new ApiError("CHANNEL_NOT_FOUND", "channel or user not found");
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const res = await stub.fetch(new Request(`https://x/internal/members-get?user_id=${encodeURIComponent(targetUserId)}`, { headers: { "X-Verified-User-Id": userId } }));
+  if (res.status === 403) throw new ApiError("FORBIDDEN", "not a member");
+  if (res.status === 404) throw new ApiError("MEMBER_NOT_FOUND", "member not found");
+  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "member get failed");
+  const raw = (await res.json()) as { user_id: string; role: string; joined_at: string; status: string };
+  const map = await resolveUserSummaries([targetUserId], env);
+  const u = map.get(targetUserId) ?? { user_id: targetUserId, display_name: `user-${targetUserId.slice(0, 8)}`, avatar_url: null };
+  return c.json({ user: u, role: raw.role, joined_at: raw.joined_at, status: raw.status }, 200, { "X-Request-Id": c.get("requestId") });
 }

@@ -8,7 +8,7 @@ import { wsUpgradeHandler } from "./routes/ws";
 import { listChannelsHandler, channelDetailHandler } from "./routes/channels";
 import { listMessagesHandler } from "./routes/messages";
 import { eventsHandler } from "./routes/events";
-import { addMemberHandler, createChannelHandler, dissolveChannelHandler, removeMemberHandler, updateChannelHandler, updateMemberRoleHandler } from "./routes/channel-mutations";
+import { addMemberHandler, createChannelHandler, dissolveChannelHandler, getMemberHandler, listMembersHandler, removeMemberHandler, updateChannelHandler, updateMemberRoleHandler } from "./routes/channel-mutations";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -49,6 +49,8 @@ app.post("/api/chat/channels", (c) => createChannelHandler(c));
 app.patch("/api/chat/channels/:channel_id", (c) => updateChannelHandler(c));
 app.post("/api/chat/channels/:channel_id/dissolve", (c) => dissolveChannelHandler(c));
 app.post("/api/chat/channels/:channel_id/members", (c) => addMemberHandler(c));
+app.get("/api/chat/channels/:channel_id/members", (c) => listMembersHandler(c));
+app.get("/api/chat/channels/:channel_id/members/:user_id", (c) => getMemberHandler(c));
 app.patch("/api/chat/channels/:channel_id/members/:user_id", (c) => updateMemberRoleHandler(c));
 app.delete("/api/chat/channels/:channel_id/members/:user_id", (c) => removeMemberHandler(c));
 app.get("/api/chat/channels/:channel_id/messages", (c) => listMessagesHandler(c));

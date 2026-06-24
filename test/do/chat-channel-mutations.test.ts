@@ -200,3 +200,44 @@ describe("ChatChannel members CRUD", () => {
     expect(res.status).toBe(422);
   });
 });
+
+describe("ChatChannel members read", () => {
+  it("members-list returns active members", async () => {
+    const cid = "0196aaaa-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-ml-1", channel_id: cid, user_id: "u-ml-a", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-list", { headers: { "X-Verified-User-Id": "u-up-owner" } }));
+    expect(res.status).toBe(200);
+    const items = ((await res.json()) as { items: Array<{ user_id: string; role: string }> }).items;
+    expect(items.some((m) => m.user_id === "u-ml-a")).toBe(true);
+  });
+
+  it("members-get returns status active for a member", async () => {
+    const cid = "0196bbbb-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-mg-1", channel_id: cid, user_id: "u-mg-a", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-get?user_id=u-mg-a", { headers: { "X-Verified-User-Id": "u-up-owner" } }));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { status: string; role: string };
+    expect(body.status).toBe("active");
+    expect(body.role).toBe("member");
+  });
+
+  it("members-get returns 404 MEMBER_NOT_FOUND for a never-joined user", async () => {
+    const cid = "0196cccc-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    const res = await stub.fetch(new Request("https://x/internal/members-get?user_id=u-never", { headers: { "X-Verified-User-Id": "u-up-owner" } }));
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("MEMBER_NOT_FOUND");
+  });
+
+  it("members-get returns status left for a removed member", async () => {
+    const cid = "0196dddd-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-mg-2", channel_id: cid, user_id: "u-mg-b", role: "member" }) }));
+    await stub.fetch(new Request("https://x/internal/members-remove", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-mg-3", channel_id: cid, user_id: "u-mg-b" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-get?user_id=u-mg-b", { headers: { "X-Verified-User-Id": "u-up-owner" } }));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { status: string }).status).toBe("left");
+  });
+});
