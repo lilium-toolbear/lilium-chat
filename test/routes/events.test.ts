@@ -55,13 +55,27 @@ describe("GET /api/chat/events", () => {
 
     const res = await authedEventsReq(userId, token, `channel_id=${sysId}&after_event_id=`);
     expect(res.status).toBe(200);
+    interface RoutedMessage {
+      message_id: string;
+      sender: {
+        kind: string;
+        user: {
+          user_id: string;
+        };
+      };
+    }
     const body = (await res.json()) as {
-      items: Array<{ event_id: string; type: string }>;
+      items: Array<{ event_id: string; type: string; payload: { message: RoutedMessage } }>;
       last_event_id_per_channel: Record<string, string>;
     };
     const found = body.items.find((e) => e.event_id === send.event_id);
     expect(found).toBeDefined();
     expect(found?.type).toBe("message.created");
+    expect(found?.payload.message).toBeDefined();
+    expect(found?.payload.message).toHaveProperty("message_id");
+    expect(found?.payload.message).toHaveProperty("sender");
+    expect(found?.payload.message.sender).toHaveProperty("user");
+    expect(found?.payload.message.sender.user.user_id).toBe("u-ev-1");
     expect(body.last_event_id_per_channel[sysId]).toBeTruthy();
   });
 

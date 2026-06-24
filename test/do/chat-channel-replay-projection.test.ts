@@ -45,4 +45,62 @@ describe("ChatChannel /internal/replay actor projection", () => {
     expect(created.payload).toHaveProperty("actor");
     expect(created.payload).not.toHaveProperty("actor_id");
   });
+
+  it("replays message.created with full message projection", async () => {
+    const cid = "0198cccc-0000-7000-8000-000000000001";
+    const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], cid);
+    await stub.fetch(
+      new Request("https://x/internal/create-channel", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": "u-replay-sender", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channel_id: cid,
+          creator_user_id: "u-replay-sender",
+          title: "R3",
+          topic: null,
+          avatar_attachment_id: null,
+          visibility: "private",
+          initial_members: [],
+        }),
+      }),
+    );
+    const send = (await (
+      await stub.fetch(
+        new Request("https://x/internal/message-send", {
+          method: "POST",
+          headers: { "X-Verified-User-Id": "u-replay-sender", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            command_id: "cm-replay-projection",
+            dedupe_principal_key: "user:u-replay-sender",
+            type: "text",
+            text: "projection check",
+            reply_to: null,
+            mentions: [],
+            channel_id: cid,
+          }),
+        }),
+      )
+    ).json()) as { event_id: string };
+    const replay = (await (
+      await stub.fetch(new Request(`https://x/internal/replay?after=`, { headers: { "X-Verified-User-Id": "u-replay-sender" } }))
+    ).json()) as { events: Array<{ event_json: string }> };
+
+    const frames = replay.events.map((e) => JSON.parse(e.event_json) as { type: string; payload: Record<string, unknown> });
+    const created = frames.find((f) => f.type === "message.created");
+    expect(created).toBeTruthy();
+    const message = (created!.payload as { message?: { sender?: { kind?: string; user?: { user_id: string } }; text?: string; attachments?: unknown[]; components?: unknown[]; mentions?: unknown[] } }).message;
+    expect(message?.text).toBe("projection check");
+    expect(message?.sender).toHaveProperty("user");
+    expect(message?.sender).toHaveProperty("kind", "user");
+    expect(message?.sender?.user).toHaveProperty("user_id", "u-replay-sender");
+    expect(Array.isArray(message?.attachments)).toBe(true);
+    expect(Array.isArray(message?.components)).toBe(true);
+    expect(Array.isArray(message?.mentions)).toBe(true);
+
+    const out = replay.events.find((e) => {
+      const frame = JSON.parse(e.event_json) as { event_id: string };
+      return frame.event_id === send.event_id;
+    });
+    expect(out).toBeDefined();
+  });
 });

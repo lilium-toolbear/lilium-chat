@@ -33,6 +33,14 @@ describe("buildMessageCreatedPayload", () => {
       sender_bot_id: null,
       status: "normal",
       created_at: "2026-06-21T05:30:00Z",
+      updated_at: "2026-06-21T05:30:00Z",
+      edited_at: null,
+      deleted_at: null,
+      deleted_by: null,
+      recalled_at: null,
+      stream_state: "none",
+      reply_to: null,
+      reply_snapshot_json: null,
       type: "text",
       format: "plain",
       text: "hello",
@@ -61,7 +69,9 @@ describe("resolveSenderForLiveBroadcast", () => {
     const persisted = buildMessageCreatedPayload({
       message_id: "m-1", command_id: "cm-1", channel_id: "ch-1",
       sender_kind: "user", sender_user_id: "u-1", sender_bot_id: null,
-      status: "normal", created_at: "2026-06-21T05:30:00Z", type: "text", format: "plain", text: "hello",
+      status: "normal", created_at: "2026-06-21T05:30:00Z", updated_at: "2026-06-21T05:30:00Z",
+      edited_at: null, deleted_at: null, deleted_by: null, recalled_at: null, stream_state: "none", reply_to: null,
+      reply_snapshot_json: null, type: "text", format: "plain", text: "hello",
     });
     const live = await resolveSenderForLiveBroadcast(
       persisted,
@@ -78,7 +88,9 @@ describe("resolveSenderForLiveBroadcast", () => {
     const persisted = buildMessageCreatedPayload({
       message_id: "m-2", command_id: "cm-2", channel_id: "ch-1",
       sender_kind: "user", sender_user_id: "u-ghost", sender_bot_id: null,
-      status: "normal", created_at: "2026-06-21T05:30:00Z", type: "text", format: "plain", text: "hi",
+      status: "normal", created_at: "2026-06-21T05:30:00Z", updated_at: "2026-06-21T05:30:00Z",
+      edited_at: null, deleted_at: null, deleted_by: null, recalled_at: null, stream_state: "none", reply_to: null,
+      reply_snapshot_json: null, type: "text", format: "plain", text: "hi",
     });
     const live = await resolveSenderForLiveBroadcast(
       persisted,

@@ -140,9 +140,10 @@ describe("UserConnection DO", () => {
     expect(ack.frame_type).toBe("command_ack");
     expect(ack.status).toBe("committed");
     expect(ack.command_id).toBe("cmd-uc-1");
-    expect(ack.channel_id).toBe(sysId);
-    expect(ack.message_id).toBeTruthy();
-    expect(ack.event_id).toBeTruthy();
+    expect(ack.payload.channel_id).toBe(sysId);
+    expect(ack.payload.message.message_id).toBeTruthy();
+    expect(ack.payload.message.sender.user.user_id).toBe(userId);
+    expect(ack.payload.event_id).toBeTruthy();
     ws.close();
   });
 
@@ -219,7 +220,7 @@ describe("UserConnection DO", () => {
     ws.send(JSON.stringify({ ...base, command_id: "c-2" }));
     const ack2 = JSON.parse(await nextMessage(ws));
 
-    expect(ack1.message_id).toBe(ack2.message_id);
+    expect(ack1.payload.message.message_id).toBe(ack2.payload.message.message_id);
     ws.close();
   });
 });

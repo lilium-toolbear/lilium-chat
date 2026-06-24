@@ -88,11 +88,13 @@ describe("e2e: message.send → committed_ack → message.created self-receive",
     }));
 
     const ackRaw = await nextMessage(ws);
-    const ack = JSON.parse(ackRaw) as { frame_type: string; status: string; event_id?: string; message_id?: string };
+    const ack = JSON.parse(ackRaw) as { frame_type: string; status: string; payload?: { event_id?: string; message?: { message_id: string; sender: { user: { user_id: string } } } } };
     expect(ack.frame_type).toBe("command_ack");
     expect(ack.status).toBe("committed");
-    expect(ack.message_id).toBeTruthy();
-    const eventId = ack.event_id;
+    expect(ack.payload?.message).toBeTruthy();
+    expect(ack.payload?.event_id).toBeTruthy();
+    expect(ack.payload?.message?.sender?.user?.user_id).toBe("u-e2e-1");
+    const eventId = ack.payload?.event_id;
     expect(eventId).toBeTruthy();
 
     const nextEvent = nextMessage(ws);

@@ -23,7 +23,7 @@ async function setupSystemAndJoin(userId: string): Promise<{ stub: DurableObject
 }
 
 describe("ChatChannel /internal/message-send", () => {
-  it("writes a message + event + outbox rows and returns message_id + event_id", async () => {
+  it("writes a message + event + outbox rows and returns full projection", async () => {
     const { stub, channelId } = await setupSystemAndJoin("u-ms-1");
     const res = await stub.fetch(
       new Request("https://x/internal/message-send", {
@@ -41,9 +41,13 @@ describe("ChatChannel /internal/message-send", () => {
       }),
     );
     expect(res.status).toBe(200);
-    const out = (await res.json()) as { message_id: string; event_id: string };
-    expect(out.message_id).toBeTruthy();
+    const out = (await res.json()) as { channel_id: string; event_id: string; message: { message_id: string; command_id: string; sender: { user: { display_name: string } } } };
+    expect(out.channel_id).toBe(channelId);
     expect(out.event_id).toBeTruthy();
+    expect(out.message.message_id).toBeTruthy();
+    expect(out.message.command_id).toBe("cm-1");
+    expect(out.message.sender).toBeDefined();
+    expect(out.message.sender).toHaveProperty("user");
   });
 
   it("rejects a non-member with FORBIDDEN", async () => {
@@ -84,7 +88,7 @@ describe("ChatChannel /internal/message-send", () => {
           body: JSON.stringify({ ...body, command_id: "cm-dup" }),
         }),
       )
-    ).json()) as { message_id: string; event_id: string };
+    ).json()) as { channel_id: string; event_id: string; message: { message_id: string } };
     const b = (await (
       await stub.fetch(
         new Request("https://x/internal/message-send", {
@@ -93,9 +97,9 @@ describe("ChatChannel /internal/message-send", () => {
           body: JSON.stringify({ ...body, command_id: "cm-dup" }),
         }),
       )
-    ).json()) as { message_id: string; event_id: string };
+    ).json()) as { channel_id: string; event_id: string; message: { message_id: string } };
 
-    expect(a.message_id).toBe(b.message_id);
+    expect(a.message.message_id).toBe(b.message.message_id);
     expect(a.event_id).toBe(b.event_id);
   });
 
@@ -156,7 +160,7 @@ describe("ChatChannel /internal/message-send", () => {
           }),
         }),
       )
-    ).json()) as { message_id: string; event_id: string };
+    ).json()) as { channel_id: string; event_id: string; message: { message_id: string } };
     const b = (await (
       await stub.fetch(
         new Request("https://x/internal/message-send", {
@@ -173,9 +177,9 @@ describe("ChatChannel /internal/message-send", () => {
           }),
         }),
       )
-    ).json()) as { message_id: string; event_id: string };
+    ).json()) as { channel_id: string; event_id: string; message: { message_id: string } };
 
-    expect(a.message_id).not.toBe(b.message_id);
+    expect(a.message.message_id).not.toBe(b.message.message_id);
   });
 
   it("/internal/replay returns the message.created event_json after creation, filtered by status", async () => {
@@ -196,7 +200,7 @@ describe("ChatChannel /internal/message-send", () => {
           }),
         }),
       )
-    ).json()) as { message_id: string; event_id: string };
+    ).json()) as { channel_id: string; event_id: string; message: { message_id: string } };
 
     const replay = (await (
       await stub.fetch(new Request(`https://x/internal/replay?after=`, { headers: { "X-Verified-User-Id": "u-ms-6" } }))

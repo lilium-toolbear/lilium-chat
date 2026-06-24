@@ -29,11 +29,24 @@ export function buildMessageCreatedPayload(raw: {
   sender_bot_id: string | null;
   status: string;
   created_at: string;
+  updated_at: string;
+  edited_at: string | null;
+  deleted_at: string | null;
+  deleted_by: string | null;
+  recalled_at: string | null;
+  stream_state: string;
+  reply_to: string | null;
+  reply_snapshot_json: string | null;
   type: string;
   format: string;
   text: string | null;
 }): Record<string, unknown> {
-  return {
+  let replySnapshot: unknown = null;
+  if (raw.reply_snapshot_json) {
+    try { replySnapshot = JSON.parse(raw.reply_snapshot_json); } catch { replySnapshot = null; }
+  }
+
+    return {
     message: {
       message_id: raw.message_id,
       command_id: raw.command_id,
@@ -43,11 +56,22 @@ export function buildMessageCreatedPayload(raw: {
         user_id: raw.sender_user_id,
         bot_id: raw.sender_bot_id,
       },
+      text: raw.text,
       type: raw.type,
       format: raw.format,
       status: raw.status,
-      text: raw.text,
+      stream_state: raw.stream_state,
+      reply_to: raw.reply_to,
+      reply_snapshot: replySnapshot,
+      attachments: [],
+      components: [],
+      mentions: [],
       created_at: raw.created_at,
+      updated_at: raw.updated_at,
+      edited_at: raw.edited_at,
+      deleted_at: raw.deleted_at,
+      deleted_by: raw.deleted_by,
+      recalled_at: raw.recalled_at,
     },
   };
 }
@@ -92,4 +116,3 @@ export async function resolveSenderForLiveBroadcast(
     message: { ...baseMessage, sender: resolvedSender },
   };
 }
-

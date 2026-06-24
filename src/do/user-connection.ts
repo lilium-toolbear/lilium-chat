@@ -284,14 +284,13 @@ export class UserConnection extends DurableObject<Env> {
         return;
       }
 
-      const body = (await res.json()) as { message_id: string; event_id: string };
-      const ack: CommandAckFrame = {
+      const body = (await res.json()) as { channel_id: string; event_id: string; message: Record<string, unknown> };
+      const ack = {
         frame_type: "command_ack",
         command_id: frame.command_id,
         status: "committed",
-        channel_id: frame.channel_id,
-        message_id: body.message_id,
-        event_id: body.event_id,
+        command: "message.send",
+        payload: { channel_id: body.channel_id, event_id: body.event_id, message: body.message },
       };
       ws.send(JSON.stringify(ack));
     } catch (err) {
