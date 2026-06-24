@@ -232,7 +232,12 @@ export function projectMessageForBrowser(
 }
 ```
 
-> **Mentions note:** the shipped `rowToMessage` returns `mentions: []` always (mention rows are read separately by the history path). The projection mirrors that — `mentions: []` (or the caller injects them). Hidden status forces `[]`. If a later task wires real mentions, they go through this builder. Do NOT add a mentions-lookup here (keep the builder pure / single-row).
+> **Two-layer design + future-extension rule (v4.0 addendum J):** `projectMessageForBrowser` is pure — it takes a single `MessageRow` + an already-resolved `senderSummary` and does NO network/DO lookup (so it can run inside a transaction after pre-resolving the sender, exactly like the Phase 2 `resolveActorMap` pattern). The caller (history pagination / message-send ack / replay) is responsible for composing the projection's inputs it cannot derive from the row alone:
+> - **sender**: pre-resolved via `resolveUserSummaries` BEFORE the projection call (or before the txn).
+> - **mentions**: NOT loaded by this builder in Phase 3.5 — it returns `mentions: []` for non-hidden, `[]` for hidden. The shipped history path reads mention rows separately; if a task wires real mentions, they are INJECTED by the caller (the builder stays single-row pure) OR the builder grows an optional `mentions` param — but the projection is still ONE function.
+> - **attachments / components**: Phase 5 / Phase 7. Always `[]` in Phase 3.5.
+>
+> Rule: **when attachments/components/mentions land, extend THIS builder (add params), never build a second ad-hoc serializer** for ack or event payloads (v4.0 addendum J). The plan-defining contract is: every Browser-visible message shape — history, `message.send`/edit/recall/delete ack, `message.created`/updated/recalled/deleted event, context read — comes from `projectMessageForBrowser`. Task 5 wires `message.send` ack + `message.created` event to it; Task 6 (deleting MessageIndex) does not touch it; future Phase 4/5/7 extend it in place.
 
 - [ ] **Step 4: Run test to verify it passes + typecheck**
 
@@ -693,11 +698,17 @@ Expected: clean + green. (The test count will be ~180 minus the removed read-sta
 
 - [ ] **Step 2: Grep-assert v4.0 terms are gone from src**
 
-Run:
+Run these TWO greps separately (do NOT lump `ROUTE_INDEX_PENDING` with the rename targets — it is allowed in the shared error table):
+
 ```bash
-grep -rnE "client_message_id|client_mutation_id|client_invocation_id|client_interaction_id|MessageIndex|message_index|ROUTE_INDEX_PENDING" src/
+grep -rnE "client_message_id|client_mutation_id|client_invocation_id|client_interaction_id|MessageIndex|message_index" src/
 ```
-Expected: zero hits (MessageIndex fully gone; client_*_id renamed to command_id). `ROUTE_INDEX_PENDING` may remain in `src/errors.ts` (the code is still defined — invite-code routing, Phase 6, may use it) — that's fine; it must not be returned by any message operation.
+Expected: **zero hits** (MessageIndex fully gone; `client_*_id` all renamed to `command_id`).
+
+```bash
+grep -rn "ROUTE_INDEX_PENDING" src/
+```
+Expected: allowed ONLY in `src/errors.ts` (the error-code-to-status table, reserved for invite-code routing in Phase 6). It must NOT be referenced/returned by any message-operation handler or test (message operations are channel-scoped and never return `ROUTE_INDEX_PENDING`).
 
 - [ ] **Step 3: Spec coverage self-review**
 

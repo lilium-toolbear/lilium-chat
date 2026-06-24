@@ -1,11 +1,11 @@
 # ToolBear Chat Browser/Bot API Contract
 
-状态：实现前 API contract（v2.6，基于 2026-06-21 v1 + backend 设计 v3.3 delta + 2026-06-23 成员精确读补丁 + 2026-06-24 前端缺口收口 + 2026-06-24 幂等冲突语义收口 + 2026-06-24 频道创建端点 + 2026-06-24 v4.0 alignment）
+状态：实现前 API contract（v2.6，v4.0-aligned —— 基于 2026-06-21 v1 + backend 设计 v4.0 delta + 2026-06-23 成员精确读补丁 + 2026-06-24 前端缺口收口 + 2026-06-24 幂等冲突语义收口 + 2026-06-24 频道创建端点 + 2026-06-24 v4.0 alignment + 2026-06-24 committed_ack canonical payload）
 日期：2026-06-22
 范围：lilium-chat 后端（Cloudflare Worker + Durable Object）的 browser/bot-facing wire shape
 权威来源：
 
-- 实现设计：`docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md`（v3.3）
+- 实现设计：`docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md`（v4.0）
 - 前身 contract：`dzmm_archive/docs/plans/2026-06-21-toolbear-chat-api-contract.md`（v1）
 
 本文件是 v1 contract 的**修订版**。所有与 v1 一致的部分保持原状；偏离处显式标注 `(v2 delta)`。前端与 bot 实现**以本文件为准**。
@@ -1578,16 +1578,19 @@ WebSocket command frame (v2.6 delta：payload 用 `bot_command_id`，移除 `cli
 }
 ```
 
-Worker 接受 command 并在事务提交后返回 committed_ack (v2 delta)：
+Worker 接受 command 并在事务提交后返回 committed_ack (v2.6 delta：ack 改为 payload-bearing；`command_id` 为 durable 幂等键)：
 
 ```json
 {
   "frame_type": "command_ack",
+  "command": "command.invoke",
   "command_id": "00000000-0000-7000-8000-000000000812",
   "status": "committed",
-  "channel_id": "00000000-0000-7000-8000-000000000201",
-  "invocation_id": "00000000-0000-7000-8000-000000000811",
-  "event_id": "01J..."
+  "payload": {
+    "channel_id": "00000000-0000-7000-8000-000000000201",
+    "invocation_id": "00000000-0000-7000-8000-000000000811",
+    "event_id": "01J..."
+  }
 }
 ```
 
@@ -1648,7 +1651,23 @@ select command：
 }
 ```
 
-Worker 接受 command 后广播：
+Worker 接受 command 并在事务提交后返回 committed_ack (v2.6 delta：ack payload-bearing；`command_id` 为 durable 幂等键)：
+
+```json
+{
+  "frame_type": "command_ack",
+  "command": "interaction.submit",
+  "command_id": "00000000-0000-7000-8000-000000000a31",
+  "status": "committed",
+  "payload": {
+    "channel_id": "00000000-0000-7000-8000-000000000201",
+    "interaction_id": "00000000-0000-7000-8000-000000000a41",
+    "event_id": "01J..."
+  }
+}
+```
+
+随后广播事件 (v2 delta)：
 
 ```json
 {
