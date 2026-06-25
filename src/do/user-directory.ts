@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { uuidv7 } from "../ids/uuidv7";
-import { execSchema } from "./sql";
+import { handleSchemaVersionRequest } from "./sql-migrations";
+import { migrateUserDirectorySchema } from "./migrations/user-directory";
 import { projectAttachmentForBrowser, projectFinalizedAttachmentForBrowser, type AttachmentRow } from "../chat/attachment-projection";
 import { presignPutUrl, headObject, deleteObject } from "../s3/presign";
 import { HTTP_STATUS_BY_CODE } from "../errors";
@@ -62,60 +63,22 @@ function validatePresignBody(body: {
     filename,
     mimeType,
     sizeBytes,
-    width: body.width,
-    height: body.height,
+    width: body.width ?? undefined,
+    height: body.height ?? undefined,
     blurhash: body.blurhash,
   };
 }
 
-const SCHEMA = [
-  `CREATE TABLE IF NOT EXISTS my_channels (
-    user_id TEXT NOT NULL, channel_id TEXT NOT NULL, kind TEXT NOT NULL,
-    joined_at TEXT NOT NULL, left_at TEXT, removed_at TEXT,
-    status TEXT NOT NULL DEFAULT 'active', membership_version INTEGER NOT NULL,
-    last_read_event_id TEXT, PRIMARY KEY (user_id, channel_id)
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_my_channels ON my_channels(user_id, status)`,
-  `CREATE INDEX IF NOT EXISTS idx_my_channels_active ON my_channels(user_id) WHERE status='active'`,
-  `CREATE TABLE IF NOT EXISTS pending_attachments (
-    attachment_id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, kind TEXT NOT NULL,
-    filename TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
-    width INTEGER, height INTEGER, blurhash TEXT, storage_key TEXT NOT NULL, url TEXT NOT NULL,
-    status TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_pending_expires ON pending_attachments(status, expires_at)`,
-  `CREATE TABLE IF NOT EXISTS idempotency_keys (
-    operation TEXT NOT NULL, operation_id TEXT NOT NULL, -- HTTP Idempotency-Key or WS command_id
-    request_hash TEXT NOT NULL, status TEXT NOT NULL,
-    channel_id TEXT, response_json TEXT,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-    PRIMARY KEY (operation, operation_id)
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_ud_idem_expires ON idempotency_keys(expires_at)`,
-  `CREATE TABLE IF NOT EXISTS personal_stickers (
-    sticker_id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    attachment_id TEXT NOT NULL,
-    url TEXT NOT NULL,
-    mime_type TEXT NOT NULL,
-    width INTEGER,
-    height INTEGER,
-    size_bytes INTEGER NOT NULL,
-    blurhash TEXT,
-    created_at TEXT NOT NULL,
-    deleted_at TEXT,
-    UNIQUE (user_id, attachment_id)
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_personal_stickers_user ON personal_stickers(user_id, created_at DESC) WHERE deleted_at IS NULL`,
-];
-
 export class UserDirectory extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    execSchema(this.ctx, SCHEMA);
+    migrateUserDirectorySchema(this.ctx);
   }
 
   async fetch(request: Request): Promise<Response> {
+    const schemaVersion = handleSchemaVersionRequest(this.ctx, "UserDirectory", request);
+    if (schemaVersion) return schemaVersion;
+
     const url = new URL(request.url);
     if (url.pathname === "/ping") return Response.json({ ok: true });
 
