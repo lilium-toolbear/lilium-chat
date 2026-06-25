@@ -1,7 +1,66 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
 
 import { getNamedDo } from "../helpers";
+import { setTestS3Client, type S3Client } from "../../src/s3/presign";
+
+class FakeS3 implements S3Client {
+  objects = new Map<string, { contentType: string; contentLength: number }>();
+
+  async sign(input: string | URL, init?: RequestInit & { aws?: any }): Promise<Request> {
+    const url = new URL(input instanceof URL ? input.toString() : input);
+    url.searchParams.set("X-Amz-Fake", "signed");
+    return new Request(url, init);
+  }
+
+  async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const u = new URL(input instanceof Request ? input.url : input.toString());
+    const method = input instanceof Request ? input.method : (init?.method ?? "GET");
+    if (method === "HEAD") {
+      const obj = this.objects.get(u.pathname);
+      if (!obj) return new Response("Not Found", { status: 404 });
+      return new Response(new ArrayBuffer(0), {
+        status: 200,
+        headers: { "Content-Type": obj.contentType, "Content-Length": String(obj.contentLength) },
+      });
+    }
+    return new Response("ok", { status: 200 });
+  }
+}
+
+function udStub(userId: string) {
+  return getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], userId);
+}
+
+async function presignAndFinalize(userId: string, fake: FakeS3): Promise<string> {
+  const key = `idem-lc-${userId}`;
+  const presignRes = await udStub(userId).fetch(
+    new Request("https://x/internal/attachment-presign", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": key, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: "img.png",
+        mime_type: "image/png",
+        size_bytes: 12345,
+        width: 1,
+        height: 1,
+      }),
+    }),
+  );
+  expect(presignRes.status).toBe(200);
+  const presignBody = (await presignRes.json()) as { attachment_id: string; upload_url: string };
+  fake.objects.set(new URL(presignBody.upload_url).pathname, { contentType: "image/png", contentLength: 12345 });
+
+  const finalizeRes = await udStub(userId).fetch(
+    new Request("https://x/internal/attachment-finalize", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": `${key}-fin`, "Content-Type": "application/json" },
+      body: JSON.stringify({ attachment_id: presignBody.attachment_id }),
+    }),
+  );
+  expect(finalizeRes.status).toBe(200);
+  return presignBody.attachment_id;
+}
 
 async function setupAndSend(
   userId: string,
@@ -9,6 +68,7 @@ async function setupAndSend(
   text: string,
   cmdId: string,
   type = "text",
+  attachmentId?: string,
 ): Promise<{ stub: DurableObjectStub; messageId: string; eventId: string }> {
   const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
   await stub.fetch(new Request("https://x/internal/create-channel", {
@@ -24,20 +84,24 @@ async function setupAndSend(
       initial_members: [],
     }),
   }));
+  const body: Record<string, unknown> = {
+    command_id: cmdId,
+    dedupe_principal_key: `user:${userId}`,
+    type,
+    text,
+    reply_to: null,
+    mentions: [],
+    channel_id: channelId,
+  };
+  if (attachmentId) {
+    body.attachment_ids = [attachmentId];
+  }
   const send = (await (
     await stub.fetch(
       new Request("https://x/internal/message-send", {
         method: "POST",
         headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          command_id: cmdId,
-          dedupe_principal_key: `user:${userId}`,
-          type,
-          text,
-          reply_to: null,
-          mentions: [],
-          channel_id: channelId,
-        }),
+        body: JSON.stringify(body),
       }),
     )
   ).json()) as { message: { message_id: string }; event_id: string };
@@ -45,6 +109,11 @@ async function setupAndSend(
 }
 
 describe("ChatChannel message lifecycle", () => {
+  let fake: FakeS3;
+  beforeEach(() => {
+    fake = new FakeS3();
+    setTestS3Client(fake);
+  });
   it("edit: owner edits own text -> status edited, text updated, event message.updated", async () => {
     const { stub, messageId } = await setupAndSend("u-lc-1", "01a40001-0000-7000-8000-000000000001", "orig", "cmd-send-1");
     const res = await stub.fetch(new Request("https://x/internal/message-edit", {
@@ -109,7 +178,8 @@ describe("ChatChannel message lifecycle", () => {
   });
 
   it("lifecycle state matrix: non-text edit and hidden message edits are rejected", async () => {
-    const nonText = await setupAndSend("u-lc-5", "01a40005-0000-7000-8000-000000000001", "img", "cmd-send-5", "image");
+    const attachmentId = await presignAndFinalize("u-lc-5", fake);
+    const nonText = await setupAndSend("u-lc-5", "01a40005-0000-7000-8000-000000000001", "img", "cmd-send-5", "image", attachmentId);
     const text = await setupAndSend("u-lc-5", "01a40005-0000-7000-8000-000000000001", "ok", "cmd-send-5b");
 
     const nonTextEditRes = await nonText.stub.fetch(new Request("https://x/internal/message-edit", {
