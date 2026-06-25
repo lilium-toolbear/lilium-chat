@@ -17,6 +17,7 @@ import {
   createChannelHandler,
   dissolveChannelHandler,
   getMemberHandler,
+  joinChannelHandler,
   listMembersHandler,
   ownerTransferHandler,
   removeMemberHandler,
@@ -65,6 +66,7 @@ app.get("/api/chat/channels", (c) => listChannelsHandler(c));
 app.post("/api/chat/channels", (c) => createChannelHandler(c));
 app.patch("/api/chat/channels/:channel_id", (c) => updateChannelHandler(c));
 app.post("/api/chat/channels/:channel_id/dissolve", (c) => dissolveChannelHandler(c));
+app.post("/api/chat/channels/:channel_id/join", (c) => joinChannelHandler(c));
 app.post("/api/chat/channels/:channel_id/owner-transfer", (c) => ownerTransferHandler(c));
 app.post("/api/chat/channels/:channel_id/invites", (c) => createInviteHandler(c));
 app.post("/api/chat/channels/:channel_id/members", (c) => addMemberHandler(c));

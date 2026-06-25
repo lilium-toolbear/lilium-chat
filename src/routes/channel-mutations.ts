@@ -504,3 +504,57 @@ export async function deleteStickerHandler(c: Context<{ Bindings: Env; Variables
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "sticker delete failed");
   return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
 }
+
+export async function joinChannelHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const channelId = c.req.param("channel_id");
+  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
+
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+
+  const joinRes = await stub.fetch(new Request("https://x/internal/join", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, operation_id: idempotencyKey }),
+  }));
+
+  if (joinRes.status === 403) {
+    const e = await joinRes.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
+    throw new ApiError("FORBIDDEN", e.error?.message ?? "channel is not publicly joinable");
+  }
+  if (joinRes.status === 409) {
+    const e = await joinRes.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
+    const code = e.error?.code ?? "CHANNEL_DISSOLVED";
+    if (code === "IDEMPOTENCY_CONFLICT") throw new ApiError("IDEMPOTENCY_CONFLICT", e.error?.message ?? "idempotency conflict");
+    throw new ApiError(code, e.error?.message ?? "channel dissolved");
+  }
+  if (!joinRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "join failed");
+
+  const joinBody = (await joinRes.json()) as { channel_id: string; membership_version: number; joined_at: string; role: string };
+
+  // Re-inflate the ChannelDetail fresh (the cached idempotency result is the membership result; the
+  // channel field is re-inflated per call and may differ in transient fields like title/avatar).
+  const summaryRes = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
+  if (!summaryRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "channel summary failed");
+  const s = (await summaryRes.json()) as Record<string, unknown>;
+
+  const channel = {
+    channel_id: s.channel_id,
+    kind: s.kind,
+    visibility: s.visibility,
+    title: s.title,
+    topic: s.topic,
+    avatar_url: s.avatar_url,
+    member_count: s.member_count,
+    role: s.my_role,
+    status: s.status,
+    created_at: s.created_at,
+    updated_at: s.updated_at,
+  };
+  const membership = { role: joinBody.role, joined_at: joinBody.joined_at };
+  return c.json({ channel, membership }, 200, { "X-Request-Id": c.get("requestId") });
+}
