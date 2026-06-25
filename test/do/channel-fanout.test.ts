@@ -61,10 +61,29 @@ describe("ChannelFanout DO", () => {
     const { runDurableObjectAlarm } = await import("cloudflare:test") as any;
     await runDurableObjectAlarm(fanout);
 
-    const dump2 = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": channelId } }))).json()) as {
-      queue: Array<{ target_session_id: string; status: string }>;
-    };
-    expect(dump2.queue.at(0)?.status).toBe("delivered");
+    // Poll for 'delivered'. Under CI load the UserConnection sub-fetch inside the alarm can
+    // throw transiently (DO rpc / environment-teardown timing), which routes through
+    // bumpFanoutRetry → status stays 'pending' with a 1s backoff. Re-running the alarm after
+    // the backoff retries the delivery. This mirrors the poll-then-retry pattern used in
+    // member-left-unsubscribe.test.ts and setupChannelAndJoin helpers.
+    let delivered = false;
+    for (let i = 0; i < 60; i++) {
+      const dump2 = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": channelId } }))).json()) as {
+        queue: Array<{ target_session_id: string; status: string; attempts?: number; last_error?: string | null; next_attempt_at?: string }>;
+      };
+      const row = dump2.queue.at(0);
+      if (row?.status === "delivered") {
+        delivered = true;
+        break;
+      }
+      if (row?.status === "dead_letter") {
+        throw new Error(`fanout dead_letter: attempts=${row.attempts} last_error=${JSON.stringify(row.last_error)}`);
+      }
+      // Re-flush the alarm so a pending row whose next_attempt_at has come due is retried.
+      await runDurableObjectAlarm(fanout);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(delivered).toBe(true);
 
     const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver"))).json()) as { event_json: string | null };
     expect(probe.event_json).toContain('"event_id":"e-1"');
