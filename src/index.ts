@@ -8,6 +8,7 @@ import { wsUpgradeHandler } from "./routes/ws";
 import { listChannelsHandler, channelDetailHandler } from "./routes/channels";
 import { listMessagesHandler } from "./routes/messages";
 import { eventsHandler } from "./routes/events";
+import { presignUploadHandler, finalizeUploadHandler } from "./routes/uploads";
 import {
   createInviteHandler,
   previewInviteHandler,
@@ -72,6 +73,8 @@ app.patch("/api/chat/channels/:channel_id/members/:user_id", (c) => updateMember
 app.delete("/api/chat/channels/:channel_id/members/:user_id", (c) => removeMemberHandler(c));
 app.get("/api/chat/channels/:channel_id/messages", (c) => listMessagesHandler(c));
 app.get("/api/chat/channels/:channel_id", (c) => channelDetailHandler(c));
+app.post("/api/chat/uploads/images/presign", (c) => presignUploadHandler(c));
+app.post("/api/chat/uploads/images/:attachment_id/finalize", (c) => finalizeUploadHandler(c));
 app.get("/api/chat/events", (c) => eventsHandler(c));
 app.all("/api/chat/*", (c) => {
   throw new ApiError("CHANNEL_NOT_FOUND", "not implemented in phase 0", { httpStatus: 404 });
