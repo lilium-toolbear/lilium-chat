@@ -186,27 +186,69 @@ describe("ChatChannel message.send type=sticker", () => {
     expect(b2.event_id).toBe(b1.event_id);
   });
 
-  it("recall hides the sticker in the projection", async () => {
-    const userId = "u-sticker-send-4";
-    const channelId = "ch-sticker-send-4";
+  it("history returns sticker snapshot", async () => {
+    const userId = "u-sticker-send-5";
+    const channelId = "ch-sticker-send-5";
     const stub = await createChannel(channelId, userId);
     const { attachment_id } = await presignAndFinalize(userId, fake);
     const { sticker_id } = await saveSticker(userId, channelId, attachment_id);
 
-    const sendRes = await sendStickerMessage(channelId, userId, sticker_id, "cmd-sticker-4");
+    const sendRes = await sendStickerMessage(channelId, userId, sticker_id, "cmd-sticker-5");
     expect(sendRes.status).toBe(200);
     const sendBody = (await sendRes.json()) as { message: { message_id: string } };
+
+    const historyRes = await stub.fetch(new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": userId } }));
+    expect(historyRes.status).toBe(200);
+    const historyBody = (await historyRes.json()) as {
+      items: Array<{ message_id: string; type: string }>;
+      stickers: Record<string, { sticker_id: string } | undefined>;
+    };
+    const live = historyBody.items.find((m) => m.message_id === sendBody.message.message_id);
+    expect(live).toBeDefined();
+    expect(live!.type).toBe("sticker");
+    expect(historyBody.stickers[sendBody.message.message_id]).toBeDefined();
+    expect(historyBody.stickers[sendBody.message.message_id]!.sticker_id).toBe(sticker_id);
+  });
+
+  it("replay returns sticker snapshot and hides it after recall", async () => {
+    const userId = "u-sticker-send-6";
+    const channelId = "ch-sticker-send-6";
+    const stub = await createChannel(channelId, userId);
+    const { attachment_id } = await presignAndFinalize(userId, fake);
+    const { sticker_id } = await saveSticker(userId, channelId, attachment_id);
+
+    const sendRes = await sendStickerMessage(channelId, userId, sticker_id, "cmd-sticker-6");
+    expect(sendRes.status).toBe(200);
+    const sendBody = (await sendRes.json()) as { event_id: string; message: { message_id: string } };
+
+    const replayRes1 = await stub.fetch(new Request("https://x/internal/replay?after=", { headers: { "X-Verified-User-Id": userId } }));
+    expect(replayRes1.status).toBe(200);
+    const replayBody1 = (await replayRes1.json()) as { events: Array<{ event_id: string; event_json: string }> };
+    const createdEvent = replayBody1.events
+      .map((e) => ({ ...e, frame: JSON.parse(e.event_json) as { type: string; payload?: { message?: { message_id: string; type: string; sticker: { sticker_id: string } | null } } } }))
+      .find((e) => e.frame.type === "message.created" && e.frame.payload?.message?.message_id === sendBody.message.message_id);
+    expect(createdEvent).toBeDefined();
+    expect(createdEvent!.frame.payload!.message!.type).toBe("sticker");
+    expect(createdEvent!.frame.payload!.message!.sticker).not.toBeNull();
+    expect(createdEvent!.frame.payload!.message!.sticker!.sticker_id).toBe(sticker_id);
 
     const recallRes = await stub.fetch(
       new Request("https://x/internal/message-recall", {
         method: "POST",
         headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({ operation_id: "op-recall", message_id: sendBody.message.message_id, channel_id: channelId }),
+        body: JSON.stringify({ operation_id: "op-recall-6", message_id: sendBody.message.message_id, channel_id: channelId }),
       }),
     );
     expect(recallRes.status).toBe(200);
-    const recallBody = (await recallRes.json()) as { message: { status: string; sticker: unknown } };
-    expect(recallBody.message.status).toBe("recalled");
-    expect(recallBody.message.sticker).toBeNull();
+
+    const replayRes2 = await stub.fetch(new Request(`https://x/internal/replay?after=${encodeURIComponent(sendBody.event_id)}`, { headers: { "X-Verified-User-Id": userId } }));
+    expect(replayRes2.status).toBe(200);
+    const replayBody2 = (await replayRes2.json()) as { events: Array<{ event_id: string; event_json: string }> };
+    const recalledEvent = replayBody2.events
+      .map((e) => ({ ...e, frame: JSON.parse(e.event_json) as { type: string; payload?: { message?: { message_id: string; status: string; sticker: unknown } } } }))
+      .find((e) => e.frame.type.startsWith("message.") && e.frame.payload?.message?.message_id === sendBody.message.message_id);
+    expect(recalledEvent).toBeDefined();
+    expect(recalledEvent!.frame.payload!.message!.status).toBe("recalled");
+    expect(recalledEvent!.frame.payload!.message!.sticker).toBeNull();
   });
 });

@@ -1,7 +1,7 @@
 import type { Env } from "../env";
 import { resolveUserSummaries } from "../profile/resolve";
 import type { MessageRow } from "../do/chat-channel";
-import { projectMessageForBrowser, type MessageMention } from "./message-projection";
+import { projectMessageForBrowser, type MessageMention, type MessageStickerSnapshot } from "./message-projection";
 import { projectAttachmentForBrowser, type AttachmentRow } from "./attachment-projection";
 import type { UserSummary } from "./event-broadcast";
 
@@ -16,6 +16,7 @@ export async function projectMessagesForBrowser(
   mentionsByMessage: Record<string, MessageMention[]>,
   env: Env,
   attachmentsByMessage: Record<string, AttachmentRow[]> = {},
+  stickersByMessage: Record<string, MessageStickerSnapshot> = {},
 ): Promise<Record<string, unknown>[]> {
   const senderUserIds = [...new Set(rows.filter((r) => r.sender_kind === "user" && r.sender_user_id).map((r) => r.sender_user_id as string))];
   const map = await resolveUserSummaries(senderUserIds, env);
@@ -36,6 +37,7 @@ export async function projectMessagesForBrowser(
       senderSummary,
       mentions: mentionsByMessage[row.message_id] ?? [],
       attachments,
+      sticker: stickersByMessage[row.message_id] ?? null,
     });
   });
 }

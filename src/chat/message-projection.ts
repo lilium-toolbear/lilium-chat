@@ -17,13 +17,23 @@ export interface MessageMention {
   end: number;
 }
 
+export interface MessageStickerSnapshot {
+  sticker_id: string;
+  attachment_id: string;
+  url: string;
+  mime_type: string;
+  width: number | null;
+  height: number | null;
+  size_bytes: number;
+}
+
 export function projectMessageForBrowser(
   row: MessageRow,
   opts: {
     senderSummary?: UserSummary | null;
     mentions?: MessageMention[];
     attachments?: unknown[];
-    sticker?: { sticker_id: string; attachment_id: string; url: string; mime_type: string; width: number | null; height: number | null; size_bytes: number } | null;
+    sticker?: MessageStickerSnapshot | null;
     components?: unknown[];
   } = {},
 ): Record<string, unknown> {

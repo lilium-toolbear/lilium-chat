@@ -3,6 +3,7 @@ import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 import { projectMessagesForBrowser } from "../chat/sender";
+import type { MessageStickerSnapshot } from "../chat/message-projection";
 import type { MessageRow } from "../do/chat-channel";
 import type { AttachmentRow } from "../chat/attachment-projection";
 import { ensureSystemJoined, channelRouteNameFor } from "../chat/system-channel";
@@ -39,9 +40,10 @@ export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables:
     items: MessageRow[];
     mentions: Record<string, Array<{ user_id: string; start: number; end: number }>>;
     attachments: Record<string, AttachmentRow[]>;
+    stickers: Record<string, MessageStickerSnapshot>;
     next_cursor: string | null;
   };
 
-  const items = await projectMessagesForBrowser(mb.items, mb.mentions ?? {}, c.env, mb.attachments ?? {});
+  const items = await projectMessagesForBrowser(mb.items, mb.mentions ?? {}, c.env, mb.attachments ?? {}, mb.stickers ?? {});
   return c.json({ items, next_cursor: mb.next_cursor }, 200, { "X-Request-Id": c.get("requestId") });
 }

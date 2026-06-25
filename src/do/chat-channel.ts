@@ -8,7 +8,7 @@ import {
   buildMessageLifecyclePayload,
   type UserSummary as LiveUserSummary,
 } from "../chat/event-broadcast";
-import { projectMessageForBrowser } from "../chat/message-projection";
+import { projectMessageForBrowser, type MessageStickerSnapshot } from "../chat/message-projection";
 import { projectAttachmentForBrowser, type AttachmentRow as ChatAttachmentRow } from "../chat/attachment-projection";
 import {
   buildChannelCreatedPayload,
@@ -938,6 +938,7 @@ export class ChatChannel extends DurableObject<Env> {
       const messageIds = page.map((r) => r.message_id);
       const mentionsByMessage: Record<string, Array<{ user_id: string; start: number; end: number }>> = {};
       const attachmentsByMessage: Record<string, ChatAttachmentRow[]> = {};
+      const stickersByMessage: Record<string, MessageStickerSnapshot> = {};
       if (messageIds.length > 0) {
         const placeholders = messageIds.map(() => "?").join(",");
         const mentionRows = this.ctx.storage.sql
@@ -959,12 +960,23 @@ export class ChatChannel extends DurableObject<Env> {
           const { message_id, ...row } = ar;
           (attachmentsByMessage[message_id] ??= []).push(row);
         }
+        const stickerRows = this.ctx.storage.sql
+          .exec(
+            `SELECT message_id, sticker_id, attachment_id, url, mime_type, width, height, size_bytes FROM message_stickers WHERE message_id IN (${placeholders})`,
+            ...messageIds,
+          )
+          .toArray() as unknown as Array<MessageStickerSnapshot & { message_id: string }>;
+        for (const sr of stickerRows) {
+          const { message_id, ...snapshot } = sr;
+          stickersByMessage[message_id] = snapshot;
+        }
       }
 
       return Response.json({
         items: page,
         mentions: mentionsByMessage,
         attachments: attachmentsByMessage,
+        stickers: stickersByMessage,
         next_cursor: nextCursor,
       });
     }
@@ -1197,16 +1209,7 @@ export class ChatChannel extends DurableObject<Env> {
         }
       }
 
-      type StickerSnapshot = {
-        sticker_id: string;
-        attachment_id: string;
-        url: string;
-        mime_type: string;
-        width: number | null;
-        height: number | null;
-        size_bytes: number;
-      };
-      let stickerSnapshot: StickerSnapshot | null = null;
+      let stickerSnapshot: MessageStickerSnapshot | null = null;
       if (b.type === "sticker") {
         if (!b.sticker_id) {
           return Response.json(
@@ -1233,7 +1236,7 @@ export class ChatChannel extends DurableObject<Env> {
             { status: stickerRes.status === 404 ? 404 : 422 },
           );
         }
-        stickerSnapshot = (await stickerRes.json()) as StickerSnapshot;
+        stickerSnapshot = (await stickerRes.json()) as MessageStickerSnapshot;
       }
 
       // Build the LIVE message projection once (used by BOTH the committed-ack response_json AND
@@ -2396,7 +2399,13 @@ export class ChatChannel extends DurableObject<Env> {
             const replayAttachments = replayAttachmentRows
               .map(projectAttachmentForBrowser)
               .filter((a): a is Record<string, unknown> => a !== null);
-            payload = { message: projectMessageForBrowser(messageRow, { senderSummary, mentions: replayMentions, attachments: replayAttachments }) };
+            const replayStickerRow = this.ctx.storage.sql
+              .exec(
+                "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes FROM message_stickers WHERE message_id=?",
+                messageRow.message_id,
+              )
+              .toArray()[0] as unknown as MessageStickerSnapshot | undefined;
+            payload = { message: projectMessageForBrowser(messageRow, { senderSummary, mentions: replayMentions, attachments: replayAttachments, sticker: replayStickerRow ?? null }) };
           } catch {
             // malformed payload or missing payload message_id
           }
