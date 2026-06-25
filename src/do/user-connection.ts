@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame } from "../ws/frames";
 import { channelRouteNameFor } from "../chat/system-channel";
-import { dedupePrincipalKeyForUser, parseMessageSendCommand } from "../chat/command";
+import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditCommand, parseMessageRecallCommand, parseMessageSendCommand } from "../chat/command";
 
 export interface ConnectionAttachment {
   user_id: string;
@@ -227,6 +227,34 @@ export class UserConnection extends DurableObject<Env> {
             other.send(JSON.stringify({ frame_type: "read_state_updated", channel_id: channelId, last_read_event_id: floor.last_read_event_id, unread_count: unreadCount }));
           } catch { /* session gone */ }
         }
+      }
+      return;
+    }
+
+    if (frame.command === "message.edit" || frame.command === "message.recall" || frame.command === "message.delete") {
+      const channelId = frame.channel_id ?? "";
+      if (!channelId) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "missing channel_id")); return; }
+      let parsed: { ok: true; command: { message_id: string; text?: string; reason?: string | null } } | { ok: false; error: { code: string; message: string; retryable: boolean } };
+      if (frame.command === "message.edit") parsed = parseMessageEditCommand(frame);
+      else if (frame.command === "message.recall") parsed = parseMessageRecallCommand(frame);
+      else parsed = parseMessageDeleteCommand(frame);
+      if (!parsed.ok) { sendCommandError(ws, frame.command_id, parsed.error); return; }
+      const routeName = await channelRouteNameFor(this.env, attachment.user_id, channelId);
+      if (routeName === null) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found")); return; }
+      const subscribed = await this.ensureSubscribed(attachment, ws, channelId);
+      if (!subscribed) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found or not a member")); return; }
+      try {
+        const stub = this.env.CHAT_CHANNEL.getByName(routeName);
+        const endpoint = frame.command === "message.edit" ? "/internal/message-edit" : frame.command === "message.recall" ? "/internal/message-recall" : "/internal/message-delete";
+        const body: Record<string, unknown> = { operation_id: frame.command_id, message_id: parsed.command.message_id, channel_id: channelId };
+        if (frame.command === "message.edit") body.text = parsed.command.text;
+        if (frame.command === "message.delete") body.reason = parsed.command.reason ?? null;
+        const res = await stub.fetch(new Request(`https://x${endpoint}`, { method: "POST", headers: { "X-Verified-User-Id": attachment.user_id, "Content-Type": "application/json" }, body: JSON.stringify(body) }));
+        if (!res.ok) { const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } }; sendCommandError(ws, frame.command_id, responseError(e.error?.code ?? "CHAT_WORKER_UNAVAILABLE", e.error?.message ?? "mutation failed")); return; }
+        const out = await res.json() as { channel_id: string; event_id: string; message: Record<string, unknown> };
+        ws.send(JSON.stringify({ frame_type: "command_ack", command: frame.command, command_id: frame.command_id, status: "committed", payload: { channel_id: out.channel_id, event_id: out.event_id, message: out.message } }));
+      } catch (err) {
+        sendCommandError(ws, frame.command_id, responseError("CHAT_WORKER_UNAVAILABLE", err instanceof Error ? err.message : "mutation failed"));
       }
       return;
     }
