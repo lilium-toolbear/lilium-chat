@@ -18,7 +18,7 @@
 - **`CHANNEL_DISSOLVED` write-gate** applies to edit/recall/delete + owner-transfer + invite create/accept (every write into ChatChannel).
 - **owner single-owner invariant:** exactly one active owner (`channel_meta.created_by`, role `owner`). Owner-transfer swaps atomically; the dissolved-channel / self-leave / self-demote guards from Phase 3 remain.
 - **`projectMessageForBrowser`** is the ONE message serializer (history/replay/ack/event). edit/recall/delete acks + `message.updated`/`recalled`/`deleted` events + history all use it. Deleted/recalled → `text:null`, `attachments:[]`, `components:[]`, `mentions:[]`, `sticker:null` (when stickers land). Edit recap: `message_edits` table already exists — append a row per edit for audit; the Browser projection exposes only current `status='edited'` + `edited_at`, NOT edit history.
-- **Git identity `kuma`.** `git -c user.name=kuma -c user.email=kuma@kuma.homes commit ...`. **Do NOT push or deploy.**
+- **Do NOT push or deploy.** Commit using the repo default git config.
 - **Test config:** `npx vitest run <files> --no-file-parallelism --test-timeout=60000 --hook-timeout=60000` (high local load makes the 5s default flake). Typecheck: `npm run typecheck` (`tsc --noEmit`). Tests use `env` from `cloudflare:workers`, `getNamedDo`/`makeJwt`/`TEST_SECRET` from `test/helpers.ts`, with the `env.<BINDING> as unknown as Parameters<typeof getNamedDo>[0]` cast. WS-command e2e tests use the `nextAck` helper that skips replay frames (see `test/do/user-connection.test.ts`).
 - **Existing endpoints are stable.** ChatChannel keeps all `/internal/*` handlers; this plan ADDS `/internal/message-edit`, `/internal/message-recall`, `/internal/message-delete`, `/internal/owner-transfer`, `/internal/invites-create`, `/internal/invites-accept`, `/internal/invites-get`, `/internal/invites-consume`. It does NOT rewrite existing handlers except to thread the new commands through `UserConnection.webSocketMessage`.
 
@@ -180,7 +180,7 @@ export function parseMessageDeleteCommand(frame: CommandFrame): ParseResult<Pars
 - [ ] **Step 5:** Commit:
 ```bash
 git add src/chat/command.ts test/chat/command.test.ts
-git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat(chat): parse message.edit/recall/delete commands (v4.0 WS lifecycle)"
+git commit -m "feat(chat): parse message.edit/recall/delete commands (v4.0 WS lifecycle)"
 ```
 
 ---
@@ -429,7 +429,7 @@ if (url.pathname === "/internal/message-delete") {
 - [ ] **Step 5:** Commit:
 ```bash
 git add src/do/chat-channel.ts src/errors.ts test/do/chat-channel-message-lifecycle.test.ts
-git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat(do): message.edit/recall/delete ChatChannel handlers (v4.0 WS lifecycle)"
+git commit -m "feat(do): message.edit/recall/delete ChatChannel handlers (v4.0 WS lifecycle)"
 ```
 
 ---
@@ -552,7 +552,7 @@ if (frame.command === "message.edit" || frame.command === "message.recall" || fr
 - [ ] **Step 5:** Commit:
 ```bash
 git add src/do/user-connection.ts test/do/user-connection-message-lifecycle.test.ts
-git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat(ws): route message.edit/recall/delete commands (v4.0 lifecycle e2e)"
+git commit -m "feat(ws): route message.edit/recall/delete commands (v4.0 lifecycle e2e)"
 ```
 
 ---
@@ -629,7 +629,7 @@ describe("POST /api/chat/channels/:id/owner-transfer", () => {
 - [ ] **Step 6:** Commit:
 ```bash
 git add src/do/chat-channel.ts src/routes/channel-mutations.ts src/index.ts test/routes/channel-owner-transfer.test.ts
-git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: POST /channels/{id}/owner-transfer (atomic single-owner swap)"
+git commit -m "feat: POST /channels/{id}/owner-transfer (atomic single-owner swap)"
 ```
 
 ---
@@ -683,7 +683,7 @@ describe("InviteDirectory", () => {
 - [ ] **Step 5:** Commit:
 ```bash
 git add src/do/invite-directory.ts test/do/invite-directory.test.ts
-git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat(do): InviteDirectory /upsert passthrough + /preview"
+git commit -m "feat(do): InviteDirectory /upsert passthrough + /preview"
 ```
 
 ---
@@ -724,7 +724,7 @@ describe("POST /api/chat/channels/:id/invites", () => {
 - [ ] **Step 5:** Commit:
 ```bash
 git add src/do/chat-channel.ts src/routes/channel-mutations.ts src/index.ts test/routes/invites.test.ts
-git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: POST /channels/{id}/invites (create invite)"
+git commit -m "feat: POST /channels/{id}/invites (create invite)"
 ```
 
 ---
@@ -772,7 +772,7 @@ describe("GET /api/chat/invites/:code", () => {
 - [ ] **Step 5:** Commit:
 ```bash
 git add src/do/chat-channel.ts src/routes/channel-mutations.ts src/index.ts test/routes/invites.test.ts
-git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: GET /invites/{code} invite preview (read-only)"
+git commit -m "feat: GET /invites/{code} invite preview (read-only)"
 ```
 
 ---
@@ -814,7 +814,7 @@ describe("POST /api/chat/invites/:code/accept", () => {
 - [ ] **Step 5:** Commit:
 ```bash
 git add src/do/chat-channel.ts src/routes/channel-mutations.ts src/index.ts test/routes/invites.test.ts
-git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: POST /invites/{code}/accept (join via invite)"
+git commit -m "feat: POST /invites/{code}/accept (join via invite)"
 ```
 
 ---
@@ -833,7 +833,7 @@ git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "feat: POST /invit
 - **The `applyMessageMutation` helper (A2) is the keystone** — edit/recall/delete share it. Get its idempotency-in-txn + full-ack + fanout pattern right once.
 - **Invite index lag:** Task C2's create route should flush the ChatChannel alarm (invite_directory outbox) before returning so preview (C3) is reliable; keep `ROUTE_INDEX_PENDING` 409 as the load-path fallback.
 - **`MESSAGE_NOT_EDITABLE`** (409) — add to `src/errors.ts` (A2 Step 3).
-- **Do NOT push or deploy.** Git identity `kuma`.
+- **Do NOT push or deploy.** Use the repo default git config.
 
 ---
 
