@@ -8,8 +8,8 @@ interface FakeClient {
   end(): Promise<void>;
 }
 
-function makeEnv(connStr: string): Pick<Env, "TOOLBEAR_DB"> {
-  return { TOOLBEAR_DB: { connectionString: connStr } as Env["TOOLBEAR_DB"] };
+function makeEnv(connStr: string): Pick<Env, "LILIUM_DB"> {
+  return { LILIUM_DB: { connectionString: connStr } as Env["LILIUM_DB"] };
 }
 
 function fakeClientFactory(rowsByBatch: Record<number, UserSummary[]>): (connStr: string) => FakeClient {

@@ -52,7 +52,7 @@ export async function resolveUserSummaries(
     const batch = unique.slice(i, i + batchSize);
     let client: ClientLike | null = null;
     try {
-      client = opts.clientFactory ? opts.clientFactory(env.TOOLBEAR_DB.connectionString) : await defaultClientFactory(env.TOOLBEAR_DB.connectionString);
+      client = opts.clientFactory ? opts.clientFactory(env.LILIUM_DB.connectionString) : await defaultClientFactory(env.LILIUM_DB.connectionString);
       await client.connect();
       const res = await client.query(
         "SELECT user_id::text, full_name, avatar_url FROM users WHERE user_id = ANY($1)",

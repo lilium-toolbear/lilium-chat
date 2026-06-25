@@ -18,7 +18,7 @@ Copied verbatim from the design (`docs/superpowers/specs/2026-06-22-lilium-chat-
 - **DO stub access:** production Worker code uses `env.NAMESPACE.getByName(key)` + `stub.fetch(request)`. Tests may use `env.NAMESPACE.idFromName(key)` + `env.NAMESPACE.get(id)` (still valid).
 - **WebSocket Hibernation:** DO calls `this.ctx.acceptWebSocket(server, tags?)` inside its `fetch`, returns `new Response(null, { status: 101, webSocket: client })`. Handlers: `webSocketMessage(ws, msg)`, `webSocketClose(ws, code, reason, wasClean)`, `webSocketError(ws, error)`. `message` is `string | ArrayBuffer`.
 - **WebSocket subprotocol caveat:** Cloudflare has NO documented API to echo a selected subprotocol on the 101 response. The browser sends `Sec-WebSocket-Protocol: lilium.chat.v1, bearer.<jwt>`; we read it server-side to extract the JWT and accept the connection. The runtime will not reflect the subprotocol back. Browsers tolerate this (connection still opens). The Phase 0 spike (Task 11) confirms browser behavior; if it breaks, fall back to `?token=<jwt>` query param (documented fallback, not the default).
-- **Profile / Hyperdrive:** `import { Client } from "pg"`; `new Client({ connectionString: env.TOOLBEAR_DB.connectionString })`; `await client.connect()`; `await client.query(sql, [params])`; `finally { await client.end() }`. `pg@^8.16.3` minimum. Read-only DB user, `SELECT user_id::text, full_name, avatar_url FROM users` only. Never persist display_name/avatar into any DO.
+- **Profile / Hyperdrive:** `import { Client } from "pg"`; `new Client({ connectionString: env.LILIUM_DB.connectionString })`; `await client.connect()`; `await client.query(sql, [params])`; `finally { await client.end() }`. `pg@^8.16.3` minimum. Read-only DB user, `SELECT user_id::text, full_name, avatar_url FROM users` only. Never persist display_name/avatar into any DO.
 - **Attachments / SeaweedFS:** `import { AwsClient } from "aws4fetch"`; presigned PUT URL via `aws.sign(url, { method: "PUT", aws: { signQuery: true } })` with `X-Amz-Expires` preset on the URL. `url` returned on `signed.url`. Public read URL = `https://s3.kuma.homes/lilium-chat-attachments/chat/{attachment_id}` (no signing for reads).
 - **Single alarm per DO:** `ctx.storage.setAlarm(ms)` is last-write-wins; one alarm per DO instance. Every DO that needs scheduling implements a unified `scheduleNextAlarm()` / `runDueJobs(now)` pair (design 2.3a). Modules never call `setAlarm` directly.
 - **Event IDs:** per-channel monotonic UUIDv7. Phase 0 only needs the generator; business events start in Phase 1.
@@ -191,7 +191,7 @@ lilium-chat/
   },
 
   "hyperdrive": [
-    { "binding": "TOOLBEAR_DB", "id": "<hyperdrive-config-id>" }
+    { "binding": "LILIUM_DB", "id": "<hyperdrive-config-id>" }
   ],
 
   "migrations": [
@@ -308,7 +308,7 @@ git commit -m "chore: scaffold lilium-chat worker project (wrangler/hono/vitest)
   - `ApiError` class: `constructor(code: string, message: string, opts?: { retryable?: boolean; httpStatus?: number })`; properties `code`, `message`, `retryable`, `httpStatus`.
   - `errorResponse(err: ApiError, requestId: string): Response` — builds the `{"error":{code,message,retryable},"request_id"}` JSON Response with correct http status and `X-Request-Id` header.
   - `HTTP_STATUS_BY_CODE` map: `UNAUTHORIZED→401`, `MACHINE_TOKEN_NOT_ALLOWED→401`, `SESSION_NOT_ALLOWED→403`, `FORBIDDEN→403`, `CHANNEL_NOT_FOUND→404`, `MESSAGE_NOT_FOUND→404`, `CHANNEL_ARCHIVED→409`, `MESSAGE_NOT_EDITABLE→409`, `IDEMPOTENCY_CONFLICT→409`, `ROUTE_INDEX_PENDING→409`, `ATTACHMENT_TOO_LARGE→413`, `UNSUPPORTED_ATTACHMENT_TYPE→415`, `INVALID_MESSAGE→422`, `COMMAND_NAME_CONFLICT→409`, `INVALID_COMMAND_OPTIONS→422`, `COMPONENT_NOT_FOUND→404`, `COMPONENT_DISABLED→409`, `INVALID_INTERACTION_VALUE→422`, `RATE_LIMITED→429`, `BOT_CALLBACK_UNAVAILABLE→503`, `CHAT_WORKER_UNAVAILABLE→503`, `EVENT_GAP→409`.
-  - `Env` interface in `src/env.ts` with all 8 DO bindings typed `DurableObjectNamespace<...>`, `TOOLBEAR_DB: Hyperdrive`, and vars/secrets.
+  - `Env` interface in `src/env.ts` with all 8 DO bindings typed `DurableObjectNamespace<...>`, `LILIUM_DB: Hyperdrive`, and vars/secrets.
   - `src/index.ts` exports `default app` (Hono) with CORS + request_id middleware + a catch-all `404` handler. No real routes yet (Task 9 adds bootstrap, Task 10 adds WS).
 
 - [ ] **Step 1: Write the failing test `src/errors.test.ts`**
@@ -424,12 +424,12 @@ Expected: PASS (4 tests).
 
 - [ ] **Step 5: Create `src/env.ts`**
 
-`wrangler types` (run in Task 1) generates `worker-configuration.d.ts`, which declares a **global `interface Env`** containing all 8 DO bindings (`DurableObjectNamespace`), `TOOLBEAR_DB: Hyperdrive`, the `vars`, and `CF_VERSION_METADATA` — synced from `wrangler.jsonc`. Do NOT redeclare `Env` (that collides with the global). Instead, `src/env.ts` only augments the global `Env` with the **secret** fields (which are never in `wrangler.jsonc`) via TypeScript declaration merging, and re-exports nothing.
+`wrangler types` (run in Task 1) generates `worker-configuration.d.ts`, which declares a **global `interface Env`** containing all 8 DO bindings (`DurableObjectNamespace`), `LILIUM_DB: Hyperdrive`, the `vars`, and `CF_VERSION_METADATA` — synced from `wrangler.jsonc`. Do NOT redeclare `Env` (that collides with the global). Instead, `src/env.ts` only augments the global `Env` with the **secret** fields (which are never in `wrangler.jsonc`) via TypeScript declaration merging, and re-exports nothing.
 
 ```ts
 // src/env.ts
 // The global `interface Env` (from worker-configuration.d.ts, generated by
-// `wrangler types`) already contains: all 8 DO bindings, TOOLBEAR_DB, vars,
+// `wrangler types`) already contains: all 8 DO bindings, LILIUM_DB, vars,
 // CF_VERSION_METADATA. Augment it with secret fields (set via `wrangler secret put`,
 // never written to wrangler.jsonc so not in the generated types).
 declare global {
@@ -903,7 +903,7 @@ git commit -m "feat(auth): HS256 browser JWT self-verification (reject machine/m
 - Test: `src/profile/resolve.test.ts`
 
 **Interfaces:**
-- Consumes: `pg` `Client`, `Env` (uses `env.TOOLBEAR_DB.connectionString`).
+- Consumes: `pg` `Client`, `Env` (uses `env.LILIUM_DB.connectionString`).
 - Produces:
   - `UserSummary = { user_id: string; display_name: string | null; avatar_url: string | null }`.
   - `resolveUserSummaries(userIds: string[], env: Env): Promise<Map<string, UserSummary>>` — dedupes input, batches in chunks of 50 (no silent truncation), returns Map keyed by user_id. Missing users are NOT in the map (caller decides fallback). NEVER persists anything.
@@ -912,7 +912,7 @@ The query: `SELECT user_id::text, full_name, avatar_url FROM users WHERE user_id
 
 - [ ] **Step 1: Write the failing test `src/profile/resolve.test.ts`**
 
-The test injects a fake Hyperdrive binding by overriding `env.TOOLBEAR_DB.connectionString` to point at an in-test stub. Since `pg.Client` connects via TCP, we stub at the module boundary: the test imports a `makeResolveWithClientFactory` that lets us pass a fake `clientFactory`. To keep this simple and avoid a real PG, `resolve.ts` accepts an optional `clientFactory` param (defaults to real `Client`) used only by tests.
+The test injects a fake Hyperdrive binding by overriding `env.LILIUM_DB.connectionString` to point at an in-test stub. Since `pg.Client` connects via TCP, we stub at the module boundary: the test imports a `makeResolveWithClientFactory` that lets us pass a fake `clientFactory`. To keep this simple and avoid a real PG, `resolve.ts` accepts an optional `clientFactory` param (defaults to real `Client`) used only by tests.
 
 ```ts
 import { describe, it, expect, vi } from "vitest";
@@ -925,8 +925,8 @@ interface FakeClient {
   end(): Promise<void>;
 }
 
-function makeEnv(connStr: string): Pick<Env, "TOOLBEAR_DB"> {
-  return { TOOLBEAR_DB: { connectionString: connStr } as Env["TOOLBEAR_DB"] };
+function makeEnv(connStr: string): Pick<Env, "LILIUM_DB"> {
+  return { LILIUM_DB: { connectionString: connStr } as Env["LILIUM_DB"] };
 }
 
 function fakeClientFactory(rowsByBatch: Record<number, UserSummary[]>): (connStr: string) => FakeClient {
@@ -1038,7 +1038,7 @@ export async function resolveUserSummaries(
 
   for (let i = 0; i < unique.length; i += batchSize) {
     const batch = unique.slice(i, i + batchSize);
-    const client = makeClient(env.TOOLBEAR_DB.connectionString);
+    const client = makeClient(env.LILIUM_DB.connectionString);
     await client.connect();
     try {
       const res = await client.query(
@@ -1360,7 +1360,7 @@ Create `wrangler.test.jsonc` — a copy of `wrangler.jsonc` with two additions: 
     ]
   },
   "hyperdrive": [
-    { "binding": "TOOLBEAR_DB", "id": "<hyperdrive-config-id>", "localConnectionString": "postgres://readonly_user:password@localhost:5432/toolbear" }
+    { "binding": "LILIUM_DB", "id": "<hyperdrive-config-id>", "localConnectionString": "postgres://readonly_user:password@localhost:5432/toolbear" }
   ],
   "migrations": [
     {
@@ -1375,7 +1375,7 @@ Create `wrangler.test.jsonc` — a copy of `wrangler.jsonc` with two additions: 
 }
 ```
 
-(The Hyperdrive binding must be present here so the live hyperdrive spike — and the bootstrap test's `resolveUserSummaries` path — see `env.TOOLBEAR_DB`. Keep the same `id` as production, or a separate test Hyperdrive config; `localConnectionString` makes `wrangler dev`/vitest use a local PG.)
+(The Hyperdrive binding must be present here so the live hyperdrive spike — and the bootstrap test's `resolveUserSummaries` path — see `env.LILIUM_DB`. Keep the same `id` as production, or a separate test Hyperdrive config; `localConnectionString` makes `wrangler dev`/vitest use a local PG.)
 
 Then update `vitest.config.ts` (already created in Task 1 Step 5, now point it at the test config):
 ```ts
@@ -2049,7 +2049,7 @@ describe("GET /api/chat/bootstrap", () => {
 });
 ```
 
-Note: the 4th test depends on `resolveUserSummaries` returning nothing (no Hyperdrive in CI), so `me` falls back. To make this deterministic without a real PG, inject a fake `TOOLBEAR_DB.connectionString` that makes `pg.Client.connect` throw, which `resolveUserSummaries` must catch → fallback. That means `resolve.ts` needs a try/catch around the query that, on failure, returns the fallback for the single requested id. Update `resolve.ts` to NOT throw on connect failure (log + treat as missing). Add that resilience now (it's a real production behavior anyway: profile resolve must never break bootstrap).
+Note: the 4th test depends on `resolveUserSummaries` returning nothing (no Hyperdrive in CI), so `me` falls back. To make this deterministic without a real PG, inject a fake `LILIUM_DB.connectionString` that makes `pg.Client.connect` throw, which `resolveUserSummaries` must catch → fallback. That means `resolve.ts` needs a try/catch around the query that, on failure, returns the fallback for the single requested id. Update `resolve.ts` to NOT throw on connect failure (log + treat as missing). Add that resilience now (it's a real production behavior anyway: profile resolve must never break bootstrap).
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2065,7 +2065,7 @@ Concretely, change the loop body to:
 ```ts
 for (let i = 0; i < unique.length; i += batchSize) {
   const batch = unique.slice(i, i + batchSize);
-  const client = makeClient(env.TOOLBEAR_DB.connectionString);
+  const client = makeClient(env.LILIUM_DB.connectionString);
   try {
     await client.connect();
     const res = await client.query(
@@ -2670,7 +2670,7 @@ const LIVE = !!process.env.SPIKE_LIVE;
 
 describe.skipIf(!LIVE)("spike: Hyperdrive + pg reads users table", () => {
   it("connects and runs SELECT", async () => {
-    const client = new Client({ connectionString: env.TOOLBEAR_DB.connectionString });
+    const client = new Client({ connectionString: env.LILIUM_DB.connectionString });
     await client.connect();
     try {
       const res = await client.query("SELECT 1 AS ok");

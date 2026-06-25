@@ -15,7 +15,7 @@ if (LIVE) {
           };
         };
       };
-      const client = new Client({ connectionString: env.TOOLBEAR_DB.connectionString });
+      const client = new Client({ connectionString: env.LILIUM_DB.connectionString });
       await client.connect();
 
       try {

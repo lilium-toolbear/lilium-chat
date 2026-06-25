@@ -7,3 +7,4 @@ worker-configuration.d.ts
 .DS_Store
 
 .superpowers/sdd/
+.env

@@ -32,7 +32,10 @@
   },
 
   "hyperdrive": [
-    { "binding": "TOOLBEAR_DB", "id": "<hyperdrive-config-id>" }
+    {
+      "binding": "LILIUM_DB",
+      "id": "c55ab0187c3c4edabc08de4d4b210732"
+    }
   ],
 
   "migrations": [
@@ -45,8 +48,24 @@
     }
   ],
 
+  // Dedicated Sentry OTLP destinations for lilium-chat — account-level,
+  // provisioned out-of-band (not definable in this file). Both ship to this
+  // project's Sentry instance (sentry.kuma.homes/api/9/...) via x-sentry-auth.
+  //   lilium-chat-logs  → .../integration/otlp/v1/logs
+  //   lilium-chat-trace → .../integration/otlp/v1/traces
   "observability": {
-    "logs": { "enabled": true, "invocation_logs": true, "destinations": ["sentry-log"] },
-    "traces": { "enabled": true, "destinations": ["sentry"] }
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "destinations": [
+        "lilium-chat-logs"
+      ]
+    },
+    "traces": {
+      "enabled": true,
+      "destinations": [
+        "lilium-chat-trace"
+      ]
+    }
   }
 }

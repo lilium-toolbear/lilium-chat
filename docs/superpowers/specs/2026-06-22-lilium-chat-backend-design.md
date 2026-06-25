@@ -36,7 +36,7 @@ v1 草稿假设了若干 Cloudflare 平台不支持的 API，经核验（对照 
 5. **event payload 落库即投影会在 replay 泄露**。`message.created` 全量 payload 落库后，消息被删/撤回就不再是"当前可见投影"，replay 原样返回会泄露原文/附件/components/mentions。→ v2 改 replay 时 join 当前 `messages.status` 过滤。
 6. **`/messages/{id}`、`/invites/{code}`、`/channels/directory` 路由无法定位 DO**。这些 URL 不含 `channel_id`，UUIDv7 `message_id` / `invite_code` 无法定位到对应 ChatChannel DO。→ v2 新增 `MessageIndex` / `InviteDirectory` / `ChannelDirectory` 全局索引 DO。（v4.0：message mutation 全部 channel-scoped，`MessageIndex` 已移除；仅 `InviteDirectory` / `ChannelDirectory` 因 URL 天然不含 channel_id 而保留。）
 7. **KV 不是 correctness layer**。KV 是 eventually consistent（~60s），不适合做"与业务写必须原子"的幂等去重。→ v2 幂等落目标 DO 的 SQLite，与业务 mutation 同事务；KV 仅作响应缓存优化。
-8. **Hyperdrive + pg 的真实调用形状**。是 `new Client({ connectionString: env.TOOLBEAR_DB.connectionString })` → `client.connect()` → `client.query(sql, [params])`，不是 v1 写的 `env.TOOLBEAR_DB.connect().execute({sql, args})`（那是 D1 形状）。
+8. **Hyperdrive + pg 的真实调用形状**。是 `new Client({ connectionString: env.LILIUM_DB.connectionString })` → `client.connect()` → `client.query(sql, [params])`，不是 v1 写的 `env.LILIUM_DB.connect().execute({sql, args})`（那是 D1 形状）。
 9. **bot 全局身份与 token 不应在 ChatChannel DO**。token 原文只返回一次、只存 hash，bot 是全局实体。→ v2 新增 `BotRegistry` DO。
 
 **本设计在本对话中与产品方确认的偏离 contract 原文的决定（v1 既定，v2 保留）：**
@@ -1147,7 +1147,7 @@ async function resolveUserSummaries(userIds: string[], env: Env): Promise<Map<st
   // 分批,每批 50,不静默截断
   for (let i = 0; i < unique.length; i += 50) {
     const batch = unique.slice(i, i + 50);
-    const client = new Client({ connectionString: env.TOOLBEAR_DB.connectionString });
+    const client = new Client({ connectionString: env.LILIUM_DB.connectionString });
     await client.connect();
     try {
       const res = await client.query(
@@ -1320,7 +1320,7 @@ class_name = "ChannelFanout"
 # v3 修正: Hyperdrive binding 用 config id(由 `wrangler hyperdrive create --connection-string=...` 生成)
 # 生产 connection string 不进 wrangler.toml, 存在 CF 侧。localConnectionString 仅本地 dev(不用 --remote)。
 [[hyperdrive]]
-binding = "TOOLBEAR_DB"
+binding = "LILIUM_DB"
 id = "<hyperdrive-config-id>"
 localConnectionString = "postgres://readonly_user:password@localhost:5432/toolbear"
 

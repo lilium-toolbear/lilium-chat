@@ -9,8 +9,8 @@ vi.mock("../profile/resolve", () => ({
   resolveUserSummaries: vi.fn(),
 }));
 
-function makeEnv(): Pick<Env, "TOOLBEAR_DB"> {
-  return { TOOLBEAR_DB: { connectionString: "postgres://fake" } as Env["TOOLBEAR_DB"] };
+function makeEnv(): Pick<Env, "LILIUM_DB"> {
+  return { LILIUM_DB: { connectionString: "postgres://fake" } as Env["LILIUM_DB"] };
 }
 
 const mockedResolve = vi.mocked(resolveUserSummaries);

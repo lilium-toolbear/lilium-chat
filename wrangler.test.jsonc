@@ -31,7 +31,11 @@
   },
 
   "hyperdrive": [
-    { "binding": "TOOLBEAR_DB", "id": "<hyperdrive-config-id>", "localConnectionString": "postgres://nobody:nobody@localhost:5432/toolbear" }
+    {
+      "binding": "LILIUM_DB",
+      "id": "<hyperdrive-config-id>",
+      "localConnectionString": "postgres://nobody:nobody@localhost:5432/toolbear"
+    }
   ],
 
   "migrations": [

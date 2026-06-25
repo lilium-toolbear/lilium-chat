@@ -813,8 +813,8 @@ import { attachSummaries } from "./sender";
 import type { Env } from "../env";
 import type { UserSummary } from "../profile/resolve";
 
-function makeEnv(): Pick<Env, "TOOLBEAR_DB"> {
-  return { TOOLBEAR_DB: { connectionString: "postgres://fake" } as Env["TOOLBEAR_DB"] };
+function makeEnv(): Pick<Env, "LILIUM_DB"> {
+  return { LILIUM_DB: { connectionString: "postgres://fake" } as Env["LILIUM_DB"] };
 }
 
 describe("attachSummaries", () => {

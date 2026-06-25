@@ -63,7 +63,7 @@ describe("buildMessageCreatedPayload", () => {
 
 describe("resolveSenderForLiveBroadcast", () => {
   it("replaces the sender ref with a resolved UserSummary on the live broadcast payload", async () => {
-    // We test against a fake env whose TOOLBEAR_DB resolve returns a known summary.
+    // We test against a fake env whose LILIUM_DB resolve returns a known summary.
     // resolveUserSummaries is sourced from src/profile/resolve; in this unit test we
     // inject a stub by calling resolveSenderForLiveBroadcast with a resolver function.
     const persisted = buildMessageCreatedPayload({
