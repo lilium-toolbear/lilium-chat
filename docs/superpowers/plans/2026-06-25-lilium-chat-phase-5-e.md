@@ -625,3 +625,146 @@ git commit -m "feat(do): message.send type=sticker (resolveSticker + message_sti
 - **`message.send` extends for type=image/sticker** — keep the idempotency/full-ack/fanout pattern identical; only the attach-to-row + projection differ.
 - **Sticker send idempotency-pre-check-first** (B5): resolve `sticker_id` AFTER the cached-ack check, so a retry after sticker deletion still returns the cached ack.
 - **Git:** repo default config, no override, no push/deploy.
+
+---
+
+# Revision Appendix (2026-06-25 — static-review P0/P1 fixes)
+
+This appendix OVERRIDES the task text above where they conflict. The reviewer ran a static pass and flagged 5 P0 + 5 P1. The task bodies above were written first; the corrections below are the spec of record. **An executor MUST apply both the task body AND its correction here** — where they differ, this appendix wins.
+
+## A1 corrections (S3 client)
+
+### A1-corr-1: `aws4fetch` has `sign()`, not `presign()` (P0-3)
+
+The plan defined `S3Client.presign(method, url, opts)` and cast `new AwsClient(...)` to it. But `aws4fetch.AwsClient` exposes only `sign(input, init?)` and `fetch(input, init?)`. The `sign` method takes a `Request | { toString: () => string }` + `RequestInit & { aws?: { signQuery?: boolean; allHeaders?: boolean; ... } }` and returns a signed `Request`.
+
+Fix the `S3Client` interface + implementation:
+```typescript
+export interface S3Client {
+  sign(input: string | URL, init?: RequestInit & { aws?: { signQuery?: boolean; allHeaders?: boolean; datetime?: string } }): Promise<Request>;
+  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
+}
+```
+
+For presigned PUT URLs: use `sign(url, { method: "PUT", headers: { "Content-Type": contentType }, aws: { signQuery: true, allHeaders: true } })` — this returns a signed `Request`; extract `signed.url` as the presigned URL. Set `X-Amz-Expires: 300` (5 min) in the query — `aws4fetch` defaults to 86400s without it; pass it in the URL or headers so the signature is query-based with the right expiry.
+
+Test fake: `FakeS3` must implement `sign` (not `presign`), returning a `Request` with the URL + a fake `X-Amz-Fake` query param. Update the A1 test accordingly.
+
+Content-Length upper bound: do NOT rely on signing to enforce it — the `Content-Length` header is in aws4fetch's default unsignable headers unless `allHeaders: true`. Even with `allHeaders`, the presigned URL doesn't enforce it client-side. The **finalize HEAD** is the authoritative check (S3 returns `Content-Length` on HEAD); the presign response tells the browser the expected size, but the server-side guarantee is at finalize time.
+
+## A3 corrections (presign/finalize DO ownership + idempotency)
+
+### A3-corr-1: presign/finalize belong in `UserDirectory DO(user_id)`, NOT ChatChannel (P0-1)
+
+The contract's presign request has NO `channel_id` — only `filename/mime_type/size_bytes/width/height`. The Worker has no stable way to route to a `ChatChannel DO(channel_id)`. The design already has `UserDirectory.pending_attachments` table (confirmed: exists with `attachment_id, owner_user_id, kind, filename, mime_type, size_bytes, width, height, storage_key, url, status, expires_at, created_at`). The DO is addressed by `user_id` (stable from JWT).
+
+**Rewrite A3:**
+- `/internal/attachment-presign` lives in **`UserDirectory DO(user_id)`** (not ChatChannel). Mint `attachment_id = uuidv7()`, `storage_key = "chat/" + attachment_id`, `url = env.S3_PUBLIC_BASE + "/" + env.S3_BUCKET + "/" + storage_key`. INSERT into `pending_attachments` (status=`pending`, `expires_at = now + 24h` for GC). Return `{attachment_id, upload_url, upload_method, upload_headers, expires_at}` via `presignPutUrl` (A1-corr-1).
+- `/internal/attachment-finalize` lives in **`UserDirectory DO(user_id)`**. Load `pending_attachments` row; verify `owner_user_id === userId`; S3 HEAD via `headObject`; if ok UPDATE `status='finalized'`; return `{attachment: projectAttachmentForBrowser(row)}`.
+- The existing `attachments` + `message_attachments` tables in **ChatChannel** are for **message-linked** finalized attachments — `message.send type=image` (Task A4) copies the finalized metadata from UserDirectory into ChatChannel's `attachments` table at send time (within the ChatChannel txn), so the message history/replay can resolve them without a cross-DO fetch.
+
+### A3-corr-2: presign/finalize HTTP idempotency (P0-2)
+
+Both presign + finalize carry `Idempotency-Key` (contract §8.1/§8.2). Add idempotency in UserDirectory:
+- presign: `operation='attachment.presign'`, `operation_id=<Idempotency-Key>`. `requestHash = JSON.stringify({filename, mime_type, size_bytes, width, height})`. Cached → same `{attachment_id, upload_url, ...}`. The `upload_url` may be re-presigned (5 min expiry) — on cache hit, re-presign if the original URL is expired, OR return the cached response (the client retries presign if the URL expired; acceptable since presign is cheap).
+- finalize: `operation='attachment.finalize'`, `operation_id=<Idempotency-Key>`. `requestHash = JSON.stringify({attachment_id, etag})`. Already-finalized row → return cached attachment projection (no re-HEAD).
+
+### A3-corr-3: error codes (P1-4)
+
+Do NOT add `ATTACHMENT_NOT_FINALIZED`. Use existing codes:
+- finalize HEAD fail (object missing / Content-Type mismatch / Content-Length mismatch) → `409` `UNSUPPORTED_ATTACHMENT_TYPE` (already in `errors.ts`).
+- upload size limit exceeded → `413` `ATTACHMENT_TOO_LARGE` (already in `errors.ts`).
+- MIME not in allowlist → `415` `UNSUPPORTED_ATTACHMENT_TYPE`.
+
+## A4 corrections (image send)
+
+### A4-corr-1: `message.send type=image` reads from UserDirectory, copies to ChatChannel (P0-1)
+
+The image-send flow is:
+1. `UserConnection` parses `message.send type=image` (parser accepts `attachment_ids: string[]`).
+2. `ChatChannel` message-send handler, in its txn:
+   a. For each `attachment_id`: cross-DO fetch `UserDirectory(user_id) /internal/attachment-get?attachment_id=` (a new lightweight read-only endpoint in UserDirectory that returns the finalized row's metadata) — if not finalized or not owned by sender → `UNSUPPORTED_ATTACHMENT_TYPE`.
+   b. INSERT/copy the attachment metadata into **ChatChannel's `attachments`** table (the channel-local copy for history/replay resolution).
+   c. INSERT `message_attachments(message_id, attachment_id)` links.
+   d. Resolve `projectAttachmentForBrowser` per attachment → feed into `projectMessageForBrowser(row, {senderSummary, mentions, attachments: resolvedProjections})`.
+
+### A4-corr-2: only sender-owned finalized uploads (P1-1)
+
+Image send accepts ONLY the sender's own finalized pending attachments (from UserDirectory). NOT "visible attachments" from other users' messages. Reusing another user's image goes through sticker save/send (Section B). This prevents bypassing deleted/recalled source rules.
+
+### A4-corr-3: requestHash must include `attachment_ids` (P0-4)
+
+Extend `message.send` `requestHash` to cover the full payload:
+```typescript
+const requestHash = JSON.stringify({
+  type: b.type,
+  text: b.text,
+  reply_to: b.reply_to,
+  mentions: b.mentions ?? [],
+  attachment_ids: b.attachment_ids ?? [],   // A4
+  sticker_id: b.sticker_id ?? null,         // B5
+});
+```
+Without this, same `command_id` with different `attachment_ids` would return the cached ack (wrong) instead of `IDEMPOTENCY_CONFLICT`.
+
+## A5 corrections (history/bootstrap also carry attachments)
+
+### A5-corr-1: routes `messages.ts` + `bootstrap.ts` + `sender.ts` must carry attachments map (P1-3)
+
+The plan only mentions ChatChannel + message-projection. But the history path goes through `src/chat/sender.ts` (`projectMessagesForBrowser`) + `src/routes/messages.ts` + `src/routes/bootstrap.ts`. These must also receive the attachments map and pass it to `projectMessageForBrowser`:
+- `/internal/messages` (ChatChannel) returns `attachments_by_message: Record<message_id, AttachmentRow[]>` alongside `items` (MessageRow[]) + `mentions`.
+- `src/chat/sender.ts` `projectMessagesForBrowser` accepts `attachmentsByMessage` and passes `attachments` (resolved via `projectAttachmentForBrowser`) into each row's `projectMessageForBrowser` call.
+- `src/routes/messages.ts` + `bootstrap.ts` read `attachments_by_message` from the DO response + pass it through.
+
+## B4 corrections (sticker save order)
+
+### B4-corr-1: UserDirectory owns the save operation (P0-5)
+
+The plan had the Worker call `ChatChannel /internal/resolve-visible-attachment` FIRST, then `UserDirectory /internal/sticker-save`. This breaks idempotent retry: if the source message is recalled after the first save, a retry would hit `INVALID_STICKER_SOURCE` instead of returning the cached save.
+
+Correct flow:
+```text
+POST /api/chat/stickers
+  -> Worker routes to UserDirectory DO(user_id)
+     -> UserDirectory /internal/sticker-save(operation_id, channel_id, attachment_id)
+        -> cheap idempotency pre-check (operation='sticker.save')
+        -> if miss: call ChatChannel(channel_id) /internal/resolve-visible-attachment(user_id, attachment_id)
+        -> UserDirectory txn: re-check idempotency (handles concurrent race), upsert personal_stickers, cache response_json
+        -> return {sticker: {...}}
+```
+The cheap pre-check returns the cached save on retry WITHOUT calling ChatChannel. Only a genuine new save calls ChatChannel. The txn re-check handles the concurrent-send race.
+
+### B4-corr-2: `resolveVisibleAttachment` supports both channel-visible + own finalized (P1-2)
+
+The contract allows saving either (a) a channel-visible attachment from a normal image/sticker message OR (b) the user's own finalized pending attachment. B3's implementation should check BOTH:
+- If the `attachment_id` is linked to a Browser-visible (status normal/edited, not deleted/recalled) image/sticker message in the channel → ok.
+- OR if the `attachment_id` is a finalized pending attachment owned by the caller in UserDirectory → ok (the Worker or UserDirectory can check this without ChatChannel — actually this is a UserDirectory-side check, so B3's ChatChannel endpoint handles the channel-visible path; the own-finalized path is checked in UserDirectory before calling ChatChannel).
+
+Simplest: UserDirectory `sticker-save` first checks its own `pending_attachments` for a finalized owned row; if found, use that directly (no ChatChannel call needed). If NOT found, call ChatChannel `resolve-visible-attachment` (the channel-visible path). This avoids one cross-DO call for the own-finalized case.
+
+## B5 corrections (sticker send requestHash)
+
+### B5-corr-1: requestHash must include `sticker_id` (P0-4)
+
+Same as A4-corr-3: the `requestHash` for `type=sticker` must include `sticker_id`. Also normalize: sticker send must have `text=""`, `attachment_ids=[]`, `mentions=[]` (enforce in parser — reject non-empty text/attachment_ids/mentions for type=sticker).
+
+## P1-5 corrections (upload validation tests)
+
+### Upload-validation tests to add (P1-5)
+
+In A3 tests, add:
+- MIME allowlist: `image/png`, `image/jpeg`, `image/gif`, `image/webp` → ok; `application/pdf` → `UNSUPPORTED_ATTACHMENT_TYPE`.
+- Size limit: > 10MB (or whatever the server limit is — check the contract) → `ATTACHMENT_TOO_LARGE`.
+- Width/height: negative or 0 → `INVALID_MESSAGE`.
+- Sticker library limit: save more than N stickers → `STICKER_LIBRARY_LIMIT_EXCEEDED` (define a server limit, e.g. 200; add a test).
+
+## Summary of task-body edits the executor makes
+
+- A1: `S3Client` interface = `sign` + `fetch` (NOT `presign`); presign via `sign(url, {method:"PUT", headers, aws:{signQuery:true, allHeaders:true}})` + `X-Amz-Expires:300`. Fake test matches `sign`.
+- A3: presign/finalize in **UserDirectory** (not ChatChannel); `pending_attachments` table; HTTP idempotency `attachment.presign`/`attachment.finalize`; error codes `UNSUPPORTED_ATTACHMENT_TYPE`/`ATTACHMENT_TOO_LARGE` (existing, no new codes).
+- A4: `message.send type=image` cross-DO reads finalized pending from UserDirectory → copies to ChatChannel `attachments`; only sender-owned; `requestHash` includes `attachment_ids`.
+- A5: `src/chat/sender.ts` `projectMessagesForBrowser` + `src/routes/messages.ts` + `bootstrap.ts` carry `attachments_by_message` map.
+- B3: `resolveVisibleAttachment` supports channel-visible + own finalized.
+- B4: `UserDirectory` owns `sticker.save` (cheap pre-check → miss → ChatChannel resolve → txn re-check + upsert). Own-finalized path checked in UserDirectory first (skip ChatChannel).
+- B5: `requestHash` includes `sticker_id`; parser enforces `text=""`/`attachment_ids=[]`/`mentions=[]` for type=sticker.
+- Upload validation tests: MIME allowlist, size limit, width/height, sticker library limit.
