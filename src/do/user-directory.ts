@@ -609,7 +609,8 @@ export class UserDirectory extends DurableObject<Env> {
           { status: 415 },
         );
       }
-      return Response.json({ attachment: projectAttachmentForBrowser(row) });
+      // Internal endpoint: ChatChannel copies the full metadata row into its own attachments table.
+      return Response.json({ attachment: row });
     }
 
     return new Response("not found", { status: 404 });

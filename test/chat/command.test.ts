@@ -82,9 +82,22 @@ describe("parseMessageSendCommand", () => {
     if (!r.ok) expect(r.error.code).toBe("CHANNEL_NOT_FOUND");
   });
 
-  it("rejects image type (text-only; images are Phase 5)", () => {
+  it("parses a valid image message.send (empty text allowed)", () => {
     const r = parseMessageSendCommand(
       { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "image", text: "", attachment_ids: ["a-1"] } },
+      "u-1",
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.command.type).toBe("image");
+      expect(r.command.text).toBe("");
+      expect(r.command.attachment_ids).toEqual(["a-1"]);
+    }
+  });
+
+  it("rejects image message without attachment_ids", () => {
+    const r = parseMessageSendCommand(
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "image", text: "", attachment_ids: [] } },
       "u-1",
     );
     expect(r.ok).toBe(false);

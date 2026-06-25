@@ -9,6 +9,7 @@ import {
   type UserSummary as LiveUserSummary,
 } from "../chat/event-broadcast";
 import { projectMessageForBrowser } from "../chat/message-projection";
+import { projectAttachmentForBrowser, type AttachmentRow as ChatAttachmentRow } from "../chat/attachment-projection";
 import {
   buildChannelCreatedPayload,
   buildChannelUpdatedPayload,
@@ -62,7 +63,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS attachments (
     attachment_id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, kind TEXT NOT NULL,
     filename TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
-    width INTEGER, height INTEGER, storage_key TEXT NOT NULL, url TEXT NOT NULL,
+    width INTEGER, height INTEGER, blurhash TEXT, storage_key TEXT NOT NULL, url TEXT NOT NULL,
     status TEXT NOT NULL, created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS message_attachments (
@@ -1028,6 +1029,7 @@ export class ChatChannel extends DurableObject<Env> {
         type: string;
         text: string;
         reply_to: string | null;
+        attachment_ids: string[];
         mentions: Array<{ user_id: string; start: number; end: number }>;
         channel_id: string;
       };
@@ -1064,6 +1066,7 @@ export class ChatChannel extends DurableObject<Env> {
         type: b.type,
         text: b.text,
         reply_to: b.reply_to,
+        attachment_ids: b.attachment_ids ?? [],
         mentions: b.mentions ?? [],
       });
 
@@ -1134,10 +1137,53 @@ export class ChatChannel extends DurableObject<Env> {
         // fallback handled by the projection builder
       }
 
+      // Phase 5 image messages: resolve finalized attachments from UserDirectory BEFORE the txn
+      // (cross-DO fetch must not happen inside a storage transaction).
+      let attachmentRows: ChatAttachmentRow[] = [];
+      let attachmentProjections: Record<string, unknown>[] = [];
+      if (b.type === "image") {
+        const ids = Array.isArray(b.attachment_ids) ? b.attachment_ids : [];
+        if (ids.length === 0) {
+          return Response.json(
+            { error: { code: "INVALID_MESSAGE", message: "image message requires attachment_ids", retryable: false } },
+            { status: 422 },
+          );
+        }
+        const userDir = this.env.USER_DIRECTORY.getByName(userId);
+        for (const attachmentId of ids) {
+          const res = await userDir.fetch(
+            new Request(`https://x/internal/attachment-get?attachment_id=${encodeURIComponent(attachmentId)}`, {
+              headers: { "X-Verified-User-Id": userId },
+            }),
+          );
+          if (!res.ok) {
+            return Response.json(
+              { error: { code: "UNSUPPORTED_ATTACHMENT_TYPE", message: "attachment not finalized", retryable: false } },
+              { status: 415 },
+            );
+          }
+          const body = (await res.json()) as { attachment: ChatAttachmentRow };
+          const row = body.attachment;
+          if (!row || row.status !== "finalized" || row.owner_user_id !== userId) {
+            return Response.json(
+              { error: { code: "UNSUPPORTED_ATTACHMENT_TYPE", message: "attachment not available", retryable: false } },
+              { status: 415 },
+            );
+          }
+          attachmentRows.push(row);
+          const projection = projectAttachmentForBrowser(row);
+          if (projection) attachmentProjections.push(projection);
+        }
+      }
+
       // Build the LIVE message projection once (used by BOTH the committed-ack response_json AND
       // the channel_fanout outbox event_json — v4.0 addendum I/J: ack and event carry the same
       // Browser-visible projection from the one shared builder).
-      const liveMessage = projectMessageForBrowser(messageRowForProjection, { senderSummary: resolvedSender, mentions: Array.isArray(b.mentions) ? b.mentions : [] });
+      const liveMessage = projectMessageForBrowser(messageRowForProjection, {
+        senderSummary: resolvedSender,
+        mentions: Array.isArray(b.mentions) ? b.mentions : [],
+        attachments: attachmentProjections,
+      });
       const liveEventFrame = buildEventFrame({
         event_id: eventId,
         type: "message.created",
@@ -1228,6 +1274,32 @@ export class ChatChannel extends DurableObject<Env> {
               m.end,
             );
           }
+        }
+        // Persist image attachments (copied from UserDirectory) and link them to this message.
+        for (const row of attachmentRows) {
+          this.ctx.storage.sql.exec(
+            `INSERT OR IGNORE INTO attachments (
+                attachment_id, owner_user_id, kind, filename, mime_type, size_bytes,
+                width, height, blurhash, storage_key, url, status, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'finalized', ?)`,
+            row.attachment_id,
+            userId,
+            row.kind,
+            row.filename,
+            row.mime_type,
+            row.size_bytes,
+            row.width,
+            row.height,
+            row.blurhash,
+            row.storage_key,
+            row.url,
+            now,
+          );
+          this.ctx.storage.sql.exec(
+            "INSERT OR IGNORE INTO message_attachments (message_id, attachment_id) VALUES (?, ?)",
+            messageId,
+            row.attachment_id,
+          );
         }
         this.ctx.storage.sql.exec(
           "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, 'message.created', ?, 'user', ?, ?, ?, ?)",

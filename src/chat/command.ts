@@ -2,7 +2,7 @@ import type { CommandFrame } from "../ws/frames";
 
 export interface ParsedMessageSend {
   command_id: string;
-  type: "text";
+  type: "text" | "image";
   text: string;
   reply_to: string | null;
   attachment_ids: string[];
@@ -47,23 +47,26 @@ export function parseMessageSendCommand(frame: CommandFrame, senderUserId: strin
   if (!command_id) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
   }
-  // Phase 2 is text-only. image messages (Phase 5) and reply_to (Phase 4) are rejected here
-  // so we never persist incomplete rows (no reply_snapshot_json, no attachment owner/finalized check).
+  // Phase 2 supports text; Phase 5 adds image; sticker follows in Phase E.
   const type = typeof p.type === "string" ? p.type : "text";
-  if (type !== "text") {
-    return { ok: false, error: { code: "INVALID_MESSAGE", message: `unsupported type: ${type} (Phase 2 supports text only)`, retryable: false } };
+  if (type !== "text" && type !== "image") {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: `unsupported type: ${type}`, retryable: false } };
   }
   const text = typeof p.text === "string" ? p.text : "";
-  if (text.trim() === "") {
+  if (type === "text" && text.trim() === "") {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "message text is empty", retryable: false } };
   }
   const reply_to_message_id = p.reply_to_message_id;
   if (typeof reply_to_message_id === "string" && reply_to_message_id.length > 0) {
-    return { ok: false, error: { code: "INVALID_MESSAGE", message: "reply_to_message_id not supported in Phase 2", retryable: false } };
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "reply_to_message_id not supported", retryable: false } };
   }
   const attachment_ids = Array.isArray(p.attachment_ids) ? p.attachment_ids.filter((a): a is string => typeof a === "string") : [];
-  if (attachment_ids.length > 0) {
-    return { ok: false, error: { code: "INVALID_MESSAGE", message: "attachment_ids not supported in Phase 2 (text only)", retryable: false } };
+  if (type === "image") {
+    if (attachment_ids.length === 0) {
+      return { ok: false, error: { code: "INVALID_MESSAGE", message: "image message requires attachment_ids", retryable: false } };
+    }
+  } else if (attachment_ids.length > 0) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "attachment_ids not allowed for text messages", retryable: false } };
   }
   const mentionsRaw = Array.isArray(p.mentions) ? p.mentions : [];
   const mentions = mentionsRaw
@@ -76,7 +79,7 @@ export function parseMessageSendCommand(frame: CommandFrame, senderUserId: strin
     .filter((m) => m.user_id);
 
   void senderUserId; // sender identity comes from the authenticated socket, not the payload
-  return { ok: true, command: { command_id, type: "text", text, reply_to: null, attachment_ids: [], mentions } };
+  return { ok: true, command: { command_id, type, text, reply_to: null, attachment_ids, mentions } };
 }
 
 function requireCommandId(frame: CommandFrame): string | null {
