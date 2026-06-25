@@ -683,13 +683,16 @@ export class ChatChannel extends DurableObject<Env> {
     }
 
     if (url.pathname === "/internal/join") {
-      const b = (await request.json()) as { user_id: string };
+      const b = (await request.json()) as { user_id: string; operation_id?: string };
       const userId = b.user_id;
+      const callerUserId = request.headers.get("X-Verified-User-Id") ?? userId;
       const now = this.nowIso();
-      let channelId = "";
-      let membershipVersion = 0;
-      let joinedAt = now;
-      let writeProjection = false;
+      const nowMs = Date.parse(now);
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const operationId = typeof b.operation_id === "string" && b.operation_id !== "" ? b.operation_id : null;
+      // request_hash for join is just {user_id, channel_id} — the only body fields that matter.
+      // The differentiator between branches is the membership state at execution time, not the body.
+      const requestHash = JSON.stringify({ user_id: userId });
 
       const meta = this.ctx.storage.sql.exec("SELECT channel_id, kind, visibility, status, membership_version, member_count FROM channel_meta").toArray()[0] as
         | { channel_id: string; kind: string; visibility: string; status: string; membership_version: number; member_count: number }
@@ -697,83 +700,163 @@ export class ChatChannel extends DurableObject<Env> {
       if (meta === undefined) {
         return new Response("not found", { status: 404 });
       }
-      channelId = meta.channel_id;
+      const channelId = meta.channel_id;
       if (meta.status === "dissolved") {
         return Response.json(
           { error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } },
           { status: 409 },
         );
       }
+      // DM channels are not joinable (no DM creation is exposed yet, but defend now).
+      if (meta.kind === "dm") {
+        return Response.json(
+          { error: { code: "FORBIDDEN", message: "channel is not publicly joinable", retryable: false } },
+          { status: 403 },
+        );
+      }
 
-      const m = this.ctx.storage.sql
-        .exec("SELECT joined_at, left_at FROM members WHERE channel_id=? AND user_id=?", channelId, userId)
-        .toArray()[0] as { joined_at: string; left_at: string | null } | undefined;
+      // Cheap pre-check: if operation_id present and the same operation already completed with the
+      // same request_hash, return the cached response WITHOUT opening a transaction.
+      if (operationId) {
+        const preCheck = this.ctx.storage.sql
+          .exec("SELECT response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.join' AND operation_id=? AND request_hash=? AND response_json IS NOT NULL AND response_json != ''",
+            callerUserId, operationId, requestHash)
+          .toArray()[0] as { response_json: string } | undefined;
+        if (preCheck) {
+          const cached = JSON.parse(preCheck.response_json) as { channel_id?: string; membership_version?: number; joined_at?: string; role?: string };
+          return Response.json({
+            channel_id: cached.channel_id ?? channelId,
+            membership_version: cached.membership_version ?? 0,
+            joined_at: cached.joined_at ?? now,
+            role: cached.role ?? "member",
+          });
+        }
+      }
 
-      if (m && m.left_at === null) {
-        membershipVersion = meta.membership_version;
-        joinedAt = m.joined_at;
-      } else {
-        membershipVersion = meta.membership_version + 1;
-        joinedAt = now;
+      type JoinTxResult =
+        | { kind: "conflict" }
+        | { kind: "ok"; membershipVersion: number; joinedAt: string; role: string; writeProjection: boolean };
+
+      const txResult = await this.ctx.storage.transaction(async (): Promise<JoinTxResult> => {
+        // Re-read meta inside the txn (handles concurrent joins).
+        const m2 = this.ctx.storage.sql.exec("SELECT status, visibility, membership_version, member_count FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as
+          | { status: string; visibility: string; membership_version: number; member_count: number }
+          | undefined;
+        if (m2 === undefined) return { kind: "conflict" };
+        if (m2.status === "dissolved") return { kind: "conflict" };
+
+        // Idempotency cache check inside the txn (handles the race where two concurrent joins interleave).
+        if (operationId) {
+          const idem = this.ctx.storage.sql
+            .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.join' AND operation_id=?",
+              callerUserId, operationId)
+            .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+          if (idem) {
+            if (idem.request_hash !== requestHash) return { kind: "conflict" };
+            const cached = JSON.parse(idem.response_json ?? "{}") as { membership_version?: number; joined_at?: string; role?: string };
+            return { kind: "ok", membershipVersion: cached.membership_version ?? m2.membership_version, joinedAt: cached.joined_at ?? now, role: cached.role ?? "member", writeProjection: false };
+          }
+        }
+
+        const m = this.ctx.storage.sql
+          .exec("SELECT joined_at, left_at, role FROM members WHERE channel_id=? AND user_id=?", channelId, userId)
+          .toArray()[0] as { joined_at: string; left_at: string | null; role: string } | undefined;
+
+        const isActiveMember = m !== undefined && m.left_at === null;
+        // Visibility gate (applies always): non-members may only join public_listed channels.
+        // Already-active members bypass the gate (they are returning their existing membership).
+        if (!isActiveMember && m2.visibility !== "public_listed") {
+          return { kind: "conflict" }; // signal FORBIDDEN via conflict branch — see below
+        }
+
+        if (isActiveMember) {
+          // Already-active-member no-op (P0-3): write the idempotency row so a retry after the user
+          // later leaves does NOT become a real rejoin. Returns the EXISTING role (P0-4).
+          const role = m!.role;
+          const responseJson = JSON.stringify({ channel_id: channelId, membership_version: m2.membership_version, joined_at: m!.joined_at, role });
+          if (operationId) {
+            this.ctx.storage.sql.exec(
+              "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.join', ?, ?, ?, 'completed', ?, ?)",
+              callerUserId, operationId, requestHash, responseJson, now, idemExpiresAt,
+            );
+          }
+          return { kind: "ok", membershipVersion: m2.membership_version, joinedAt: m!.joined_at, role, writeProjection: false };
+        }
+
+        // Fresh join OR rejoin (left/removed): real mutation. Rejoin resets role to 'member'.
+        const membershipVersion = m2.membership_version + 1;
+        const joinedAt = now;
         if (m === undefined) {
           this.ctx.storage.sql.exec(
             "INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, 'member', ?, NULL)",
-            channelId,
-            userId,
-            joinedAt,
+            channelId, userId, joinedAt,
           );
         } else {
           this.ctx.storage.sql.exec(
             "UPDATE members SET joined_at=?, left_at=NULL, role='member' WHERE channel_id=? AND user_id=?",
-            joinedAt,
-            channelId,
-            userId,
+            joinedAt, channelId, userId,
           );
         }
-
-        const nextCount = (meta.member_count ?? 0) + 1;
+        const nextCount = (m2.member_count ?? 0) + 1;
         this.ctx.storage.sql.exec(
           "UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?",
-          membershipVersion,
-          nextCount,
-          now,
-          channelId,
+          membershipVersion, nextCount, now, channelId,
         );
 
-        const eventId = this.nextEventId(Date.parse(now));
+        const eventId = this.nextEventId(nowMs);
         this.ctx.storage.sql.exec(
           "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, 'member.joined', ?, 'system', 'system', ?, ?, ?)",
-          eventId,
-          channelId,
-          JSON.stringify({
-            channel_id: channelId,
-            user_id: userId,
-            membership_version: membershipVersion,
-          }),
-          membershipVersion,
-          now,
+          eventId, channelId,
+          JSON.stringify({ channel_id: channelId, user_id: userId, membership_version: membershipVersion }),
+          membershipVersion, now,
         );
 
         await this.insertOutboxRow(
           "user_directory",
           userId,
-          {
-            action: "join",
-            channel_id: channelId,
-            kind: meta.kind,
-            membership_version: membershipVersion,
-          },
+          { action: "join", channel_id: channelId, kind: meta.kind, membership_version: membershipVersion },
           now,
         );
         // channel_directory projection: bump the directory's member_count for public channels.
-        if (meta.visibility === "public_listed") {
+        if (m2.visibility === "public_listed") {
           this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
         }
-        writeProjection = true;
+
+        const role = "member";
+        const responseJson = JSON.stringify({ channel_id: channelId, membership_version: membershipVersion, joined_at: joinedAt, role });
+        if (operationId) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.join', ?, ?, ?, 'completed', ?, ?)",
+            callerUserId, operationId, requestHash, responseJson, now, idemExpiresAt,
+          );
+        }
+        return { kind: "ok", membershipVersion: membershipVersion, joinedAt: joinedAt, role, writeProjection: true };
+      });
+
+      // The "conflict" kind is overloaded here to signal the visibility-gate failure (403) because
+      // the gate is evaluated inside the txn. We disambiguate by re-checking visibility post-txn.
+      if (txResult.kind === "conflict") {
+        // If the cache had a request_hash mismatch, that's a 409 IDEMPOTENCY_CONFLICT.
+        if (operationId) {
+          const idem = this.ctx.storage.sql
+            .exec("SELECT request_hash FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.join' AND operation_id=?",
+              callerUserId, operationId)
+            .toArray()[0] as { request_hash: string } | undefined;
+          if (idem && idem.request_hash !== requestHash) {
+            return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: 409 });
+          }
+        }
+        // Otherwise the txn rejected because the channel is not publicly joinable (visibility gate)
+        // or the channel dissolved concurrently. The post-txn meta read distinguishes.
+        const postMeta = this.ctx.storage.sql.exec("SELECT status, visibility FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; visibility: string } | undefined;
+        if (postMeta?.status === "dissolved") {
+          return Response.json({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }, { status: 409 });
+        }
+        return Response.json({ error: { code: "FORBIDDEN", message: "channel is not publicly joinable", retryable: false } }, { status: 403 });
       }
 
-      if (writeProjection) await this.scheduleOutboxAlarm(now);
-      return Response.json({ channel_id: channelId, membership_version: membershipVersion, joined_at: joinedAt });
+      if (txResult.writeProjection) await this.scheduleOutboxAlarm(now);
+      return Response.json({ channel_id: channelId, membership_version: txResult.membershipVersion, joined_at: txResult.joinedAt, role: txResult.role });
     }
 
     if (url.pathname === "/internal/outbox-pending") {
