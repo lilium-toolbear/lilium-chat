@@ -1731,6 +1731,214 @@ export class ChatChannel extends DurableObject<Env> {
       });
     }
 
+    if (url.pathname === "/internal/invites-accept") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as {
+        operation_id: string;
+        channel_id: string;
+        invite_code: string;
+      };
+      const operationId = b.operation_id;
+      if (!operationId) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "operation_id is required", retryable: false } }, { status: 422 });
+      }
+      const channelId = b.channel_id;
+      if (!channelId) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "channel_id is required", retryable: false } }, { status: 422 });
+      }
+      const inviteCode = b.invite_code;
+      if (!inviteCode) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "invite_code is required", retryable: false } }, { status: 422 });
+      }
+
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+      const requestHash = JSON.stringify({ channel_id: channelId, invite_code: inviteCode });
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+
+      type TxResult =
+        | { kind: "conflict" }
+        | { kind: "cached"; responseJson: string }
+        | { kind: "ok"; responseJson: string };
+
+      const txResult = await this.ctx.storage.transaction(async (): Promise<TxResult> => {
+        const idem = this.ctx.storage.sql
+          .exec(
+            "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.invite_accept' AND operation_id=?",
+            userId,
+            operationId,
+          )
+          .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        if (idem) {
+          if (idem.request_hash !== requestHash) return { kind: "conflict" };
+          return { kind: "cached", responseJson: idem.response_json ?? "{}" };
+        }
+
+        const meta = this.ctx.storage.sql
+          .exec(
+            "SELECT channel_id, kind, visibility, title, avatar_url, member_count, membership_version, status FROM channel_meta WHERE channel_id=?",
+            channelId,
+          )
+          .toArray()[0] as
+          | { channel_id: string; kind: string; visibility: string; title: string; avatar_url: string | null; member_count: number; membership_version: number; status: string }
+          | undefined;
+        if (!meta) {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
+        }
+        const dissolved = this.assertNotDissolved(meta.status);
+        if (dissolved) {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: dissolved.code, message: dissolved.message, retryable: false } }) };
+        }
+
+        const invite = this.ctx.storage.sql
+          .exec(
+            "SELECT invite_code, created_by, expires_at, max_uses, used_count, revoked_at FROM invites WHERE invite_code=?",
+            inviteCode,
+          )
+          .toArray()[0] as
+          | { invite_code: string; created_by: string; expires_at: string; max_uses: number | null; used_count: number; revoked_at: string | null }
+          | undefined;
+        if (!invite || invite.invite_code !== inviteCode) {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "INVITE_NOT_FOUND", message: "invite not found", retryable: false } }) };
+        }
+
+        const expiresAtMs = Date.parse(invite.expires_at);
+        if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs || invite.revoked_at !== null) {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "INVITE_NOT_FOUND", message: "invite not found", retryable: false } }) };
+        }
+
+        const currentMember = this.ctx.storage.sql
+          .exec("SELECT joined_at, left_at FROM members WHERE channel_id=? AND user_id=?", channelId, userId)
+          .toArray()[0] as { joined_at: string; left_at: string | null } | undefined;
+
+        if (currentMember && currentMember.left_at === null) {
+          const responseJson = JSON.stringify({
+            channel: {
+              channel_id: meta.channel_id,
+              kind: meta.kind,
+              visibility: meta.visibility,
+              title: meta.title,
+              avatar_url: meta.avatar_url,
+              member_count: meta.member_count,
+              status: meta.status,
+            },
+            membership: {
+              role: "member",
+              joined_at: currentMember.joined_at,
+              status: "active",
+            },
+          });
+          this.ctx.storage.sql.exec(
+            "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.invite_accept', ?, ?, ?, 'completed', ?, ?)",
+            userId,
+            operationId,
+            requestHash,
+            responseJson,
+            now,
+            idemExpiresAt,
+          );
+          return { kind: "ok", responseJson };
+        }
+
+        if (invite.max_uses !== null && invite.used_count >= invite.max_uses) {
+          return {
+            kind: "cached",
+            responseJson: JSON.stringify({ error: { code: "INVITE_NOT_AVAILABLE", message: "invite max uses exceeded", retryable: false } }),
+          };
+        }
+
+        const actorMap = await this.resolveActorMap([userId]);
+        const mv = meta.membership_version + 1;
+        if (currentMember === undefined) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, ?, ?, NULL)",
+            channelId,
+            userId,
+            "member",
+            now,
+          );
+        } else {
+          this.ctx.storage.sql.exec(
+            "UPDATE members SET role=?, joined_at=?, left_at=NULL WHERE channel_id=? AND user_id=?",
+            "member",
+            now,
+            channelId,
+            userId,
+          );
+        }
+        this.ctx.storage.sql.exec("UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?", mv, meta.member_count + 1, now, channelId);
+        this.ctx.storage.sql.exec("UPDATE invites SET used_count = used_count + 1 WHERE invite_code=?", invite.invite_code);
+
+        const joinedId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(
+          joinedId,
+          "member.joined",
+          channelId,
+          now,
+          buildMemberJoinedPayload({
+            channel_id: channelId,
+            user_id: userId,
+            role: "member",
+            membership_version: mv,
+            actor_kind: "user",
+            actor_id: userId,
+          }),
+          mv,
+          now,
+          actorMap,
+        );
+        const noticeId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({
+          notice_kind: "member.joined",
+          actor_kind: "user",
+          actor_id: userId,
+          target_user_id: userId,
+          message_id: null,
+          channel_changes: null,
+        }), mv, now, actorMap);
+        this.ctx.storage.sql.exec(
+          "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+          `user_directory:join:${channelId}:${userId}:${now}`,
+          userId,
+          JSON.stringify({ action: "join", channel_id: channelId, kind: meta.kind, membership_version: mv }),
+          now,
+          now,
+          now,
+        );
+
+        const channel = {
+          channel_id: meta.channel_id,
+          kind: meta.kind,
+          visibility: meta.visibility,
+          title: meta.title,
+          avatar_url: meta.avatar_url,
+          member_count: meta.member_count + 1,
+          status: meta.status,
+        };
+        const responseJson = JSON.stringify({ channel, membership: { role: "member", joined_at: now, status: "active" } });
+        this.ctx.storage.sql.exec(
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.invite_accept', ?, ?, ?, 'completed', ?, ?)",
+          userId,
+          operationId,
+          requestHash,
+          responseJson,
+          now,
+          idemExpiresAt,
+        );
+        return { kind: "ok", responseJson };
+      });
+
+      if (txResult.kind === "conflict") {
+        return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: 409 });
+      }
+      if (txResult.kind === "ok") {
+        await this.scheduleOutboxAlarm(now);
+        return Response.json(JSON.parse(txResult.responseJson), { status: 200 });
+      }
+      return this.cachedResponse(txResult.responseJson);
+    }
+
     if (url.pathname === "/internal/dissolve") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });

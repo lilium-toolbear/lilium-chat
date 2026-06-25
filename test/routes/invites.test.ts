@@ -131,4 +131,92 @@ describe("POST /api/chat/channels/:id/invites", () => {
     const body = await preview.json() as { error: { code: string } };
     expect(body.error.code).toBe("INVITE_NOT_FOUND");
   });
+
+  it("accepts an invite and returns channel membership payload", async () => {
+    const create = await authedReq("u-invite-accept-1", "POST", "/api/chat/channels", {
+      title: "Invite accept room",
+      visibility: "private",
+      initial_members: [],
+    }, "invite-accept-create-1");
+    const createBody = (await create.json()) as { channel: { channel_id: string } };
+
+    const createInvite = await authedReq("u-invite-accept-1", "POST", `/api/chat/channels/${createBody.channel.channel_id}/invites`, {
+      expires_in_seconds: 3600,
+      max_uses: null,
+    }, "invite-accept-key-1");
+    const invite = (await createInvite.json()) as { invite_code: string };
+
+    const accept = await authedReq("u-invite-accept-user", "POST", `/api/chat/invites/${invite.invite_code}/accept`, undefined, "invite-accept-op");
+    expect(accept.status).toBe(200);
+    const acceptBody = await accept.json() as {
+      channel: { channel_id: string; kind: string; visibility: string; title: string; member_count: number; status: string };
+      membership: { role: string; joined_at: string; status: string };
+    };
+    expect(acceptBody.channel.channel_id).toBe(createBody.channel.channel_id);
+    expect(acceptBody.channel.kind).toBe("channel");
+    expect(acceptBody.channel.visibility).toBe("private");
+    expect(acceptBody.membership.role).toBe("member");
+    expect(acceptBody.membership.status).toBe("active");
+    expect(typeof acceptBody.membership.joined_at).toBe("string");
+  });
+
+  it("idempotent accept does not consume extra invite usage for the same operation_id", async () => {
+    const create = await authedReq("u-invite-accept-2", "POST", "/api/chat/channels", {
+      title: "Invite accept idempotent room",
+      visibility: "private",
+      initial_members: [],
+    }, "invite-accept-create-2");
+    const createBody = (await create.json()) as { channel: { channel_id: string } };
+
+    const createInvite = await authedReq("u-invite-accept-2", "POST", `/api/chat/channels/${createBody.channel.channel_id}/invites`, {
+      expires_in_seconds: 3600,
+      max_uses: 1,
+    }, "invite-accept-key-2");
+    const invite = (await createInvite.json()) as { invite_code: string };
+
+    const accept1 = await authedReq("u-invite-accept-idem", "POST", `/api/chat/invites/${invite.invite_code}/accept`, undefined, "invite-accept-op-idem");
+    expect(accept1.status).toBe(200);
+    const accepted1 = await accept1.json() as { membership: { joined_at: string; role: string } };
+
+    const accept2 = await authedReq("u-invite-accept-idem", "POST", `/api/chat/invites/${invite.invite_code}/accept`, undefined, "invite-accept-op-idem");
+    expect(accept2.status).toBe(200);
+    const accepted2 = await accept2.json() as { membership: { joined_at: string; role: string } };
+    expect(accepted2).toEqual(accepted1);
+
+    const blocked = await authedReq("u-invite-accept-idem-other", "POST", `/api/chat/invites/${invite.invite_code}/accept`, undefined, "invite-accept-other-key");
+    expect(blocked.status).toBe(409);
+    const blockedBody = await blocked.json() as { error: { code: string; message: string } };
+    expect(blockedBody.error.code).toBe("INVITE_NOT_AVAILABLE");
+    expect(blockedBody.error.message).toBe("invite max uses exceeded");
+  });
+
+  it("allows re-accept for a left user and consumes invite usage", async () => {
+    const create = await authedReq("u-invite-accept-3", "POST", "/api/chat/channels", {
+      title: "Invite accept left room",
+      visibility: "private",
+      initial_members: [],
+    }, "invite-accept-create-3");
+    const createBody = (await create.json()) as { channel: { channel_id: string } };
+
+    const createInvite = await authedReq("u-invite-accept-3", "POST", `/api/chat/channels/${createBody.channel.channel_id}/invites`, {
+      expires_in_seconds: 3600,
+      max_uses: 2,
+    }, "invite-accept-key-3");
+    const invite = (await createInvite.json()) as { invite_code: string };
+
+    const accept = await authedReq("u-invite-left-user", "POST", `/api/chat/invites/${invite.invite_code}/accept`, undefined, "invite-left-op");
+    expect(accept.status).toBe(200);
+    await authedReq("u-invite-accept-3", "DELETE", `/api/chat/channels/${createBody.channel.channel_id}/members/u-invite-left-user`, undefined, "invite-left-rem");
+
+    const reaccept = await authedReq("u-invite-left-user", "POST", `/api/chat/invites/${invite.invite_code}/accept`, undefined, "invite-left-op-rejoin");
+    expect(reaccept.status).toBe(200);
+    const rejoinBody = await reaccept.json() as { membership: { status: string; role: string } };
+    expect(rejoinBody.membership.status).toBe("active");
+    expect(rejoinBody.membership.role).toBe("member");
+
+    const blocked = await authedReq("u-invite-left-other", "POST", `/api/chat/invites/${invite.invite_code}/accept`, undefined, "invite-left-other-op");
+    expect(blocked.status).toBe(409);
+    const blockedBody = await blocked.json() as { error: { code: string } };
+    expect(blockedBody.error.code).toBe("INVITE_NOT_AVAILABLE");
+  });
 });

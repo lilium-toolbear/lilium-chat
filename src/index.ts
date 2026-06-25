@@ -11,6 +11,7 @@ import { eventsHandler } from "./routes/events";
 import {
   createInviteHandler,
   previewInviteHandler,
+  acceptInviteHandler,
   addMemberHandler,
   createChannelHandler,
   dissolveChannelHandler,
@@ -64,6 +65,7 @@ app.post("/api/chat/channels/:channel_id/owner-transfer", (c) => ownerTransferHa
 app.post("/api/chat/channels/:channel_id/invites", (c) => createInviteHandler(c));
 app.post("/api/chat/channels/:channel_id/members", (c) => addMemberHandler(c));
 app.get("/api/chat/invites/:invite_code", (c) => previewInviteHandler(c));
+app.post("/api/chat/invites/:invite_code/accept", (c) => acceptInviteHandler(c));
 app.get("/api/chat/channels/:channel_id/members", (c) => listMembersHandler(c));
 app.get("/api/chat/channels/:channel_id/members/:user_id", (c) => getMemberHandler(c));
 app.patch("/api/chat/channels/:channel_id/members/:user_id", (c) => updateMemberRoleHandler(c));

@@ -371,3 +371,60 @@ export async function previewInviteHandler(c: Context<{ Bindings: Env; Variables
 
   return c.json(await inviteRes.json(), 200, { "X-Request-Id": c.get("requestId") });
 }
+
+export async function acceptInviteHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const inviteCode = c.req.param("invite_code");
+  if (!inviteCode) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
+
+  const dirStub = env.INVITE_DIRECTORY.getByName("shared");
+  const dirRes = await dirStub.fetch(new Request(`https://x/preview?code=${encodeURIComponent(inviteCode)}`));
+  if (dirRes.status === 404) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
+  if (!dirRes.ok) {
+    const dirErr = await dirRes.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "invite directory unavailable" } })) as {
+      error?: { code?: string; message?: string };
+    };
+    throw new ApiError(dirErr.error?.code ?? "CHAT_WORKER_UNAVAILABLE", dirErr.error?.message ?? "invite directory unavailable");
+  }
+
+  const row = await dirRes.json() as { channel_id?: string; status?: string };
+  if (row.channel_id === undefined || row.status !== undefined && row.status !== "active") {
+    throw new ApiError("INVITE_NOT_FOUND", "invite not found");
+  }
+
+  const routeName = await channelRouteNameFor(env, userId, row.channel_id);
+  if (routeName === null) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const inviteRes = await stub.fetch(new Request("https://x/internal/invites-accept", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operation_id: idempotencyKey,
+      channel_id: row.channel_id,
+      invite_code: inviteCode,
+    }),
+  }));
+
+  if (inviteRes.status === 409) {
+    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency conflict" } })) as {
+      error?: { code?: string; message?: string };
+    };
+    throw new ApiError(inviteErr.error?.code ?? "IDEMPOTENCY_CONFLICT", inviteErr.error?.message ?? "idempotency conflict");
+  }
+  if (inviteRes.status === 404) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
+  if (inviteRes.status === 422) {
+    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "INVALID_MESSAGE", message: "invite accept failed" } })) as {
+      error?: { code?: string; message?: string };
+    };
+    throw new ApiError(inviteErr.error?.code ?? "INVALID_MESSAGE", inviteErr.error?.message ?? "invite accept failed");
+  }
+  if (!inviteRes.ok) {
+    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "invite accept failed" } })) as {
+      error?: { code?: string; message?: string };
+    };
+    throw new ApiError(inviteErr.error?.code ?? "CHAT_WORKER_UNAVAILABLE", inviteErr.error?.message ?? "invite accept failed");
+  }
+  return c.json(await inviteRes.json(), 200, { "X-Request-Id": c.get("requestId") });
+}
