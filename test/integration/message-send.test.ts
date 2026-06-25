@@ -40,6 +40,13 @@ describe("e2e: message.send → committed_ack → message.created self-receive",
         body: JSON.stringify({ user_id: userId }),
       }),
     );
+    // /internal/join wrote a user_directory outbox row; flush it via the ChatChannel alarm so
+    // UserDirectory.my_channels has the row BEFORE we upgrade the WS. registerOnlineOnConnect
+    // reads my_channels once on connect — if the row is not yet flushed it subscribes to nothing
+    // and the ChannelFanout online_sessions poll below can never see the user. Same race that
+    // member-left-unsubscribe.test.ts guards against with an explicit pre-connect alarm flush.
+    const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
+    await runDurableObjectAlarm(sysStub);
     const sysId = (await (await sysStub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }))).json() as {
       channel_id: string;
     }).channel_id;
@@ -98,7 +105,6 @@ describe("e2e: message.send → committed_ack → message.created self-receive",
     expect(eventId).toBeTruthy();
 
     const nextEvent = nextMessage(ws);
-    const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
     await runDurableObjectAlarm(sysStub);
     await runDurableObjectAlarm(fanoutStub);
     const evRaw = await nextEvent;

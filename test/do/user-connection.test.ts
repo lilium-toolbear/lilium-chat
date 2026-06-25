@@ -136,6 +136,10 @@ describe("UserConnection DO", () => {
         body: JSON.stringify({ user_id: userId }),
       }),
     );
+    // Flush the join's user_directory outbox so ensureSubscribed sees the my_channels row.
+    // Same race as message-send.test.ts / member-left-unsubscribe.test.ts.
+    const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
+    await runDurableObjectAlarm(sysStub);
     const sysId = (await (await sysStub.fetch(new Request("https://x/internal/summary", {
       headers: { "X-Verified-User-Id": userId },
     }))).json() as { channel_id: string }).channel_id;
@@ -216,6 +220,9 @@ describe("UserConnection DO", () => {
         body: JSON.stringify({ user_id: userId }),
       }),
     );
+    // Flush the join outbox so ensureSubscribed sees the my_channels row (same race as above).
+    const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
+    await runDurableObjectAlarm(sysStub);
     const sysId = (await (await sysStub.fetch(new Request("https://x/internal/summary", {
       headers: { "X-Verified-User-Id": userId },
     }))).json() as { channel_id: string }).channel_id;
