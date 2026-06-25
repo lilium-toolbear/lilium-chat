@@ -1374,6 +1374,87 @@ export class ChatChannel extends DurableObject<Env> {
       });
     }
 
+    if (url.pathname === "/internal/resolve-visible-attachment") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const attachmentId = url.searchParams.get("attachment_id") ?? "";
+      if (!attachmentId) {
+        return Response.json(
+          { error: { code: "INVALID_MESSAGE", message: "attachment_id required", retryable: false } },
+          { status: 422 },
+        );
+      }
+
+      const meta = this.ctx.storage.sql
+        .exec("SELECT channel_id, visibility FROM channel_meta LIMIT 1")
+        .toArray()[0] as { channel_id: string; visibility: string } | undefined;
+      if (!meta) {
+        return Response.json(
+          { error: { code: "CHANNEL_NOT_FOUND", message: "channel not created", retryable: false } },
+          { status: 404 },
+        );
+      }
+
+      const member = this.ctx.storage.sql
+        .exec("SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", meta.channel_id, userId)
+        .toArray()[0] as { x: number } | undefined;
+      if (!member) {
+        return Response.json(
+          { error: { code: "FORBIDDEN", message: "not a member", retryable: false } },
+          { status: 403 },
+        );
+      }
+
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT a.attachment_id, a.url, a.mime_type, a.width, a.height, a.size_bytes, m.status, m.type
+           FROM attachments a
+           JOIN message_attachments ma ON a.attachment_id = ma.attachment_id
+           JOIN messages m ON m.message_id = ma.message_id
+           WHERE a.attachment_id=? AND m.channel_id=?`,
+          attachmentId,
+          meta.channel_id,
+        )
+        .toArray() as Array<{
+          attachment_id: string;
+          url: string;
+          mime_type: string;
+          width: number;
+          height: number;
+          size_bytes: number;
+          status: string;
+          type: string;
+        }>;
+      if (rows.length === 0) {
+        return Response.json(
+          { error: { code: "ATTACHMENT_NOT_FOUND", message: "attachment not found in channel", retryable: false } },
+          { status: 404 },
+        );
+      }
+
+      const visible = rows.some(
+        (r) => (r.status === "normal" || r.status === "edited") && (r.type === "image" || r.type === "sticker"),
+      );
+      if (!visible) {
+        return Response.json(
+          { error: { code: "INVALID_STICKER_SOURCE", message: "attachment is not a visible image or sticker", retryable: false } },
+          { status: 422 },
+        );
+      }
+
+      const row = rows[0]!;
+      return Response.json({
+        attachment: {
+          attachment_id: row.attachment_id,
+          url: row.url,
+          mime_type: row.mime_type,
+          width: row.width,
+          height: row.height,
+          size_bytes: row.size_bytes,
+        },
+      });
+    }
+
     if (url.pathname === "/internal/message-edit") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });
