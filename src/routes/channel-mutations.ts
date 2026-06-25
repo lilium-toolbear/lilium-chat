@@ -267,3 +267,44 @@ export async function ownerTransferHandler(c: Context<{ Bindings: Env; Variables
   }
   return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
 }
+
+export async function createInviteHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const channelId = c.req.param("channel_id");
+  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
+
+  const body = (await c.req.json().catch(() => ({}))) as { expires_in_seconds?: number; max_uses?: number | null };
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const res = await stub.fetch(new Request("https://x/internal/invites-create", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operation_id: idempotencyKey,
+      channel_id: channelId,
+      expires_in_seconds: body.expires_in_seconds,
+      max_uses: body.max_uses,
+    }),
+  }));
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "create invite failed" } })) as {
+      error?: { code?: string; message?: string };
+    };
+    const code = e.error?.code ?? "CHAT_WORKER_UNAVAILABLE";
+    throw new ApiError(code, e.error?.message ?? "create invite failed");
+  }
+
+  const out = await res.json() as { invite_code: string; expires_at: string; max_uses: number | null };
+  const base = new URL(c.req.url).origin;
+  return c.json({
+    invite_code: out.invite_code,
+    invite_url: `${base}/api/chat/invites/${out.invite_code}`,
+    expires_at: out.expires_at,
+    max_uses: out.max_uses,
+  }, 200, { "X-Request-Id": c.get("requestId") });
+}

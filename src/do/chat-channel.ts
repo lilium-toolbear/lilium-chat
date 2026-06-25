@@ -627,6 +627,31 @@ export class ChatChannel extends DurableObject<Env> {
     );
   }
 
+  private async flushSingleInviteDirectoryOutbox(outboxId: string, nowIso: string): Promise<boolean> {
+    const row = this.ctx.storage.sql
+      .exec("SELECT payload_json FROM projection_outbox WHERE outbox_id=?", outboxId)
+      .toArray()[0] as { payload_json: string } | undefined;
+    if (!row) return false;
+
+    const target = this.env.INVITE_DIRECTORY.getByName("shared");
+    try {
+      const res = await target.fetch(new Request("https://x/upsert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: row.payload_json,
+      }));
+      if (!res.ok) return false;
+      this.ctx.storage.sql.exec(
+        "UPDATE projection_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
+        nowIso,
+        outboxId,
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   nextEventId(nowMs: number = Date.now()): string {
     const rows = this.ctx.storage.sql.exec("SELECT last_ms, counter FROM event_seq WHERE id=1").toArray();
     const row = rows[0] as { last_ms: number; counter: number } | undefined;
@@ -1465,6 +1490,139 @@ export class ChatChannel extends DurableObject<Env> {
         return Response.json(JSON.parse(txResult.responseJson), { status: 200 });
       }
       return this.cachedResponse(txResult.responseJson);
+    }
+
+    if (url.pathname === "/internal/invites-create") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+
+      const b = (await request.json()) as {
+        operation_id: string;
+        channel_id: string;
+        expires_in_seconds?: number;
+        max_uses?: number | null;
+      };
+
+      if (!b.operation_id) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "operation_id is required", retryable: false } }, { status: 422 });
+      }
+      if (!b.channel_id) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "channel_id is required", retryable: false } }, { status: 422 });
+      }
+
+      const channelId = b.channel_id;
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+      const requestHash = JSON.stringify({
+        channel_id: channelId,
+        expires_in_seconds: b.expires_in_seconds ?? 7 * 24 * 60 * 60,
+        max_uses: b.max_uses ?? null,
+      });
+
+      const rawExpires = b.expires_in_seconds ?? 7 * 24 * 60 * 60;
+      if (!Number.isInteger(rawExpires) || rawExpires <= 0) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "expires_in_seconds must be a positive integer", retryable: false } }, { status: 422 });
+      }
+
+      const rawMaxUses = b.max_uses ?? null;
+      if (rawMaxUses !== null && (!Number.isInteger(rawMaxUses) || rawMaxUses < 0)) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "max_uses must be a non-negative integer or null", retryable: false } }, { status: 422 });
+      }
+
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const expiresAt = new Date(nowMs + rawExpires * 1000).toISOString();
+      const maxUses: number | null = rawMaxUses;
+
+      const preCheck = this.ctx.storage.sql
+        .exec(
+          "SELECT response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.invite_create' AND operation_id=? AND request_hash=? AND response_json IS NOT NULL AND response_json != ''",
+          userId, b.operation_id, requestHash,
+        )
+        .toArray()[0] as { response_json: string } | undefined;
+      if (preCheck) return this.cachedResponse(preCheck.response_json);
+
+      const inviteCode = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+      const outboxId = `invite_directory:${inviteCode}:${now}`;
+      const outboxEventId = this.nextEventId(nowMs);
+      const response = {
+        invite_code: inviteCode,
+        expires_at: expiresAt,
+        max_uses: maxUses,
+      };
+      const responseJson = JSON.stringify(response);
+
+      type TxResult =
+        | { kind: "conflict" }
+        | { kind: "cached"; responseJson: string }
+        | { kind: "ok"; responseJson: string; outboxId: string };
+
+      const txResult = await this.ctx.storage.transaction(async (): Promise<TxResult> => {
+        const idem = this.ctx.storage.sql
+          .exec(
+            "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.invite_create' AND operation_id=?",
+            userId,
+            b.operation_id,
+          )
+          .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        if (idem) {
+          if (idem.request_hash !== requestHash) return { kind: "conflict" };
+          return { kind: "cached", responseJson: idem.response_json ?? "{}" };
+        }
+
+        const meta = this.ctx.storage.sql
+          .exec("SELECT status FROM channel_meta WHERE channel_id=?", channelId)
+          .toArray()[0] as { status: string } | undefined;
+        if (!meta) return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
+        if (meta.status === "dissolved") {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
+        }
+
+        const role = this.activeRole(channelId, userId);
+        if (role !== "owner" && role !== "admin") {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner or admin may create invite", retryable: false } }) };
+        }
+
+        this.ctx.storage.sql.exec(
+          "INSERT INTO invites (invite_code, created_by, expires_at, max_uses, used_count, revoked_at, created_at) VALUES (?, ?, ?, ?, 0, NULL, ?)",
+          inviteCode,
+          userId,
+          expiresAt,
+          maxUses,
+          now,
+        );
+        this.ctx.storage.sql.exec(
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.invite_create', ?, ?, ?, 'completed', ?, ?)",
+          userId,
+          b.operation_id,
+          requestHash,
+          responseJson,
+          now,
+          idemExpiresAt,
+        );
+        this.ctx.storage.sql.exec(
+          "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'invite_directory', ?, ?, ?, 'pending', ?, ?, ?, 0, 5)",
+          outboxId,
+          inviteCode,
+          outboxEventId,
+          JSON.stringify({ invite_code: inviteCode, channel_id: channelId, status: "active", expires_at: expiresAt, revoked_at: null }),
+          now,
+          now,
+          now,
+        );
+
+        return { kind: "ok", responseJson, outboxId };
+      });
+
+      if (txResult.kind === "conflict") {
+        return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: 409 });
+      }
+      if (txResult.kind === "cached") {
+        return this.cachedResponse(txResult.responseJson);
+      }
+
+      await this.flushSingleInviteDirectoryOutbox(txResult.outboxId, now);
+      await this.scheduleOutboxAlarm(now);
+      return Response.json(JSON.parse(txResult.responseJson));
     }
 
     if (url.pathname === "/internal/dissolve") {

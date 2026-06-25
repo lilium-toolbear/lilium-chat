@@ -9,6 +9,7 @@ import { listChannelsHandler, channelDetailHandler } from "./routes/channels";
 import { listMessagesHandler } from "./routes/messages";
 import { eventsHandler } from "./routes/events";
 import {
+  createInviteHandler,
   addMemberHandler,
   createChannelHandler,
   dissolveChannelHandler,
@@ -59,6 +60,7 @@ app.post("/api/chat/channels", (c) => createChannelHandler(c));
 app.patch("/api/chat/channels/:channel_id", (c) => updateChannelHandler(c));
 app.post("/api/chat/channels/:channel_id/dissolve", (c) => dissolveChannelHandler(c));
 app.post("/api/chat/channels/:channel_id/owner-transfer", (c) => ownerTransferHandler(c));
+app.post("/api/chat/channels/:channel_id/invites", (c) => createInviteHandler(c));
 app.post("/api/chat/channels/:channel_id/members", (c) => addMemberHandler(c));
 app.get("/api/chat/channels/:channel_id/members", (c) => listMembersHandler(c));
 app.get("/api/chat/channels/:channel_id/members/:user_id", (c) => getMemberHandler(c));
