@@ -20,7 +20,12 @@
 - **`projectMessageForBrowser` / `channel_summary` reuse.** The join response's `channel` field is the same `ChannelDetail` projection used by `GET /channels/:id` (built from `channel_meta` + resolved profile + last message). The `membership` field is `{role, joined_at}`. No new serializer.
 - **Public directory row shape.** `public_channels` columns: `channel_id, title, avatar_url, member_count, last_message_at, status, updated_at` (already in the migration). The contract §5.6 response shape adds `kind, visibility, role, unread_count, last_read_event_id, last_message_preview` — these are NOT stored in `public_channels`; they are joined at read time:
   - `kind`, `visibility` — fixed to `'channel'` / `'public_listed'` for every row in the directory (the directory only contains public_listed channels, so these are constants; we still return them for shape parity).
-  - `role`, `unread_count`, `last_read_event_id` — require the calling user's `my_channels` row. ChannelDirectory does NOT own user state. The Worker handler resolves these by calling `UserDirectory(user_id)/internal/my-channels-index` for the caller's `my_channels` map and merging. If the caller is not a member, `role=null, unread_count=0, last_read_event_id=null`.
+  - `role`, `unread_count`, `last_read_event_id` — require the calling user's membership + read-state. **`UserDirectory.my_channels` does NOT store `role`** (schema: `user_id/channel_id/kind/joined_at/left_at/removed_at/status/membership_version/last_read_event_id`); the existing `/internal/my-channels` returns only `{channel_id, kind, last_read_event_id, membership_version}`. So `role` is NOT fetched from UserDirectory. The Worker handler resolves membership in two steps:
+    1. `UserDirectory(user_id)/internal/my-channels` (existing, line 88 of user-directory.ts) → set of `channel_id` where the caller is an **active** member, plus `last_read_event_id` per channel. This gives `last_read_event_id` (directly) and the membership boolean (channel_id in the active set).
+    2. For each directory row whose `channel_id` is in the caller's active set, fetch `role` from `ChatChannel(channel_id)/internal/summary` (existing handler, line 719 of chat-channel.ts — it already resolves `role` for the `X-Verified-User-Id` caller and returns it in the summary). Batch this as one `summary` fetch per joined channel in the page (worst case 50 fetches; acceptable for a directory list and avoids expanding UserDirectory's projection).
+    3. If the caller is not an active member of a row's channel → `role=null, unread_count=0, last_read_event_id=null`.
+    4. `unread_count` is set to `0` for all directory rows (computing real unread for arbitrary public channels is expensive and not needed for the discover list; the left rail already shows unread for joined channels). Documented in contract v2.9.
+    This keeps `UserDirectory.my_channels` schema unchanged (no Phase 6 migration of user state) and reuses the existing `ChatChannel/internal/summary` which already returns `role`.
   - `last_message_preview`, `last_message_at` — stored in `public_channels.last_message_at` (projected); `last_message_preview` is NOT stored (preview text is not in the read model to avoid stale/profanity issues). The Worker handler sets `last_message_preview=null` (the directory UI shows member_count + last_message_at only). A future plan can backfill preview; out of scope here.
 - **Do NOT push or deploy.** Commit using the repo default git config.
 - **Test config:** `npx vitest run <files> --no-file-parallelism --test-timeout=60000 --hook-timeout=60000`. Typecheck: `npm run typecheck`.
@@ -70,13 +75,14 @@
 - Test: `test/do/channel-directory.test.ts`
 
 **Interfaces:**
-- `/internal/apply-projection` (POST): body `{ action: "upsert" | "delete", channel_id, title?, avatar_url?, member_count?, last_message_at?, status? }`. For `upsert`: `INSERT ... ON CONFLICT(channel_id) DO UPDATE SET title=excluded.title, avatar_url=excluded.avatar_url, member_count=excluded.member_count, last_message_at=excluded.last_message_at, status=excluded.status, updated_at=<now>` (only update fields that are present in the payload; absent fields keep existing values — use `COALESCE(excluded.X, public_channels.X)`). For `delete`: `DELETE FROM public_channels WHERE channel_id=?`. Idempotent: repeated upsert with same payload yields same row; repeated delete is a no-op. Returns `{ok:true}`.
-- `/internal/list` (GET, query `?q=&limit=&cursor=`): returns `{ items: PublicChannelRow[], next_cursor: string | null }` where `PublicChannelRow = { channel_id, title, avatar_url, member_count, last_message_at, status, updated_at }`. Filter `status='active'` always. `q` → `WHERE title LIKE '%' || ? || '%'`. Cursor → opaque `updated_at || channel_id` tuple (keyset pagination, stable order). `limit` default 50, max 100.
+- `/internal/apply-projection` (POST): body `{ action: "upsert" | "delete", channel_id, fields?: { title?, avatar_url?, member_count?, last_message_at?, status? }, fields_present?: string[] }`. For `upsert`: dynamically build the `SET` clause from `fields_present` (the list of keys actually present in `fields`) so that a field explicitly set to `null` (e.g. `avatar_url=null`) is written as `NULL`, while absent fields keep their existing value. **Do NOT use `COALESCE(excluded.X, public_channels.X)`** (P1-2 closure: COALESCE cannot distinguish "absent" from "explicit null" for nullable columns like `avatar_url`/`last_message_at`). Implementation: build `SET title=excluded.title, avatar_url=excluded.avatar_url, ...` only for keys in `fields_present`, always set `updated_at=<now>`. Use `INSERT ... ON CONFLICT(channel_id) DO UPDATE SET <built-clause>`. For `delete`: `DELETE FROM public_channels WHERE channel_id=?`. Idempotent: repeated upsert with same payload yields same row; repeated delete is a no-op. Returns `{ok:true}`.
+- `/internal/list` (GET, query `?q=&limit=&cursor=`): returns `{ items: PublicChannelRow[], next_cursor: string | null }` where `PublicChannelRow = { channel_id, title, avatar_url, member_count, last_message_at, status, updated_at }`. Filter `status='active'` always. `q` → `WHERE title LIKE '%' || ? || '%'`. **Sort order (P1-1 closure, authoritative for both backend and frontend):** `ORDER BY COALESCE(last_message_at, updated_at) DESC, channel_id DESC` — most-recently-active first, ties broken by `channel_id` descending. Cursor → opaque base64url of `JSON.stringify({ last_activity: <COALESCE(last_message_at, updated_at)>, channel_id })` (keyset pagination on the same sort tuple). `limit` default 50, max 100.
 
 - [ ] **Step 1: Write failing tests** (`test/do/channel-directory.test.ts`):
-  - upsert inserts new row; second upsert updates only provided fields; absent fields preserved.
+  - upsert inserts new row; second upsert with a subset of fields updates only those fields; absent fields preserved.
+  - upsert with `avatar_url=null` explicitly (in `fields_present`) writes `NULL` to the column (P1-2: not preserved as old value).
   - delete removes row; second delete is no-op (200).
-  - list returns only `status='active'`; `q` filters by title substring; cursor paginates correctly; limit clamped to 100.
+  - list returns only `status='active'`; `q` filters by title substring; cursor paginates correctly on the `COALESCE(last_message_at, updated_at) DESC, channel_id DESC` order; limit clamped to 100; rows with null `last_message_at` sort by `updated_at`.
 - [ ] **Step 2: Implement** `/internal/apply-projection` + `/internal/list` in `src/do/channel-directory.ts`.
 - [ ] **Step 3:** Run `npx vitest run test/do/channel-directory.test.ts --no-file-parallelism --test-timeout=60000 --hook-timeout=60000`. Green.
 - [ ] **Step 4:** `npm run typecheck`. Clean.
@@ -138,18 +144,25 @@ git commit -m "feat(do): ChatChannel channel_directory projection outbox + flush
 - Test: `test/do/chat-channel-join.test.ts`
 
 **Behavior changes to `/internal/join`:**
-- Accept optional body field `operation_id: string`. When present:
-  - Pre-check: `SELECT response_json FROM idempotency_keys WHERE operation='channel.join' AND operation_id=?`. If hit, return the cached JSON (200). If the same `operation_id` exists with a different `request_hash` → return `409 IDEMPOTENCY_CONFLICT`. Compute `request_hash` from `{user_id, channel_id}` (the only body fields that matter for join; there is no user-supplied mutation body beyond identity).
-  - After the member upsert + event + outbox writes, write `idempotency_keys(operation='channel.join', operation_id=<operation_id>, request_hash, response_json=<full response>)` co-atomic with the rest. The full response is `{ channel_id, membership_version, joined_at }` (existing shape) — the Worker handler will inflate it to `{channel, membership}` using a fresh `channel_detail` fetch + profile resolve, so the cached response stores the raw `{channel_id, membership_version, joined_at}` and the Worker re-inflates. (Rationale: the cached `ChannelDetail` would go stale on title/avatar changes; re-inflation keeps it fresh. The idempotency guarantee is on the membership mutation, not the channel snapshot.)
+- Accept optional body field `operation_id: string`. When present, all idempotency operations are **principal-scoped** (P0-2 closure): `principal_kind='user'`, `principal_id=<caller user_id>` (from `X-Verified-User-Id`), `operation='channel.join'`, `operation_id=<operation_id>`. This matches the existing `idempotency_keys` schema (PK = `principal_kind, principal_id, operation, operation_id`) and the existing `message.send`/`message.edit`/`channel.owner_transfer` handlers (chat-channel.ts lines 213/252/426/1290/1517/1635). Never query or insert without `principal_kind='user' AND principal_id=?`.
+- Pre-check (when `operation_id` present): `SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.join' AND operation_id=?`. If hit and `request_hash` matches the current request hash → return cached `response_json` (200). If hit and `request_hash` differs → `409 IDEMPOTENCY_CONFLICT`. Compute `request_hash` from `{user_id, channel_id}` (the only body fields that matter for join).
+- **All three success branches write the idempotency row (P0-3 closure):** fresh join, rejoin (left/removed), and already-active-member no-op. The no-op branch MUST write the row so that a retry of the same `operation_id` after the user later leaves does NOT become a real rejoin mutation. The cached `response_json` stores the raw internal response `{ channel_id, membership_version, joined_at, role }` (see P0-4 for `role`). The Worker re-inflates `ChannelDetail` fresh on each call (rationale: `ChannelDetail` goes stale on title/avatar changes; the idempotency guarantee is on the membership mutation identity + role, not the channel snapshot). This is documented as a join-specific exception in contract Task D1: the cached response is the membership result; the `channel` field is re-inflated and may differ in transient fields (title/avatar) but the `membership` is stable.
+  - `request_hash` for the already-active-member no-op is still `{user_id, channel_id}` — the same as a fresh join. The differentiator is the existing membership state at execution time, not the request body. A retry with the same `operation_id` always returns the cached no-op result (even if the user later left), because the operation was committed as a no-op at first call. This is the correct idempotency semantics: the operation result is frozen at first execution.
+- `expires_at`: set to `now + 24h` (matches the existing `message.send`/`owner_transfer` idempotency expiry convention).
 - Visibility gate (NEW — current code joins regardless of visibility): before the member upsert, check `channel_meta.visibility`. If `!= 'public_listed'` AND the caller is not already a member → `403 FORBIDDEN` with `{error:{code:"FORBIDDEN", message:"channel is not publicly joinable"}}`. Already-a-member bypasses the gate (returns existing membership). System channel (`system-general`) bypasses the gate (legacy `ensureSystemJoined` path — it calls `/internal/join` without `operation_id`; the gate only applies when `operation_id` is present OR we explicitly gate always-on for public join — see design decision below).
   - **Design decision:** the visibility gate applies **always** (regardless of `operation_id` presence). `ensureSystemJoined` already only calls join for the system channel which has `visibility='public_listed'` (set at creation in `maybe-create-system`), so the gate passes. This keeps the gate simple and prevents any internal caller from accidentally joining a private channel. Add a test asserting `ensureSystemJoined` still works after the gate.
 - `channel_meta.status='dissolved'` → `409 CHANNEL_DISSOLVED` (current code already does this — keep).
 - `channel_meta.kind='dm'` → `403 FORBIDDEN` (DMs are not joinable; no DM creation is exposed yet but defend now).
 - **Rejoin semantics (P0-3 closure):** when the caller has an existing `members` row with `left_at IS NOT NULL` (status `left` or `removed`), the handler treats this as a re-join, NOT as the "already-a-member" idempotent branch:
   - The visibility gate still applies (`public_listed` required; a `left`/`removed` user rejoining a private channel → `403 FORBIDDEN`). Rationale: `left`/`removed` means the user is no longer a member, so they must meet the same join precondition as a fresh joiner.
-  - The existing member-upsert path runs: `UPDATE members SET joined_at=<now>, left_at=NULL, role='member' WHERE channel_id=? AND user_id=?` (current code line 660–665), bump `member_count`, emit `member.joined` event, write `user_directory` outbox (action=`join`) + `channel_directory` outbox (bumped count), and write the `idempotency_keys` row with the new `joined_at`. This is a real mutation, not a cached return.
-  - The "already-a-member" idempotent branch (return existing `joined_at`, no event, no count bump) applies ONLY when `left_at IS NULL` (active member).
+  - The existing member-upsert path runs: `UPDATE members SET joined_at=<now>, left_at=NULL, role='member' WHERE channel_id=? AND user_id=?` (current code line 660–665), bump `member_count`, emit `member.joined` event, write `user_directory` outbox (action=`join`) + `channel_directory` outbox (bumped count), and write the `idempotency_keys` row with the new `joined_at` and `role='member'`. This is a real mutation, not a cached return.
+  - The "already-a-member" idempotent branch (return existing `joined_at`, no event, no count bump) applies ONLY when `left_at IS NULL` (active member). **The active-member no-op returns the EXISTING `role`** (read from the `members` row — could be `owner`/`admin`/`member`), NOT a hardcoded `'member'`. This is P0-4: the API must reflect the caller's actual current role.
   - `role` on rejoin is reset to `'member'` (an admin/owner who left and rejoins becomes a member; this matches the current code and the design spec's "join path = member role" rule). If the channel needs to re-promote, that's a separate `PATCH /members/:id` call by an owner.
+- **Internal response now carries `role` (P0-4 closure):** the `/internal/join` response body changes from `{ channel_id, membership_version, joined_at }` to `{ channel_id, membership_version, joined_at, role }`. The `role` value:
+  - fresh join → `'member'`
+  - rejoin (left/removed) → `'member'` (reset)
+  - already-active-member no-op → the existing `members.role` value (could be `owner`/`admin`/`member`)
+  The Worker `joinChannelHandler` uses this `role` to build `membership.role` (no hardcoded `'member'`). The cached `idempotency_keys.response_json` includes `role` so the cached retry returns the same role.
 
 - [ ] **Step 1: Write failing tests** (`test/do/chat-channel-join.test.ts`):
   - join public_listed channel as non-member → 200, member row inserted, `member.joined` event, `user_directory` outbox, `channel_directory` outbox with bumped count, `idempotency_keys` row (when `operation_id` provided).
@@ -159,7 +172,9 @@ git commit -m "feat(do): ChatChannel channel_directory projection outbox + flush
   - join `public_unlisted` channel as non-member → `403 FORBIDDEN`.
   - join dissolved channel → `409 CHANNEL_DISSOLVED`.
   - join `kind='dm'` channel → `403 FORBIDDEN`.
-  - already-active-member join (`left_at IS NULL`) → 200, returns existing `joined_at`/`membership_version`, no duplicate event, no `member_count` bump, no `member.joined` event.
+  - already-active-member join (`left_at IS NULL`) → 200, returns existing `joined_at`/`membership_version`/existing `role` (NOT reset to member), no duplicate event, no `member_count` bump, no `member.joined` event, **idempotency_keys row IS written** (P0-3: no-op success must be cached so a later retry after leave does not become a rejoin).
+  - already-active-owner join → `role='owner'` in response (P0-4).
+  - cached retry of an already-active-member no-op returns the cached `role`/`joined_at` even after the user later leaves (the operation result is frozen at first execution).
   - rejoin as a `left` user (`left_at` set) on a public channel → 200, `joined_at` updated to now, `left_at=NULL`, `role='member'`, `member.joined` event emitted, `member_count` bumped, `user_directory` + `channel_directory` outbox written.
   - rejoin as a `removed` user (`left_at` set) on a public channel → same as `left` rejoin (removed users can rejoin public channels via the join endpoint).
   - rejoin as a `left` user on a private channel → `403 FORBIDDEN` (visibility gate applies to rejoin too).
@@ -190,9 +205,9 @@ git commit -m "feat(do): ChatChannel /internal/join idempotency + public visibil
 4. `stub = env.CHAT_CHANNEL.getByName(routeName)`.
 5. `res = await stub.fetch(new Request("https://x/internal/join", { method:"POST", headers:{"X-Verified-User-Id": userId, "Content-Type":"application/json"}, body: JSON.stringify({ user_id: userId, operation_id: idempotencyKey }) }))`.
 6. Map `res.status`: 200 → continue; 403 → `FORBIDDEN`; 409 → parse `{error.code}` → `CHANNEL_DISSOLVED` or `IDEMPOTENCY_CONFLICT`; else → `CHAT_WORKER_UNAVAILABLE`.
-7. On 200: `joinBody = await res.json()` → `{channel_id, membership_version, joined_at}`. Then fetch the full `ChannelDetail` via `stub.fetch("/internal/summary", {headers:{X-Verified-User-Id: userId}})` (existing handler) and resolve profiles via `resolveUserSummaries`. Build `membership = { role: "member", joined_at: joinBody.joined_at }`. Return `c.json({ channel: detail, membership }, 200, {"X-Request-Id": ...})`.
+7. On 200: `joinBody = await res.json()` → `{channel_id, membership_version, joined_at, role}` (P0-4: `role` comes from the internal response, not hardcoded). Then fetch the full `ChannelDetail` via `stub.fetch("/internal/summary", {headers:{X-Verified-User-Id: userId}})` (existing handler) and resolve profiles via `resolveUserSummaries`. Build `membership = { role: joinBody.role, joined_at: joinBody.joined_at }`. Return `c.json({ channel: detail, membership }, 200, {"X-Request-Id": ...})`.
 
-- [ ] **Step 1: Write failing tests** (`test/routes/channel-join.test.ts`): full HTTP flow for public join, private→403, dissolved→409, already-member→200 with existing `joined_at`, missing `Idempotency-Key`→400, duplicate `Idempotency-Key`→cached, response shape `{channel, membership}`.
+- [ ] **Step 1: Write failing tests** (`test/routes/channel-join.test.ts`): full HTTP flow for public join (fresh → `membership.role='member'`), private→403, dissolved→409, already-active-member→200 with existing `joined_at` AND existing `role` (assert an already-owner joining returns `membership.role='owner'`, not `'member'`), missing `Idempotency-Key`→400, duplicate `Idempotency-Key`→cached (assert cached `membership.role` matches the first call), rejoin of a `left` former-admin → `membership.role='member'` (reset), response shape `{channel, membership}`.
 - [ ] **Step 2: Implement** `joinChannelHandler` + register `app.post("/api/chat/channels/:channel_id/join", ...)` in `src/index.ts`.
 - [ ] **Step 3:** Run `npx vitest run test/routes/channel-join.test.ts --no-file-parallelism --test-timeout=60000 --hook-timeout=60000`. Green.
 - [ ] **Step 4:** `npm run typecheck`. Clean.
@@ -219,7 +234,10 @@ git commit -m "feat(routes): POST /api/chat/channels/:channel_id/join"
 3. `dirStub = env.CHANNEL_DIRECTORY.getByName("shared")`.
 4. `res = await dirStub.fetch(new Request("https://x/internal/list?q="+encodeURIComponent(q)+"&limit="+limit+(cursor?"&cursor="+cursor:"")))`.
 5. `dirBody = await res.json()` → `{ items: PublicChannelRow[], next_cursor }`.
-6. Merge caller's membership/read-state: `udStub = env.USER_DIRECTORY.getByName(userId)`; `udRes = await udStub.fetch(new Request("https://x/internal/my-channels-index"))` → `{ [channel_id]: { role, last_read_event_id, status } }`. (If this internal endpoint does not exist yet, add a thin one in Task C2; see below.)
+6. **Membership + read-state merge (two-step, P0-1 closure):**
+   a. `udStub = env.USER_DIRECTORY.getByName(userId)`; `udRes = await udStub.fetch(new Request("https://x/internal/my-channels", { headers: { "X-Verified-User-Id": userId } }))` → existing endpoint (user-directory.ts line 88) returns `[{ channel_id, kind, last_read_event_id, membership_version }]` for active memberships. Build `activeChannelIds: Set<string>` and `lastReadByChannel: Map<ChatId, ChatId | null>` from this.
+   b. For each `item` in `dirBody.items` whose `channel_id` is in `activeChannelIds`: fetch `role` via `ChatChannel(channel_id)/internal/summary` (existing handler, chat-channel.ts line 719 — pass `X-Verified-User-Id: userId`). The summary returns `{ role, ... }`. Build `roleByChannel: Map<ChatId, ChannelRole>`. Run these fetches concurrently with `Promise.all` (worst case `limit` fetches; `limit` max 100, but directory default 50 — acceptable; each is a cheap single-row read).
+   c. If a `channel_id` is NOT in `activeChannelIds` → `role=null, last_read_event_id=null`.
 7. For each `item` in `items`: build the contract §5.6 row:
    ```json
    {
@@ -229,35 +247,30 @@ git commit -m "feat(routes): POST /api/chat/channels/:channel_id/join"
      "title": item.title,
      "avatar_url": item.avatar_url,
      "member_count": item.member_count,
-     "role": udMap[item.channel_id]?.role ?? null,
+     "role": roleByChannel.get(item.channel_id) ?? null,
      "status": "active",
      "unread_count": 0,
-     "last_read_event_id": udMap[item.channel_id]?.last_read_event_id ?? null,
+     "last_read_event_id": lastReadByChannel.get(item.channel_id) ?? null,
      "last_message_preview": null,
      "last_message_at": item.last_message_at
    }
    ```
-   `unread_count` is set to 0 here (computing real unread for arbitrary public channels is expensive and not needed for the directory list — the UI shows unread only for joined channels in the left rail, not in the discover list). Document this in the contract patch.
+   `unread_count` is set to 0 for all directory rows (see Global Constraints). `last_message_preview` is `null` (not stored).
 8. Return `c.json({ items: mergedRows, next_cursor: dirBody.next_cursor }, 200, {"X-Request-Id": ...})`.
 
-### Task C2: UserDirectory `/internal/my-channels-index` (if missing)
+### Task C2: UserDirectory — no change needed (P1-3 closure)
 
-**Files:**
-- Modify: `src/do/user-directory.ts` (only if the endpoint does not already exist — check first)
-- Test: (covered by Task C1 route test)
+**Files:** (none — Task C2 deleted)
 
-- [ ] **Step 1:** Check `src/do/user-directory.ts` for an existing `/internal/my-channels-index` or equivalent that returns a `{channel_id: {role, last_read_event_id, status}}` map. If it exists, skip this task. If not, add a thin handler that returns the caller's `my_channels` rows as a JSON map (read-only, no outbox).
-- [ ] **Step 2:** (Only if added) commit:
-```bash
-git add src/do/user-directory.ts
-git commit -m "feat(do): UserDirectory /internal/my-channels-index read endpoint"
-```
+The existing `UserDirectory/internal/my-channels` (user-directory.ts line 88) already returns the active-membership set + `last_read_event_id` that Task C1 needs. `role` is fetched from `ChatChannel/internal/summary` (existing). **No modification to `src/do/user-directory.ts` is required.** The earlier draft's `/internal/my-channels-index` is removed; `user-directory.ts` stays in the "Do NOT touch" list.
 
-- [ ] **Step 3: Write failing tests** (`test/routes/channel-directory.test.ts`): pagination, `q` filter, membership merge (caller is member of one of the listed channels → `role`/`last_read_event_id` populated; non-member → null), shape parity with §5.6, `kind='channel'` + `visibility='public_listed'` constants, `last_message_preview=null`, `unread_count=0`.
-- [ ] **Step 4: Implement** `listPublicDirectoryHandler` + register `app.get("/api/chat/channels/directory", ...)` in `src/index.ts`.
-- [ ] **Step 5:** Run `npx vitest run test/routes/channel-directory.test.ts --no-file-parallelism --test-timeout=60000 --hook-timeout=60000`. Green.
-- [ ] **Step 6:** `npm run typecheck`. Clean.
-- [ ] **Step 7:** Commit:
+### Task C1 (continued): tests + implementation
+
+- [ ] **Step 1: Write failing tests** (`test/routes/channel-directory.test.ts`): pagination, `q` filter, **two-step membership merge** (caller is active member of one listed channel → `role` fetched from that channel's `/internal/summary` + `last_read_event_id` from UserDirectory; non-member → `role=null, last_read_event_id=null`), shape parity with §5.6, `kind='channel'` + `visibility='public_listed'` constants, `last_message_preview=null`, `unread_count=0`. Assert that `UserDirectory/internal/my-channels` is called once (not per-row) and `ChatChannel/internal/summary` is called once per active-member row.
+- [ ] **Step 2: Implement** `listPublicDirectoryHandler` + register `app.get("/api/chat/channels/directory", ...)` in `src/index.ts`.
+- [ ] **Step 3:** Run `npx vitest run test/routes/channel-directory.test.ts --no-file-parallelism --test-timeout=60000 --hook-timeout=60000`. Green.
+- [ ] **Step 4:** `npm run typecheck`. Clean.
+- [ ] **Step 5:** Commit:
 ```bash
 git add src/routes/channel-mutations.ts src/index.ts test/routes/channel-directory.test.ts
 git commit -m "feat(routes): GET /api/chat/channels/directory public catalog"
@@ -272,7 +285,7 @@ git commit -m "feat(routes): GET /api/chat/channels/directory public catalog"
 **Files:**
 - Modify: `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`
 
-- [ ] **Step 1:** Edit §1.1 routes table: change `GET /api/chat/channels/{channel_id}/public-catalog` → `GET /api/chat/channels/directory` (remove the erroneous `{channel_id}`). Add a revision entry `v2.9 (2026-06-26): Phase 6 tail — public directory + join implemented; §1.1 route corrected to /channels/directory (matches §5.6); directory row shape finalized (last_message_preview=null, unread_count=0, kind/visibility constants)`.
+- [ ] **Step 1:** Edit §1.1 routes table: change `GET /api/chat/channels/{channel_id}/public-catalog` → `GET /api/chat/channels/directory` (remove the erroneous `{channel_id}`). Add a revision entry `v2.9 (2026-06-26): Phase 6 tail — public directory + join implemented; §1.1 route corrected to /channels/directory (matches §5.6); directory row shape finalized (last_message_preview=null, unread_count=0, kind/visibility constants); directory sort = COALESCE(last_message_at, updated_at) DESC, channel_id DESC; join idempotency cache exception documented (cached response = membership result {role, joined_at}; the `channel` field is re-inflated per call and may differ in transient fields like title/avatar, but membership is stable — this is a join-specific exception to the v4.0 "cache full ack payload" rule because ChannelDetail is mutable post-join while membership is not); join response `membership.role` reflects the caller's actual current role (owner/admin/member), not a hardcoded 'member'`.
 - [ ] **Step 2:** In §5.6, add a note clarifying `last_message_preview=null` and `unread_count=0` in the current implementation, and that `kind`/`visibility` are constants (`channel`/`public_listed`) for directory rows.
 - [ ] **Step 3:** Commit:
 ```bash
@@ -295,13 +308,13 @@ git commit -m "docs(chat): contract v2.9 — Phase 6 directory route + row shape
 
 ## Summary of task-body edits the executor makes
 
-- A1: `apply-projection` uses `INSERT ... ON CONFLICT DO UPDATE` with `COALESCE(excluded.X, public_channels.X)` so partial upserts preserve absent fields. `delete` is idempotent.
+- A1: `apply-projection` builds the `SET` clause dynamically from `fields_present` (NOT `COALESCE`) so explicit `null` writes work for `avatar_url`/`last_message_at`. `delete` is idempotent. `/internal/list` sorts by `COALESCE(last_message_at, updated_at) DESC, channel_id DESC`; cursor is a base64url keyset on that tuple.
 - A2: `channel_directory` outbox writes are co-atomic with each business txn (create-public, visibility transition, public title/topic/avatar update, member_count delta on join/add/remove/leave, message.send last_message_at, dissolve). `message.delete`/`recall` do NOT rewind `last_message_at`. Alarm flush branch mirrors `invite_directory`; dead_letter rows are repairable by a fresh outbox write since `apply-projection` is idempotent.
-- B1: visibility gate applies **always** (not gated on `operation_id` presence). `ensureSystemJoined` still passes because system channel is `public_listed`. `kind='dm'` → 403. Idempotency cache stores raw `{channel_id, membership_version, joined_at}`; Worker re-inflates to `{channel, membership}`. **Rejoin (`left`/`removed` users) is a real mutation** — runs the member-upsert path, emits `member.joined`, bumps count, resets `role='member'`, and is subject to the visibility gate. The "already-a-member" idempotent branch applies ONLY to active members (`left_at IS NULL`).
-- B2: Worker `joinChannelHandler` requires `Idempotency-Key`, calls `/internal/join` with `operation_id`, re-inflates the response via `/internal/summary` + profile resolve.
-- C1: `last_message_preview=null` and `unread_count=0` in directory rows (documented in contract). `kind='channel'`, `visibility='public_listed'` are constants.
-- C2: only add `/internal/my-channels-index` if it does not already exist.
-- D1: contract §1.1 route table corrected to `/channels/directory`; v2.9 revision entry.
+- B1: visibility gate applies **always**. `ensureSystemJoined` still passes. `kind='dm'` → 403. **Idempotency is principal-scoped** (`principal_kind='user', principal_id=userId`). **All three success branches (fresh/rejoin/active-no-op) write the idempotency row**; cached response includes `role`. Rejoin (`left`/`removed`) is a real mutation (member-upsert, `member.joined`, count bump, `role='member'` reset). Active-no-op returns the EXISTING `role` (could be owner/admin) and writes the row.
+- B2: Worker `joinChannelHandler` requires `Idempotency-Key`, calls `/internal/join` with `operation_id`, uses the internal response's `role` for `membership.role` (no hardcoded `'member'`), re-inflates `ChannelDetail` fresh.
+- C1: `role` fetched per active-member row from `ChatChannel/internal/summary` (NOT from UserDirectory — UserDirectory has no `role`); `last_read_event_id` + active-membership set from existing `UserDirectory/internal/my-channels`. `last_message_preview=null` and `unread_count=0`. `kind='channel'`, `visibility='public_listed'` constants.
+- C2: deleted — no `user-directory.ts` change needed.
+- D1: contract §1.1 route table corrected to `/channels/directory`; v2.9 revision entry documents the join idempotency cache exception (membership result cached, `channel` re-inflated).
 
 ---
 
