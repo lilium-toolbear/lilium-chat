@@ -107,6 +107,37 @@ async function presignFinalizeAndSend(channelId: string, userId: string, fake: F
   return { attachment_id: presignBody.attachment_id, message_id: sendBody.message.message_id };
 }
 
+async function presignAndFinalizeOnly(userId: string, fake: FakeS3): Promise<{ attachment_id: string; upload_url: string }> {
+  const key = `idem-attach-only-${userId}`;
+  const presignRes = await udStub(userId).fetch(
+    new Request("https://x/internal/attachment-presign", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": key, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: "img.png",
+        mime_type: "image/png",
+        size_bytes: 12345,
+        width: 512,
+        height: 512,
+        blurhash: "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
+      }),
+    }),
+  );
+  expect(presignRes.status).toBe(200);
+  const presignBody = (await presignRes.json()) as { attachment_id: string; upload_url: string };
+  fake.objects.set(new URL(presignBody.upload_url).pathname, { contentType: "image/png", contentLength: 12345 });
+
+  const finalizeRes = await udStub(userId).fetch(
+    new Request("https://x/internal/attachment-finalize", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": `${key}-fin`, "Content-Type": "application/json" },
+      body: JSON.stringify({ attachment_id: presignBody.attachment_id }),
+    }),
+  );
+  expect(finalizeRes.status).toBe(200);
+  return presignBody;
+}
+
 describe("ChatChannel /internal/resolve-visible-attachment", () => {
   let fake: FakeS3;
   beforeEach(() => {
@@ -173,5 +204,53 @@ describe("ChatChannel /internal/resolve-visible-attachment", () => {
       }),
     );
     expect(res.status).toBe(403);
+  });
+
+  it("returns the projection for a visible sticker message attachment (sticker source)", async () => {
+    const channelId = "ch-attach-sticker-src";
+    const userId = "u-attach-sticker-src";
+    const stub = await createChannel(channelId, userId);
+    const { attachment_id } = await presignAndFinalizeOnly(userId, fake);
+
+    // Save the finalized attachment to the user's sticker library, then send a sticker message.
+    const saveRes = await udStub(userId).fetch(
+      new Request("https://x/internal/sticker-save", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+        body: JSON.stringify({ operation_id: `op-save-${userId}`, channel_id: channelId, attachment_id }),
+      }),
+    );
+    expect(saveRes.status).toBe(200);
+    const saveBody = (await saveRes.json()) as { sticker: { sticker_id: string } };
+
+    const sendRes = await stub.fetch(
+      new Request("https://x/internal/message-send", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          command_id: `cmd-sticker-${userId}`,
+          dedupe_principal_key: `user:${userId}`,
+          type: "sticker",
+          text: "",
+          reply_to: null,
+          sticker_id: saveBody.sticker.sticker_id,
+          attachment_ids: [],
+          mentions: [],
+          channel_id: channelId,
+        }),
+      }),
+    );
+    expect(sendRes.status).toBe(200);
+
+    const res = await stub.fetch(
+      new Request(`https://x/internal/resolve-visible-attachment?attachment_id=${encodeURIComponent(attachment_id)}`, {
+        headers: { "X-Verified-User-Id": userId },
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { attachment: { attachment_id: string; url: string; blurhash: string | null } };
+    expect(body.attachment.attachment_id).toBe(attachment_id);
+    expect(body.attachment.blurhash).toBe("LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB");
+    expect((body.attachment as Record<string, unknown>).storage_key).toBeUndefined();
   });
 });

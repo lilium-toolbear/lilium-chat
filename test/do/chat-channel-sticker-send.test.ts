@@ -157,7 +157,7 @@ describe("ChatChannel message.send type=sticker", () => {
       new Request("https://x/internal/sticker-delete", {
         method: "POST",
         headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({ sticker_id }),
+        body: JSON.stringify({ sticker_id, operation_id: `op-del-${userId}` }),
       }),
     );
     expect(delRes.status).toBe(200);

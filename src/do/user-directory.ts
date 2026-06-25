@@ -2,12 +2,13 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { uuidv7 } from "../ids/uuidv7";
 import { execSchema } from "./sql";
-import { projectAttachmentForBrowser, type AttachmentRow } from "../chat/attachment-projection";
+import { projectAttachmentForBrowser, projectFinalizedAttachmentForBrowser, type AttachmentRow } from "../chat/attachment-projection";
 import { presignPutUrl, headObject, deleteObject } from "../s3/presign";
 import { HTTP_STATUS_BY_CODE } from "../errors";
 
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const MAX_ATTACHMENT_SIZE_BYTES = 20 * 1024 * 1024; // 20 MiB
+const MAX_PERSONAL_STICKERS = 200; // contract §8.3 sticker library limit
 
 type PresignValidation =
   | { ok: false; error: string; code: string }
@@ -28,14 +29,15 @@ type StickerSourceAttachment = {
   width: number | null;
   height: number | null;
   size_bytes: number;
+  blurhash: string | null;
 };
 
 function validatePresignBody(body: {
   filename?: string;
   mime_type?: string;
   size_bytes?: number;
-  width?: number;
-  height?: number;
+  width?: number | null;
+  height?: number | null;
   blurhash?: string;
 }): PresignValidation {
   const filename = body.filename?.trim();
@@ -48,6 +50,12 @@ function validatePresignBody(body: {
   }
   if (typeof sizeBytes !== "number" || sizeBytes <= 0 || sizeBytes > MAX_ATTACHMENT_SIZE_BYTES) {
     return { ok: false, error: "attachment too large", code: "ATTACHMENT_TOO_LARGE" };
+  }
+  if (body.width != null && (typeof body.width !== "number" || !Number.isInteger(body.width) || body.width <= 0)) {
+    return { ok: false, error: "width must be a positive integer", code: "INVALID_MESSAGE" };
+  }
+  if (body.height != null && (typeof body.height !== "number" || !Number.isInteger(body.height) || body.height <= 0)) {
+    return { ok: false, error: "height must be a positive integer", code: "INVALID_MESSAGE" };
   }
   return {
     ok: true,
@@ -93,6 +101,7 @@ const SCHEMA = [
     width INTEGER,
     height INTEGER,
     size_bytes INTEGER NOT NULL,
+    blurhash TEXT,
     created_at TEXT NOT NULL,
     deleted_at TEXT,
     UNIQUE (user_id, attachment_id)
@@ -322,12 +331,12 @@ export class UserDirectory extends DurableObject<Env> {
       }
       const row = this.ctx.storage.sql
         .exec(
-          "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes FROM personal_stickers WHERE sticker_id=? AND user_id=? AND deleted_at IS NULL",
+          "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash FROM personal_stickers WHERE sticker_id=? AND user_id=? AND deleted_at IS NULL",
           stickerId,
           userId,
         )
         .toArray()[0] as
-        | { sticker_id: string; attachment_id: string; url: string; mime_type: string; width: number | null; height: number | null; size_bytes: number }
+        | { sticker_id: string; attachment_id: string; url: string; mime_type: string; width: number | null; height: number | null; size_bytes: number; blurhash: string | null }
         | undefined;
       if (!row) {
         return Response.json(
@@ -384,7 +393,7 @@ export class UserDirectory extends DurableObject<Env> {
         // Own finalized attachment path: no ChatChannel call needed.
         const ownRow = this.ctx.storage.sql
           .exec(
-            "SELECT attachment_id, url, mime_type, width, height, size_bytes FROM pending_attachments WHERE attachment_id=? AND owner_user_id=? AND status='finalized'",
+            "SELECT attachment_id, url, mime_type, width, height, size_bytes, blurhash FROM pending_attachments WHERE attachment_id=? AND owner_user_id=? AND status='finalized'",
             attachmentId,
             userId,
           )
@@ -450,17 +459,26 @@ export class UserDirectory extends DurableObject<Env> {
         const stickerId = existing?.sticker_id ?? newStickerId;
         if (existing) {
           if (existing.deleted_at !== null) {
+            // Restoring a soft-deleted row: this does not grow the library, so no limit check.
             this.ctx.storage.sql.exec(
-              "UPDATE personal_stickers SET deleted_at=NULL, created_at=? WHERE sticker_id=?",
+              "UPDATE personal_stickers SET deleted_at=NULL, blurhash=?, created_at=? WHERE sticker_id=?",
+              projection.blurhash ?? null,
               now,
               stickerId,
             );
           }
         } else {
+          // Library limit applies only to genuinely new items (contract §8.3).
+          const countRow = this.ctx.storage.sql
+            .exec("SELECT COUNT(*) AS n FROM personal_stickers WHERE user_id=? AND deleted_at IS NULL", userId)
+            .toArray()[0] as { n: number };
+          if (countRow.n >= MAX_PERSONAL_STICKERS) {
+            return { kind: "limit" as const };
+          }
           this.ctx.storage.sql.exec(
             `INSERT INTO personal_stickers (
-              sticker_id, user_id, attachment_id, url, mime_type, width, height, size_bytes, created_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+              sticker_id, user_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash, created_at, deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
             stickerId,
             userId,
             projection.attachment_id,
@@ -469,6 +487,7 @@ export class UserDirectory extends DurableObject<Env> {
             projection.width ?? null,
             projection.height ?? null,
             projection.size_bytes,
+            projection.blurhash ?? null,
             now,
           );
         }
@@ -476,12 +495,16 @@ export class UserDirectory extends DurableObject<Env> {
         const json = JSON.stringify({
           sticker: {
             sticker_id: stickerId,
-            attachment_id: projection.attachment_id,
-            url: projection.url,
-            mime_type: projection.mime_type,
-            width: projection.width,
-            height: projection.height,
-            size_bytes: projection.size_bytes,
+            attachment: {
+              attachment_id: projection.attachment_id,
+              url: projection.url,
+              mime_type: projection.mime_type,
+              width: projection.width,
+              height: projection.height,
+              size_bytes: projection.size_bytes,
+              blurhash: projection.blurhash,
+            },
+            created_at: now,
           },
         });
         this.ctx.storage.sql.exec(
@@ -504,6 +527,12 @@ export class UserDirectory extends DurableObject<Env> {
           { status: 409 },
         );
       }
+      if (saveResult.kind === "limit") {
+        return Response.json(
+          { error: { code: "STICKER_LIBRARY_LIMIT_EXCEEDED", message: "personal sticker library is full", retryable: false } },
+          { status: 409 },
+        );
+      }
       return new Response(saveResult.responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
@@ -515,7 +544,7 @@ export class UserDirectory extends DurableObject<Env> {
       const rows = cursor
         ? this.ctx.storage.sql
           .exec(
-            "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes, created_at FROM personal_stickers WHERE user_id=? AND deleted_at IS NULL AND created_at < ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash, created_at FROM personal_stickers WHERE user_id=? AND deleted_at IS NULL AND created_at < ? ORDER BY created_at DESC LIMIT ?",
             userId,
             cursor,
             limit,
@@ -523,12 +552,12 @@ export class UserDirectory extends DurableObject<Env> {
           .toArray()
         : this.ctx.storage.sql
           .exec(
-            "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes, created_at FROM personal_stickers WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
+            "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash, created_at FROM personal_stickers WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
             userId,
             limit,
           )
           .toArray();
-      const items = rows as Array<{
+      const raw = rows as Array<{
         sticker_id: string;
         attachment_id: string;
         url: string;
@@ -536,41 +565,102 @@ export class UserDirectory extends DurableObject<Env> {
         width: number | null;
         height: number | null;
         size_bytes: number;
+        blurhash: string | null;
         created_at: string;
       }>;
-      const nextCursor = items.length > 0 ? items[items.length - 1]!.created_at : null;
+      const items = raw.map((r) => ({
+        sticker_id: r.sticker_id,
+        attachment: {
+          attachment_id: r.attachment_id,
+          url: r.url,
+          mime_type: r.mime_type,
+          width: r.width,
+          height: r.height,
+          size_bytes: r.size_bytes,
+          blurhash: r.blurhash,
+        },
+        created_at: r.created_at,
+      }));
+      const nextCursor = items.length > 0 ? raw[raw.length - 1]!.created_at : null;
       return Response.json({ items, next_cursor: nextCursor });
     }
 
     if (url.pathname === "/internal/sticker-delete") {
       const userId = request.headers.get("X-Verified-User-Id");
       if (userId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
-      const body = (await request.json()) as { sticker_id?: string };
+      const body = (await request.json()) as { sticker_id?: string; operation_id?: string };
       const stickerId = body.sticker_id ?? "";
+      const operationId = body.operation_id ?? "";
       if (!stickerId) {
         return Response.json(
           { error: { code: "INVALID_MESSAGE", message: "sticker_id required", retryable: false } },
           { status: 422 },
         );
       }
+      if (!operationId) {
+        return Response.json(
+          { error: { code: "INVALID_MESSAGE", message: "operation_id required", retryable: false } },
+          { status: 422 },
+        );
+      }
 
+      const requestHash = JSON.stringify({ sticker_id: stickerId });
       const now = this.nowIso();
-      const row = this.ctx.storage.sql
-        .exec("SELECT user_id, deleted_at FROM personal_stickers WHERE sticker_id=?", stickerId)
-        .toArray()[0] as { user_id: string; deleted_at: string | null } | undefined;
-      if (row && row.user_id !== userId) {
+      const idemExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const responseJson = JSON.stringify({ sticker_id: stickerId, deleted: true });
+
+      const result = await this.ctx.storage.transaction(async () => {
+        const idem = this.ctx.storage.sql
+          .exec(
+            "SELECT request_hash, status, response_json FROM idempotency_keys WHERE operation='sticker.delete' AND operation_id=?",
+            operationId,
+          )
+          .toArray()[0] as { request_hash: string; status: string; response_json: string | null } | undefined;
+        if (idem) {
+          if (idem.request_hash !== requestHash) {
+            return { kind: "conflict" as const };
+          }
+          return { kind: "done" as const, responseJson: idem.response_json ?? responseJson };
+        }
+
+        const row = this.ctx.storage.sql
+          .exec("SELECT user_id, deleted_at FROM personal_stickers WHERE sticker_id=?", stickerId)
+          .toArray()[0] as { user_id: string; deleted_at: string | null } | undefined;
+        if (row && row.user_id !== userId) {
+          return { kind: "forbidden" as const };
+        }
+        // Idempotent soft-delete: no-op if already deleted or absent (contract §8.3).
+        this.ctx.storage.sql.exec(
+          "UPDATE personal_stickers SET deleted_at=? WHERE sticker_id=? AND user_id=? AND deleted_at IS NULL",
+          now,
+          stickerId,
+          userId,
+        );
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('sticker.delete', ?, ?, 'completed', NULL, ?, ?, ?, ?)",
+          operationId,
+          requestHash,
+          responseJson,
+          now,
+          now,
+          idemExpiresAt,
+        );
+        return { kind: "done" as const, responseJson };
+      });
+
+      if (result.kind === "conflict") {
+        return Response.json(
+          { error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } },
+          { status: 409 },
+        );
+      }
+      if (result.kind === "forbidden") {
         return Response.json(
           { error: { code: "FORBIDDEN", message: "sticker does not belong to user", retryable: false } },
           { status: 403 },
         );
       }
-      this.ctx.storage.sql.exec(
-        "UPDATE personal_stickers SET deleted_at=? WHERE sticker_id=? AND user_id=? AND deleted_at IS NULL",
-        now,
-        stickerId,
-        userId,
-      );
-      return Response.json({ ok: true });
+      return new Response(result.responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
     if (url.pathname === "/internal/attachment-presign") {
@@ -781,7 +871,7 @@ export class UserDirectory extends DurableObject<Env> {
         }
         if (row.status === "finalized") {
           // Idempotent without re-HEAD: build projection and cache it.
-          const projection = projectAttachmentForBrowser(row);
+          const projection = projectFinalizedAttachmentForBrowser(row);
           const responseJson = JSON.stringify({ attachment: projection });
           if (!idem) {
             // No prior idempotency row but attachment is already finalized: create one so future retries hit cache.
@@ -852,7 +942,7 @@ export class UserDirectory extends DurableObject<Env> {
             attachmentId,
           )
           .toArray()[0] as AttachmentRow | undefined;
-        const projection = projectAttachmentForBrowser(finalizedRow!);
+        const projection = projectFinalizedAttachmentForBrowser(finalizedRow!);
         const json = JSON.stringify({ attachment: projection });
         this.ctx.storage.sql.exec(
           "INSERT OR REPLACE INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('attachment.finalize', ?, ?, 'completed', ?, ?, COALESCE((SELECT created_at FROM idempotency_keys WHERE operation='attachment.finalize' AND operation_id=?), ?), ?, ?)",

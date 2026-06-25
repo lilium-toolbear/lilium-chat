@@ -484,18 +484,23 @@ export async function deleteStickerHandler(c: Context<{ Bindings: Env; Variables
   const { userId, env } = await getIdentity(c);
   const stickerId = c.req.param("sticker_id");
   if (!stickerId) throw new ApiError("STICKER_NOT_FOUND", "sticker not found");
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
   const stub = env.USER_DIRECTORY.getByName(userId);
   const res = await stub.fetch(new Request("https://x/internal/sticker-delete", {
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ sticker_id: stickerId }),
+    body: JSON.stringify({ sticker_id: stickerId, operation_id: idempotencyKey }),
   }));
   if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to delete sticker");
-  if (res.status === 404) throw new ApiError("STICKER_NOT_FOUND", "sticker not found");
+  if (res.status === 409) {
+    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
+    throw new ApiError(e.error?.code ?? "IDEMPOTENCY_CONFLICT", e.error?.message ?? "sticker delete conflict");
+  }
   if (res.status === 422) {
     const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
     throw new ApiError(e.error?.code ?? "INVALID_MESSAGE", e.error?.message ?? "invalid sticker delete");
   }
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "sticker delete failed");
-  return c.json({ sticker_id: stickerId, deleted: true }, 200, { "X-Request-Id": c.get("requestId") });
+  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
 }

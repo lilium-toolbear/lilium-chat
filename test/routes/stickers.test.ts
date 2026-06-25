@@ -147,8 +147,9 @@ describe("Sticker library HTTP routes", () => {
       attachment_id,
     }, `op-${userId}-save`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { sticker: { sticker_id: string; attachment_id: string } };
-    expect(body.sticker.attachment_id).toBe(attachment_id);
+    const body = (await res.json()) as { sticker: { sticker_id: string; attachment: { attachment_id: string; blurhash: string | null } } };
+    expect(body.sticker.attachment.attachment_id).toBe(attachment_id);
+    expect(body.sticker.attachment.blurhash).toBe("LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB");
   });
 
   it("GET /api/chat/stickers lists saved stickers", async () => {
@@ -164,7 +165,7 @@ describe("Sticker library HTTP routes", () => {
     expect(listBody.items).toHaveLength(1);
   });
 
-  it("DELETE /api/chat/stickers/:sticker_id removes a sticker", async () => {
+  it("DELETE /api/chat/stickers/:sticker_id removes a sticker and is idempotent", async () => {
     const userId = "u-sticker-route-del";
     const channelId = "ch-sticker-route-del";
     await createChannel(channelId, userId);
@@ -173,14 +174,33 @@ describe("Sticker library HTTP routes", () => {
     const saveRes = await authedReq(userId, "POST", "/api/chat/stickers", { channel_id: channelId, attachment_id }, `op-${userId}-save`);
     const saveBody = (await saveRes.json()) as { sticker: { sticker_id: string } };
 
-    const delRes = await authedReq(userId, "DELETE", `/api/chat/stickers/${saveBody.sticker.sticker_id}`);
+    const delOp = `op-${userId}-del`;
+    const delRes = await authedReq(userId, "DELETE", `/api/chat/stickers/${saveBody.sticker.sticker_id}`, undefined, delOp);
     expect(delRes.status).toBe(200);
     const delBody = (await delRes.json()) as { sticker_id: string; deleted: boolean };
     expect(delBody.deleted).toBe(true);
 
+    // Idempotent retry returns the same result.
+    const delRes2 = await authedReq(userId, "DELETE", `/api/chat/stickers/${saveBody.sticker.sticker_id}`, undefined, delOp);
+    expect(delRes2.status).toBe(200);
+    const delBody2 = (await delRes2.json()) as { sticker_id: string; deleted: boolean };
+    expect(delBody2.deleted).toBe(true);
+
     const listRes = await authedReq(userId, "GET", "/api/chat/stickers?limit=10");
     const listBody = (await listRes.json()) as { items: Array<unknown> };
     expect(listBody.items).toHaveLength(0);
+  });
+
+  it("rejects DELETE without Idempotency-Key", async () => {
+    const userId = "u-sticker-route-del-nokey";
+    const channelId = "ch-sticker-route-del-nokey";
+    await createChannel(channelId, userId);
+    const { attachment_id } = await presignAndFinalize(userId, fake);
+    const saveRes = await authedReq(userId, "POST", "/api/chat/stickers", { channel_id: channelId, attachment_id }, `op-${userId}-save`);
+    const saveBody = (await saveRes.json()) as { sticker: { sticker_id: string } };
+
+    const delRes = await authedReq(userId, "DELETE", `/api/chat/stickers/${saveBody.sticker.sticker_id}`);
+    expect(delRes.status).toBe(422);
   });
 
   it("saves a channel-visible attachment from another member's image message", async () => {
@@ -197,8 +217,50 @@ describe("Sticker library HTTP routes", () => {
       attachment_id,
     }, `op-${memberId}-visible`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { sticker: { attachment_id: string } };
-    expect(body.sticker.attachment_id).toBe(attachment_id);
+    const body = (await res.json()) as { sticker: { attachment: { attachment_id: string } } };
+    expect(body.sticker.attachment.attachment_id).toBe(attachment_id);
+  });
+
+  it("saves a channel-visible attachment from another member's sticker message", async () => {
+    const channelId = "ch-sticker-route-sticker-src";
+    const ownerId = "u-sticker-route-sticker-owner";
+    const memberId = "u-sticker-route-sticker-member";
+    await createChannel(channelId, ownerId);
+    await addMember(channelId, ownerId, memberId);
+    const { attachment_id } = await presignAndFinalize(ownerId, fake);
+
+    // Owner saves the finalized attachment to their own library, then sends a sticker message.
+    const saveRes = await authedReq(ownerId, "POST", "/api/chat/stickers", { channel_id: channelId, attachment_id }, `op-${ownerId}-lib`);
+    expect(saveRes.status).toBe(200);
+    const saveBody = (await saveRes.json()) as { sticker: { sticker_id: string } };
+
+    const sendRes = await chatStub(channelId).fetch(
+      new Request("https://x/internal/message-send", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          command_id: `cmd-sticker-route-msg-${ownerId}`,
+          dedupe_principal_key: `user:${ownerId}`,
+          type: "sticker",
+          text: "",
+          reply_to: null,
+          sticker_id: saveBody.sticker.sticker_id,
+          attachment_ids: [],
+          mentions: [],
+          channel_id: channelId,
+        }),
+      }),
+    );
+    expect(sendRes.status).toBe(200);
+
+    // Member saves the sticker from the owner's sticker message using its canonical attachment_id.
+    const res = await authedReq(memberId, "POST", "/api/chat/stickers", {
+      channel_id: channelId,
+      attachment_id,
+    }, `op-${memberId}-sticker-src`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { sticker: { attachment: { attachment_id: string } } };
+    expect(body.sticker.attachment.attachment_id).toBe(attachment_id);
   });
 
   it("is idempotent on retry", async () => {

@@ -25,6 +25,7 @@ export interface MessageStickerSnapshot {
   width: number | null;
   height: number | null;
   size_bytes: number;
+  blurhash: string | null;
 }
 
 export function projectMessageForBrowser(

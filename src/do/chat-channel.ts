@@ -71,7 +71,8 @@ const SCHEMA = [
   )`,
   `CREATE TABLE IF NOT EXISTS message_stickers (
     message_id TEXT PRIMARY KEY, sticker_id TEXT NOT NULL, attachment_id TEXT NOT NULL,
-    url TEXT NOT NULL, mime_type TEXT NOT NULL, width INTEGER, height INTEGER, size_bytes INTEGER NOT NULL
+    url TEXT NOT NULL, mime_type TEXT NOT NULL, width INTEGER, height INTEGER, size_bytes INTEGER NOT NULL,
+    blurhash TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS mentions (
     message_id TEXT NOT NULL, user_id TEXT NOT NULL, start INTEGER NOT NULL, end_ INTEGER NOT NULL,
@@ -962,7 +963,7 @@ export class ChatChannel extends DurableObject<Env> {
         }
         const stickerRows = this.ctx.storage.sql
           .exec(
-            `SELECT message_id, sticker_id, attachment_id, url, mime_type, width, height, size_bytes FROM message_stickers WHERE message_id IN (${placeholders})`,
+            `SELECT message_id, sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash FROM message_stickers WHERE message_id IN (${placeholders})`,
             ...messageIds,
           )
           .toArray() as unknown as Array<MessageStickerSnapshot & { message_id: string }>;
@@ -1369,8 +1370,8 @@ export class ChatChannel extends DurableObject<Env> {
         if (stickerSnapshot) {
           this.ctx.storage.sql.exec(
             `INSERT INTO message_stickers (
-              message_id, sticker_id, attachment_id, url, mime_type, width, height, size_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              message_id, sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             messageId,
             stickerSnapshot.sticker_id,
             stickerSnapshot.attachment_id,
@@ -1379,6 +1380,7 @@ export class ChatChannel extends DurableObject<Env> {
             stickerSnapshot.width,
             stickerSnapshot.height,
             stickerSnapshot.size_bytes,
+            stickerSnapshot.blurhash ?? null,
           );
         }
         this.ctx.storage.sql.exec(
@@ -1470,9 +1472,23 @@ export class ChatChannel extends DurableObject<Env> {
         );
       }
 
-      const rows = this.ctx.storage.sql
+      // A sticker save source can be either (a) a channel-visible image message attachment
+      // (attachments JOIN message_attachments JOIN messages) or (b) a channel-visible sticker
+      // message (message_stickers JOIN messages). Contract §8.3: both are valid save sources.
+      type SourceRow = {
+        attachment_id: string;
+        url: string;
+        mime_type: string;
+        width: number | null;
+        height: number | null;
+        size_bytes: number;
+        blurhash: string | null;
+        status: string;
+        type: string;
+      };
+      const imageRows = this.ctx.storage.sql
         .exec(
-          `SELECT a.attachment_id, a.url, a.mime_type, a.width, a.height, a.size_bytes, m.status, m.type
+          `SELECT a.attachment_id, a.url, a.mime_type, a.width, a.height, a.size_bytes, a.blurhash, m.status, m.type
            FROM attachments a
            JOIN message_attachments ma ON a.attachment_id = ma.attachment_id
            JOIN messages m ON m.message_id = ma.message_id
@@ -1480,42 +1496,39 @@ export class ChatChannel extends DurableObject<Env> {
           attachmentId,
           meta.channel_id,
         )
-        .toArray() as Array<{
-          attachment_id: string;
-          url: string;
-          mime_type: string;
-          width: number;
-          height: number;
-          size_bytes: number;
-          status: string;
-          type: string;
-        }>;
-      if (rows.length === 0) {
-        return Response.json(
-          { error: { code: "ATTACHMENT_NOT_FOUND", message: "attachment not found in channel", retryable: false } },
-          { status: 404 },
-        );
-      }
+        .toArray() as unknown as SourceRow[];
+      const stickerRows = this.ctx.storage.sql
+        .exec(
+          `SELECT ms.attachment_id, ms.url, ms.mime_type, ms.width, ms.height, ms.size_bytes, ms.blurhash, m.status, m.type
+           FROM message_stickers ms
+           JOIN messages m ON m.message_id = ms.message_id
+           WHERE ms.attachment_id=? AND m.channel_id=?`,
+          attachmentId,
+          meta.channel_id,
+        )
+        .toArray() as unknown as SourceRow[];
+      const rows = [...imageRows, ...stickerRows];
 
-      const visible = rows.some(
+      const visibleRow = rows.find(
         (r) => (r.status === "normal" || r.status === "edited") && (r.type === "image" || r.type === "sticker"),
       );
-      if (!visible) {
+      if (!visibleRow) {
+        // No visible image/sticker message carries this attachment in this channel.
         return Response.json(
           { error: { code: "INVALID_STICKER_SOURCE", message: "attachment is not a visible image or sticker", retryable: false } },
           { status: 422 },
         );
       }
 
-      const row = rows[0]!;
       return Response.json({
         attachment: {
-          attachment_id: row.attachment_id,
-          url: row.url,
-          mime_type: row.mime_type,
-          width: row.width,
-          height: row.height,
-          size_bytes: row.size_bytes,
+          attachment_id: visibleRow.attachment_id,
+          url: visibleRow.url,
+          mime_type: visibleRow.mime_type,
+          width: visibleRow.width,
+          height: visibleRow.height,
+          size_bytes: visibleRow.size_bytes,
+          blurhash: visibleRow.blurhash,
         },
       });
     }
@@ -2401,7 +2414,7 @@ export class ChatChannel extends DurableObject<Env> {
               .filter((a): a is Record<string, unknown> => a !== null);
             const replayStickerRow = this.ctx.storage.sql
               .exec(
-                "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes FROM message_stickers WHERE message_id=?",
+                "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash FROM message_stickers WHERE message_id=?",
                 messageRow.message_id,
               )
               .toArray()[0] as unknown as MessageStickerSnapshot | undefined;
