@@ -156,6 +156,72 @@ export class ChatChannel extends DurableObject<Env> {
     );
   }
 
+  // Read the current full channel_meta snapshot for a channel_directory projection.
+  // Returns title/avatar_url/member_count/status + last_message_at (from the latest visible message)
+  // so every channel_directory upsert is a FULL snapshot (P0-3): a missing directory row is always
+  // repairable by any subsequent call site (create/update/message.send/member delta).
+  private readChannelDirectorySnapshot(channelId: string, nowIso: string): {
+    title: string;
+    avatar_url: string | null;
+    member_count: number;
+    last_message_at: string | null;
+    status: string;
+  } | null {
+    const meta = this.ctx.storage.sql
+      .exec("SELECT title, avatar_url, member_count, status FROM channel_meta WHERE channel_id=?", channelId)
+      .toArray()[0] as { title: string; avatar_url: string | null; member_count: number; status: string } | undefined;
+    if (meta === undefined) return null;
+    const lastMsg = this.ctx.storage.sql
+      .exec("SELECT created_at FROM messages WHERE channel_id=? AND status NOT IN ('deleted','recalled') ORDER BY message_id DESC LIMIT 1", channelId)
+      .toArray()[0] as { created_at: string } | undefined;
+    void nowIso;
+    return {
+      title: meta.title,
+      avatar_url: meta.avatar_url,
+      member_count: meta.member_count,
+      last_message_at: lastMsg?.created_at ?? null,
+      status: meta.status,
+    };
+  }
+
+  // Write a channel_directory projection_outbox row. For `upsert` the snapshot is read from the
+  // current channel_meta (FULL snapshot — every NOT NULL field present). For `delete` only the
+  // channel_id is needed. Co-atomic with the caller's business txn (call inside the txn).
+  private insertOutboxRowForChannelDirectory(
+    channelId: string,
+    action: "upsert" | "delete",
+    snapshot: { title: string; avatar_url: string | null; member_count: number; last_message_at: string | null; status: string } | null,
+    nowIso: string,
+  ): void {
+    if (action === "delete") {
+      const eventId = this.nextEventId(Date.parse(nowIso));
+      this.ctx.storage.sql.exec(
+        "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'channel_directory', 'shared', ?, ?, 'pending', ?, ?, ?, 0, 5)",
+        `channel_directory:delete:${channelId}:${eventId}:${Math.random()}`,
+        eventId,
+        JSON.stringify({ action: "delete", channel_id: channelId }),
+        nowIso, nowIso, nowIso,
+      );
+      return;
+    }
+    if (snapshot === null) return; // channel gone — nothing to project
+    const fields = {
+      title: snapshot.title,
+      avatar_url: snapshot.avatar_url,
+      member_count: snapshot.member_count,
+      last_message_at: snapshot.last_message_at,
+      status: snapshot.status,
+    };
+    const eventId = this.nextEventId(Date.parse(nowIso));
+    this.ctx.storage.sql.exec(
+      "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'channel_directory', 'shared', ?, ?, 'pending', ?, ?, ?, 0, 5)",
+      `channel_directory:upsert:${channelId}:${eventId}:${Math.random()}`,
+      eventId,
+      JSON.stringify({ action: "upsert", channel_id: channelId, fields, fields_present: ["title", "avatar_url", "member_count", "last_message_at", "status"] }),
+      nowIso, nowIso, nowIso,
+    );
+  }
+
   private async resolveActorMap(userIds: string[]): Promise<Map<string, import("../chat/event-broadcast").UserSummary>> {
     const raw = await resolveUserSummaries(userIds, this.env);
     const m = new Map<string, import("../chat/event-broadcast").UserSummary>();
@@ -625,8 +691,8 @@ export class ChatChannel extends DurableObject<Env> {
       let joinedAt = now;
       let writeProjection = false;
 
-      const meta = this.ctx.storage.sql.exec("SELECT channel_id, kind, status, membership_version, member_count FROM channel_meta").toArray()[0] as
-        | { channel_id: string; kind: string; status: string; membership_version: number; member_count: number }
+      const meta = this.ctx.storage.sql.exec("SELECT channel_id, kind, visibility, status, membership_version, member_count FROM channel_meta").toArray()[0] as
+        | { channel_id: string; kind: string; visibility: string; status: string; membership_version: number; member_count: number }
         | undefined;
       if (meta === undefined) {
         return new Response("not found", { status: 404 });
@@ -699,6 +765,10 @@ export class ChatChannel extends DurableObject<Env> {
           },
           now,
         );
+        // channel_directory projection: bump the directory's member_count for public channels.
+        if (meta.visibility === "public_listed") {
+          this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
+        }
         writeProjection = true;
       }
 
@@ -1186,7 +1256,7 @@ export class ChatChannel extends DurableObject<Env> {
         | { kind: "dissolved" };
 
       const txResult = await this.ctx.storage.transaction(async (): Promise<SendResult> => {
-        const statusRow = this.ctx.storage.sql.exec("SELECT status FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string } | undefined;
+        const statusRow = this.ctx.storage.sql.exec("SELECT status, visibility FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; visibility: string } | undefined;
         if (statusRow?.status === "dissolved") {
           return { kind: "dissolved" };
         }
@@ -1298,6 +1368,12 @@ export class ChatChannel extends DurableObject<Env> {
         // channel_fanout outbox carries the LIVE (sender-resolved) event frame — same projection as
         // the ack (addendum I). Written in-txn so a crash after commit leaves a deliverable event.
         this.insertOutboxRowForFanout(channelId, eventId, liveEventFrameJson, mv, now);
+        // channel_directory projection: full-snapshot upsert with last_message_at=<now> for public
+        // channels (P0-3: the snapshot carries title/avatar_url/member_count/status too, so a missing
+        // directory row is repaired by the next message, not just last_message_at updated).
+        if (statusRow?.visibility === "public_listed") {
+          this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
+        }
         return { kind: "created", response_json: fullAckJson };
       });
 
@@ -2120,7 +2196,7 @@ export class ChatChannel extends DurableObject<Env> {
           return { kind: "cached", responseJson: idem.response_json ?? "{}" };
         }
 
-        const meta = this.ctx.storage.sql.exec("SELECT status, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; created_by: string } | undefined;
+        const meta = this.ctx.storage.sql.exec("SELECT status, visibility, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; visibility: string; created_by: string } | undefined;
         if (meta === undefined) return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
 
         if (meta.status === "dissolved") {
@@ -2152,6 +2228,10 @@ export class ChatChannel extends DurableObject<Env> {
           "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.dissolve', ?, ?, ?, 'completed', ?, ?)",
           userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt,
         );
+        // channel_directory projection: a dissolved channel must leave the public directory.
+        if (meta.visibility === "public_listed") {
+          this.insertOutboxRowForChannelDirectory(channelId, "delete", null, now);
+        }
         return { kind: "dissolved", channel: { channel_id: channelId, status: "dissolved", updated_at: now } };
       });
 
@@ -2437,6 +2517,12 @@ export class ChatChannel extends DurableObject<Env> {
             now, now, now,
           );
         }
+        // channel_directory projection: only public_listed channels appear in the directory.
+        if (visibility === "public_listed") {
+          this.insertOutboxRowForChannelDirectory(channelId, "upsert", {
+            title, avatar_url: null, member_count: memberCount, last_message_at: null, status: "active",
+          }, now);
+        }
         return { kind: "created" as const, channel: { channel_id: channelId, kind: "channel", visibility, title, topic: b.topic ?? null, avatar_url: null, member_count: memberCount, status: "active", created_at: now, updated_at: now }, joinedAt: now };
       });
 
@@ -2533,6 +2619,18 @@ export class ChatChannel extends DurableObject<Env> {
           "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.update', ?, ?, ?, 'completed', ?, ?)",
           userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt,
         );
+        // channel_directory projection: visibility transitions + public title/topic/avatar updates.
+        if (meta.visibility === "public_listed" && newVisibility !== "public_listed") {
+          // public → private/public_unlisted: remove from directory
+          this.insertOutboxRowForChannelDirectory(channelId, "delete", null, now);
+        } else if (meta.visibility !== "public_listed" && newVisibility === "public_listed") {
+          // non-public → public_listed: add to directory with current full snapshot
+          this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
+        } else if (meta.visibility === "public_listed" && newVisibility === "public_listed") {
+          // public → public: re-project (title/topic/avatar changed)
+          this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
+        }
+        // both non-public → no outbox write
         return { kind: "ok", channel };
       });
 
@@ -2562,7 +2660,7 @@ export class ChatChannel extends DurableObject<Env> {
         const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.add' AND operation_id=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
-        const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, member_count, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; member_count: number; kind: string; created_by: string } | undefined;
+        const meta = this.ctx.storage.sql.exec("SELECT status, visibility, membership_version, member_count, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; visibility: string; membership_version: number; member_count: number; kind: string; created_by: string } | undefined;
         if (!meta) return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
         if (meta.status === "dissolved") return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
         const callerRole = this.activeRole(channelId, userId);
@@ -2599,6 +2697,10 @@ export class ChatChannel extends DurableObject<Env> {
         const noticeId = this.nextEventId(nowMs);
         this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.joined", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mv, now, actorMap);
         this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:join:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "join", channel_id: channelId, kind: meta.kind, membership_version: mv }), now, now, now);
+        // channel_directory projection: bump the directory's member_count for public channels.
+        if (meta.visibility === "public_listed") {
+          this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
+        }
 
         const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: b.role, joined_at: now } });
         this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.add', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
@@ -2669,7 +2771,7 @@ export class ChatChannel extends DurableObject<Env> {
         const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.remove' AND operation_id=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
-        const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; kind: string; created_by: string } | undefined;
+        const meta = this.ctx.storage.sql.exec("SELECT status, visibility, membership_version, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; visibility: string; membership_version: number; kind: string; created_by: string } | undefined;
         if (!meta) return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
         if (meta.status === "dissolved") return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
         const callerRole = this.activeRole(channelId, userId);
@@ -2692,6 +2794,10 @@ export class ChatChannel extends DurableObject<Env> {
         this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.left", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mvAfter, now, actorMap);
         // user_directory leave projection (so my_channels reflects status='left')
         this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:leave:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "leave", channel_id: channelId, kind: meta.kind, membership_version: mvAfter }), now, now, now);
+        // channel_directory projection: decrement the directory's member_count for public channels.
+        if (meta.visibility === "public_listed") {
+          this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
+        }
 
         const responseJson = JSON.stringify({ channel_id: channelId, user_id: b.user_id, removed: true });
         this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.remove', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
@@ -2807,6 +2913,31 @@ export class ChatChannel extends DurableObject<Env> {
             headers: {
               "Content-Type": "application/json",
             },
+            body: r.payload_json,
+          }));
+          if (!res.ok) {
+            const text = await res.text();
+            await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
+            continue;
+          }
+          this.ctx.storage.sql.exec(
+            "UPDATE projection_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
+            nowIso,
+            r.outbox_id,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.bumpOutboxRetry(r.outbox_id, nowIso, msg);
+        }
+        continue;
+      }
+
+      if (r.target_kind === "channel_directory") {
+        const target = this.env.CHANNEL_DIRECTORY.getByName("shared");
+        try {
+          const res = await target.fetch(new Request("https://x/internal/apply-projection", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
             body: r.payload_json,
           }));
           if (!res.ok) {
