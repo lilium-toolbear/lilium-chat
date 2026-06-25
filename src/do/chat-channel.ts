@@ -69,6 +69,10 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS message_attachments (
     message_id TEXT NOT NULL, attachment_id TEXT NOT NULL, PRIMARY KEY (message_id, attachment_id)
   )`,
+  `CREATE TABLE IF NOT EXISTS message_stickers (
+    message_id TEXT PRIMARY KEY, sticker_id TEXT NOT NULL, attachment_id TEXT NOT NULL,
+    url TEXT NOT NULL, mime_type TEXT NOT NULL, width INTEGER, height INTEGER, size_bytes INTEGER NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS mentions (
     message_id TEXT NOT NULL, user_id TEXT NOT NULL, start INTEGER NOT NULL, end_ INTEGER NOT NULL,
     PRIMARY KEY (message_id, start, end_)
@@ -1045,6 +1049,7 @@ export class ChatChannel extends DurableObject<Env> {
         text: string;
         reply_to: string | null;
         attachment_ids: string[];
+        sticker_id?: string;
         mentions: Array<{ user_id: string; start: number; end: number }>;
         channel_id: string;
       };
@@ -1082,6 +1087,7 @@ export class ChatChannel extends DurableObject<Env> {
         text: b.text,
         reply_to: b.reply_to,
         attachment_ids: b.attachment_ids ?? [],
+        sticker_id: b.sticker_id ?? null,
         mentions: b.mentions ?? [],
       });
 
@@ -1191,6 +1197,45 @@ export class ChatChannel extends DurableObject<Env> {
         }
       }
 
+      type StickerSnapshot = {
+        sticker_id: string;
+        attachment_id: string;
+        url: string;
+        mime_type: string;
+        width: number | null;
+        height: number | null;
+        size_bytes: number;
+      };
+      let stickerSnapshot: StickerSnapshot | null = null;
+      if (b.type === "sticker") {
+        if (!b.sticker_id) {
+          return Response.json(
+            { error: { code: "INVALID_MESSAGE", message: "sticker message requires sticker_id", retryable: false } },
+            { status: 422 },
+          );
+        }
+        const userDir = this.env.USER_DIRECTORY.getByName(userId);
+        const stickerRes = await userDir.fetch(
+          new Request(`https://x/internal/sticker-resolve?sticker_id=${encodeURIComponent(b.sticker_id)}`, {
+            headers: { "X-Verified-User-Id": userId },
+          }),
+        );
+        if (!stickerRes.ok) {
+          const failBody = (await stickerRes.json().catch(() => ({}))) as { error?: { code?: string; message?: string } };
+          return Response.json(
+            {
+              error: {
+                code: failBody.error?.code ?? "STICKER_NOT_FOUND",
+                message: failBody.error?.message ?? "sticker not found",
+                retryable: false,
+              },
+            },
+            { status: stickerRes.status === 404 ? 404 : 422 },
+          );
+        }
+        stickerSnapshot = (await stickerRes.json()) as StickerSnapshot;
+      }
+
       // Build the LIVE message projection once (used by BOTH the committed-ack response_json AND
       // the channel_fanout outbox event_json — v4.0 addendum I/J: ack and event carry the same
       // Browser-visible projection from the one shared builder).
@@ -1198,6 +1243,7 @@ export class ChatChannel extends DurableObject<Env> {
         senderSummary: resolvedSender,
         mentions: Array.isArray(b.mentions) ? b.mentions : [],
         attachments: attachmentProjections,
+        sticker: stickerSnapshot,
       });
       const liveEventFrame = buildEventFrame({
         event_id: eventId,
@@ -1314,6 +1360,22 @@ export class ChatChannel extends DurableObject<Env> {
             "INSERT OR IGNORE INTO message_attachments (message_id, attachment_id) VALUES (?, ?)",
             messageId,
             row.attachment_id,
+          );
+        }
+        // Snapshot the sticker for historical stability (independent of future personal_stickers changes).
+        if (stickerSnapshot) {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO message_stickers (
+              message_id, sticker_id, attachment_id, url, mime_type, width, height, size_bytes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            messageId,
+            stickerSnapshot.sticker_id,
+            stickerSnapshot.attachment_id,
+            stickerSnapshot.url,
+            stickerSnapshot.mime_type,
+            stickerSnapshot.width,
+            stickerSnapshot.height,
+            stickerSnapshot.size_bytes,
           );
         }
         this.ctx.storage.sql.exec(

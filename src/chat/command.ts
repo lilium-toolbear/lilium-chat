@@ -2,10 +2,11 @@ import type { CommandFrame } from "../ws/frames";
 
 export interface ParsedMessageSend {
   command_id: string;
-  type: "text" | "image";
+  type: "text" | "image" | "sticker";
   text: string;
   reply_to: string | null;
   attachment_ids: string[];
+  sticker_id: string | null;
   mentions: Array<{ user_id: string; start: number; end: number }>;
 }
 
@@ -47,23 +48,34 @@ export function parseMessageSendCommand(frame: CommandFrame, senderUserId: strin
   if (!command_id) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
   }
-  // Phase 2 supports text; Phase 5 adds image; sticker follows in Phase E.
+  // Phase 2 supports text; Phase 5 adds image; Phase E adds sticker.
   const type = typeof p.type === "string" ? p.type : "text";
-  if (type !== "text" && type !== "image") {
+  if (type !== "text" && type !== "image" && type !== "sticker") {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: `unsupported type: ${type}`, retryable: false } };
   }
   const text = typeof p.text === "string" ? p.text : "";
   if (type === "text" && text.trim() === "") {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "message text is empty", retryable: false } };
   }
+  if (type === "sticker" && text !== "") {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "sticker message text must be empty", retryable: false } };
+  }
   const reply_to_message_id = p.reply_to_message_id;
   if (typeof reply_to_message_id === "string" && reply_to_message_id.length > 0) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "reply_to_message_id not supported", retryable: false } };
   }
   const attachment_ids = Array.isArray(p.attachment_ids) ? p.attachment_ids.filter((a): a is string => typeof a === "string") : [];
+  const sticker_id = typeof p.sticker_id === "string" ? p.sticker_id : "";
   if (type === "image") {
     if (attachment_ids.length === 0) {
       return { ok: false, error: { code: "INVALID_MESSAGE", message: "image message requires attachment_ids", retryable: false } };
+    }
+  } else if (type === "sticker") {
+    if (!sticker_id) {
+      return { ok: false, error: { code: "INVALID_MESSAGE", message: "sticker message requires sticker_id", retryable: false } };
+    }
+    if (attachment_ids.length > 0) {
+      return { ok: false, error: { code: "INVALID_MESSAGE", message: "attachment_ids not allowed for sticker messages", retryable: false } };
     }
   } else if (attachment_ids.length > 0) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "attachment_ids not allowed for text messages", retryable: false } };
@@ -77,9 +89,12 @@ export function parseMessageSendCommand(frame: CommandFrame, senderUserId: strin
       end: typeof m.end === "number" ? m.end : 0,
     }))
     .filter((m) => m.user_id);
+  if (type === "sticker" && mentions.length > 0) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "mentions not allowed for sticker messages", retryable: false } };
+  }
 
   void senderUserId; // sender identity comes from the authenticated socket, not the payload
-  return { ok: true, command: { command_id, type, text, reply_to: null, attachment_ids, mentions } };
+  return { ok: true, command: { command_id, type, text, reply_to: null, attachment_ids, sticker_id: sticker_id || null, mentions } };
 }
 
 function requireCommandId(frame: CommandFrame): string | null {

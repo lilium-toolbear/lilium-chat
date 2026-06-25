@@ -121,6 +121,38 @@ describe("parseMessageSendCommand", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
   });
+
+  it("parses a valid sticker message.send", () => {
+    const r = parseMessageSendCommand(
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "sticker", text: "", sticker_id: "s-1", attachment_ids: [], mentions: [] } },
+      "u-1",
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.command.type).toBe("sticker");
+      expect(r.command.sticker_id).toBe("s-1");
+      expect(r.command.text).toBe("");
+      expect(r.command.attachment_ids).toEqual([]);
+    }
+  });
+
+  it("rejects sticker message without sticker_id", () => {
+    const r = parseMessageSendCommand(
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "sticker", text: "", attachment_ids: [], mentions: [] } },
+      "u-1",
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
+  });
+
+  it("rejects sticker message with non-empty text", () => {
+    const r = parseMessageSendCommand(
+      { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "sticker", text: "hi", sticker_id: "s-1" } },
+      "u-1",
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
+  });
 });
 
 describe("dedupePrincipalKeyForUser", () => {

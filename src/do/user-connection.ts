@@ -302,6 +302,7 @@ export class UserConnection extends DurableObject<Env> {
           text: parsed.command.text,
           reply_to: parsed.command.reply_to,
           attachment_ids: parsed.command.attachment_ids,
+          sticker_id: parsed.command.sticker_id,
           mentions: parsed.command.mentions,
           channel_id: frame.channel_id,
         }),

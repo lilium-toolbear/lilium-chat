@@ -23,6 +23,7 @@ export function projectMessageForBrowser(
     senderSummary?: UserSummary | null;
     mentions?: MessageMention[];
     attachments?: unknown[];
+    sticker?: { sticker_id: string; attachment_id: string; url: string; mime_type: string; width: number | null; height: number | null; size_bytes: number } | null;
     components?: unknown[];
   } = {},
 ): Record<string, unknown> {
@@ -62,6 +63,7 @@ export function projectMessageForBrowser(
     reply_to: row.reply_to,
     reply_snapshot: replySnapshot,
     attachments: hidden ? [] : (opts.attachments ?? []),
+    sticker: hidden ? null : (opts.sticker ?? null),
     components: hidden ? [] : (opts.components ?? []),
     mentions: hidden ? [] : (opts.mentions ?? []),
     created_at: row.created_at,
