@@ -1,6 +1,6 @@
 # ToolBear Chat Browser/Bot API Contract
 
-状态：实现前 API contract（v2.7，v4.0-aligned —— 基于 2026-06-21 v1 + backend 设计 v4.0 delta + 2026-06-23 成员精确读补丁 + 2026-06-24 前端缺口收口 + 2026-06-24 幂等冲突语义收口 + 2026-06-24 频道创建端点 + 2026-06-24 v4.0 alignment + 2026-06-24 committed_ack canonical payload + 2026-06-25 Phase E delta：invite preview + owner transfer + 个人表情库 + sticker message）
+状态：实现前 API contract（v2.8，v4.0-aligned —— 基于 2026-06-21 v1 + backend 设计 v4.0 delta + 2026-06-23 成员精确读补丁 + 2026-06-24 前端缺口收口 + 2026-06-24 幂等冲突语义收口 + 2026-06-24 频道创建端点 + 2026-06-24 v4.0 alignment + 2026-06-24 committed_ack canonical payload + 2026-06-25 Phase E delta：invite preview + owner transfer + 个人表情库 + sticker message + 2026-06-25 BlurHash：attachment metadata 补 blurhash 字段）
 日期：2026-06-22
 范围：lilium-chat 后端（Cloudflare Worker + Durable Object）的 browser/bot-facing wire shape
 权威来源：
@@ -45,6 +45,7 @@
 - **v2.6 (2026-06-24)**：v4.0 alignment — message mutations + read-state moved to WS commands; MessageIndex/ROUTE_INDEX_PENDING-for-messages removed; client_message_id → command_id; HTTP Idempotency-Key ≡ WS command_id (operation_id)。具体：§2.5 幂等改写为 transport-neutral operation_id（HTTP `Idempotency-Key` ≡ WS `command_id`，内部归一为 `operation_id`）；新增 `MessageLocator`（`{channel_id, message_id}`，`message_id` 单独不是合法 locator）；§3.4 Message model 移除 `client_message_id`、加 `command_id`；§6.2 `message.send` payload 移除 `client_message_id`，ack + event payload 含 `command_id`；§6.3/§6.4/§6.5 编辑/撤回/删除改为 WS `message.edit`/`message.recall`/`message.delete`（不再暴露 HTTP 端点）；§5.5 标记已读改为 WS `channel.mark_read`（不写 channel timeline event），多端同步用 user-local `read_state_updated` WS frame（非 channel event）；新增 §6.6 读取消息上下文 HTTP `GET .../context`；§6.3 移除 `ROUTE_INDEX_PENDING` 语义（`ROUTE_INDEX_PENDING` 仅 invite-code 路由保留，消息操作永不返回）；§9.5 `command.invoke` payload 用 `bot_command_id`，§9.6 `interaction.submit` 用 `command_id`，移除 `client_invocation_id`/`client_interaction_id`；全文移除 `MessageIndex`/`client_message_id` 等过时术语。
 - **v2.6 addendum (2026-06-24, WS committed_ack canonical payload)**：`committed_ack` 现携带 canonical mutation payload——`message.*` ack `payload = { channel_id, event_id, message }`，`message` 为完整 Browser-visible Message 投影（含 sender UserSummary、type、format、status、stream_state、text、reply_to、reply_snapshot、attachments、components、mentions、created/updated/edited/deleted/recalled）；`channel.mark_read` ack `payload = { channel_id, last_read_event_id, unread_count }`（无 `event_id`）。`message.*` event frame 的 `payload.message` 与 ack **同形**（同一 `projectMessageForBrowser` builder 产物，recalled/deleted 用安全投影不泄露原文）。幂等缓存存完整 ack payload。具体：§2.5 加幂等缓存完整 ack 说明；§5.5 ack 改 payload 形状；§6.2/§6.3/§6.4/§6.5 ack + event 改 payload 形状；§10.2 CommandAck 通用形状改写；§10.4 EventEnvelope 加 `message.*` payload 同形说明。新增 §13 v4.0 addendum 实现不变量。
 - **v2.7 (2026-06-25)**：Phase E delta — invite preview; owner transfer; personal sticker library (list/save/delete); sticker message (type=sticker + sticker field)。具体：§1.1 路由总览补 4 个新端点；§3.4 Message model `type` 扩展为 `text` | `image` | `sticker` | `system`，新增 `sticker` 字段（sticker 消息投影 + deleted/recalled sticker 投影）；§6.2 `message.send` 新增 sticker payload 变体（`type:"sticker"` + `sticker_id`，服务端 resolve 为 canonical `attachment_id`）；§5.10 邀请预览（read-only，无 join 副作用）；§7.5 转让群主（原子，前端不得用多个 role PATCH 拼接）；§8.3 个人表情库（list/save/delete，复用 canonical image attachment，不复制二进制）；§11 错误码表补 `STICKER_NOT_FOUND`、`STICKER_LIBRARY_LIMIT_EXCEEDED`、`INVALID_STICKER_SOURCE`。Phase E 不引入 `AttachmentDirectory DO`，sticker save 用 `{channel_id, attachment_id}` 定位源附件。
+- **v2.8 (2026-06-25)**：BlurHash delta — 前端生成 BlurHash 占位图编码，在 presign 请求中传给后端；后端保存为 attachment metadata，在 finalize 响应、attachment 投影、sticker 投影、PersonalSticker model 中返回。§8.1 presign 请求加 `blurhash` 字段（可选）；§8.2 finalize 响应 + sticker image projection + PersonalSticker model + Message model sticker 投影均补 `blurhash` 字段。
 
 ## 1. 边界
 
@@ -363,7 +364,8 @@ Sticker 消息投影：
     "mime_type": "image/png",
     "width": 512,
     "height": 512,
-    "size_bytes": 12345
+    "size_bytes": 12345,
+    "blurhash": "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB"
   },
   "reply_to": null,
   "reply_snapshot": null,
@@ -1576,9 +1578,12 @@ Worker 校验当前用户、文件类型和大小，创建 pending attachment me
   "mime_type": "image/png",
   "size_bytes": 12345,
   "width": 512,
-  "height": 512
+  "height": 512,
+  "blurhash": "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB"
 }
 ```
+
+`blurhash` 是前端从图片生成的 BlurHash 字符串（占位图编码），可选；后端保存为 attachment metadata。
 
 响应：
 
@@ -1625,6 +1630,7 @@ Idempotency-Key: client-key-attachment-finalize
     "size_bytes": 12345,
     "width": 512,
     "height": 512,
+    "blurhash": "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
     "url": "https://s3.kuma.homes/lilium-chat-attachments/chat/00000000-0000-7000-8000-000000000501"
   }
 }
@@ -1649,7 +1655,8 @@ Phase E **不引入 `AttachmentDirectory DO`**。因此 sticker save 必须用 `
   "mime_type": "image/png",
   "width": 512,
   "height": 512,
-  "size_bytes": 12345
+  "size_bytes": 12345,
+  "blurhash": "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB"
 }
 ```
 
@@ -1671,7 +1678,8 @@ Phase E **不引入 `AttachmentDirectory DO`**。因此 sticker save 必须用 `
     "mime_type": "image/png",
     "width": 512,
     "height": 512,
-    "size_bytes": 12345
+    "size_bytes": 12345,
+    "blurhash": "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB"
   },
   "created_at": "2026-06-25T00:00:00Z"
 }

@@ -1,6 +1,6 @@
 # Lilium Chat 后端设计
 
-状态：设计稿（v4.1，Phase E：personal stickers + owner transfer + invite preview backend；v4.0 channel-scoped message API + WS write path + command_id idempotency + simplified DO topology）
+状态：设计稿（v4.2，BlurHash attachment metadata；Phase E：personal stickers + owner transfer + invite preview backend；v4.0 channel-scoped message API + WS write path + command_id idempotency + simplified DO topology）
 日期：2026-06-22
 范围：lilium-chat 仓库（Cloudflare Worker + Durable Object 纯后端）的实现设计
 参考：
@@ -154,6 +154,19 @@ v4.0 收口如下：
 - `ChatChannel DO` 继续作为频道实时写入 owner / source-of-truth。
 - 实时 fanout 不引入 Queue，继续走 DO→DO：ChatChannel 产生 event → ChannelFanout 维护在线 session 并投递 → UserConnection 接收 deliver 并推送 WebSocket。
 - `projection_outbox` 保留，但只用于必要的跨 DO projection / fanout 补偿，不作为通用 MQ。
+
+### 0.9 v4.2 修订：BlurHash attachment metadata
+
+前端在 presign 请求中传 `blurhash`（前端从图片生成的 BlurHash 占位图编码），后端保存为 attachment metadata，在所有 attachment / sticker 投影中返回。v4.2 收口：
+
+- `pending_attachments`（UserDirectory）加 `blurhash TEXT` 列。
+- `attachments`（ChatChannel）加 `blurhash TEXT` 列（channel-local copy 从 UserDirectory 拷贝时带上）。
+- `personal_stickers`（UserDirectory）加 `blurhash TEXT` 列（save 时快照）。
+- `message_stickers`（ChatChannel）加 `blurhash TEXT` 列（send 时快照，历史 sticker 消息占位图稳定）。
+- `resolveVisibleAttachment` 返回的 canonical projection 加 `blurhash`。
+- `resolveSticker` 返回的 canonical projection 加 `blurhash`。
+- `projectAttachmentForBrowser` + `projectMessageForBrowser` sticker 投影均含 `blurhash`。
+- `blurhash` 可选（`null` for non-image or missing）；前端用它渲染占位图，不发请求即可显示模糊缩略图。
 
 ### 0.8 v4.1 修订：Phase E personal stickers（DO ownership 收口）
 
@@ -377,6 +390,7 @@ CREATE TABLE attachments (
   size_bytes      INTEGER NOT NULL,
   width           INTEGER,
   height          INTEGER,
+  blurhash        TEXT,                    -- v2.8: 前端生成的 BlurHash 占位图编码
   storage_key     TEXT NOT NULL,           -- chat/{attachment_id},不暴露给前端
   url             TEXT NOT NULL,           -- public read URL,存 DO
   status          TEXT NOT NULL,           -- pending | finalized | transferred | hidden
@@ -398,11 +412,12 @@ CREATE TABLE message_stickers (
   mime_type     TEXT NOT NULL,
   width         INTEGER,
   height        INTEGER,
-  size_bytes    INTEGER
+  size_bytes    INTEGER,
+  blurhash      TEXT            -- v2.8: BlurHash 快照,历史 sticker 消息占位图稳定
 );
 -- 备选方案: 用 message_attachments + messages.type='sticker',但 v1 首选 message_stickers。
 -- 理由: sticker 消息应投影为 sticker 而非普通 image 附件; attachments=[] 避免重复渲染;
--- 快照 url/mime/width/height/size 使历史 sticker 消息在 sender 删除库条目后仍稳定。
+-- 快照 url/mime/width/height/size/blurhash 使历史 sticker 消息在 sender 删除库条目后仍稳定。
 
 -- mentions(主键改为 range,允许同一用户多次 mention)
 CREATE TABLE mentions (
@@ -565,6 +580,7 @@ CREATE TABLE pending_attachments (
   size_bytes      INTEGER NOT NULL,
   width           INTEGER,
   height          INTEGER,
+  blurhash        TEXT,                   -- v2.8: 前端生成的 BlurHash 占位图编码
   storage_key     TEXT NOT NULL,
   url             TEXT NOT NULL,
   status          TEXT NOT NULL,           -- pending | finalized | transferred
@@ -583,6 +599,7 @@ CREATE TABLE personal_stickers (
   width         INTEGER,
   height        INTEGER,
   size_bytes    INTEGER,
+  blurhash      TEXT,                     -- v2.8: BlurHash 占位图编码快照
   created_at    TEXT NOT NULL,
   deleted_at    TEXT,
   UNIQUE (user_id, attachment_id)
@@ -962,7 +979,7 @@ function nextEventId(seq) {
   - `type="sticker"`
   - `text=null`
   - `attachments=[]`
-  - `sticker={ sticker_id, attachment_id, url, mime_type, width, height, size_bytes }`
+  - `sticker={ sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash }`
   - `components=[]`
   - `mentions=[]`
   - `format="plain"`
@@ -1258,7 +1275,7 @@ Worker
        │    ├─ requires user is current active member or otherwise authorized by existing Browser visibility rules
        │    ├─ requires attachment is currently Browser-visible
        │    ├─ rejects deleted/recalled message attachments
-       │    └─ returns canonical attachment projection { attachment_id, url, mime_type, width, height, size_bytes }
+       │    └─ returns canonical attachment projection { attachment_id, url, mime_type, width, height, size_bytes, blurhash }
        ├─ upserts personal_stickers(user_id, attachment_id)
        └─ returns PersonalSticker projection
 ```
