@@ -75,6 +75,20 @@ const SCHEMA = [
     PRIMARY KEY (operation, operation_id)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_ud_idem_expires ON idempotency_keys(expires_at)`,
+  `CREATE TABLE IF NOT EXISTS personal_stickers (
+    sticker_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    attachment_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    width INTEGER,
+    height INTEGER,
+    size_bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    deleted_at TEXT,
+    UNIQUE (user_id, attachment_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_personal_stickers_user ON personal_stickers(user_id, created_at DESC) WHERE deleted_at IS NULL`,
 ];
 
 export class UserDirectory extends DurableObject<Env> {
@@ -285,6 +299,34 @@ export class UserDirectory extends DurableObject<Env> {
         last_read_event_id: floor.stored, // ALWAYS the stored floor, never the request cursor (P0-2)
         advanced: floor.advanced,
       });
+    }
+
+    if (url.pathname === "/internal/sticker-resolve") {
+      const userId = request.headers.get("X-Verified-User-Id");
+      if (userId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
+      const stickerId = url.searchParams.get("sticker_id");
+      if (!stickerId) {
+        return Response.json(
+          { error: { code: "INVALID_MESSAGE", message: "sticker_id required", retryable: false } },
+          { status: 422 },
+        );
+      }
+      const row = this.ctx.storage.sql
+        .exec(
+          "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes FROM personal_stickers WHERE sticker_id=? AND user_id=? AND deleted_at IS NULL",
+          stickerId,
+          userId,
+        )
+        .toArray()[0] as
+        | { sticker_id: string; attachment_id: string; url: string; mime_type: string; width: number | null; height: number | null; size_bytes: number }
+        | undefined;
+      if (!row) {
+        return Response.json(
+          { error: { code: "STICKER_NOT_FOUND", message: "sticker not found", retryable: false } },
+          { status: 404 },
+        );
+      }
+      return Response.json(row);
     }
 
     if (url.pathname === "/internal/attachment-presign") {
