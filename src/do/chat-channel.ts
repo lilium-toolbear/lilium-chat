@@ -1316,6 +1316,157 @@ export class ChatChannel extends DurableObject<Env> {
       });
     }
 
+    if (url.pathname === "/internal/owner-transfer") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as {
+        operation_id: string;
+        channel_id: string;
+        target_user_id: string;
+        previous_owner_role: string;
+      };
+      const requestHash = JSON.stringify({ target_user_id: b.target_user_id, previous_owner_role: b.previous_owner_role });
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const actorMap = await this.resolveActorMap([userId, b.target_user_id]);
+
+      const preCheck = this.ctx.storage.sql
+        .exec(
+          "SELECT response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.owner_transfer' AND operation_id=? AND request_hash=? AND response_json IS NOT NULL AND response_json != ''",
+          userId, b.operation_id, requestHash,
+        )
+        .toArray()[0] as { response_json: string } | undefined;
+      if (preCheck) return this.cachedResponse(preCheck.response_json);
+
+      type TxResult =
+        | { kind: "conflict" }
+        | { kind: "cached"; responseJson: string }
+        | { kind: "ok"; responseJson: string };
+      const txResult = await this.ctx.storage.transaction(async (): Promise<TxResult> => {
+        const idem = this.ctx.storage.sql
+          .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.owner_transfer' AND operation_id=?",
+            userId, b.operation_id)
+          .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+        if (idem) {
+          if (idem.request_hash !== requestHash) return { kind: "conflict" };
+          return { kind: "cached", responseJson: idem.response_json ?? "{}" };
+        }
+
+        const meta = this.ctx.storage.sql
+          .exec("SELECT status, created_by, membership_version FROM channel_meta WHERE channel_id=?", b.channel_id)
+          .toArray()[0] as { status: string; created_by: string; membership_version: number } | undefined;
+        if (!meta) return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
+        if (meta.status === "dissolved") {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
+        }
+
+        const callerRole = this.activeRole(b.channel_id, userId);
+        if (callerRole !== "owner" || meta.created_by !== userId) {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner may transfer ownership", retryable: false } }) };
+        }
+
+        if (b.previous_owner_role !== "admin" && b.previous_owner_role !== "member") {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "previous_owner_role must be admin or member", retryable: false } }) };
+        }
+
+        const target = this.ctx.storage.sql
+          .exec("SELECT role FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", b.channel_id, b.target_user_id)
+          .toArray()[0] as { role: string } | undefined;
+        if (!target) {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "MEMBER_NOT_FOUND", message: "target not an active member", retryable: false } }) };
+        }
+        if (target.role !== "member" && target.role !== "admin") {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "INVALID_MEMBER_ROLE", message: "target must be member or admin", retryable: false } }) };
+        }
+        if (b.target_user_id === meta.created_by) {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "INVALID_MEMBER_ROLE", message: "cannot transfer ownership to current owner", retryable: false } }) };
+        }
+
+        const firstMembershipVersion = meta.membership_version + 1;
+        const secondMembershipVersion = meta.membership_version + 2;
+
+        this.ctx.storage.sql.exec("UPDATE members SET role=? WHERE channel_id=? AND user_id=?", b.previous_owner_role, b.channel_id, userId);
+        this.ctx.storage.sql.exec("UPDATE members SET role=? WHERE channel_id=? AND user_id=?", "owner", b.channel_id, b.target_user_id);
+        this.ctx.storage.sql.exec("UPDATE channel_meta SET created_by=?, membership_version=?, updated_at=? WHERE channel_id=?", b.target_user_id, secondMembershipVersion, now, b.channel_id);
+
+        const oldOwnerEventId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(
+          oldOwnerEventId,
+          "member.role_updated",
+          b.channel_id,
+          now,
+          buildMemberRoleUpdatedPayload({
+            channel_id: b.channel_id,
+            user_id: userId,
+            before_role: "owner",
+            after_role: b.previous_owner_role,
+            membership_version: firstMembershipVersion,
+            actor_kind: "user",
+            actor_id: userId,
+          }),
+          firstMembershipVersion,
+          now,
+          actorMap,
+        );
+
+        const newOwnerEventId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(
+          newOwnerEventId,
+          "member.role_updated",
+          b.channel_id,
+          now,
+          buildMemberRoleUpdatedPayload({
+            channel_id: b.channel_id,
+            user_id: b.target_user_id,
+            before_role: target.role,
+            after_role: "owner",
+            membership_version: secondMembershipVersion,
+            actor_kind: "user",
+            actor_id: userId,
+          }),
+          secondMembershipVersion,
+          now,
+          actorMap,
+        );
+
+        const noticeId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(noticeId, "system.notice", b.channel_id, now,
+          buildSystemNoticePayload({
+            notice_kind: "member.role_updated",
+            actor_kind: "user",
+            actor_id: userId,
+            target_user_id: b.target_user_id,
+            message_id: null,
+            channel_changes: null,
+          }),
+          secondMembershipVersion,
+          now,
+          actorMap,
+        );
+
+        const response = {
+          channel_id: b.channel_id,
+          previous_owner: { user_id: userId, role: b.previous_owner_role },
+          new_owner: { user_id: b.target_user_id, role: "owner" },
+        };
+        const responseJson = JSON.stringify(response);
+        this.ctx.storage.sql.exec(
+          "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.owner_transfer', ?, ?, ?, 'completed', ?, ?)",
+          userId, b.operation_id, requestHash, responseJson, now, idemExpiresAt,
+        );
+        return { kind: "ok", responseJson };
+      });
+      if (txResult.kind === "conflict") {
+        return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: 409 });
+      }
+      if (txResult.kind === "ok") {
+        await this.scheduleOutboxAlarm(now);
+        return Response.json(JSON.parse(txResult.responseJson), { status: 200 });
+      }
+      return this.cachedResponse(txResult.responseJson);
+    }
+
     if (url.pathname === "/internal/dissolve") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });

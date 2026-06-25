@@ -235,3 +235,35 @@ export async function getMemberHandler(c: Context<{ Bindings: Env; Variables: { 
   const u = map.get(targetUserId) ?? { user_id: targetUserId, display_name: `user-${targetUserId.slice(0, 8)}`, avatar_url: null };
   return c.json({ user: u, role: raw.role, joined_at: raw.joined_at, status: raw.status }, 200, { "X-Request-Id": c.get("requestId") });
 }
+
+export async function ownerTransferHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const channelId = c.req.param("channel_id");
+  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
+  const body = (await c.req.json().catch(() => ({}))) as { target_user_id?: string; previous_owner_role?: string };
+  const routeName = await channelRouteNameFor(env, userId, channelId);
+  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const res = await stub.fetch(new Request("https://x/internal/owner-transfer", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operation_id: idempotencyKey,
+      channel_id: channelId,
+      target_user_id: body.target_user_id ?? "",
+      previous_owner_role: body.previous_owner_role ?? "",
+    }),
+  }));
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "owner transfer failed" } })) as {
+      error?: { code?: string; message?: string };
+    };
+    if (res.status === 409) {
+      throw new ApiError(e.error?.code ?? "IDEMPOTENCY_CONFLICT", e.error?.message ?? "idempotency conflict");
+    }
+    throw new ApiError(e.error?.code ?? "CHAT_WORKER_UNAVAILABLE", e.error?.message ?? "owner transfer failed");
+  }
+  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+}
