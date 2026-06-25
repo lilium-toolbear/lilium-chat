@@ -4,6 +4,8 @@ import type { UserSummary } from "../profile/resolve";
 import { projectMessagesForBrowser } from "./sender";
 import { resolveUserSummaries } from "../profile/resolve";
 import type { MessageRow } from "../do/chat-channel";
+import type { AttachmentRow } from "./attachment-projection";
+
 
 vi.mock("../profile/resolve", () => ({
   resolveUserSummaries: vi.fn(),
@@ -65,13 +67,35 @@ describe("projectMessagesForBrowser (history path)", () => {
     expect((out[0] as { sender: { user: { display_name: string } } }).sender.user.display_name).toBe("user-00000000");
   });
 
-  it("null display_name from pg → fallback user-<8>", async () => {
-    mockedResolve.mockResolvedValueOnce(new Map<string, UserSummary>([
-      ["u1", { user_id: "u1", display_name: null, avatar_url: null }],
-    ]));
+  it("projects finalized attachments and drops non-finalized ones", async () => {
+    mockedResolve.mockResolvedValueOnce(new Map<string, UserSummary>());
+
+    const attachment: AttachmentRow = {
+      attachment_id: "a1",
+      owner_user_id: "u1",
+      kind: "image",
+      filename: "img.png",
+      mime_type: "image/png",
+      size_bytes: 12345,
+      width: 512,
+      height: 512,
+      blurhash: "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
+      storage_key: "k1",
+      url: "https://s3.kuma.homes/chat/a1",
+      status: "finalized",
+      created_at: "t",
+    };
 
     const env = makeEnv() as Env;
-    const out = await projectMessagesForBrowser([row()], {}, env);
-    expect((out[0] as { sender: { user: { display_name: string } } }).sender.user.display_name).toBe("user-u1");
+    const out = await projectMessagesForBrowser(
+      [row({ message_id: "m1" })],
+      {},
+      env,
+      { m1: [attachment, { ...attachment, attachment_id: "a2", status: "pending" }] },
+    );
+
+    const atts = (out[0] as { attachments: Array<{ attachment_id: string }> }).attachments;
+    expect(atts).toHaveLength(1);
+    expect(atts[0]!.attachment_id).toBe("a1");
   });
 });

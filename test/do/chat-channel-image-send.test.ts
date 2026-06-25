@@ -128,6 +128,65 @@ describe("ChatChannel message.send type=image", () => {
     expect(att.blurhash).toBe("LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB");
   });
 
+  it("history and replay include the image attachment projection", async () => {
+    const channelId = "ch-img-hist";
+    const userId = "u-img-hist";
+    const stub = await createChannel(channelId, userId);
+    const { attachment_id } = await presignAndFinalize(userId, fake);
+
+    const sendRes = await stub.fetch(
+      new Request("https://x/internal/message-send", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          command_id: "cmd-img-hist",
+          dedupe_principal_key: `user:${userId}`,
+          type: "image",
+          text: "",
+          reply_to: null,
+          attachment_ids: [attachment_id],
+          mentions: [],
+          channel_id: channelId,
+        }),
+      }),
+    );
+    expect(sendRes.status).toBe(200);
+    const sendBody = (await sendRes.json()) as {
+      event_id: string;
+      message: { message_id: string; attachments: Array<{ attachment_id: string; blurhash: string }> };
+    };
+    expect(sendBody.message.attachments).toHaveLength(1);
+
+    const historyRes = await stub.fetch(
+      new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": userId } }),
+    );
+    expect(historyRes.status).toBe(200);
+    const historyBody = (await historyRes.json()) as {
+      items: Array<{ message_id: string }>;
+      attachments: Record<string, Array<{ attachment_id: string }>>;
+    };
+    expect(historyBody.items).toHaveLength(1);
+    expect(historyBody.items[0]!.message_id).toBe(sendBody.message.message_id);
+    expect(historyBody.attachments[sendBody.message.message_id]).toHaveLength(1);
+    expect(historyBody.attachments[sendBody.message.message_id]![0]!.attachment_id).toBe(attachment_id);
+
+    const replayRes = await stub.fetch(
+      new Request("https://x/internal/replay?after=", { headers: { "X-Verified-User-Id": userId } }),
+    );
+    expect(replayRes.status).toBe(200);
+    const replayBody = (await replayRes.json()) as { events: Array<{ event_type: string; event_json: string }> };
+    const created = replayBody.events.find((e) => {
+      const frame = JSON.parse(e.event_json) as { type: string; payload?: { message?: { message_id: string } } };
+      return frame.type === "message.created" && frame.payload?.message?.message_id === sendBody.message.message_id;
+    });
+    expect(created).toBeDefined();
+    const event = JSON.parse(created!.event_json) as {
+      payload: { message: { attachments: Array<{ attachment_id: string }> } };
+    };
+    expect(event.payload.message.attachments).toHaveLength(1);
+    expect(event.payload.message.attachments[0]!.attachment_id).toBe(attachment_id);
+  });
+
   it("rejects image message with a non-finalized attachment", async () => {
     const channelId = "ch-img-2";
     const userId = "u-img-2";

@@ -933,6 +933,7 @@ export class ChatChannel extends DurableObject<Env> {
       // serializer across history / ack / event (addendum J). rowToMessage is no longer used here.
       const messageIds = page.map((r) => r.message_id);
       const mentionsByMessage: Record<string, Array<{ user_id: string; start: number; end: number }>> = {};
+      const attachmentsByMessage: Record<string, ChatAttachmentRow[]> = {};
       if (messageIds.length > 0) {
         const placeholders = messageIds.map(() => "?").join(",");
         const mentionRows = this.ctx.storage.sql
@@ -941,11 +942,25 @@ export class ChatChannel extends DurableObject<Env> {
         for (const mr of mentionRows) {
           (mentionsByMessage[mr.message_id] ??= []).push({ user_id: mr.user_id, start: mr.start, end: mr.end });
         }
+        const attachmentRows = this.ctx.storage.sql
+          .exec(
+            `SELECT ma.message_id, a.attachment_id, a.owner_user_id, a.kind, a.filename, a.mime_type, a.size_bytes, a.width, a.height, a.blurhash, a.storage_key, a.url, a.status, a.created_at
+             FROM message_attachments ma
+             JOIN attachments a ON a.attachment_id = ma.attachment_id
+             WHERE ma.message_id IN (${placeholders})`,
+            ...messageIds,
+          )
+          .toArray() as unknown as Array<ChatAttachmentRow & { message_id: string }>;
+        for (const ar of attachmentRows) {
+          const { message_id, ...row } = ar;
+          (attachmentsByMessage[message_id] ??= []).push(row);
+        }
       }
 
       return Response.json({
         items: page,
         mentions: mentionsByMessage,
+        attachments: attachmentsByMessage,
         next_cursor: nextCursor,
       });
     }
@@ -2226,7 +2241,19 @@ export class ChatChannel extends DurableObject<Env> {
               .exec("SELECT user_id, start, end_ AS end FROM mentions WHERE message_id=?", messageRow.message_id)
               .toArray() as Array<{ user_id: string; start: number; end: number }>;
             const replayMentions = replayMentionRows.map((m) => ({ user_id: m.user_id, start: m.start, end: m.end }));
-            payload = { message: projectMessageForBrowser(messageRow, { senderSummary, mentions: replayMentions }) };
+            const replayAttachmentRows = this.ctx.storage.sql
+              .exec(
+                `SELECT a.attachment_id, a.owner_user_id, a.kind, a.filename, a.mime_type, a.size_bytes, a.width, a.height, a.blurhash, a.storage_key, a.url, a.status, a.created_at
+                 FROM message_attachments ma
+                 JOIN attachments a ON a.attachment_id = ma.attachment_id
+                 WHERE ma.message_id=?`,
+                messageRow.message_id,
+              )
+              .toArray() as unknown as ChatAttachmentRow[];
+            const replayAttachments = replayAttachmentRows
+              .map(projectAttachmentForBrowser)
+              .filter((a): a is Record<string, unknown> => a !== null);
+            payload = { message: projectMessageForBrowser(messageRow, { senderSummary, mentions: replayMentions, attachments: replayAttachments }) };
           } catch {
             // malformed payload or missing payload message_id
           }

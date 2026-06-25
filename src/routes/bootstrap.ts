@@ -5,6 +5,7 @@ import { verifyBrowserJwt } from "../auth/jwt";
 import { resolveUserSummaries, type UserSummary } from "../profile/resolve";
 import { projectMessagesForBrowser } from "../chat/sender";
 import type { MessageRow } from "../do/chat-channel";
+import type { AttachmentRow } from "../chat/attachment-projection";
 import { channelRouteNameFor, ensureSystemJoined } from "../chat/system-channel";
 
 interface MyChannel {
@@ -126,9 +127,9 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
       }));
       if (!mres.ok) return { items: [] as Array<unknown>, next_cursor: null };
 
-      const body = await mres.json() as { items: MessageRow[]; mentions: Record<string, Array<{ user_id: string; start: number; end: number }>>; next_cursor: string | null };
+      const body = await mres.json() as { items: MessageRow[]; mentions: Record<string, Array<{ user_id: string; start: number; end: number }>>; attachments: Record<string, AttachmentRow[]>; next_cursor: string | null };
       return {
-        items: await projectMessagesForBrowser(body.items, body.mentions ?? {}, c.env),
+        items: await projectMessagesForBrowser(body.items, body.mentions ?? {}, c.env, body.attachments ?? {}),
         next_cursor: body.next_cursor,
       };
     })()

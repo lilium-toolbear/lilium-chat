@@ -4,6 +4,7 @@ import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 import { projectMessagesForBrowser } from "../chat/sender";
 import type { MessageRow } from "../do/chat-channel";
+import type { AttachmentRow } from "../chat/attachment-projection";
 import { ensureSystemJoined, channelRouteNameFor } from "../chat/system-channel";
 
 export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
@@ -34,8 +35,13 @@ export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables:
     throw new ApiError("CHANNEL_NOT_FOUND", "channel not found", { httpStatus: 404 });
   }
   if (!mres.ok) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const mb = await mres.json() as { items: MessageRow[]; mentions: Record<string, Array<{ user_id: string; start: number; end: number }>>; next_cursor: string | null };
+  const mb = await mres.json() as {
+    items: MessageRow[];
+    mentions: Record<string, Array<{ user_id: string; start: number; end: number }>>;
+    attachments: Record<string, AttachmentRow[]>;
+    next_cursor: string | null;
+  };
 
-  const items = await projectMessagesForBrowser(mb.items, mb.mentions ?? {}, c.env);
+  const items = await projectMessagesForBrowser(mb.items, mb.mentions ?? {}, c.env, mb.attachments ?? {});
   return c.json({ items, next_cursor: mb.next_cursor }, 200, { "X-Request-Id": c.get("requestId") });
 }
