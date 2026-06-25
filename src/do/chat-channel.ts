@@ -1625,6 +1625,112 @@ export class ChatChannel extends DurableObject<Env> {
       return Response.json(JSON.parse(txResult.responseJson));
     }
 
+    if (url.pathname === "/internal/invites-get") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      const inviteCode = url.searchParams.get("invite_code") ?? "";
+      const channelId = url.searchParams.get("channel_id") ?? "";
+      if (!inviteCode || !channelId) {
+        return Response.json({ error: { code: "INVITE_NOT_FOUND", message: "invite not found", retryable: false } }, { status: 404 });
+      }
+
+      const invite = this.ctx.storage.sql
+        .exec(
+          "SELECT invite_code, created_by, expires_at, max_uses, revoked_at FROM invites WHERE invite_code=?",
+          inviteCode,
+        )
+        .toArray()[0] as
+        | {
+            invite_code: string;
+            created_by: string;
+            expires_at: string;
+            max_uses: number | null;
+            revoked_at: string | null;
+          }
+        | undefined;
+      if (invite === undefined) {
+        return Response.json({ error: { code: "INVITE_NOT_FOUND", message: "invite not found", retryable: false } }, { status: 404 });
+      }
+
+      const nowMs = Date.now();
+      const expiresAtMs = Date.parse(invite.expires_at);
+      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs || invite.revoked_at !== null) {
+        return Response.json({ error: { code: "INVITE_NOT_FOUND", message: "invite not found", retryable: false } }, { status: 404 });
+      }
+
+      const meta = this.ctx.storage.sql
+        .exec(
+          "SELECT channel_id, kind, visibility, title, avatar_url, member_count, status FROM channel_meta WHERE channel_id=?",
+          channelId,
+        )
+        .toArray()[0] as
+        | { channel_id: string; kind: string; visibility: string; title: string; avatar_url: string | null; member_count: number; status: string }
+        | undefined;
+      if (meta === undefined) {
+        return Response.json({ error: { code: "INVITE_NOT_FOUND", message: "invite not found", retryable: false } }, { status: 404 });
+      }
+
+      const inviterUserId = url.searchParams.get("inviter_user_id") ?? invite.created_by;
+      const sampleRows = this.ctx.storage.sql
+        .exec("SELECT user_id FROM members WHERE channel_id=? AND left_at IS NULL ORDER BY user_id ASC LIMIT 3", channelId)
+        .toArray() as Array<{ user_id: string }>;
+      const userIds = Array.from(new Set([inviterUserId, ...sampleRows.map((row) => row.user_id)]));
+
+      const memberRow = this.ctx.storage.sql
+        .exec("SELECT left_at FROM members WHERE channel_id=? AND user_id=?", meta.channel_id, userId)
+        .toArray()[0] as { left_at: string | null } | undefined;
+      const membershipStatus = memberRow === undefined
+        ? "not_joined"
+        : memberRow.left_at === null
+          ? "active"
+          : "left";
+
+      const resolvedMembers = await resolveUserSummaries(userIds, this.env);
+      const inviterSummary = resolvedMembers.get(inviterUserId) ?? {
+        user_id: inviterUserId,
+        display_name: `user-${inviterUserId.slice(0, 8)}`,
+        avatar_url: null,
+      };
+      const sampleMembers = sampleRows.map((sampleRow) => {
+        const summary = resolvedMembers.get(sampleRow.user_id) ?? {
+          user_id: sampleRow.user_id,
+          display_name: `user-${sampleRow.user_id.slice(0, 8)}`,
+          avatar_url: null,
+        };
+        return {
+          user_id: summary.user_id,
+          display_name: summary.display_name,
+          avatar_url: summary.avatar_url,
+        };
+      });
+
+      return Response.json({
+        invite: {
+          invite_code: invite.invite_code,
+          expires_at: invite.expires_at,
+          max_uses: invite.max_uses,
+        },
+        channel: {
+          channel_id: meta.channel_id,
+          kind: meta.kind,
+          visibility: meta.visibility,
+          title: meta.title,
+          avatar_url: meta.avatar_url,
+          member_count: meta.member_count,
+          status: meta.status === "dissolved" ? "dissolved" : meta.status,
+        },
+        inviter: {
+          user_id: inviterSummary.user_id,
+          display_name: inviterSummary.display_name,
+          avatar_url: inviterSummary.avatar_url,
+        },
+        sample_members: sampleMembers,
+        my_membership: {
+          status: membershipStatus,
+          channel_id: membershipStatus === "active" ? meta.channel_id : null,
+        },
+      });
+    }
+
     if (url.pathname === "/internal/dissolve") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });

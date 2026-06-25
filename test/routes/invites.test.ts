@@ -73,4 +73,62 @@ describe("POST /api/chat/channels/:id/invites", () => {
     expect(b2.expires_at).toBe(b1.expires_at);
     expect(b2.max_uses).toBeNull();
   });
+
+  it("previews invite details for owner and strangers", async () => {
+    const create = await authedReq("u-invite-preview-1", "POST", "/api/chat/channels", {
+      title: "Invite preview room",
+      visibility: "private",
+      initial_members: [
+        { user_id: "u-preview-member-1", role: "member" },
+        { user_id: "u-preview-member-2", role: "member" },
+        { user_id: "u-preview-member-3", role: "member" },
+      ],
+    }, "invite-preview-channel-1");
+    expect(create.status).toBe(201);
+    const createBody = (await create.json()) as { channel: { channel_id: string } };
+
+    const createInvite = await authedReq("u-invite-preview-1", "POST", `/api/chat/channels/${createBody.channel.channel_id}/invites`, {
+      expires_in_seconds: 3600,
+      max_uses: null,
+    }, "invite-preview-key-1");
+    const invite = (await createInvite.json()) as { invite_code: string };
+
+    const previewOwner = await authedReq("u-invite-preview-1", "GET", `/api/chat/invites/${invite.invite_code}`);
+    expect(previewOwner.status).toBe(200);
+    const ownerBody = await previewOwner.json() as {
+      invite: { invite_code: string; expires_at: string; max_uses: number | null };
+      channel: { channel_id: string; kind: string; visibility: string; title: string; avatar_url: null; member_count: number; status: string };
+      inviter: { user_id: string; display_name: string | null; avatar_url: null };
+      sample_members: Array<{ user_id: string; display_name: string | null; avatar_url: null }>;
+      my_membership: { status: string; channel_id: string | null };
+    };
+    expect(ownerBody.invite.invite_code).toBe(invite.invite_code);
+    expect(ownerBody.invite.max_uses).toBeNull();
+    expect(typeof ownerBody.invite.expires_at).toBe("string");
+    expect(ownerBody.channel.channel_id).toBe(createBody.channel.channel_id);
+    expect(ownerBody.channel.kind).toBe("channel");
+    expect(ownerBody.channel.visibility).toBe("private");
+    expect(ownerBody.channel.status).toBe("active");
+    expect(ownerBody.channel.member_count).toBe(4);
+    expect(ownerBody.inviter.user_id).toBe("u-invite-preview-1");
+    expect(Array.isArray(ownerBody.sample_members)).toBe(true);
+    expect(ownerBody.sample_members.length).toBeLessThanOrEqual(3);
+    expect(ownerBody.my_membership.status).toBe("active");
+    expect(ownerBody.my_membership.channel_id).toBe(createBody.channel.channel_id);
+
+    const previewStranger = await authedReq("u-invite-preview-stranger", "GET", `/api/chat/invites/${invite.invite_code}`);
+    expect(previewStranger.status).toBe(200);
+    const strangerBody = (await previewStranger.json()) as {
+      my_membership: { status: string; channel_id: string | null };
+    };
+    expect(strangerBody.my_membership.status).toBe("not_joined");
+    expect(strangerBody.my_membership.channel_id).toBeNull();
+  });
+
+  it("returns INVITE_NOT_FOUND for unknown code", async () => {
+    const preview = await authedReq("u-invite-preview-2", "GET", "/api/chat/invites/not-found-code");
+    expect(preview.status).toBe(404);
+    const body = await preview.json() as { error: { code: string } };
+    expect(body.error.code).toBe("INVITE_NOT_FOUND");
+  });
 });

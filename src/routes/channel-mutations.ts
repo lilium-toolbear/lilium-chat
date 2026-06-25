@@ -308,3 +308,66 @@ export async function createInviteHandler(c: Context<{ Bindings: Env; Variables:
     max_uses: out.max_uses,
   }, 200, { "X-Request-Id": c.get("requestId") });
 }
+
+export async function previewInviteHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const inviteCode = c.req.param("invite_code");
+  if (!inviteCode) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
+
+  const dirStub = env.INVITE_DIRECTORY.getByName("shared");
+  const dirRes = await dirStub.fetch(new Request(`https://x/preview?code=${encodeURIComponent(inviteCode)}`));
+  if (dirRes.status === 404) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
+  if (!dirRes.ok) {
+    const e = await dirRes.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "invite index unavailable" } })) as {
+      error?: { code?: string; message?: string };
+    };
+    throw new ApiError(e.error?.code ?? "CHAT_WORKER_UNAVAILABLE", e.error?.message ?? "invite preview failed");
+  }
+
+  const row = await dirRes.json() as {
+    invite_code?: string;
+    channel_id?: string;
+    status?: string;
+    expires_at?: string;
+    revoked_at?: string | null;
+  };
+  if (row.invite_code !== inviteCode || row.channel_id === undefined || row.status !== "active") {
+    throw new ApiError("INVITE_NOT_FOUND", "invite not found");
+  }
+
+  const expiresAtMs = Date.parse(row.expires_at ?? "");
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now() || row.revoked_at !== null) {
+    throw new ApiError("INVITE_NOT_FOUND", "invite expired or revoked");
+  }
+
+  const routeName = await channelRouteNameFor(env, userId, row.channel_id);
+  if (routeName === null) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
+  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const inviteRes = await stub.fetch(new Request(
+    `https://x/internal/invites-get?invite_code=${encodeURIComponent(row.invite_code)}&channel_id=${encodeURIComponent(row.channel_id)}`,
+    { headers: { "X-Verified-User-Id": userId } },
+  ));
+  if (inviteRes.status === 404) {
+    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "INVITE_NOT_FOUND", message: "invite not found" } })) as { error?: { code?: string; message?: string } };
+    const code = inviteErr.error?.code;
+    if (code === "ROUTE_INDEX_PENDING") throw new ApiError("ROUTE_INDEX_PENDING", inviteErr.error?.message ?? "invite index pending");
+    if (code === "INVITE_NOT_FOUND") throw new ApiError("INVITE_NOT_FOUND", inviteErr.error?.message ?? "invite not found");
+    throw new ApiError("INVITE_NOT_FOUND", "invite not found");
+  }
+  if (inviteRes.status === 409) {
+    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "ROUTE_INDEX_PENDING", message: "invite index pending" } })) as {
+      error?: { code?: string; message?: string };
+    };
+    const code = inviteErr.error?.code ?? "ROUTE_INDEX_PENDING";
+    if (code === "ROUTE_INDEX_PENDING") throw new ApiError("ROUTE_INDEX_PENDING", inviteErr.error?.message ?? "invite index pending");
+    throw new ApiError(code, inviteErr.error?.message ?? "preview failed");
+  }
+  if (!inviteRes.ok) {
+    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "invite preview failed" } })) as {
+      error?: { code?: string; message?: string };
+    };
+    throw new ApiError(inviteErr.error?.code ?? "CHAT_WORKER_UNAVAILABLE", inviteErr.error?.message ?? "invite preview failed");
+  }
+
+  return c.json(await inviteRes.json(), 200, { "X-Request-Id": c.get("requestId") });
+}

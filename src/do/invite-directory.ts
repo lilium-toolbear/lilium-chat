@@ -20,16 +20,36 @@ export class InviteDirectory extends DurableObject<Env> {
     if (url.pathname === "/ping") return Response.json({ ok: true });
 
     if (request.method === "POST" && url.pathname === "/upsert") {
-      const body = (await request.json()) as { invite_code?: string; channel_id?: string; status?: string };
+      const body = (await request.json()) as {
+        invite_code?: string;
+        channel_id?: string;
+        status?: string;
+        expires_at?: string;
+        revoked_at?: string | null;
+      };
+      const status = body.status ?? "active";
+      const expiresAt = body.expires_at ?? "2999-01-01T00:00:00Z";
       this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO invite_index (invite_code, channel_id, status, expires_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO invite_index (invite_code, channel_id, status, expires_at, revoked_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
         body.invite_code ?? "",
         body.channel_id ?? "",
-        body.status ?? "active",
-        "2999-01-01T00:00:00Z",
+        status,
+        expiresAt,
+        body.revoked_at ?? null,
         new Date().toISOString(),
       );
       return Response.json({ ok: true });
+    }
+
+    if (url.pathname === "/preview") {
+      const inviteCode = url.searchParams.get("code") ?? "";
+      const row = this.ctx.storage.sql
+        .exec("SELECT invite_code, channel_id, status, expires_at, revoked_at FROM invite_index WHERE invite_code=?", inviteCode)
+        .toArray() as
+        | Array<{ invite_code: string; channel_id: string; status: string; expires_at: string; revoked_at: string | null }>
+        | undefined;
+      if (row?.length !== 1 || !row[0]) return new Response("not found", { status: 404 });
+      return Response.json(row[0]);
     }
 
     if (url.pathname === "/get") {
