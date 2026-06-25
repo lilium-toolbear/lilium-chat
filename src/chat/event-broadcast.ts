@@ -76,6 +76,30 @@ export function buildMessageCreatedPayload(raw: {
   };
 }
 
+export function buildMessageLifecyclePayload(raw: {
+  message_id: string;
+  command_id: string;
+  channel_id: string;
+  sender_kind: string;
+  sender_user_id: string | null;
+  sender_bot_id: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  edited_at: string | null;
+  deleted_at: string | null;
+  deleted_by: string | null;
+  recalled_at: string | null;
+  stream_state: string;
+  reply_to: string | null;
+  reply_snapshot_json: string | null;
+  type: string;
+  format: string;
+  text: string | null;
+}): Record<string, unknown> {
+  return buildMessageCreatedPayload(raw);
+}
+
 // Per design spec §3.5: the LIVE broadcast (wire) projection resolves UserSummary at output
 // time. The persisted payload keeps the sender ref; this function takes that persisted payload
 // and returns a NEW payload with sender replaced by { kind:'user', user: UserSummary } so the

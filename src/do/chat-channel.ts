@@ -5,6 +5,7 @@ import { uuidv7, monotonicUuidV7, type EventSeq } from "../ids/uuidv7";
 import {
   buildEventFrame,
   buildMessageCreatedPayload,
+  buildMessageLifecyclePayload,
   type UserSummary as LiveUserSummary,
 } from "../chat/event-broadcast";
 import { projectMessageForBrowser } from "../chat/message-projection";
@@ -18,6 +19,7 @@ import {
   buildSystemNoticePayload,
   resolveActorWithMap,
 } from "../chat/channel-events";
+import { HTTP_STATUS_BY_CODE } from "../errors";
 import { resolveUserSummaries } from "../profile/resolve";
 
 const SCHEMA = [
@@ -288,15 +290,257 @@ export class ChatChannel extends DurableObject<Env> {
     const cached = JSON.parse(j) as { channel?: unknown; member?: unknown; error?: { code?: string; message?: string } };
     if (cached.error) {
       const code = cached.error.code ?? "CHAT_WORKER_UNAVAILABLE";
-      const status = code === "FORBIDDEN" ? 403
-        : code === "CHANNEL_NOT_FOUND" ? 404
-        : code === "MEMBER_NOT_FOUND" ? 404
-        : code === "CHANNEL_DISSOLVED" ? 409
-        : code === "INVALID_MESSAGE" ? 422
-        : 503;
+      const status = HTTP_STATUS_BY_CODE[code] ?? 500;
       return Response.json({ error: { code, message: cached.error.message ?? "error", retryable: false } }, { status });
     }
     return new Response(j, { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+
+  private async applyMessageMutation(input: {
+    userId: string;
+    operationId: string;
+    channelId: string;
+    messageId: string;
+    operation: "message.edit" | "message.recall" | "message.delete";
+    requestHash: string;
+    mutate: (row: MessageRow) => {
+      eventType: "message.updated" | "message.recalled" | "message.deleted";
+      fields: Partial<MessageRow>;
+    };
+  }): Promise<Response> {
+    const now = this.nowIso();
+    const nowMs = Date.parse(now);
+    const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+
+    // v4.0 cheap pre-check: if this exact operation+user+body already completed, return cached ack
+    // without resolving user summaries or opening a transaction.
+    const preCheck = this.ctx.storage.sql
+      .exec("SELECT response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation=? AND operation_id=? AND request_hash=? AND response_json IS NOT NULL AND response_json != ''",
+        input.userId, input.operation, input.operationId, input.requestHash)
+      .toArray()[0] as { response_json: string } | undefined;
+    if (preCheck) {
+      const cached = JSON.parse(preCheck.response_json) as { payload?: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } };
+      if (cached.payload && cached.payload.event_id && cached.payload.message) {
+        return Response.json({
+          channel_id: cached.payload.channel_id ?? input.channelId,
+          event_id: cached.payload.event_id,
+          message: cached.payload.message,
+        });
+      }
+    }
+
+    // A2-corr-5: pre-read the message sender before txn so sender projection survives admin-delete.
+    const preflight = this.ctx.storage.sql
+      .exec("SELECT sender_user_id FROM messages WHERE message_id=? AND channel_id=?", input.messageId, input.channelId)
+      .toArray()[0] as { sender_user_id: string | null } | undefined;
+    const preflightActorIds = new Set<string>([input.userId]);
+    if (preflight?.sender_user_id) preflightActorIds.add(preflight.sender_user_id);
+    const actorMap = await this.resolveActorMap(Array.from(preflightActorIds));
+
+    type TxResult =
+      | { kind: "conflict" }
+      | { kind: "cached"; responseJson: string }
+      | { kind: "error"; j: string }
+      | { kind: "ok"; responseJson: string };
+
+    const txResult = await this.ctx.storage.transaction(async (): Promise<TxResult> => {
+      const statusRow = this.ctx.storage.sql.exec("SELECT status FROM channel_meta WHERE channel_id=?", input.channelId).toArray()[0] as {
+        status: string;
+      } | undefined;
+      if (!statusRow) return { kind: "error", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
+      if (statusRow.status === "dissolved") return {
+        kind: "error",
+        j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }),
+      };
+
+      const idem = this.ctx.storage.sql
+        .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation=? AND operation_id=?",
+          input.userId, input.operation, input.operationId)
+        .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+      if (idem) {
+        if (idem.request_hash !== input.requestHash) return { kind: "conflict" };
+        return { kind: "cached", responseJson: idem.response_json ?? "{}" };
+      }
+
+      const row = this.ctx.storage.sql
+        .exec(
+          "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE message_id=? AND channel_id=?",
+          input.messageId, input.channelId,
+        )
+        .toArray()[0] as MessageRow | undefined;
+      if (!row) return { kind: "error", j: JSON.stringify({ error: { code: "MESSAGE_NOT_FOUND", message: "message not found", retryable: false } }) };
+
+      const callerRole = this.activeRole(input.channelId, input.userId);
+      const isSender = row.sender_kind === "user" && row.sender_user_id === input.userId;
+      if (input.operation === "message.edit") {
+        if (!isSender || row.type !== "text" || (row.status !== "normal" && row.status !== "edited")) {
+          return { kind: "error", j: JSON.stringify({ error: { code: "MESSAGE_NOT_EDITABLE", message: "message is not editable", retryable: false } }) };
+        }
+      } else if (input.operation === "message.recall") {
+        if (!isSender || (row.status !== "normal" && row.status !== "edited")) {
+          return { kind: "error", j: JSON.stringify({ error: { code: "MESSAGE_NOT_EDITABLE", message: "message is not recallable", retryable: false } }) };
+        }
+      } else if (input.operation === "message.delete") {
+        if (!isSender && callerRole !== "owner" && callerRole !== "admin") {
+          return { kind: "error", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "only sender or owner/admin may delete", retryable: false } }) };
+        }
+        if (row.status !== "normal" && row.status !== "edited" && row.status !== "recalled") {
+          return { kind: "error", j: JSON.stringify({ error: { code: "MESSAGE_NOT_EDITABLE", message: "message is not deletable", retryable: false } }) };
+        }
+      }
+
+      const mutation = input.mutate(row);
+      const updatedRow: MessageRow = { ...row, ...mutation.fields, updated_at: now };
+      const mutateEntries = Object.entries(mutation.fields);
+      const setClauses: string[] = mutateEntries.map(([k]) => `${k}=?`);
+      const setArgs: unknown[] = mutateEntries.map(([, v]) => v);
+      setClauses.push("updated_at=?");
+      setArgs.push(now, input.messageId, input.channelId);
+
+      this.ctx.storage.sql.exec(`UPDATE messages SET ${setClauses.join(", ")} WHERE message_id=? AND channel_id=?`, ...setArgs);
+
+      const mvRow = this.ctx.storage.sql.exec("SELECT membership_version FROM channel_meta WHERE channel_id=?", input.channelId).toArray()[0] as
+        | { membership_version: number }
+        | undefined;
+      const mv = mvRow?.membership_version ?? 0;
+      const eventId = this.nextEventId(nowMs);
+      const persistedPayload = buildMessageLifecyclePayload({
+        message_id: updatedRow.message_id,
+        command_id: updatedRow.command_id,
+        channel_id: updatedRow.channel_id,
+        sender_kind: updatedRow.sender_kind,
+        sender_user_id: updatedRow.sender_user_id,
+        sender_bot_id: updatedRow.sender_bot_id,
+        status: updatedRow.status,
+        created_at: updatedRow.created_at,
+        updated_at: updatedRow.updated_at,
+        edited_at: updatedRow.edited_at,
+        deleted_at: updatedRow.deleted_at,
+        deleted_by: updatedRow.deleted_by,
+        recalled_at: updatedRow.recalled_at,
+        stream_state: updatedRow.stream_state,
+        reply_to: updatedRow.reply_to,
+        reply_snapshot_json: updatedRow.reply_snapshot_json,
+        type: updatedRow.type,
+        format: updatedRow.format,
+        text: updatedRow.text,
+      });
+      this.ctx.storage.sql.exec(
+        "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, ?, ?, 'user', ?, ?, ?, ?)",
+        eventId,
+        mutation.eventType,
+        input.channelId,
+        input.userId,
+        JSON.stringify(persistedPayload),
+        mv,
+        now,
+      );
+
+      const senderSummary = updatedRow.sender_kind === "user" && updatedRow.sender_user_id
+        ? actorMap.get(updatedRow.sender_user_id) ?? null
+        : null;
+      const liveMessage = projectMessageForBrowser(updatedRow, { senderSummary });
+      const liveFrame = buildEventFrame({
+        event_id: eventId,
+        type: mutation.eventType,
+        channel_id: input.channelId,
+        occurred_at: now,
+        payload: { message: liveMessage },
+      });
+      const liveFrameJson = JSON.stringify(liveFrame);
+      this.insertOutboxRowForFanout(input.channelId, eventId, liveFrameJson, mv, now);
+
+      if (input.operation === "message.edit") {
+        const editId = `${eventId}:edit`;
+        this.ctx.storage.sql.exec(
+          "INSERT INTO message_edits (edit_id, message_id, old_text, new_text, editor_user_id, request_id, edited_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          editId,
+          input.messageId,
+          row.text ?? "",
+          updatedRow.text ?? "",
+          input.userId,
+          input.operationId,
+          now,
+        );
+      } else if (input.operation === "message.recall") {
+        const auditId = `${eventId}:audit`;
+        this.ctx.storage.sql.exec(
+          "INSERT INTO audit_logs (audit_id, actor_kind, actor_id, action, target_type, target_id, before_json, after_json, reason, request_id, created_at) VALUES (?, 'user', ?, ?, 'message', ?, ?, ?, ?, ?, ?)",
+          auditId,
+          input.userId,
+          "message.recall",
+          input.messageId,
+          JSON.stringify(row),
+          JSON.stringify(updatedRow),
+          null,
+          input.operationId,
+          now,
+        );
+      } else {
+        const auditId = `${eventId}:audit`;
+        this.ctx.storage.sql.exec(
+          "INSERT INTO audit_logs (audit_id, actor_kind, actor_id, action, target_type, target_id, before_json, after_json, reason, request_id, created_at) VALUES (?, 'user', ?, ?, 'message', ?, ?, ?, ?, ?, ?)",
+          auditId,
+          input.userId,
+          "message.delete",
+          input.messageId,
+          JSON.stringify(row),
+          JSON.stringify(updatedRow),
+          null,
+          input.operationId,
+          now,
+        );
+        const senderUserId = row.sender_kind === "user" ? row.sender_user_id : null;
+        if (senderUserId !== null && senderUserId !== input.userId) {
+          const noticeId = this.nextEventId(nowMs);
+          this.persistEventAndFanout(
+            noticeId,
+            "system.notice",
+            input.channelId,
+            now,
+            buildSystemNoticePayload({
+              notice_kind: "message.deleted",
+              actor_kind: "user",
+              actor_id: input.userId,
+              target_user_id: senderUserId,
+              message_id: input.messageId,
+              channel_changes: null,
+            }),
+            mv,
+            now,
+            actorMap,
+          );
+        }
+      }
+
+      const fullAckJson = JSON.stringify({
+        frame_type: "command_ack",
+        command: input.operation,
+        command_id: input.operationId,
+        status: "committed",
+        payload: { channel_id: input.channelId, event_id: eventId, message: liveMessage },
+      });
+
+      this.ctx.storage.sql.exec(
+        "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, ?, ?, ?, ?, 'completed', ?, ?)",
+        input.userId, input.operation, input.operationId, input.requestHash, fullAckJson, now, idemExpiresAt,
+      );
+      return { kind: "ok", responseJson: fullAckJson };
+    });
+
+    if (txResult.kind === "conflict") {
+      return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: HTTP_STATUS_BY_CODE.IDEMPOTENCY_CONFLICT ?? 409 });
+    }
+    if (txResult.kind === "cached") {
+      return this.cachedResponse(txResult.responseJson);
+    }
+    if (txResult.kind === "error") {
+      return this.cachedResponse(txResult.j);
+    }
+
+    await this.scheduleOutboxAlarm(now);
+    const ack = JSON.parse(txResult.responseJson) as { payload?: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } };
+    return Response.json({ channel_id: ack.payload?.channel_id ?? input.channelId, event_id: ack.payload?.event_id ?? "", message: ack.payload?.message ?? null });
   }
 
   // Sync: persists the event (ref payload) + writes a channel_fanout outbox row with the
@@ -869,7 +1113,7 @@ export class ChatChannel extends DurableObject<Env> {
         status: "committed",
         payload: { channel_id: channelId, event_id: eventId, message: liveMessage },
       });
-      const persistedPayload = buildMessageCreatedPayload({
+      const persistedPayload = buildMessageLifecyclePayload({
         message_id: messageRowForProjection.message_id,
         command_id: messageRowForProjection.command_id,
         channel_id: messageRowForProjection.channel_id,
@@ -1003,6 +1247,75 @@ export class ChatChannel extends DurableObject<Env> {
       });
     }
 
+    if (url.pathname === "/internal/message-edit") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as { operation_id: string; message_id: string; text: string; channel_id: string };
+      const requestHash = JSON.stringify({ message_id: b.message_id, text: b.text });
+      const now = this.nowIso();
+      return this.applyMessageMutation({
+        userId,
+        operationId: b.operation_id,
+        channelId: b.channel_id,
+        messageId: b.message_id,
+        operation: "message.edit",
+        requestHash,
+        mutate: () => ({
+          eventType: "message.updated",
+          fields: {
+            text: b.text,
+            status: "edited",
+            edited_at: now,
+          },
+        }),
+      });
+    }
+
+    if (url.pathname === "/internal/message-recall") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as { operation_id: string; message_id: string; channel_id: string };
+      const now = this.nowIso();
+      return this.applyMessageMutation({
+        userId,
+        operationId: b.operation_id,
+        channelId: b.channel_id,
+        messageId: b.message_id,
+        operation: "message.recall",
+        requestHash: JSON.stringify({ message_id: b.message_id }),
+        mutate: () => ({
+          eventType: "message.recalled",
+          fields: {
+            status: "recalled",
+            recalled_at: now,
+          },
+        }),
+      });
+    }
+
+    if (url.pathname === "/internal/message-delete") {
+      const userId = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!userId) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as { operation_id: string; message_id: string; reason?: string | null; channel_id: string };
+      const now = this.nowIso();
+      return this.applyMessageMutation({
+        userId,
+        operationId: b.operation_id,
+        channelId: b.channel_id,
+        messageId: b.message_id,
+        operation: "message.delete",
+        requestHash: JSON.stringify({ message_id: b.message_id, reason: b.reason ?? null }),
+        mutate: () => ({
+          eventType: "message.deleted",
+          fields: {
+            status: "deleted",
+            deleted_at: now,
+            deleted_by: userId,
+          },
+        }),
+      });
+    }
+
     if (url.pathname === "/internal/dissolve") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });
@@ -1104,6 +1417,7 @@ export class ChatChannel extends DurableObject<Env> {
         payload_json: typeof row.payload_json === "string" ? row.payload_json : "",
         occurred_at: typeof row.occurred_at === "string" ? row.occurred_at : "",
       }));
+      const messageReplayTypes = new Set(["message.created", "message.updated", "message.recalled", "message.deleted"]);
       const managementTypes = new Set([
         "channel.created",
         "channel.updated",
@@ -1115,10 +1429,18 @@ export class ChatChannel extends DurableObject<Env> {
       ]);
       const userIdsToResolve: string[] = [];
       for (const r of parsedRows) {
-        if (r.event_type === "message.created" || r.event_type === "message.updated") {
+        if (messageReplayTypes.has(r.event_type)) {
           try {
-            const p = JSON.parse(r.payload_json) as { message?: { sender?: { kind?: string; user_id?: string | null } } };
-            if (p.message?.sender?.kind === "user" && p.message.sender.user_id) userIdsToResolve.push(p.message.sender.user_id);
+            const p = JSON.parse(r.payload_json) as { message?: { message_id?: string } };
+            const messageId = p.message?.message_id;
+            if (messageId) {
+              const messageRow = this.ctx.storage.sql
+                .exec("SELECT sender_kind, sender_user_id FROM messages WHERE message_id=?", messageId)
+                .toArray()[0] as { sender_kind: string; sender_user_id: string | null } | undefined;
+              if (messageRow?.sender_kind === "user" && messageRow.sender_user_id) {
+                userIdsToResolve.push(messageRow.sender_user_id);
+              }
+            }
           } catch {
             // ignore malformed payload
           }
@@ -1154,22 +1476,6 @@ export class ChatChannel extends DurableObject<Env> {
       const out: Array<ReplayEnvelope> = [];
 
       for (const r of parsedRows) {
-        if (r.event_type === "message.created" || r.event_type === "message.updated") {
-          try {
-            const p = JSON.parse(r.payload_json) as { message?: { message_id?: string } };
-            const messageId = p.message?.message_id;
-            if (messageId) {
-              const messageRow = this.ctx.storage.sql.exec(
-                "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE message_id=?",
-                messageId,
-              ).toArray()[0] as MessageRow | undefined;
-              if (messageRow && (messageRow.status === "deleted" || messageRow.status === "recalled")) continue;
-            }
-          } catch {
-            // malformed payload or missing payload message_id
-          }
-        }
-
         let payload: Record<string, unknown> = {};
         try {
           payload = JSON.parse(r.payload_json) as Record<string, unknown>;
@@ -1177,29 +1483,33 @@ export class ChatChannel extends DurableObject<Env> {
           payload = {};
         }
 
-        if (r.event_type === "message.created" || r.event_type === "message.updated") {
+        if (messageReplayTypes.has(r.event_type)) {
           try {
-            const p = JSON.parse(r.payload_json) as { message?: { message_id?: string } };
-            const messageId = p.message?.message_id;
+            const p = payload.message as { message_id?: string } | undefined;
+            const messageId = typeof p?.message_id === "string" ? p.message_id : "";
             if (!messageId) {
-              throw new Error("missing message_id");
+              continue;
             }
-            const messageRow = this.ctx.storage.sql.exec(
-              "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE message_id=?",
-              messageId,
-            ).toArray()[0] as MessageRow | undefined;
+            const messageRow = this.ctx.storage.sql
+              .exec(
+                "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE message_id=?",
+                messageId,
+              )
+              .toArray()[0] as MessageRow | undefined;
             if (!messageRow) {
-              throw new Error("message row missing");
+              continue;
+            }
+            if (r.event_type === "message.created" && (messageRow.status === "deleted" || messageRow.status === "recalled")) {
+              continue;
             }
             const senderSummary = messageRow.sender_kind === "user" && messageRow.sender_user_id
               ? liveSenderMap.get(messageRow.sender_user_id) ?? undefined
               : undefined;
             payload = { message: projectMessageForBrowser(messageRow, { senderSummary }) };
           } catch {
-            // malformed payload or missing payload
+            // malformed payload or missing payload message_id
           }
-        }
-        if (managementTypes.has(r.event_type) && r.event_type !== "read_state.updated") {
+        } else if (managementTypes.has(r.event_type) && r.event_type !== "read_state.updated") {
           payload = resolveActorWithMap(payload, liveMap);
         }
 
