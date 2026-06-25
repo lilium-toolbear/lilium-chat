@@ -2146,6 +2146,33 @@ export class ChatChannel extends DurableObject<Env> {
         continue;
       }
 
+      if (r.target_kind === "invite_directory") {
+        const target = this.env.INVITE_DIRECTORY.getByName("shared");
+        try {
+          const res = await target.fetch(new Request("https://x/upsert", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: r.payload_json,
+          }));
+          if (!res.ok) {
+            const text = await res.text();
+            await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
+            continue;
+          }
+          this.ctx.storage.sql.exec(
+            "UPDATE projection_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
+            nowIso,
+            r.outbox_id,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.bumpOutboxRetry(r.outbox_id, nowIso, msg);
+        }
+        continue;
+      }
+
       if (r.target_kind === "channel_fanout") {
         let payload: { action?: string; event_id?: string; event_json?: string; membership_version_at_event?: number; user_id?: string };
         try {
