@@ -38,7 +38,7 @@
 **Create:**
 - `test/do/channel-directory.test.ts` — ChannelDirectory `/internal/apply-projection` upsert/delete idempotency + `/internal/list` pagination + visibility filter (read model only returns `status=active` rows).
 - `test/do/chat-channel-public-projection.test.ts` — ChatChannel writes `channel_directory` outbox on: create-public, visibility private→public_listed, public title/topic/avatar update, member_count delta, dissolve. Asserts outbox rows co-atomic with business rows.
-- `test/do/chat-channel-join.test.ts` — `POST /internal/join` with `operation_id`: idempotency cache hit, conflict on different body, visibility gate (`private`/`public_unlisted`/`system`/`dissolved` rejections), already-a-member success, dissolved rejection.
+- `test/do/chat-channel-join.test.ts` — `POST /internal/join` with `operation_id`: idempotency cache hit, conflict on different body, visibility gate (`private`/`public_unlisted`/`dm`/`dissolved` rejections), system channel allowed as `public_listed` already-member no-op, already-a-member success, dissolved rejection.
 - `test/routes/channel-directory.test.ts` — `GET /api/chat/channels/directory` HTTP route: pagination, q filter, merges caller's `role`/`unread_count`/`last_read_event_id` from UserDirectory, shape parity with contract §5.6.
 - `test/routes/channel-join.test.ts` — `POST /api/chat/channels/:channel_id/join` HTTP route: idempotency, visibility gate, dissolved, already-member, returns `{channel, membership}`.
 
@@ -183,6 +183,7 @@ git commit -m "feat(do): ChatChannel channel_directory projection outbox + flush
   - rejoin as a `left` user on a private channel → `403 FORBIDDEN` (visibility gate applies to rejoin too).
   - rejoin as a former admin (`left_at` set, prior `role='admin'`) on a public channel → `role` reset to `'member'` (not restored to admin).
   - `ensureSystemJoined` still succeeds (system channel is `public_listed`).
+  - browser join of the system channel (with `operation_id`) → 200, already-active-member no-op, returns existing `role`/`joined_at`, no `member.joined` event, `idempotency_keys` row written (P1-1: system channel join is allowed, not 403).
 - [ ] **Step 2: Implement** the gate + idempotency cache in `/internal/join`.
 - [ ] **Step 3:** Run `npx vitest run test/do/chat-channel-join.test.ts --no-file-parallelism --test-timeout=60000 --hook-timeout=60000`. Green.
 - [ ] **Step 4:** `npm run typecheck`. Clean.
