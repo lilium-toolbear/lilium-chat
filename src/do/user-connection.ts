@@ -162,7 +162,13 @@ export class UserConnection extends DurableObject<Env> {
       })(),
     );
 
-    return new Response(null, { status: 101, webSocket: client });
+    // Browsers require the server to select one offered subprotocol on 101.
+    // JWT auth uses bearer.<jwt> client-side only; echo the API version.
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      headers: { "Sec-WebSocket-Protocol": "lilium.chat.v1" },
+    });
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {

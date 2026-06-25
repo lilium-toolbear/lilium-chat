@@ -63,6 +63,7 @@ describe("e2e: message.send → committed_ack → message.created self-receive",
       { waitUntil: () => {}, passThroughOnException: () => {} } as any,
     );
     expect(res.status).toBe(101);
+    expect(res.headers.get("Sec-WebSocket-Protocol")).toBe("lilium.chat.v1");
     const ws = res.webSocket as WebSocket;
     ws.accept();
 
