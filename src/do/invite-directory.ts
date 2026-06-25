@@ -1,21 +1,18 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
-import { execSchema } from "./sql";
-
-const SCHEMA = [
-  `CREATE TABLE IF NOT EXISTS invite_index (
-    invite_code TEXT PRIMARY KEY, channel_id TEXT NOT NULL, status TEXT NOT NULL,
-    expires_at TEXT NOT NULL, revoked_at TEXT, updated_at TEXT NOT NULL
-  )`,
-];
+import { handleSchemaVersionRequest } from "./sql-migrations";
+import { migrateInviteDirectorySchema } from "./migrations/invite-directory";
 
 export class InviteDirectory extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    execSchema(this.ctx, SCHEMA);
+    migrateInviteDirectorySchema(this.ctx);
   }
 
   async fetch(request: Request): Promise<Response> {
+    const schemaVersion = handleSchemaVersionRequest(this.ctx, "InviteDirectory", request);
+    if (schemaVersion) return schemaVersion;
+
     const url = new URL(request.url);
     if (url.pathname === "/ping") return Response.json({ ok: true });
 
