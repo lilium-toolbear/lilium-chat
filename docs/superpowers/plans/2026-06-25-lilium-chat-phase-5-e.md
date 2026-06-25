@@ -768,3 +768,75 @@ In A3 tests, add:
 - B4: `UserDirectory` owns `sticker.save` (cheap pre-check → miss → ChatChannel resolve → txn re-check + upsert). Own-finalized path checked in UserDirectory first (skip ChatChannel).
 - B5: `requestHash` includes `sticker_id`; parser enforces `text=""`/`attachment_ids=[]`/`mentions=[]` for type=sticker.
 - Upload validation tests: MIME allowlist, size limit, width/height, sticker library limit.
+
+---
+
+## Residual Appendix (2026-06-25 — second review pass, 2 P0-R + 3 P1-R)
+
+The first Appendix closed the original 5 P0 but introduced/missed 5 more issues. These override the first Appendix where they conflict.
+
+### P0-R1: A4-corr-1 cross-DO fetch must NOT be inside ChatChannel transaction
+
+A4-corr-1 wrote "ChatChannel message-send handler, in its txn: for each attachment_id: cross-DO fetch UserDirectory". This violates the no-network-call-in-txn rule (same as P1-3 from the Phase 4+6 review: Hyperdrive/S3/cross-DO calls are network I/O that must happen before or after `ctx.storage.transaction`).
+
+**Corrected A4-corr-1 flow:**
+```text
+ChatChannel /internal/message-send (type=image):
+  1. cheap idempotency pre-check (cached → return)
+  2. resolve sender UserSummary (before txn — existing pattern)
+  3. NEW: for each attachment_id, fetch UserDirectory(user_id) /internal/attachment-get
+     → get finalized pending attachment metadata (BEFORE txn, not in it)
+     → if any attachment is not finalized / not owned → error
+  4. enter ChatChannel txn:
+     a. re-check idempotency (concurrent race guard)
+     b. dissolved-gate, member-gate
+     c. for each attachment: INSERT/copy into ChatChannel.attachments (channel-local copy)
+     d. INSERT messages + message_attachments
+     e. INSERT events + idempotency_keys (full ack) + fanout outbox
+  5. return ack payload
+```
+
+This mirrors the existing `message.send` pattern (resolve sender before txn → txn does writes only) + the `applyMessageMutation` preflight-sender pattern.
+
+### P0-R2: `src/do/user-connection.ts` MUST be modified — remove from Do NOT touch
+
+The File Structure says `src/do/user-connection.ts` under "Do NOT touch" with the note "(message.send already routed)". But `UserConnection.webSocketMessage` currently forwards only `{command_id, dedupe_principal_key, type, text, reply_to, mentions, channel_id}` to ChatChannel `/internal/message-send`. It does NOT forward `attachment_ids` or `sticker_id`.
+
+**Fix:**
+- Remove `src/do/user-connection.ts` from the "Do NOT touch" list in File Structure.
+- Task A4 (image) must extend the UserConnection message-send dispatch body to include `attachment_ids: parsed.command.attachment_ids` (the parser will parse them).
+- Task B5 (sticker) must extend it to include `sticker_id: parsed.command.sticker_id`.
+- The parser (`src/chat/command.ts`) must also be extended to return `attachment_ids` / `sticker_id` in `ParsedMessageSend` (the plan's A4/B5 already say this, but the UserConnection pass-through was missing).
+
+### P1-R1: B6 must also carry `stickers_by_message` through routes/sender
+
+A5-corr-1 added `attachments_by_message` through `/internal/messages` → `sender.ts` → `routes/messages.ts` + `bootstrap.ts`. B6 has the same gap for stickers: it only mentions `message-projection.ts` + `chat-channel.ts`, not the route/sender layer.
+
+**Fix B6:**
+- `/internal/messages` (ChatChannel) also returns `stickers_by_message: Record<message_id, {sticker_id, attachment_id, url, mime_type, width, height, size_bytes}>` (read from `message_stickers` by `message_id`, like `mentions` + `attachments`).
+- `src/chat/sender.ts` `projectMessagesForBrowser` accepts `stickersByMessage` alongside `attachmentsByMessage` + `mentionsByMessage`, and passes `sticker` into each `projectMessageForBrowser(row, {senderSummary, mentions, attachments, sticker})` call.
+- `src/routes/messages.ts` + `bootstrap.ts` read `stickers_by_message` from the DO response + pass it through.
+- `projectMessageForBrowser` already accepts `sticker` (added in B5); this just wires the history/bootstrap path.
+
+### P1-R2: `UNSUPPORTED_ATTACHMENT_TYPE` is `415`, not `409`
+
+A3-corr-3 wrote "finalize HEAD fail → `409` `UNSUPPORTED_ATTACHMENT_TYPE`". But `src/errors.ts` defines `UNSUPPORTED_ATTACHMENT_TYPE: 415`. `cachedResponse` maps via `HTTP_STATUS_BY_CODE` so the status is automatic — just don't hardcode 409.
+
+**Fix:** A3-corr-3: finalize HEAD fail → `UNSUPPORTED_ATTACHMENT_TYPE` (code only; `errors.ts` already maps it to 415). Size limit → `ATTACHMENT_TOO_LARGE` (413). Do NOT write explicit HTTP status numbers in the plan — reference the code and let `errors.ts` + `cachedResponse` resolve the status.
+
+### P1-R3: `X-Amz-Expires` must be set in URL query BEFORE signing
+
+A1-corr-1 wrote "pass it in the URL or headers". But `aws4fetch` query signing reads `X-Amz-Expires` from the URL's search params; if absent it defaults to 86400s. Headers don't work for query signing.
+
+**Fix A1-corr-1:** the `presignPutUrl` implementation must:
+```typescript
+const url = new URL(`${env.S3_ENDPOINT}/${env.S3_BUCKET}/${key}`);
+url.searchParams.set("X-Amz-Expires", "300"); // 5 min — MUST be in URL query, not headers
+const signedReq = await client.sign(url, {
+  method: "PUT",
+  headers: { "Content-Type": contentType },
+  aws: { signQuery: true, allHeaders: true },
+});
+return { upload_url: signedReq.url, expires_at: new Date(Date.now() + 300 * 1000).toISOString() };
+```
+Not "URL or headers" — URL query only, set BEFORE `sign()`.
