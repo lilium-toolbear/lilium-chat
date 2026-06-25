@@ -558,3 +558,60 @@ export async function joinChannelHandler(c: Context<{ Bindings: Env; Variables: 
   const membership = { role: joinBody.role, joined_at: joinBody.joined_at };
   return c.json({ channel, membership }, 200, { "X-Request-Id": c.get("requestId") });
 }
+
+export async function listPublicDirectoryHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const q = c.req.query("q") ?? "";
+  const rawLimit = parseInt(c.req.query("limit") ?? "50", 10);
+  const limit = Number.isNaN(rawLimit) ? 50 : Math.max(1, Math.min(100, rawLimit));
+  const cursor = c.req.query("cursor") ?? null;
+
+  const dirStub = env.CHANNEL_DIRECTORY.getByName("shared");
+  const listUrl = `https://x/internal/list?q=${encodeURIComponent(q)}&limit=${limit}` + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+  const dirRes = await dirStub.fetch(new Request(listUrl));
+  if (!dirRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "directory list failed");
+  const dirBody = (await dirRes.json()) as { items: { channel_id: string; title: string; avatar_url: string | null; member_count: number; last_message_at: string | null; status: string }[]; next_cursor: string | null };
+
+  // Step 1: caller's active-membership set + last_read_event_id from UserDirectory/my-channels (one call).
+  const udStub = env.USER_DIRECTORY.getByName(userId);
+  const udRes = await udStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
+  if (!udRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "my-channels failed");
+  const udBody = (await udRes.json()) as { items: { channel_id: string; last_read_event_id: string | null }[] };
+  const activeChannelIds = new Set(udBody.items.map((i) => i.channel_id));
+  const lastReadByChannel = new Map<string, string | null>();
+  for (const i of udBody.items) lastReadByChannel.set(i.channel_id, i.last_read_event_id);
+
+  // Step 2: for each directory row the caller is an active member of, fetch role from
+  // ChatChannel/internal/summary.my_role (NOT .role). Run concurrently.
+  const joinedRows = dirBody.items.filter((i) => activeChannelIds.has(i.channel_id));
+  const roleEntries = await Promise.all(
+    joinedRows.map(async (row) => {
+      try {
+        const chStub = env.CHAT_CHANNEL.getByName(row.channel_id);
+        const sRes = await chStub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
+        if (!sRes.ok) return [row.channel_id, null] as const;
+        const s = (await sRes.json()) as { my_role?: string | null };
+        return [row.channel_id, s.my_role ?? null] as const;
+      } catch {
+        return [row.channel_id, null] as const;
+      }
+    }),
+  );
+  const roleByChannel = new Map<string, string | null>(roleEntries);
+
+  const items = dirBody.items.map((row) => ({
+    channel_id: row.channel_id,
+    kind: "channel",
+    visibility: "public_listed",
+    title: row.title,
+    avatar_url: row.avatar_url,
+    member_count: row.member_count,
+    role: roleByChannel.get(row.channel_id) ?? null,
+    status: row.status,
+    unread_count: 0,
+    last_read_event_id: lastReadByChannel.get(row.channel_id) ?? null,
+    last_message_preview: null,
+    last_message_at: row.last_message_at,
+  }));
+  return c.json({ items, next_cursor: dirBody.next_cursor }, 200, { "X-Request-Id": c.get("requestId") });
+}
