@@ -1,7 +1,6 @@
 import {
   applyBaselineSchema,
   migrateSqlite,
-  tableExists,
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
@@ -35,9 +34,6 @@ export const CHANNEL_FANOUT_BASELINE_SCHEMA: string[] = [
 export const channelFanoutBaseline: BaselineDetector = {
   version: 1,
   name: "baseline existing ChannelFanout schema",
-  isAlreadyApplied(ctx) {
-    return tableExists(ctx, "online_sessions");
-  },
   applyFresh(ctx) {
     applyBaselineSchema(ctx, CHANNEL_FANOUT_BASELINE_SCHEMA);
   },

@@ -1,7 +1,6 @@
 import {
   applyBaselineSchema,
   migrateSqlite,
-  tableExists,
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
@@ -18,9 +17,6 @@ export const INVITE_DIRECTORY_BASELINE_SCHEMA: string[] = [
 export const inviteDirectoryBaseline: BaselineDetector = {
   version: 1,
   name: "baseline existing InviteDirectory schema",
-  isAlreadyApplied(ctx) {
-    return tableExists(ctx, "invite_index");
-  },
   applyFresh(ctx) {
     applyBaselineSchema(ctx, INVITE_DIRECTORY_BASELINE_SCHEMA);
   },

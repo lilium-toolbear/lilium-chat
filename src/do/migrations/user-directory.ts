@@ -2,7 +2,6 @@ import {
   applyBaselineSchema,
   columnExists,
   migrateSqlite,
-  tableExists,
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
@@ -54,9 +53,6 @@ export const USER_DIRECTORY_LEGACY_BASELINE_SCHEMA = USER_DIRECTORY_BASELINE_SCH
 export const userDirectoryBaseline: BaselineDetector = {
   version: 1,
   name: "baseline existing UserDirectory schema",
-  isAlreadyApplied(ctx) {
-    return tableExists(ctx, "my_channels");
-  },
   applyFresh(ctx) {
     applyBaselineSchema(ctx, USER_DIRECTORY_BASELINE_SCHEMA);
   },

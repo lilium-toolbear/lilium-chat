@@ -9,7 +9,6 @@ export interface SqlMigration {
 export interface BaselineDetector {
   version: number;
   name: string;
-  isAlreadyApplied(ctx: DurableObjectState): boolean;
   applyFresh(ctx: DurableObjectState): void;
 }
 
@@ -64,12 +63,8 @@ export function migrateSqlite(
       let currentVersion = maxRow?.v ?? null;
 
       if (currentVersion === null) {
-        if (baseline.isAlreadyApplied(ctx)) {
-          stampMigration(ctx, baseline.version, baseline.name);
-        } else {
-          baseline.applyFresh(ctx);
-          stampMigration(ctx, baseline.version, baseline.name);
-        }
+        baseline.applyFresh(ctx);
+        stampMigration(ctx, baseline.version, baseline.name);
         currentVersion = baseline.version;
       }
 

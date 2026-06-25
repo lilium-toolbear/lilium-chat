@@ -2,7 +2,6 @@ import {
   applyBaselineSchema,
   columnExists,
   migrateSqlite,
-  tableExists,
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
@@ -126,9 +125,6 @@ export const CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA = CHAT_CHANNEL_BASELINE_SCHEMA;
 export const chatChannelBaseline: BaselineDetector = {
   version: 1,
   name: "baseline existing ChatChannel schema",
-  isAlreadyApplied(ctx) {
-    return tableExists(ctx, "channel_meta");
-  },
   applyFresh(ctx) {
     applyBaselineSchema(ctx, CHAT_CHANNEL_BASELINE_SCHEMA);
   },

@@ -1,7 +1,6 @@
 import {
   applyBaselineSchema,
   migrateSqlite,
-  tableExists,
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
@@ -19,9 +18,6 @@ export const CHANNEL_DIRECTORY_BASELINE_SCHEMA: string[] = [
 export const channelDirectoryBaseline: BaselineDetector = {
   version: 1,
   name: "baseline existing ChannelDirectory schema",
-  isAlreadyApplied(ctx) {
-    return tableExists(ctx, "public_channels");
-  },
   applyFresh(ctx) {
     applyBaselineSchema(ctx, CHANNEL_DIRECTORY_BASELINE_SCHEMA);
   },

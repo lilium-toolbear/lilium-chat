@@ -44,7 +44,7 @@ describe("migrateSqlite", () => {
     expect(body.applied.map((row) => row.version)).toEqual([1]);
   });
 
-  it("existing baseline tables without schema_migrations stamp baseline without re-running DDL", async () => {
+  it("existing baseline tables without schema_migrations re-run idempotent baseline DDL and stamp baseline", async () => {
     const stub = directoryStub(`migrate-legacy-${crypto.randomUUID()}`);
     await stub.fetch(new Request("https://x/ping"));
 
@@ -63,6 +63,7 @@ describe("migrateSqlite", () => {
 
       migrateSqlite(ctx, "ChannelDirectory", channelDirectoryBaseline, channelDirectoryMigrations);
 
+      // Idempotent baseline DDL re-ran (CREATE TABLE IF NOT EXISTS) — anchor data preserved
       const rows = ctx.storage.sql
         .exec("SELECT channel_id, title FROM public_channels WHERE channel_id=?", "legacy-channel")
         .toArray() as Array<{ channel_id: string; title: string }>;
@@ -82,9 +83,6 @@ describe("migrateSqlite", () => {
     const testBaseline: BaselineDetector = {
       version: 1,
       name: "test baseline",
-      isAlreadyApplied(ctx) {
-        return tableExists(ctx, "public_channels");
-      },
       applyFresh(ctx) {
         applyBaselineSchema(ctx, CHANNEL_DIRECTORY_BASELINE_SCHEMA);
       },

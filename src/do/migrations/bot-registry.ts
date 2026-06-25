@@ -1,7 +1,6 @@
 import {
   applyBaselineSchema,
   migrateSqlite,
-  tableExists,
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
@@ -24,9 +23,6 @@ export const BOT_REGISTRY_BASELINE_SCHEMA: string[] = [
 export const botRegistryBaseline: BaselineDetector = {
   version: 1,
   name: "baseline existing BotRegistry schema",
-  isAlreadyApplied(ctx) {
-    return tableExists(ctx, "bot_apps");
-  },
   applyFresh(ctx) {
     applyBaselineSchema(ctx, BOT_REGISTRY_BASELINE_SCHEMA);
   },
