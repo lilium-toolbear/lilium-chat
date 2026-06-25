@@ -303,6 +303,7 @@ export class ChatChannel extends DurableObject<Env> {
     messageId: string;
     operation: "message.edit" | "message.recall" | "message.delete";
     requestHash: string;
+    reason: string | null;
     mutate: (row: MessageRow) => {
       eventType: "message.updated" | "message.recalled" | "message.deleted";
       fields: Partial<MessageRow>;
@@ -439,7 +440,13 @@ export class ChatChannel extends DurableObject<Env> {
       const senderSummary = updatedRow.sender_kind === "user" && updatedRow.sender_user_id
         ? actorMap.get(updatedRow.sender_user_id) ?? null
         : null;
-      const liveMessage = projectMessageForBrowser(updatedRow, { senderSummary });
+      // Load the message's mentions for the live projection. For deleted/recalled the builder
+      // forces mentions=[] anyway; for edited we preserve current mentions (text-edit only).
+      const mentionRows = this.ctx.storage.sql
+        .exec("SELECT user_id, start, end_ AS end FROM mentions WHERE message_id=?", input.messageId)
+        .toArray() as Array<{ user_id: string; start: number; end: number }>;
+      const mentionsForProjection = mentionRows.map((m) => ({ user_id: m.user_id, start: m.start, end: m.end }));
+      const liveMessage = projectMessageForBrowser(updatedRow, { senderSummary, mentions: mentionsForProjection });
       const liveFrame = buildEventFrame({
         event_id: eventId,
         type: mutation.eventType,
@@ -472,7 +479,7 @@ export class ChatChannel extends DurableObject<Env> {
           input.messageId,
           JSON.stringify(row),
           JSON.stringify(updatedRow),
-          null,
+          input.reason,
           input.operationId,
           now,
         );
@@ -486,7 +493,7 @@ export class ChatChannel extends DurableObject<Env> {
           input.messageId,
           JSON.stringify(row),
           JSON.stringify(updatedRow),
-          null,
+          input.reason,
           input.operationId,
           now,
         );
@@ -532,7 +539,15 @@ export class ChatChannel extends DurableObject<Env> {
       return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: HTTP_STATUS_BY_CODE.IDEMPOTENCY_CONFLICT ?? 409 });
     }
     if (txResult.kind === "cached") {
-      return this.cachedResponse(txResult.responseJson);
+      // unwrap the full command_ack JSON → return {channel_id, event_id, message} (the internal
+      // endpoint contract). The cached response_json is a full ack frame; the WS UserConnection
+      // re-wraps it. This mirrors the cheap pre-check path + the message-send cached branch.
+      const cached = JSON.parse(txResult.responseJson) as { payload?: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } };
+      if (cached.payload && cached.payload.event_id && cached.payload.message) {
+        return Response.json({ channel_id: cached.payload.channel_id ?? input.channelId, event_id: cached.payload.event_id, message: cached.payload.message });
+      }
+      // malformed/empty cached entry — treat as conflict (shouldn't happen with in-txn full-ack write)
+      return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: HTTP_STATUS_BY_CODE.IDEMPOTENCY_CONFLICT ?? 409 });
     }
     if (txResult.kind === "error") {
       return this.cachedResponse(txResult.j);
@@ -1285,6 +1300,7 @@ export class ChatChannel extends DurableObject<Env> {
         messageId: b.message_id,
         operation: "message.edit",
         requestHash,
+        reason: null,
         mutate: () => ({
           eventType: "message.updated",
           fields: {
@@ -1308,6 +1324,7 @@ export class ChatChannel extends DurableObject<Env> {
         messageId: b.message_id,
         operation: "message.recall",
         requestHash: JSON.stringify({ message_id: b.message_id }),
+        reason: null,
         mutate: () => ({
           eventType: "message.recalled",
           fields: {
@@ -1330,6 +1347,7 @@ export class ChatChannel extends DurableObject<Env> {
         messageId: b.message_id,
         operation: "message.delete",
         requestHash: JSON.stringify({ message_id: b.message_id, reason: b.reason ?? null }),
+        reason: b.reason ?? null,
         mutate: () => ({
           eventType: "message.deleted",
           fields: {
@@ -1762,6 +1780,9 @@ export class ChatChannel extends DurableObject<Env> {
         | { kind: "cached"; responseJson: string }
         | { kind: "ok"; responseJson: string };
 
+      // Resolve actor profile BEFORE the transaction (Hyperdrive is a network call).
+      const actorMap = await this.resolveActorMap([userId]);
+
       const txResult = await this.ctx.storage.transaction(async (): Promise<TxResult> => {
         const idem = this.ctx.storage.sql
           .exec(
@@ -1809,8 +1830,8 @@ export class ChatChannel extends DurableObject<Env> {
         }
 
         const currentMember = this.ctx.storage.sql
-          .exec("SELECT joined_at, left_at FROM members WHERE channel_id=? AND user_id=?", channelId, userId)
-          .toArray()[0] as { joined_at: string; left_at: string | null } | undefined;
+          .exec("SELECT role, joined_at, left_at FROM members WHERE channel_id=? AND user_id=?", channelId, userId)
+          .toArray()[0] as { role: string; joined_at: string; left_at: string | null } | undefined;
 
         if (currentMember && currentMember.left_at === null) {
           const responseJson = JSON.stringify({
@@ -1824,7 +1845,7 @@ export class ChatChannel extends DurableObject<Env> {
               status: meta.status,
             },
             membership: {
-              role: "member",
+              role: currentMember.role,
               joined_at: currentMember.joined_at,
               status: "active",
             },
@@ -1848,7 +1869,6 @@ export class ChatChannel extends DurableObject<Env> {
           };
         }
 
-        const actorMap = await this.resolveActorMap([userId]);
         const mv = meta.membership_version + 1;
         if (currentMember === undefined) {
           this.ctx.storage.sql.exec(
@@ -2128,7 +2148,13 @@ export class ChatChannel extends DurableObject<Env> {
             const senderSummary = messageRow.sender_kind === "user" && messageRow.sender_user_id
               ? liveSenderMap.get(messageRow.sender_user_id) ?? undefined
               : undefined;
-            payload = { message: projectMessageForBrowser(messageRow, { senderSummary }) };
+            // Load this message's mentions for the projection (edited preserves mentions;
+            // deleted/recalled builder forces [] anyway).
+            const replayMentionRows = this.ctx.storage.sql
+              .exec("SELECT user_id, start, end_ AS end FROM mentions WHERE message_id=?", messageRow.message_id)
+              .toArray() as Array<{ user_id: string; start: number; end: number }>;
+            const replayMentions = replayMentionRows.map((m) => ({ user_id: m.user_id, start: m.start, end: m.end }));
+            payload = { message: projectMessageForBrowser(messageRow, { senderSummary, mentions: replayMentions }) };
           } catch {
             // malformed payload or missing payload message_id
           }

@@ -234,4 +234,68 @@ describe("ChatChannel message lifecycle", () => {
     expect(noticePayload.payload.actor?.user_id).toBe(owner);
     expect(noticePayload.payload.target_user?.user_id).toBe(member);
   });
+
+  // P0-2 regression: edit after send-with-mention must preserve mentions in the ack projection.
+  it("P0-2: edit a message that has mentions -> ack projection preserves mentions", async () => {
+    const userId = "u-lc-p02";
+    const cid = "0199aa01-0000-7000-8000-000000000001";
+    const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], cid);
+    await stub.fetch(new Request("https://x/internal/create-channel", {
+      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ channel_id: cid, creator_user_id: userId, title: "M2", topic: null, avatar_attachment_id: null, visibility: "private", initial_members: [] }),
+    }));
+    // send a message WITH a mention
+    const send = await (await stub.fetch(new Request("https://x/internal/message-send", {
+      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ command_id: "cmd-send-p02", dedupe_principal_key: `user:${userId}`, type: "text", text: "hi @bob", reply_to: null, mentions: [{ user_id: "u-bob", start: 3, end: 6 }], channel_id: cid }),
+    }))).json() as { message: { message_id: string; mentions: Array<{ user_id: string }> } };
+    expect(send.message.mentions).toHaveLength(1);
+    expect(send.message.mentions[0]?.user_id).toBe("u-bob");
+
+    // edit — text changes, mentions should be preserved (not dropped to [])
+    const editRes = await stub.fetch(new Request("https://x/internal/message-edit", {
+      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ operation_id: "cmd-edit-p02", message_id: send.message.message_id, text: "edited @bob", channel_id: cid }),
+    }));
+    expect(editRes.status).toBe(200);
+    const editAck = (await editRes.json()) as { message: { mentions: Array<{ user_id: string }> } };
+    expect(editAck.message.mentions).toHaveLength(1);
+    expect(editAck.message.mentions[0]?.user_id).toBe("u-bob");
+  });
+
+  // P0-1 regression: concurrent same command_id — the second (in-txn cached) branch must return
+  // {channel_id, event_id, message}, NOT the full command_ack JSON frame.
+  it("P0-1: in-txn cached branch returns {channel_id, event_id, message} shape (not full ack frame)", async () => {
+    const userId = "u-lc-p01";
+    const cid = "0199bb02-0000-7000-8000-000000000001";
+    const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], cid);
+    await stub.fetch(new Request("https://x/internal/create-channel", {
+      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ channel_id: cid, creator_user_id: userId, title: "M3", topic: null, avatar_attachment_id: null, visibility: "private", initial_members: [] }),
+    }));
+    const send = await (await stub.fetch(new Request("https://x/internal/message-send", {
+      method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+      body: JSON.stringify({ command_id: "cmd-send-p01", dedupe_principal_key: `user:${userId}`, type: "text", text: "orig", reply_to: null, mentions: [], channel_id: cid }),
+    }))).json() as { message: { message_id: string } };
+
+    // two concurrent edits with the SAME command_id + same body — both should return the internal shape
+    const editBody = JSON.stringify({ operation_id: "cmd-edit-p01", message_id: send.message.message_id, text: "edited", channel_id: cid });
+    const [r1, r2] = await Promise.all([
+      stub.fetch(new Request("https://x/internal/message-edit", { method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" }, body: editBody })),
+      stub.fetch(new Request("https://x/internal/message-edit", { method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" }, body: editBody })),
+    ]);
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    const b1 = (await r1.json()) as { channel_id: string; event_id: string; message: Record<string, unknown> };
+    const b2 = (await r2.json()) as { channel_id: string; event_id: string; message: Record<string, unknown> };
+    // both must have the internal shape (channel_id/event_id/message at top level), NOT frame_type:"command_ack"
+    expect(b1.channel_id).toBe(cid);
+    expect(b1.event_id).toBeTruthy();
+    expect(b1.message).toBeTruthy();
+    expect(b2.channel_id).toBe(cid);
+    expect(b2.event_id).toBe(b1.event_id); // cached returns same event_id
+    // critical: b2 must NOT be a full ack frame (no frame_type field)
+    expect(b1 as unknown as { frame_type?: string }).not.toHaveProperty("frame_type");
+    expect(b2 as unknown as { frame_type?: string }).not.toHaveProperty("frame_type");
+  });
 });

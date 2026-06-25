@@ -303,7 +303,7 @@ export async function createInviteHandler(c: Context<{ Bindings: Env; Variables:
   const base = new URL(c.req.url).origin;
   return c.json({
     invite_code: out.invite_code,
-    invite_url: `${base}/api/chat/invites/${out.invite_code}`,
+    invite_url: `${base}/chat/invites/${out.invite_code}`,
     expires_at: out.expires_at,
     max_uses: out.max_uses,
   }, 200, { "X-Request-Id": c.get("requestId") });
