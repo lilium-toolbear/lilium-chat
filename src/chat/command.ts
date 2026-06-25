@@ -9,15 +9,29 @@ export interface ParsedMessageSend {
   mentions: Array<{ user_id: string; start: number; end: number }>;
 }
 
-export type ParseResult =
-  | { ok: true; command: ParsedMessageSend }
+export interface ParsedMessageEdit {
+  message_id: string;
+  text: string;
+}
+
+export interface ParsedMessageRecall {
+  message_id: string;
+}
+
+export interface ParsedMessageDelete {
+  message_id: string;
+  reason: string | null;
+}
+
+export type ParseResult<T> =
+  | { ok: true; command: T }
   | { ok: false; error: { code: string; message: string; retryable: boolean } };
 
 export function dedupePrincipalKeyForUser(userId: string): string {
   return `user:${userId}`;
 }
 
-export function parseMessageSendCommand(frame: CommandFrame, senderUserId: string): ParseResult {
+export function parseMessageSendCommand(frame: CommandFrame, senderUserId: string): ParseResult<ParsedMessageSend> {
   if (frame.command !== "message.send") {
     return { ok: false, error: { code: "INVALID_COMMAND", message: `unsupported command: ${frame.command}`, retryable: false } };
   }
@@ -62,5 +76,73 @@ export function parseMessageSendCommand(frame: CommandFrame, senderUserId: strin
     .filter((m) => m.user_id);
 
   void senderUserId; // sender identity comes from the authenticated socket, not the payload
-    return { ok: true, command: { command_id, type: "text", text, reply_to: null, attachment_ids: [], mentions } };
+  return { ok: true, command: { command_id, type: "text", text, reply_to: null, attachment_ids: [], mentions } };
+}
+
+function requireCommandId(frame: CommandFrame): string | null {
+  return typeof frame.command_id === "string" && frame.command_id ? frame.command_id : null;
+}
+
+function requireChannelId(frame: CommandFrame): string | null {
+  return typeof frame.channel_id === "string" && frame.channel_id ? frame.channel_id : null;
+}
+
+export function parseMessageEditCommand(frame: CommandFrame): ParseResult<ParsedMessageEdit> {
+  if (frame.command !== "message.edit") {
+    return { ok: false, error: { code: "INVALID_COMMAND", message: `unsupported command: ${frame.command}`, retryable: false } };
   }
+  if (!requireCommandId(frame)) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
+  }
+  if (!requireChannelId(frame)) {
+    return { ok: false, error: { code: "CHANNEL_NOT_FOUND", message: "missing channel_id", retryable: false } };
+  }
+  const p = frame.payload as Record<string, unknown>;
+  const message_id = typeof p.message_id === "string" ? p.message_id : "";
+  if (!message_id) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "message_id is required", retryable: false } };
+  }
+  const text = typeof p.text === "string" ? p.text : "";
+  if (text.trim() === "") {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "message text is empty", retryable: false } };
+  }
+  return { ok: true, command: { message_id, text } };
+}
+
+export function parseMessageRecallCommand(frame: CommandFrame): ParseResult<ParsedMessageRecall> {
+  if (frame.command !== "message.recall") {
+    return { ok: false, error: { code: "INVALID_COMMAND", message: `unsupported command: ${frame.command}`, retryable: false } };
+  }
+  if (!requireCommandId(frame)) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
+  }
+  if (!requireChannelId(frame)) {
+    return { ok: false, error: { code: "CHANNEL_NOT_FOUND", message: "missing channel_id", retryable: false } };
+  }
+  const p = frame.payload as Record<string, unknown>;
+  const message_id = typeof p.message_id === "string" ? p.message_id : "";
+  if (!message_id) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "message_id is required", retryable: false } };
+  }
+  return { ok: true, command: { message_id } };
+}
+
+export function parseMessageDeleteCommand(frame: CommandFrame): ParseResult<ParsedMessageDelete> {
+  if (frame.command !== "message.delete") {
+    return { ok: false, error: { code: "INVALID_COMMAND", message: `unsupported command: ${frame.command}`, retryable: false } };
+  }
+  if (!requireCommandId(frame)) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
+  }
+  if (!requireChannelId(frame)) {
+    return { ok: false, error: { code: "CHANNEL_NOT_FOUND", message: "missing channel_id", retryable: false } };
+  }
+  const p = frame.payload as Record<string, unknown>;
+  const message_id = typeof p.message_id === "string" ? p.message_id : "";
+  if (!message_id) {
+    return { ok: false, error: { code: "INVALID_MESSAGE", message: "message_id is required", retryable: false } };
+  }
+  const reasonRaw = p.reason;
+  const reason = typeof reasonRaw === "string" ? reasonRaw : null;
+  return { ok: true, command: { message_id, reason } };
+}
