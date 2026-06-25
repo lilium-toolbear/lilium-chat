@@ -50,5 +50,18 @@ export async function headObject(
   }
 }
 
+export async function deleteObject(env: S3EnvLike, key: string): Promise<void> {
+  const client = getS3Client(env as Env);
+  const url = new URL(`${env.S3_ENDPOINT}/${env.S3_BUCKET}/${key}`);
+  const signedReq = await client.sign(url, {
+    method: "DELETE",
+    aws: { signQuery: true, allHeaders: true },
+  });
+  const res = await client.fetch(signedReq);
+  if (!res.ok && res.status !== 204 && res.status !== 404) {
+    throw new Error(`deleteObject ${key} failed: ${res.status}`);
+  }
+}
+
 export { createS3Client, getS3Client, setTestS3Client } from "./client";
 export type { S3Client };
