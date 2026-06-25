@@ -1,6 +1,6 @@
 # Lilium Chat 后端设计
 
-状态：设计稿（v4.2，BlurHash attachment metadata；Phase E：personal stickers + owner transfer + invite preview backend；v4.0 channel-scoped message API + WS write path + command_id idempotency + simplified DO topology）
+状态：设计稿（v4.3，Phase 7 Bot Gateway WebSocket RPC：bot runtime transport 改为 bot 主动连 `/api/chat/bot/ws` → `BotConnection DO(bot_id)`，HTTP callback 降级为 future transport；BlurHash attachment metadata；Phase E：personal stickers + owner transfer + invite preview backend；v4.0 channel-scoped message API + WS write path + command_id idempotency + simplified DO topology）
 日期：2026-06-22
 范围：lilium-chat 仓库（Cloudflare Worker + Durable Object 纯后端）的实现设计
 参考：
@@ -182,16 +182,31 @@ Phase E 引入 personal sticker library，需在落地前明确 DO ownership。v
 - **幂等沿用 v4.0 `operation_id` 语义**：sticker save 幂等 operation = `sticker.save`，归 `UserDirectory(user_id)`；sticker send 幂等 = 现有 `message.send`，归 `ChatChannel(channel_id)`。
 - **owner-transfer 后端实现不在本节范围**：API wire shape 见 contract issue #1028；若后续需后端 DO 实现，另行补丁。
 
+### 0.10 v4.3 修订：Phase 7 Bot Gateway WebSocket RPC
+
+Phase 7 bot runtime transport 不再以 HTTP callback 为主。改为 bot 主动向 Chat 发起 outbound WebSocket（`/api/chat/bot/ws`，bot token 鉴权），Chat 经此 WS 向 bot 推 delivery（`command_invocation` / `message_interaction` / `message_event`），bot 回 `delivery_result`（含 effects），Chat 回 `delivery_ack`。HTTP callback（Chat → bot `POST <bot_callback_url>` + HMAC 签名）降级为 **future transport**，Phase 7 不实现。v4.3 收口（contract v2.8 delta）：
+
+- **新增 `BotConnection DO`（by `bot_id`）**：bot WebSocket hibernation（`ctx.acceptWebSocket`）、active bot connection/session、delivery 队列、`delivery_result` 处理、reconnect/redelivery/backpressure、把 `delivery_result` 的 effects 路由回源 `ChatChannel DO`。一个 `bot_id` Phase 7 单 active connection，新连接替换旧连接。Delivery at-least-once；BotConnection 持久化 `bot_deliveries` 后再推 socket；`delivery_result` 按 `delivery_id` 幂等；BotConnection 调源 `ChatChannel /internal/bot-delivery-result` 应用 effects。
+- **`BotRegistry DO` 收口为 singleton**（`getByName("registry")`）：token 原文→hash 不可反查 `bot_id`，bot API 入口只有 bearer token，验 token 前无法定位 by-bot_id DO。singleton SQLite 做 `SELECT ... WHERE token_hash=?`（`idx_bot_tokens_hash` UNIQUE）最简。bot 数量小，无热点。封装唯一 helper `botRegistryStub(env) = env.BOT_REGISTRY.get(env.BOT_REGISTRY.idFromName("registry"))`。BotRegistry 仍掌 bot 身份 + token hash + GLOBAL command catalog + aliases + event capabilities + bot profile。
+- **`ChatChannel DO` 是 invocation / interaction / subscription / effect 应用 source-of-truth**：per-channel bot installation/binding/subscription、`command_invocations`、`interactions`、`bot_delivery_outbox`、effect 校验/应用、timeline events/fanout。`command.invoke` / `interaction.submit` 事务只持久化 invocation/interaction + event + `bot_delivery_outbox` 行，立即返回 committed_ack；ChatChannel alarm flush `bot_delivery_outbox` 到 `BotConnection.enqueueDelivery`，不在请求路径同步等 bot。
+- **`bot_callback_outbox` 重命名为 `bot_delivery_outbox`**（transport 不再 HTTP callback-specific）：`kind ∈ {command_invocation, message_interaction, message_event}`，status `pending | delivered | failed | dead_letter`（与 `projection_outbox` 命名对齐）；与 invocation/interaction lifecycle status `pending | dispatched | completed | failed | expired` 分开。
+- **effect 幂等键 = `(channel_id, bot_id, client_effect_id)`**（`bot_effects_applied`，跨 delivery retry 去重，`outbox_id` 降为 debug 列，加 `request_hash`/`response_json`，同 `client_effect_id` 异 body → `IDEMPOTENCY_CONFLICT`）。
+- **passive `message_event` 订阅**：新增 `BotRegistry.bot_event_capabilities`（bot 全局声明支持的 event_type + 默认 filters）+ `ChatChannel.channel_bot_event_subscriptions`（频道级 enable/disable + filters）。message send 事务内为 enabled 且 filter 匹配的订阅写 `bot_delivery_outbox(kind=message_event)`。listener observer/responder only，**无 consume/stop-propagation**；loop prevention 默认排除 bot 自己的消息与该 bot 自己生成的消息。Phase 7 仅 `message.created`。
+- **bot offline policy**：`command_invocation` / `message_interaction` precheck 时 bot 离线 → `command_error` `BOT_OFFLINE`；已 commit 后 delivery 前断连 → 短 TTL 标 failed；`message_event` 离线 drop/expire，无用户可见错误，Phase 7 不批量重放历史 passive event。
+- **Browser WS 与 Bot WS 物理分离**：`/api/chat/ws` + ToolBear browser JWT + `UserConnection DO(user_id)`；`/api/chat/bot/ws` + bot token + `BotConnection DO(bot_id)`。Bot 不复用 Browser WS。
+- **DO 类由 8 增至 9**（新增 `BotConnection`）；wrangler `migrations[].new_sqlite_classes` 两个 config 同步加 `BotConnection`。完整 schema SQL 见 Phase 7 plan `docs/superpowers/plans/2026-06-26-lilium-chat-phase-7.md`。
+
 ## 1. 架构总览
 
 Durable Objects:
-- `ChatChannel` by `channel_id` — realtime write owner; channel metadata, members, messages, events, idempotency; source-of-truth for channel permissions and timeline
+- `ChatChannel` by `channel_id` — realtime write owner; channel metadata, members, messages, events, idempotency; source-of-truth for channel permissions and timeline; Phase 7 also owns per-channel bot installation/binding/subscription, `command_invocations`, `interactions`, `bot_delivery_outbox`, effect validation/application
 - `UserDirectory` by `user_id` — `my_channels` projection; read-state; pending attachment projection
 - `UserConnection` by `user_id` — WebSocket hibernation; Browser command routing; per-channel cursors; read-state command handling; event delivery to browser socket
+- `BotConnection` by `bot_id` — Phase 7 bot WebSocket hibernation; active bot connection/session; delivery queue; `delivery_result` handling; reconnect/redelivery/backpressure; routes effect results back to source ChatChannel (v4.3)
 - `ChannelFanout` by `channel_id` — online session registry; short-lived fanout event cache; per-session delivery queue
 - `InviteDirectory` by `invite_code` — invite_code → channel_id/status index; retained because invite URLs naturally do not contain channel_id
 - `ChannelDirectory` — public channel directory read model
-- `BotRegistry` by `bot_id` — bot identity; token hash; callback config
+- `BotRegistry` singleton (`getByName("registry")`) — bot identity; token hash; GLOBAL command catalog; aliases; event capabilities; bot profile (v4.3: singleton, not by bot_id — token hash cannot reverse-resolve bot_id)
 
 Removed: `MessageIndex DO`; `message_index` table; `message_id → channel_id` Browser route index; message `ROUTE_INDEX_PENDING`.
 
@@ -203,21 +218,33 @@ Browser
   ├─ HTTP reads / auxiliary APIs
   │    └─ Worker → target DO
   │
-  └─ WebSocket write path
-       └─ Worker upgrade proxy
+  └─ WebSocket write path (Browser WS)
+       └─ Worker upgrade proxy (/api/chat/ws, browser JWT)
              └─ UserConnection DO
                    ├─ message.* commands → ChatChannel DO
                    ├─ channel.mark_read → UserDirectory DO
+                   ├─ command.invoke → ChatChannel DO → bot_delivery_outbox → BotConnection DO → Bot WS
+                   ├─ interaction.submit → ChatChannel DO → bot_delivery_outbox → BotConnection DO → Bot WS
                    └─ deliver(event) → browser socket
 
+Bot process (v4.3)
+  │
+  ├─ outbound WS /api/chat/bot/ws (bot token) → BotConnection DO(bot_id)
+  │    Chat pushes delivery frames → Bot; Bot returns delivery_result → Chat applies effects → delivery_ack
+  │
+  └─ outbound HTTP management/active-send (bot token, no inbound HTTP endpoint required)
+       ├─ PUT  /api/chat/bot/commands           → BotRegistry singleton
+       └─ POST /api/chat/bot/channels/{id}/messages → ChatChannel DO
+
 Durable Objects
-  ├─ ChatChannel      by channel_id  —— realtime write owner
+  ├─ ChatChannel      by channel_id  —— realtime write owner; bot install/invocation/effect source
   ├─ UserDirectory    by user_id     —— my_channels/read-state projection
-  ├─ UserConnection   by user_id     —— WS hibernation + command routing
+  ├─ UserConnection   by user_id     —— Browser WS hibernation + command routing
+  ├─ BotConnection    by bot_id      —— bot WS hibernation + delivery queue (v4.3)
   ├─ ChannelFanout    by channel_id  —— online sessions + delivery queue
   ├─ InviteDirectory  by invite_code —— invite routing index
   ├─ ChannelDirectory global         —— public channel directory
-  └─ BotRegistry      by bot_id      —— bot identity/token hash
+  └─ BotRegistry      singleton       —— bot identity/token hash/catalog (v4.3)
 
 External:
   ├─ Hyperdrive → ToolBear Postgres users table, read-only profile resolve
@@ -248,13 +275,18 @@ External:
 | `GET /api/chat/channels/directory` | ChannelDirectory DO |
 | `POST /api/chat/stickers` | UserDirectory DO(user_id) → ChatChannel DO(channel_id).resolveVisibleAttachment（Phase E） |
 | `WS /api/chat/ws` | upgrade 代理到 UserConnection DO |
+| `WS /api/chat/bot/ws` (v4.3) | bot token 验证 → BotConnection DO(bot_id) |
 | WS command `message.send` | UserConnection DO → ChatChannel DO |
 | WS command `message.edit` | UserConnection DO → ChatChannel DO |
 | WS command `message.recall` | UserConnection DO → ChatChannel DO |
 | WS command `message.delete` | UserConnection DO → ChatChannel DO |
 | WS command `channel.mark_read` | UserConnection DO → UserDirectory DO，必要时查询 ChatChannel 计算 unread |
-| WS command `command.invoke` | UserConnection DO → ChatChannel DO / Bot flow |
-| WS command `interaction.submit` | UserConnection DO → ChatChannel DO / Bot flow |
+| WS command `command.invoke` (v4.3) | UserConnection DO → ChatChannel DO → bot_delivery_outbox → BotConnection DO → Bot WS |
+| WS command `interaction.submit` (v4.3) | UserConnection DO → ChatChannel DO → bot_delivery_outbox → BotConnection DO → Bot WS |
+| message.created passive listener (v4.3) | ChatChannel message commit → bot_delivery_outbox(kind=message_event) for enabled subscriptions → BotConnection DO → Bot WS |
+| `PUT /api/chat/bot/commands` (v4.3) | Worker 验 bot token → BotRegistry singleton |
+| `POST /api/chat/bot/channels/{channel_id}/messages` (v4.3) | Worker 验 bot token → ChatChannel DO |
+| `PATCH .../bot-installations/{bot_id}/event-subscriptions/message.created` (v4.3) | Browser admin → ChatChannel DO |
 
 Browser-facing message writes and read-state writes are WebSocket commands. Public HTTP endpoints must not mutate message timeline state or read-state. Internal DO-to-DO `fetch()` endpoints may still exist for implementation, but they are not Browser API.
 
@@ -296,6 +328,8 @@ Ownership split:
 ### 2.1 ChatChannel DO（by channel_id）
 
 一个 DO 实例 = 一个频道的全部状态 + 该频道的事件日志 + 频道内幂等。
+
+> **Phase 7 (v4.3) schema 变更：** baseline 中的 `bot_installations` / `commands` / `invocations` / `interactions` 表由 Phase 7 migration 收口：`commands`/`invocations` DROP 重建为 `channel_command_bindings` + `channel_command_names` + `command_invocations`；`bot_installations` 加 `status`/`updated_by`/`updated_at`/`bot_display_name`/`bot_avatar_url`；`interactions` 加 `updated_at`/`completed_at`/`error_code`；`messages` 加 `components_json`/`sender_bot_display_name`/`sender_bot_avatar_url`；新增 `bot_delivery_outbox`（原 `bot_callback_outbox` 重命名，`kind ∈ {command_invocation, message_interaction, message_event}`）、`bot_effects_applied`（PK=`(channel_id, bot_id, client_effect_id)`）、`channel_bot_event_subscriptions`。HTTP callback 签名相关列（`callback_secret`）Phase 7 不写入。完整 SQL + DROP 安全证明见 Phase 7 plan `docs/superpowers/plans/2026-06-26-lilium-chat-phase-7.md`。
 
 ```sql
 -- 频道元信息（单行）
@@ -676,10 +710,11 @@ runDueJobs(now):  // alarm handler 入口: flush 所有 due 表(outbox、fanout_
 
 各 DO 类的 due work 映射：
 
-- **ChatChannel DO**：`projection_outbox` flush、`idempotency_keys` 过期清理、`rate_buckets` 清理（若有）、`fanout_events` TTL 清理。
+- **ChatChannel DO**：`projection_outbox` flush、`bot_delivery_outbox` flush（到 `BotConnection.enqueueDelivery`，earliest-wins + retry/backoff/dead-letter，v4.3）、`idempotency_keys` 过期清理、`rate_buckets` 清理（若有）、`fanout_events` TTL 清理。
 - **UserDirectory DO**：`pending_attachments` GC（earliest-wins，见 5.5）、`projection_outbox`（如该 DO 也发 outbox）。
+- **BotConnection DO (v4.3)**：`bot_deliveries` due flush（reconnect 后 redelivery pending/sent 未完成的；short TTL 后 expire/drop `message_event`）、stale `bot_connection_state` 清理、连接心跳/pong 超时回收。
 - **ChannelFanout DO**：`fanout_queue` flush（带 dead-letter）、stale `online_sessions` 清理（断线未反注册的）、`fanout_events` TTL 清理。
-- **InviteDirectory/ChannelDirectory/BotRegistry DO**：自身 outbox/过期清理（如有）。
+- **InviteDirectory/ChannelDirectory/BotRegistry DO**：自身 outbox/过期清理（如有）。`BotRegistry` singleton 自身无 delivery outbox（delivery 由源 ChatChannel + BotConnection 承担）。
 
 `runDueJobs` 处理完后调 `scheduleNextAlarm()` 重设下一个最早 due。alarm at-least-once + 自动退避重试担保可靠性。
 
@@ -689,7 +724,8 @@ runDueJobs(now):  // alarm handler 入口: flush 所有 due 表(outbox、fanout_
 
 - **InviteDirectory DO（by invite_code）**：`invite_code → {channel_id, status, expires_at, revoked_at}`。invite 创建/撤销时写 outbox flush。`/invites/{code}/accept` 先查此 DO。
 - **ChannelDirectory DO**：`public_listed` 且 `status=active` 的 channel summaries（title, member_count, last_message_at）。channel 事件写 outbox flush。
-- **BotRegistry DO（by bot_id）**：bot profile(`display_name`/`avatar_url`/`callback_url`)、`token_hash`、scopes、status。token 原文只返回一次，只存 hash。callback HMAC secret 与 token 分开管理。
+- **BotRegistry DO（singleton, `getByName("registry")`, v4.3）**：bot profile(`display_name`/`avatar_url`)、`token_hash`、scopes、status、GLOBAL command catalog（`bot_commands` + `bot_command_aliases`）、event capabilities（`bot_event_capabilities`）。token 原文只返回一次，只存 hash；`idx_bot_tokens_hash UNIQUE`。token 原文→hash 不可反查 `bot_id`，bot API 入口只有 bearer token，验 token 前无法定位 by-bot_id DO，故收口为 singleton 做 `SELECT ... WHERE token_hash=?`。封装唯一 helper `botRegistryStub(env)`。callback HMAC secret / HTTP callback 为 future transport，Phase 7 不实现。
+- **BotConnection DO（by `bot_id`, v4.3 新增）**：bot WebSocket hibernation（`ctx.acceptWebSocket`）+ active connection/session + delivery 队列（`bot_deliveries`）+ `delivery_result` 处理 + reconnect/redelivery/backpressure。一个 `bot_id` 单 active connection，新连接替换旧连接。Delivery at-least-once：持久化 `bot_deliveries` 后再推 socket；`delivery_result` 按 `delivery_id` 幂等；把 `delivery_result` 的 effects 路由回源 `ChatChannel /internal/bot-delivery-result`（不在 BotConnection 应用 effect，effect 应用归 ChatChannel source-of-truth）。bot 离线时 delivery queue 累积，short TTL 后 expire/drop。
 - **ChannelFanout DO（by channel_id，v3 新增）**：接管该频道在线成员 fanout，降低 ChatChannel 热点。
 
 **ChannelFanout DO schema：**
@@ -734,6 +770,37 @@ CREATE TABLE fanout_queue (
 CREATE INDEX idx_fanout_due ON fanout_queue(status, next_attempt_at);
 CREATE INDEX idx_fanout_event ON fanout_queue(channel_id, event_id);
 ```
+
+**BotConnection DO schema (v4.3)：**
+
+```sql
+CREATE TABLE bot_connection_state (
+  bot_id          TEXT PRIMARY KEY,
+  session_id      TEXT,
+  status          TEXT NOT NULL,             -- connected | disconnected
+  connected_at    TEXT,
+  disconnected_at TEXT,
+  last_seen_at    TEXT
+);
+
+CREATE TABLE bot_deliveries (
+  delivery_id      TEXT PRIMARY KEY,
+  bot_id           TEXT NOT NULL,
+  channel_id       TEXT NOT NULL,
+  kind             TEXT NOT NULL,            -- command_invocation | message_interaction | message_event
+  source_outbox_id TEXT NOT NULL,            -- 来自源 ChatChannel bot_delivery_outbox.outbox_id
+  target_id        TEXT NOT NULL,            -- invocation_id | interaction_id | event_id
+  request_json     TEXT NOT NULL,            -- delivery frame 请求体
+  status           TEXT NOT NULL,            -- pending | sent | completed | failed | expired
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at  TEXT NOT NULL,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+);
+CREATE INDEX idx_bot_deliveries_due ON bot_deliveries(bot_id, status, next_attempt_at);
+```
+
+BotConnection 职责：一个 `bot_id` 单 active connection，新连接替换旧连接；Delivery at-least-once（持久化 `bot_deliveries` 后再推 socket）；`delivery_result` 按 `delivery_id` 幂等；调源 `ChatChannel /internal/bot-delivery-result` 应用 effects（effect 应用归 ChatChannel source-of-truth，不归 BotConnection）；reconnect 后 redelivery pending/sent 未完成的；`message_event` 短 TTL expire/drop。
 
 **职责：**
 
@@ -1391,7 +1458,7 @@ Worker upgrade 时 `Origin` ∈ {`https://lilium.kuma.homes`, `http://localhost:
 
 DO 内业务语义限流兜底（不限平台层）：
 
-- per-user 消息发送率、per-channel 消息发送率、per-user upload presign/finalize 率、per-IP WS connect 率（Worker 层）、per-channel command/bot callback 率、admin mutation 率。
+- per-user 消息发送率、per-channel 消息发送率、per-user upload presign/finalize 率、per-IP WS connect 率（Worker 层，含 Browser WS 与 Bot WS 分开计数）、per-channel command/bot delivery 率、bot delivery 失败/dead-letter 率、admin mutation 率。
 
 **Token bucket schema（v3 补，放对应 DO 的 SQLite）：**
 
@@ -1414,7 +1481,7 @@ CREATE TABLE rate_buckets (
 
 ### 6.8 可观测性指标（补 PRD 21.2）
 
-WS 连接数、WS 重连率、message send p50/p95/p99、event replay lag、DO 错误、attachment finalize 失败、bot callback 失败、rate limit 命中、projection outbox backlog（pending 行数）、fanout queue backlog、DO alarm 触发数。写入 Sentry / Workers Analytics。
+WS 连接数（Browser WS / Bot WS 分开）、WS 重连率（Browser / Bot 分开）、message send p50/p95/p99、event replay lag、DO 错误、attachment finalize 失败、bot delivery 失败/dead-letter、rate limit 命中、projection outbox backlog（pending 行数）、bot_delivery_outbox backlog、fanout queue backlog、DO alarm 触发数。写入 Sentry / Workers Analytics。
 
 ## 7. 测试策略
 
@@ -1550,17 +1617,19 @@ GitHub Actions：`typecheck` + `test`，scripts 跟 game-worker 一致。
 
 验收：contract 12.7。
 
-### 阶段 7：Bot slash command 与 rich interaction（contract 12.8）
+### 阶段 7：Bot slash command 与 rich interaction（contract 12.8, v2.8）
 
-交付：BotRegistry 全局身份 + token_hash + callback HMAC + command 注册 + invoke + interaction + effects + streaming。
+交付：BotRegistry（singleton）全局身份 + token_hash + GLOBAL command catalog + aliases + event capabilities；BotConnection DO + Bot Gateway WS RPC（runtime transport，非 HTTP callback）；channel installation/binding + `command.invoke` + `interaction.submit` + 异步 `bot_delivery_outbox` delivery + effects + streaming + passive `message_event` 订阅 + bot 直接发消息。完整任务拆分见 `docs/superpowers/plans/2026-06-26-lilium-chat-phase-7.md`。
 
-- 7a：BotRegistry + token 认证 + `PUT /bot/commands` + channel commands 查询。
-- 7b：`command.invoke` + invocation 状态 + bot callback 签名（HMAC jose）+ effects 校验。
-- 7c：`interaction.submit` + interaction 状态 + message_interaction callback。
-- 7d：stream effects + stream 事件。
-- 7e：Bot 直接发消息。
+- 7a：BotRegistry（singleton）+ token 认证 + `PUT /bot/commands` catalog sync + channel installation/binding/commands 查询 + 官方 bot seed。`botRegistryStub(env)` 统一 helper；`idx_bot_tokens_hash UNIQUE`。
+- 7b：Bot Gateway WS（`GET /api/chat/bot/ws` → `BotConnection DO(bot_id)`）+ hello/ready/ping/pong + delivery 队列（`bot_deliveries`，at-least-once，`delivery_id` 去重）+ `delivery_result` → ChatChannel `/internal/bot-delivery-result` + `delivery_ack`（applied/failed）+ reconnect/redelivery。BotConnection 单 active connection/bot_id。
+- 7c：`command.invoke` + invocation 状态 + `bot_delivery_outbox(kind=command_invocation)` + 异步 delivery（不在请求路径同步等 bot）+ effects 校验/应用（`bot_effects_applied` PK=`(channel_id, bot_id, client_effect_id)`）+ stream effects。command.invoke correctness = 当前 BotRegistry catalog（drift 刷新 binding snapshot）；bot offline precheck → `BOT_OFFLINE`。
+- 7d：`interaction.submit` + interaction 状态 + `bot_delivery_outbox(kind=message_interaction)` + delivery + effects；component ownership/disabled/custom_id 校验；`interaction.completed`。
+- 7e：passive `message_event` 订阅（BotRegistry `bot_event_capabilities` + ChatChannel `channel_bot_event_subscriptions` + `PATCH .../event-subscriptions/message.created`）；message send 事务内写 `bot_delivery_outbox(kind=message_event)`；loop prevention；bot 离线 drop/expire。observer/responder only，无 consume/stop-propagation。
+- 7f：bot 直接发消息 `POST /bot/channels/{channel_id}/messages`（bot token，可带 components，已安装+scope 校验）。
+- 7g (future, non-goal for 7a–7f)：完整旧 external_commands stateful_ws session 语义（session.start/started/update/input/timer/closed、effect 序列 + ack、resume active sessions、room mutex/exclusive game session）。basic Bot Gateway WS RPC 不含 stateful session；如需另起 phase。
 
-验收：contract 12.8。
+验收：contract 12.8 + §14 v2.8 addendum 不变量。
 
 ### 关于 DM
 
