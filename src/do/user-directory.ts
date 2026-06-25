@@ -21,6 +21,15 @@ type PresignValidation =
       blurhash: string | undefined;
     };
 
+type StickerSourceAttachment = {
+  attachment_id: string;
+  url: string;
+  mime_type: string;
+  width: number | null;
+  height: number | null;
+  size_bytes: number;
+};
+
 function validatePresignBody(body: {
   filename?: string;
   mime_type?: string;
@@ -327,6 +336,241 @@ export class UserDirectory extends DurableObject<Env> {
         );
       }
       return Response.json(row);
+    }
+
+    if (url.pathname === "/internal/sticker-save") {
+      const userId = request.headers.get("X-Verified-User-Id");
+      if (userId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
+      const body = (await request.json()) as {
+        operation_id?: string;
+        channel_id?: string;
+        attachment_id?: string;
+      };
+      const operationId = body.operation_id ?? "";
+      const channelId = body.channel_id ?? "";
+      const attachmentId = body.attachment_id ?? "";
+      if (!operationId || !channelId || !attachmentId) {
+        return Response.json(
+          { error: { code: "INVALID_MESSAGE", message: "operation_id, channel_id and attachment_id required", retryable: false } },
+          { status: 422 },
+        );
+      }
+
+      const requestHash = JSON.stringify({ channel_id: channelId, attachment_id: attachmentId });
+      const now = this.nowIso();
+      const idemExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+      type SaveCoord =
+        | { kind: "conflict" }
+        | { kind: "cached"; responseJson: string }
+        | { kind: "resolve"; projection: StickerSourceAttachment };
+
+      const coord = (await this.ctx.storage.transaction(async () => {
+        const idem = this.ctx.storage.sql
+          .exec(
+            "SELECT request_hash, status, response_json FROM idempotency_keys WHERE operation='sticker.save' AND operation_id=?",
+            operationId,
+          )
+          .toArray()[0] as { request_hash: string; status: string; response_json: string | null } | undefined;
+        if (idem) {
+          if (idem.request_hash !== requestHash) {
+            return { kind: "conflict" as const };
+          }
+          if (idem.status === "completed" && idem.response_json) {
+            return { kind: "cached" as const, responseJson: idem.response_json };
+          }
+        }
+
+        // Own finalized attachment path: no ChatChannel call needed.
+        const ownRow = this.ctx.storage.sql
+          .exec(
+            "SELECT attachment_id, url, mime_type, width, height, size_bytes FROM pending_attachments WHERE attachment_id=? AND owner_user_id=? AND status='finalized'",
+            attachmentId,
+            userId,
+          )
+          .toArray()[0] as StickerSourceAttachment | undefined;
+        if (ownRow) {
+          return { kind: "resolve" as const, projection: ownRow };
+        }
+
+        return { kind: "resolve" as const, projection: null as unknown as StickerSourceAttachment };
+      })) as SaveCoord;
+
+      if (coord.kind === "conflict") {
+        return Response.json(
+          { error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } },
+          { status: 409 },
+        );
+      }
+      if (coord.kind === "cached") {
+        return new Response(coord.responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      let projection = coord.projection;
+      if (!projection) {
+        // Channel-visible path: ask ChatChannel for the canonical projection.
+        const chatStub = this.env.CHAT_CHANNEL.getByName(channelId);
+        const res = await chatStub.fetch(
+          new Request(`https://x/internal/resolve-visible-attachment?attachment_id=${encodeURIComponent(attachmentId)}`, {
+            headers: { "X-Verified-User-Id": userId },
+          }),
+        );
+        if (!res.ok) {
+          const failBody = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+          return Response.json(failBody, { status: res.status });
+        }
+        const resBody = (await res.json()) as { attachment: StickerSourceAttachment };
+        projection = resBody.attachment;
+      }
+
+      const newStickerId = uuidv7();
+      const saveResult = await this.ctx.storage.transaction(async () => {
+        const idem = this.ctx.storage.sql
+          .exec(
+            "SELECT request_hash, status, response_json FROM idempotency_keys WHERE operation='sticker.save' AND operation_id=?",
+            operationId,
+          )
+          .toArray()[0] as { request_hash: string; status: string; response_json: string | null } | undefined;
+        if (idem) {
+          if (idem.request_hash !== requestHash) {
+            return { kind: "conflict" as const };
+          }
+          if (idem.status === "completed" && idem.response_json) {
+            return { kind: "done" as const, responseJson: idem.response_json };
+          }
+        }
+
+        const existing = this.ctx.storage.sql
+          .exec(
+            "SELECT sticker_id, deleted_at FROM personal_stickers WHERE user_id=? AND attachment_id=?",
+            userId,
+            projection.attachment_id,
+          )
+          .toArray()[0] as { sticker_id: string; deleted_at: string | null } | undefined;
+        const stickerId = existing?.sticker_id ?? newStickerId;
+        if (existing) {
+          if (existing.deleted_at !== null) {
+            this.ctx.storage.sql.exec(
+              "UPDATE personal_stickers SET deleted_at=NULL, created_at=? WHERE sticker_id=?",
+              now,
+              stickerId,
+            );
+          }
+        } else {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO personal_stickers (
+              sticker_id, user_id, attachment_id, url, mime_type, width, height, size_bytes, created_at, deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+            stickerId,
+            userId,
+            projection.attachment_id,
+            projection.url,
+            projection.mime_type,
+            projection.width ?? null,
+            projection.height ?? null,
+            projection.size_bytes,
+            now,
+          );
+        }
+
+        const json = JSON.stringify({
+          sticker: {
+            sticker_id: stickerId,
+            attachment_id: projection.attachment_id,
+            url: projection.url,
+            mime_type: projection.mime_type,
+            width: projection.width,
+            height: projection.height,
+            size_bytes: projection.size_bytes,
+          },
+        });
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('sticker.save', ?, ?, 'completed', ?, ?, COALESCE((SELECT created_at FROM idempotency_keys WHERE operation='sticker.save' AND operation_id=?), ?), ?, ?)",
+          operationId,
+          requestHash,
+          channelId,
+          json,
+          operationId,
+          now,
+          now,
+          idemExpiresAt,
+        );
+        return { kind: "done" as const, responseJson: json };
+      });
+
+      if (saveResult.kind === "conflict") {
+        return Response.json(
+          { error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } },
+          { status: 409 },
+        );
+      }
+      return new Response(saveResult.responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+
+    if (url.pathname === "/internal/sticker-list") {
+      const userId = request.headers.get("X-Verified-User-Id");
+      if (userId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") ?? "50")));
+      const cursor = url.searchParams.get("cursor");
+      const rows = cursor
+        ? this.ctx.storage.sql
+          .exec(
+            "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes, created_at FROM personal_stickers WHERE user_id=? AND deleted_at IS NULL AND created_at < ? ORDER BY created_at DESC LIMIT ?",
+            userId,
+            cursor,
+            limit,
+          )
+          .toArray()
+        : this.ctx.storage.sql
+          .exec(
+            "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes, created_at FROM personal_stickers WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
+            userId,
+            limit,
+          )
+          .toArray();
+      const items = rows as Array<{
+        sticker_id: string;
+        attachment_id: string;
+        url: string;
+        mime_type: string;
+        width: number | null;
+        height: number | null;
+        size_bytes: number;
+        created_at: string;
+      }>;
+      const nextCursor = items.length > 0 ? items[items.length - 1]!.created_at : null;
+      return Response.json({ items, next_cursor: nextCursor });
+    }
+
+    if (url.pathname === "/internal/sticker-delete") {
+      const userId = request.headers.get("X-Verified-User-Id");
+      if (userId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
+      const body = (await request.json()) as { sticker_id?: string };
+      const stickerId = body.sticker_id ?? "";
+      if (!stickerId) {
+        return Response.json(
+          { error: { code: "INVALID_MESSAGE", message: "sticker_id required", retryable: false } },
+          { status: 422 },
+        );
+      }
+
+      const now = this.nowIso();
+      const row = this.ctx.storage.sql
+        .exec("SELECT user_id, deleted_at FROM personal_stickers WHERE sticker_id=?", stickerId)
+        .toArray()[0] as { user_id: string; deleted_at: string | null } | undefined;
+      if (row && row.user_id !== userId) {
+        return Response.json(
+          { error: { code: "FORBIDDEN", message: "sticker does not belong to user", retryable: false } },
+          { status: 403 },
+        );
+      }
+      this.ctx.storage.sql.exec(
+        "UPDATE personal_stickers SET deleted_at=? WHERE sticker_id=? AND user_id=? AND deleted_at IS NULL",
+        now,
+        stickerId,
+        userId,
+      );
+      return Response.json({ ok: true });
     }
 
     if (url.pathname === "/internal/attachment-presign") {
