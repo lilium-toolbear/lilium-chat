@@ -428,3 +428,74 @@ export async function acceptInviteHandler(c: Context<{ Bindings: Env; Variables:
   }
   return c.json(await inviteRes.json(), 200, { "X-Request-Id": c.get("requestId") });
 }
+
+export async function listStickersHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const url = new URL(c.req.url);
+  const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") ?? "50")));
+  const cursor = url.searchParams.get("cursor") ?? "";
+  const stub = env.USER_DIRECTORY.getByName(userId);
+  const query = cursor
+    ? `https://x/internal/sticker-list?limit=${limit}&cursor=${encodeURIComponent(cursor)}`
+    : `https://x/internal/sticker-list?limit=${limit}`;
+  const res = await stub.fetch(new Request(query, { headers: { "X-Verified-User-Id": userId } }));
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "sticker list failed" } })) as {
+      error?: { code?: string; message?: string };
+    };
+    throw new ApiError(e.error?.code ?? "CHAT_WORKER_UNAVAILABLE", e.error?.message ?? "sticker list failed");
+  }
+  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+}
+
+export async function saveStickerHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
+  if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
+  const body = (await c.req.json().catch(() => ({}))) as { channel_id?: string; attachment_id?: string };
+  if (!body.channel_id || !body.attachment_id) {
+    throw new ApiError("INVALID_MESSAGE", "channel_id and attachment_id required");
+  }
+  const stub = env.USER_DIRECTORY.getByName(userId);
+  const res = await stub.fetch(new Request("https://x/internal/sticker-save", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operation_id: idempotencyKey,
+      channel_id: body.channel_id,
+      attachment_id: body.attachment_id,
+    }),
+  }));
+  if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to save sticker");
+  if (res.status === 404) throw new ApiError("STICKER_NOT_FOUND", "sticker source not found");
+  if (res.status === 409) {
+    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
+    throw new ApiError(e.error?.code ?? "IDEMPOTENCY_CONFLICT", e.error?.message ?? "idempotency conflict");
+  }
+  if (res.status === 422) {
+    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
+    throw new ApiError(e.error?.code ?? "INVALID_MESSAGE", e.error?.message ?? "invalid sticker save");
+  }
+  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "sticker save failed");
+  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+}
+
+export async function deleteStickerHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  const stickerId = c.req.param("sticker_id");
+  if (!stickerId) throw new ApiError("STICKER_NOT_FOUND", "sticker not found");
+  const stub = env.USER_DIRECTORY.getByName(userId);
+  const res = await stub.fetch(new Request("https://x/internal/sticker-delete", {
+    method: "POST",
+    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
+    body: JSON.stringify({ sticker_id: stickerId }),
+  }));
+  if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to delete sticker");
+  if (res.status === 404) throw new ApiError("STICKER_NOT_FOUND", "sticker not found");
+  if (res.status === 422) {
+    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
+    throw new ApiError(e.error?.code ?? "INVALID_MESSAGE", e.error?.message ?? "invalid sticker delete");
+  }
+  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "sticker delete failed");
+  return c.json({ sticker_id: stickerId, deleted: true }, 200, { "X-Request-Id": c.get("requestId") });
+}

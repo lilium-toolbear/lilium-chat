@@ -22,6 +22,9 @@ import {
   removeMemberHandler,
   updateChannelHandler,
   updateMemberRoleHandler,
+  listStickersHandler,
+  saveStickerHandler,
+  deleteStickerHandler,
 } from "./routes/channel-mutations";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
@@ -75,6 +78,9 @@ app.get("/api/chat/channels/:channel_id/messages", (c) => listMessagesHandler(c)
 app.get("/api/chat/channels/:channel_id", (c) => channelDetailHandler(c));
 app.post("/api/chat/uploads/images/presign", (c) => presignUploadHandler(c));
 app.post("/api/chat/uploads/images/:attachment_id/finalize", (c) => finalizeUploadHandler(c));
+app.get("/api/chat/stickers", (c) => listStickersHandler(c));
+app.post("/api/chat/stickers", (c) => saveStickerHandler(c));
+app.delete("/api/chat/stickers/:sticker_id", (c) => deleteStickerHandler(c));
 app.get("/api/chat/events", (c) => eventsHandler(c));
 app.all("/api/chat/*", (c) => {
   throw new ApiError("CHANNEL_NOT_FOUND", "not implemented in phase 0", { httpStatus: 404 });
