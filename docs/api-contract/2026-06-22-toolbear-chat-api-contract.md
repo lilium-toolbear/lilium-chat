@@ -817,7 +817,7 @@ GET /api/chat/channels/directory?q=game&limit=50&cursor=opaque-cursor
       "status": "active",
       "unread_count": 0,
       "last_read_event_id": null,
-      "last_message_preview": "最近消息摘要",
+      "last_message_preview": null,
       "last_message_at": "2026-06-21T05:24:00Z"
     }
   ],

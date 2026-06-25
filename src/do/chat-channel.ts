@@ -2222,6 +2222,9 @@ export class ChatChannel extends DurableObject<Env> {
           now,
           now,
         );
+        if (meta.visibility === "public_listed") {
+          this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
+        }
 
         const channel = {
           channel_id: meta.channel_id,

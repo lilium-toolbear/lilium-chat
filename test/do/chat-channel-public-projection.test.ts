@@ -216,6 +216,58 @@ describe("ChatChannel channel_directory projection outbox", () => {
     expect(rows.find((r) => parsePayload(r).channel_id === channelId)).toBeUndefined();
   });
 
+  it("invite-accept on a public channel writes a full-snapshot channel_directory upsert with bumped member_count; private channel invite-accept writes no channel_directory outbox", async () => {
+    const pubId = uniqId("a20910");
+    const privId = uniqId("a20911");
+    const { stub: pubStub } = await createChannel({ channelId: pubId, ownerId: "u-a2-9", visibility: "public_listed", title: "PubInvite" });
+    const { stub: privStub } = await createChannel({ channelId: privId, ownerId: "u-a2-9b", visibility: "private", title: "PrivInvite" });
+
+    const createPubInviteRes = await pubStub.fetch(new Request("https://x/internal/invites-create", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-a2-9", "Content-Type": "application/json" },
+      body: JSON.stringify({ operation_id: "ik-invite-pub", channel_id: pubId, expires_in_seconds: 3600, max_uses: null }),
+    }));
+    expect(createPubInviteRes.status).toBe(200);
+    const { invite_code: pubInviteCode } = (await createPubInviteRes.json()) as { invite_code: string };
+
+    const rowsBefore = await listDirectoryOutbox(pubStub);
+    const acceptPubRes = await pubStub.fetch(new Request("https://x/internal/invites-accept", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-invite-joiner", "Content-Type": "application/json" },
+      body: JSON.stringify({ operation_id: "ik-accept-pub", channel_id: pubId, invite_code: pubInviteCode }),
+    }));
+    expect(acceptPubRes.status).toBe(200);
+
+    const rowsAfter = await listDirectoryOutbox(pubStub);
+    const newRows = rowsAfter.slice(rowsBefore.length);
+    const acceptUpsert = newRows.map(parsePayload).find((p) => p.channel_id === pubId && p.action === "upsert");
+    expect(acceptUpsert).toBeDefined();
+    expect(acceptUpsert!.fields!.member_count).toBe(2); // owner + invite acceptor
+    expect(acceptUpsert!.fields!.title).toBe("PubInvite");
+    expect(acceptUpsert!.fields!.status).toBe("active");
+
+    const createPrivInviteRes = await privStub.fetch(new Request("https://x/internal/invites-create", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-a2-9b", "Content-Type": "application/json" },
+      body: JSON.stringify({ operation_id: "ik-invite-priv", channel_id: privId, expires_in_seconds: 3600, max_uses: null }),
+    }));
+    expect(createPrivInviteRes.status).toBe(200);
+    const { invite_code: privInviteCode } = (await createPrivInviteRes.json()) as { invite_code: string };
+
+    const privRowsBefore = await listDirectoryOutbox(privStub);
+    expect(privRowsBefore.length).toBe(0);
+
+    const acceptPrivRes = await privStub.fetch(new Request("https://x/internal/invites-accept", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-invite-joiner2", "Content-Type": "application/json" },
+      body: JSON.stringify({ operation_id: "ik-accept-priv", channel_id: privId, invite_code: privInviteCode }),
+    }));
+    expect(acceptPrivRes.status).toBe(200);
+
+    const privRowsAfter = await listDirectoryOutbox(privStub);
+    expect(privRowsAfter.length).toBe(0);
+  });
+
   it("alarm flush delivers an upsert payload to ChannelDirectory(shared)/internal/apply-projection and marks delivered", async () => {
     const channelId = uniqId("a20801");
     const { stub } = await createChannel({ channelId, ownerId: "u-a2-8", visibility: "public_listed", title: "PubFlush" });
