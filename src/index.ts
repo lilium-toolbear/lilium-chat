@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { ALLOWED_BROWSER_ORIGINS } from "./allowed-origins";
 import type { Env } from "./env";
 import { ApiError, errorResponse } from "./errors";
 import { uuidv7 } from "./ids/uuidv7";
@@ -34,7 +35,7 @@ const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 app.use(
   "/api/chat/*",
   cors({
-    origin: ["https://lilium.kuma.homes", "http://localhost:5173"],
+    origin: [...ALLOWED_BROWSER_ORIGINS],
     allowMethods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
     allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key"],
     exposeHeaders: ["X-Request-Id"],

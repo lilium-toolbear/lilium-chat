@@ -55,6 +55,44 @@ describe("wsUpgradeHandler", () => {
     expect(res.status).toBe(401);
   });
 
+  it("accepts 127.0.0.1 dev origin for upgrade", async () => {
+    const uid = "00000000-0000-7000-8000-000000000202";
+    const token = await makeJwt({ sub: uid });
+    const req = upgradeReq({
+      subprotocol: `lilium.chat.v1, bearer.${token}`,
+      origin: "http://127.0.0.1:5174",
+    });
+    const res = await wsUpgradeHandler({
+      req: {
+        header: (h: string) => req.headers.get(h),
+        raw: req,
+      },
+      env: ({ ...env, JWT_SECRET: TEST_SECRET } as Env),
+      get: () => undefined,
+      set: () => { },
+    } as any);
+    expect(res.status).toBe(101);
+  });
+
+  it("accepts toolbear FastAPI dev origin for upgrade", async () => {
+    const uid = "00000000-0000-7000-8000-000000000203";
+    const token = await makeJwt({ sub: uid });
+    const req = upgradeReq({
+      subprotocol: `lilium.chat.v1, bearer.${token}`,
+      origin: "http://127.0.0.1:3334",
+    });
+    const res = await wsUpgradeHandler({
+      req: {
+        header: (h: string) => req.headers.get(h),
+        raw: req,
+      },
+      env: ({ ...env, JWT_SECRET: TEST_SECRET } as Env),
+      get: () => undefined,
+      set: () => { },
+    } as any);
+    expect(res.status).toBe(101);
+  });
+
   it("rejects bad origin with 403", async () => {
     const token = await makeJwt({ sub: "u1" });
     const res = await wsUpgradeHandler({

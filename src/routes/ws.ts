@@ -1,10 +1,9 @@
 import type { Context } from "hono";
 import type { Env } from "../env";
+import { ALLOWED_BROWSER_ORIGIN_SET } from "../allowed-origins";
 import { ApiError, errorResponse } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 import { uuidv7 } from "../ids/uuidv7";
-
-const ALLOWED_ORIGINS = new Set(["https://lilium.kuma.homes", "http://localhost:5173"]);
 
 interface ParsedSubprotocol {
   api: boolean;
@@ -29,7 +28,7 @@ export async function wsUpgradeHandler(c: Context<{ Bindings: Env; Variables: { 
     return errorResponse(new ApiError("UNAUTHORIZED", "Expected WebSocket upgrade"), requestId);
   }
   const origin = c.req.header("Origin") ?? "";
-  if (!ALLOWED_ORIGINS.has(origin)) {
+  if (!ALLOWED_BROWSER_ORIGIN_SET.has(origin)) {
     return errorResponse(new ApiError("FORBIDDEN", "origin not allowed"), requestId);
   }
   const { api, token } = parseSubprotocol(c.req.header("Sec-WebSocket-Protocol"));
