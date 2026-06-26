@@ -11,7 +11,7 @@
   "vars": {
     "API_BASE_URL": "https://lilium.kuma.homes",
     "S3_ENDPOINT": "https://s3.kuma.homes",
-    "S3_BUCKET": "lilium-chat-attachments",
+    "S3_BUCKET": "s3.kuma.homes",
     "S3_PUBLIC_BASE": "https://s3.kuma.homes",
     "S3_REGION": "us-east-1",
     "SENTRY_ENVIRONMENT": "test"

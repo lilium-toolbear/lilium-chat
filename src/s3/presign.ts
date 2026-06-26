@@ -1,10 +1,12 @@
 import type { Env } from "../env";
-import { createS3Client, getS3Client, type S3Client } from "./client";
+import { getS3Client, isTestS3ClientActive, type S3Client } from "./client";
+import { s3BrowserUploadUrl, s3ObjectUrl, s3PublicObjectUrl } from "./url";
 
 export interface S3EnvLike {
   S3_ENDPOINT: string;
   S3_BUCKET: string;
   S3_REGION: string;
+  S3_PUBLIC_BASE?: string;
 }
 
 export const PRESIGN_TTL_SECONDS = 5 * 60; // 5 minutes
@@ -16,7 +18,7 @@ export async function presignPutUrl(
   _sizeBytes?: number,
 ): Promise<{ upload_url: string; expires_at: string }> {
   const client = getS3Client(env as Env);
-  const url = new URL(`${env.S3_ENDPOINT}/${env.S3_BUCKET}/${key}`);
+  const url = s3ObjectUrl(env.S3_ENDPOINT, env.S3_BUCKET, key);
   url.searchParams.set("X-Amz-Expires", String(PRESIGN_TTL_SECONDS));
   const signedReq = await client.sign(url, {
     method: "PUT",
@@ -24,20 +26,23 @@ export async function presignPutUrl(
     aws: { signQuery: true, allHeaders: true },
   });
   return {
-    upload_url: signedReq.url,
+    upload_url: s3BrowserUploadUrl(signedReq.url, key),
     expires_at: new Date(Date.now() + PRESIGN_TTL_SECONDS * 1000).toISOString(),
   };
 }
 
-export async function headObject(
+/** HEAD object by storage key via public URL (bucket is public-read; no SigV4). */
+export async function headObjectKey(
   env: S3EnvLike,
-  url: string,
+  key: string,
   expectedContentType: string,
   expectedSize: number,
 ): Promise<{ ok: boolean; contentType?: string; contentLength?: number }> {
-  const client = getS3Client(env as Env);
+  const headUrl = s3PublicObjectUrl(env.S3_PUBLIC_BASE ?? env.S3_ENDPOINT, key);
   try {
-    const res = await client.fetch(new URL(url), { method: "HEAD" });
+    const res = isTestS3ClientActive()
+      ? await getS3Client(env as Env).fetch(headUrl, { method: "HEAD" })
+      : await fetch(headUrl, { method: "HEAD" });
     if (!res.ok) return { ok: false };
     const contentType = res.headers.get("Content-Type") ?? undefined;
     const contentLengthRaw = res.headers.get("Content-Length");
@@ -52,7 +57,7 @@ export async function headObject(
 
 export async function deleteObject(env: S3EnvLike, key: string): Promise<void> {
   const client = getS3Client(env as Env);
-  const url = new URL(`${env.S3_ENDPOINT}/${env.S3_BUCKET}/${key}`);
+  const url = s3ObjectUrl(env.S3_ENDPOINT, env.S3_BUCKET, key);
   const signedReq = await client.sign(url, {
     method: "DELETE",
     aws: { signQuery: true, allHeaders: true },

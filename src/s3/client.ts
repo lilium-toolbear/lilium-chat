@@ -37,3 +37,7 @@ export function setTestS3Client(client: S3Client | null): void {
 export function getS3Client(env: Env): S3Client {
   return _testClient ?? createS3Client(env);
 }
+
+export function isTestS3ClientActive(): boolean {
+  return _testClient !== null;
+}

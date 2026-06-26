@@ -5,7 +5,7 @@ import type { Env } from "../env";
 function makeEnv(): Pick<Env, "S3_ENDPOINT" | "S3_BUCKET" | "S3_PUBLIC_BASE" | "S3_REGION" | "S3_ACCESS_KEY_ID" | "S3_SECRET_ACCESS_KEY"> {
   return {
     S3_ENDPOINT: "https://s3.kuma.homes",
-    S3_BUCKET: "lilium-chat-attachments",
+    S3_BUCKET: "s3.kuma.homes",
     S3_PUBLIC_BASE: "https://s3.kuma.homes",
     S3_REGION: "us-east-1",
     S3_ACCESS_KEY_ID: "AKIATEST",
@@ -14,20 +14,22 @@ function makeEnv(): Pick<Env, "S3_ENDPOINT" | "S3_BUCKET" | "S3_PUBLIC_BASE" | "
 }
 
 describe("publicReadUrl", () => {
-  it("builds the long-lived public URL at s3.kuma.homes/{bucket}/chat/{id}", () => {
+  it("builds the long-lived public URL at s3.kuma.homes/chat/{id}", () => {
     const env = makeEnv() as Env;
-    expect(publicReadUrl(env, "chat/abc-123")).toBe("https://s3.kuma.homes/lilium-chat-attachments/chat/abc-123");
+    expect(publicReadUrl(env, "chat/attachments/abc-123.png")).toBe(
+      "https://s3.kuma.homes/chat/attachments/abc-123.png",
+    );
   });
 });
 
 describe("presignPut", () => {
   it("returns a presigned PUT URL with SigV4 query params and X-Amz-Expires", async () => {
     const env = makeEnv() as Env;
-    const { url, method, headers } = await presignPut(env, "chat/abc-123", { mimeType: "image/png", sizeBytes: 12345, expiresSeconds: 300 });
+    const { url, method, headers } = await presignPut(env, "chat/attachments/abc-123.png", { mimeType: "image/png", sizeBytes: 12345, expiresSeconds: 300 });
     expect(method).toBe("PUT");
     const u = new URL(url);
     expect(u.host).toBe("s3.kuma.homes");
-    expect(u.pathname).toBe("/lilium-chat-attachments/chat/abc-123");
+    expect(u.pathname).toBe("/chat/attachments/abc-123.png");
     expect(u.searchParams.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
     expect(u.searchParams.get("X-Amz-Expires")).toBe("300");
     expect(u.searchParams.has("X-Amz-Signature")).toBe(true);

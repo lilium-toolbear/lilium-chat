@@ -14,13 +14,13 @@ describe("projectAttachmentForBrowser", () => {
       height: 512,
       blurhash: "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
       storage_key: "secret/key",
-      url: "https://s3.kuma.homes/lilium-chat-attachments/chat/att-1",
+      url: "https://s3.kuma.homes/chat/attachments/att-1.png",
       status: "finalized",
       created_at: "2026-06-25T00:00:00.000Z",
     });
     expect(p).not.toBeNull();
     expect(p!.attachment_id).toBe("att-1");
-    expect(p!.url).toBe("https://s3.kuma.homes/lilium-chat-attachments/chat/att-1");
+    expect(p!.url).toBe("https://s3.kuma.homes/chat/attachments/att-1.png");
     expect(p!.mime_type).toBe("image/png");
     expect(p!.width).toBe(512);
     expect(p!.height).toBe(512);

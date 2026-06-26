@@ -7,7 +7,7 @@ const LIVE = !!(globalThis as { process?: { env?: { SPIKE_LIVE?: string } } }).p
 
 describe.skipIf(!LIVE)("spike: SeaweedFS presign + HEAD", () => {
   it("presigns a PUT and HEADs a known object", async () => {
-    const key = "chat/spike-probe";
+    const key = "chat/attachments/spike-probe.txt";
     const { url } = await presignPut(env as unknown as Env, key, { mimeType: "text/plain", sizeBytes: 5, expiresSeconds: 60 });
 
     const putRes = await fetch(url, { method: "PUT", headers: { "Content-Type": "text/plain" }, body: "hello" });

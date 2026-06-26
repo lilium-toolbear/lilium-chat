@@ -4,7 +4,8 @@ import { uuidv7 } from "../ids/uuidv7";
 import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateUserDirectorySchema } from "./migrations/user-directory";
 import { projectAttachmentForBrowser, projectFinalizedAttachmentForBrowser, type AttachmentRow } from "../chat/attachment-projection";
-import { presignPutUrl, headObject, deleteObject } from "../s3/presign";
+import { presignPutUrl, headObjectKey, deleteObject } from "../s3/presign";
+import { attachmentObjectKey, attachmentPublicUrl } from "../s3/object-key";
 import { HTTP_STATUS_BY_CODE } from "../errors";
 
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -688,8 +689,8 @@ export class UserDirectory extends DurableObject<Env> {
         }
 
         const attachmentId = uuidv7();
-        const storageKey = `chat/${attachmentId}`;
-        const publicUrl = `${this.env.S3_PUBLIC_BASE}/${this.env.S3_BUCKET}/${storageKey}`;
+        const storageKey = attachmentObjectKey(attachmentId, filename, mimeType);
+        const publicUrl = attachmentPublicUrl(this.env.S3_PUBLIC_BASE, attachmentId, filename, mimeType);
         this.ctx.storage.sql.exec(
           `INSERT INTO pending_attachments
             (attachment_id, owner_user_id, kind, filename, mime_type, size_bytes,
@@ -889,7 +890,7 @@ export class UserDirectory extends DurableObject<Env> {
       const row = coord.row;
 
       // Network call outside txn.
-      const head = await headObject(this.env, row.url, row.mime_type, row.size_bytes);
+      const head = await headObjectKey(this.env, row.storage_key, row.mime_type, row.size_bytes);
       if (!head.ok) {
         return Response.json(
           { error: { code: "UNSUPPORTED_ATTACHMENT_TYPE", message: "S3 object missing or mismatch", retryable: false } },

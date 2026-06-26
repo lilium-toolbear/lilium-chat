@@ -1,35 +1,12 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { makeJwt, TEST_SECRET } from "../helpers";
-import { setTestS3Client, type S3Client } from "../../src/s3/presign";
+import { makeJwt, TEST_SECRET, fakeS3PublicPath } from "../helpers";
+import { setTestS3Client } from "../../src/s3/presign";
+import { FakeS3 } from "../fake-s3";
 
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
 };
-
-class FakeS3 implements S3Client {
-  objects = new Map<string, { contentType: string; contentLength: number }>();
-
-  async sign(input: string | URL, init?: RequestInit & { aws?: any }): Promise<Request> {
-    const url = new URL(input instanceof URL ? input.toString() : input);
-    url.searchParams.set("X-Amz-Fake", "signed");
-    return new Request(url, init);
-  }
-
-  async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    const u = new URL(input instanceof Request ? input.url : input.toString());
-    const method = input instanceof Request ? input.method : (init?.method ?? "GET");
-    if (method === "HEAD") {
-      const obj = this.objects.get(u.pathname);
-      if (!obj) return new Response("Not Found", { status: 404 });
-      return new Response(new ArrayBuffer(0), {
-        status: 200,
-        headers: { "Content-Type": obj.contentType, "Content-Length": String(obj.contentLength) },
-      });
-    }
-    return new Response("ok", { status: 200 });
-  }
-}
 
 async function authedReq(userId: string, method: string, path: string, body?: unknown, idemKey?: string): Promise<Response> {
   const headers: Record<string, string> = { Authorization: `Bearer ${await makeJwt({ sub: userId }, TEST_SECRET)}` };
@@ -67,7 +44,7 @@ describe("POST /api/chat/uploads/images/presign", () => {
     expect(body.attachment_id).toBeTruthy();
     expect(body.upload_method).toBe("PUT");
     expect(body.upload_url).toContain("s3.kuma.homes");
-    expect(body.upload_url).toContain(`chat/${body.attachment_id}`);
+    expect(body.upload_url).toContain(`chat/attachments/${body.attachment_id}.png`);
     expect(body.upload_headers["Content-Type"]).toBe("image/png");
     expect(body.expires_at).toBeTruthy();
   });
@@ -107,7 +84,7 @@ describe("POST /api/chat/uploads/images/:attachment_id/finalize", () => {
   it("finalizes a uploaded image and returns the projection", async () => {
     const userId = "u-finalize-route-1";
     const { attachment_id, upload_url } = await presign(userId);
-    fake.objects.set(new URL(upload_url).pathname, { contentType: "image/png", contentLength: 12345 });
+    fake.objects.set(fakeS3PublicPath(attachment_id), { contentType: "image/png", contentLength: 12345 });
 
     const res = await authedReq(userId, "POST", `/api/chat/uploads/images/${attachment_id}/finalize`, {}, `idem-${userId}-finalize`);
     expect(res.status).toBe(200);

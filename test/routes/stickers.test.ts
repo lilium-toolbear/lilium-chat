@@ -1,35 +1,12 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { makeJwt, TEST_SECRET } from "../helpers";
-import { setTestS3Client, type S3Client } from "../../src/s3/presign";
+import { makeJwt, TEST_SECRET, fakeS3PublicPath } from "../helpers";
+import { setTestS3Client } from "../../src/s3/presign";
+import { FakeS3 } from "../fake-s3";
 
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
 };
-
-class FakeS3 implements S3Client {
-  objects = new Map<string, { contentType: string; contentLength: number }>();
-
-  async sign(input: string | URL, init?: RequestInit & { aws?: any }): Promise<Request> {
-    const url = new URL(input instanceof URL ? input.toString() : input);
-    url.searchParams.set("X-Amz-Fake", "signed");
-    return new Request(url, init);
-  }
-
-  async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    const u = new URL(input instanceof Request ? input.url : input.toString());
-    const method = input instanceof Request ? input.method : (init?.method ?? "GET");
-    if (method === "HEAD") {
-      const obj = this.objects.get(u.pathname);
-      if (!obj) return new Response("Not Found", { status: 404 });
-      return new Response(new ArrayBuffer(0), {
-        status: 200,
-        headers: { "Content-Type": obj.contentType, "Content-Length": String(obj.contentLength) },
-      });
-    }
-    return new Response("ok", { status: 200 });
-  }
-}
 
 function chatStub(channelId: string) {
   return (env.CHAT_CHANNEL as unknown as { getByName: (name: string) => { fetch: (req: Request) => Promise<Response> } }).getByName(channelId);
@@ -96,7 +73,7 @@ async function presignAndFinalize(userId: string, fake: FakeS3): Promise<{ attac
   );
   expect(presignRes.status).toBe(200);
   const presignBody = (await presignRes.json()) as { attachment_id: string; upload_url: string };
-  fake.objects.set(new URL(presignBody.upload_url).pathname, { contentType: "image/png", contentLength: 12345 });
+  fake.objects.set(fakeS3PublicPath(presignBody.attachment_id), { contentType: "image/png", contentLength: 12345 });
 
   const finalizeRes = await udStub(userId).fetch(
     new Request("https://x/internal/attachment-finalize", {

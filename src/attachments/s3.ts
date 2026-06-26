@@ -1,5 +1,6 @@
 import { AwsClient } from "aws4fetch";
 import type { Env } from "../env";
+import { s3BrowserUploadUrl, s3ObjectUrl, s3PublicObjectUrl } from "../s3/url";
 
 function client(env: Env): AwsClient {
   return new AwsClient({
@@ -11,11 +12,12 @@ function client(env: Env): AwsClient {
 }
 
 function objectUrl(env: Env, key: string): URL {
-  return new URL(`${env.S3_ENDPOINT}/${env.S3_BUCKET}/${key}`);
+  return s3ObjectUrl(env.S3_ENDPOINT, env.S3_BUCKET, key);
 }
 
-export function publicReadUrl(env: Env, key: string): string {
-  return `${env.S3_PUBLIC_BASE}/${env.S3_BUCKET}/${key}`;
+/** Public read URL: clean path; nginx injects bucket prefix on gina. */
+export function publicReadUrl(env: Env, objectKey: string): string {
+  return s3PublicObjectUrl(env.S3_PUBLIC_BASE, objectKey);
 }
 
 export interface PresignPutOptions {
@@ -37,19 +39,16 @@ export async function presignPut(
     headers: { "Content-Type": opts.mimeType, "Content-Length": String(opts.sizeBytes) },
     aws: { signQuery: true },
   });
-  // signed is a Request; pull the presigned URL string off .url
   return {
-    url: new URL(signed.url).toString(),
+    url: s3BrowserUploadUrl(signed.url, key),
     method: "PUT",
     headers: { "Content-Type": opts.mimeType },
   };
 }
 
 export async function headObject(env: Env, key: string): Promise<{ exists: boolean; contentLength: number | null; contentType: string | null }> {
-  const aws = client(env);
-  const url = objectUrl(env, key);
-  const signed = await aws.sign(url, { method: "HEAD", aws: { signQuery: true } });
-  const res = await fetch(signed);
+  const headUrl = s3PublicObjectUrl(env.S3_PUBLIC_BASE, key);
+  const res = await fetch(headUrl, { method: "HEAD" });
   if (res.status === 404) return { exists: false, contentLength: null, contentType: null };
   if (!res.ok) throw new Error(`headObject ${key} failed: ${res.status}`);
   const cl = res.headers.get("Content-Length");

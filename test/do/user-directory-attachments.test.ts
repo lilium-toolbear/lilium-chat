@@ -1,34 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
-import { setTestS3Client, type S3Client } from "../../src/s3/presign";
-
-class FakeS3 implements S3Client {
-  objects = new Map<string, { contentType: string; contentLength: number }>();
-
-  async sign(input: string | URL, init?: RequestInit & { aws?: any }): Promise<Request> {
-    const url = new URL(input instanceof URL ? input.toString() : input);
-    url.searchParams.set("X-Amz-Fake", "signed");
-    return new Request(url, init);
-  }
-
-  async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    const u = new URL(input instanceof Request ? input.url : input.toString());
-    const method = input instanceof Request ? input.method : (init?.method ?? "GET");
-    if (method === "HEAD") {
-      const obj = this.objects.get(u.pathname);
-      if (!obj) return new Response("Not Found", { status: 404 });
-      return new Response(new ArrayBuffer(0), {
-        status: 200,
-        headers: {
-          "Content-Type": obj.contentType,
-          "Content-Length": String(obj.contentLength),
-        },
-      });
-    }
-    return new Response("ok", { status: 200 });
-  }
-}
+import { getNamedDo, fakeS3PublicPath } from "../helpers";
+import { setTestS3Client } from "../../src/s3/presign";
+import { FakeS3 } from "../fake-s3";
 
 function udStub(userId: string) {
   return getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], userId);
@@ -78,7 +52,7 @@ describe("UserDirectory attachment presign + finalize", () => {
     expect(body.attachment_id).toBeTruthy();
     expect(body.upload_method).toBe("PUT");
     expect(body.upload_url).toContain("s3.kuma.homes");
-    expect(body.upload_url).toContain(`chat/${body.attachment_id}`);
+    expect(body.upload_url).toContain(`chat/attachments/${body.attachment_id}.png`);
     expect(body.upload_headers["Content-Type"]).toBe("image/png");
     expect(body.expires_at).toBeTruthy();
   });
@@ -121,7 +95,7 @@ describe("UserDirectory attachment presign + finalize", () => {
     const stub = udStub(userId);
     const presignRes = await presign(stub, userId, "idem-finalize-1");
     const presignBody = (await presignRes.json()) as { attachment_id: string; upload_url: string };
-    fake.objects.set(new URL(presignBody.upload_url).pathname, { contentType: "image/png", contentLength: 12345 });
+    fake.objects.set(fakeS3PublicPath(presignBody.attachment_id), { contentType: "image/png", contentLength: 12345 });
 
     const res = await stub.fetch(
       new Request("https://x/internal/attachment-finalize", {
@@ -143,7 +117,7 @@ describe("UserDirectory attachment presign + finalize", () => {
     const stub = udStub(userId);
     const presignRes = await presign(stub, userId, "idem-finalize-2");
     const presignBody = (await presignRes.json()) as { attachment_id: string; upload_url: string };
-    fake.objects.set(new URL(presignBody.upload_url).pathname, { contentType: "image/png", contentLength: 12345 });
+    fake.objects.set(fakeS3PublicPath(presignBody.attachment_id), { contentType: "image/png", contentLength: 12345 });
     const key = "idem-finalize-2a";
 
     const r1 = await stub.fetch(
@@ -202,7 +176,7 @@ describe("UserDirectory attachment presign + finalize", () => {
     const stub = udStub(userId);
     const presignRes = await presign(stub, userId, "idem-get-1");
     const presignBody = (await presignRes.json()) as { attachment_id: string; upload_url: string };
-    fake.objects.set(new URL(presignBody.upload_url).pathname, { contentType: "image/png", contentLength: 12345 });
+    fake.objects.set(fakeS3PublicPath(presignBody.attachment_id), { contentType: "image/png", contentLength: 12345 });
 
     await stub.fetch(
       new Request("https://x/internal/attachment-finalize", {
