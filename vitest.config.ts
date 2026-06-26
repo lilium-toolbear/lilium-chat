@@ -10,6 +10,11 @@ export default defineConfig({
       },
     }),
   ],
+  resolve: {
+    alias: {
+      "./pg-client": new URL("./src/profile/pg-client.stub.ts", import.meta.url).pathname,
+    },
+  },
   test: {
     include: ["test/**/*.test.ts", "src/**/*.test.ts"],
   },

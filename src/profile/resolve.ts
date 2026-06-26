@@ -1,4 +1,5 @@
 import type { Env } from "../env";
+import { Client } from "./pg-client";
 
 export interface UserSummary {
   user_id: string;
@@ -19,16 +20,9 @@ export interface ResolveOptions {
 }
 
 const DEFAULT_BATCH = 50;
-let CachedPgClient: (new (opts: { connectionString: string }) => ClientLike) | null = null;
 
-async function defaultClientFactory(connectionString: string): Promise<ClientLike> {
-  if (!CachedPgClient) {
-    const module = (await new Function("return import('pg')")()) as {
-      Client: new (opts: { connectionString: string }) => ClientLike;
-    };
-    CachedPgClient = module.Client;
-  }
-  return new (CachedPgClient!)({ connectionString }) as ClientLike;
+function defaultClientFactory(connectionString: string): ClientLike {
+  return new Client({ connectionString }) as ClientLike;
 }
 
 /**
@@ -52,17 +46,17 @@ export async function resolveUserSummaries(
     const batch = unique.slice(i, i + batchSize);
     let client: ClientLike | null = null;
     try {
-      client = opts.clientFactory ? opts.clientFactory(env.LILIUM_DB.connectionString) : await defaultClientFactory(env.LILIUM_DB.connectionString);
+      client = opts.clientFactory ? opts.clientFactory(env.LILIUM_DB.connectionString) : defaultClientFactory(env.LILIUM_DB.connectionString);
       await client.connect();
       const res = await client.query(
-        "SELECT user_id::text, full_name, avatar_url FROM users WHERE user_id = ANY($1)",
+        "SELECT user_id::text, full_name, avatar_url FROM users WHERE user_id = ANY($1::uuid[])",
         [batch],
       );
       for (const row of res.rows) {
         map.set(row.user_id, { user_id: row.user_id, display_name: row.full_name, avatar_url: row.avatar_url });
       }
     } catch (error) {
-      console.warn("resolveUserSummaries: profile query failed", { batch, error: String(error) });
+      console.warn(`resolveUserSummaries: profile query failed: ${String(error)}`, { batch });
       // leave these ids absent; caller applies fallback
     } finally {
       try {
