@@ -3320,7 +3320,7 @@ export class ChatChannel extends DurableObject<Env> {
     return Response.json(JSON.parse(txResult.responseJson));
   }
 
-  /** POST /internal/bot-install-update — enable/disable/uninstall a bot's bindings batch. */
+  /** POST /internal/bot-install-update — uninstall a bot's bindings batch. */
   private async handleBotInstallUpdate(request: Request): Promise<Response> {
     const userId = request.headers.get("X-Verified-User-Id") ?? "";
     if (!userId) return this.botInstallError("UNAUTHORIZED", "missing verified user");
@@ -3333,14 +3333,16 @@ export class ChatChannel extends DurableObject<Env> {
     }
     const channelId = b.channel_id;
     const botId = b.bot_id;
-    const newStatus = b.status; // active | removed
+    const newStatus = b.status;
     const operationId = b.operation_id;
     const operation = "bot.install_update";
     const now = this.nowIso();
     const nowMs = Date.parse(now);
     const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
-    const policy = (b.command_policy ?? {}) as Record<string, unknown>;
-    const requestHash = JSON.stringify({ bot_id: botId, status: newStatus, command_policy: policy });
+    if (newStatus !== "removed") {
+      return this.botInstallError("INVALID_MESSAGE", "status must be removed");
+    }
+    const requestHash = JSON.stringify({ bot_id: botId, status: newStatus });
 
     const preCheck = this.ctx.storage.sql
       .exec(
@@ -3378,56 +3380,10 @@ export class ChatChannel extends DurableObject<Env> {
         .toArray()[0] as { bot_id: string } | undefined;
       if (!install) return { kind: "error" as const, j: JSON.stringify({ error: { code: "BOT_NOT_FOUND", message: "bot not installed" } }) };
 
-      if (newStatus === "removed") {
-        this.ctx.storage.sql.exec("DELETE FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botId);
-        this.ctx.storage.sql.exec("DELETE FROM channel_command_bindings WHERE channel_id=? AND bot_id=?", channelId, botId);
-        this.ctx.storage.sql.exec("DELETE FROM channel_bot_event_subscriptions WHERE channel_id=? AND bot_id=?", channelId, botId);
-        this.ctx.storage.sql.exec("UPDATE bot_installations SET status='removed', updated_by=?, updated_at=? WHERE bot_id=?", userId, now, botId);
-      } else if (newStatus === "active") {
-        const bindingRows = this.ctx.storage.sql
-          .exec("SELECT binding_id, bot_command_id, name, aliases_json FROM channel_command_bindings WHERE channel_id=? AND bot_id=?", channelId, botId)
-          .toArray() as Array<{ binding_id: string; bot_command_id: string; name: string; aliases_json: string }>;
-        const plannedNames = new Map<string, string>();
-        for (const binding of bindingRows) {
-          const policyEntry = policy[binding.bot_command_id];
-          const enabled = typeof policyEntry === "boolean" ? policyEntry : typeof policyEntry === "object" && policyEntry !== null && typeof (policyEntry as { enabled?: unknown }).enabled === "boolean" ? (policyEntry as { enabled: boolean }).enabled : true;
-          if (!enabled) continue;
-          const aliases = JSON.parse(binding.aliases_json) as string[];
-          for (const slashName of [binding.name, ...aliases]) {
-            const existingCommandId = plannedNames.get(slashName);
-            if (existingCommandId && existingCommandId !== binding.bot_command_id) {
-              return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NAME_CONFLICT", message: `slash token already in use: ${slashName}` } }) };
-            }
-            plannedNames.set(slashName, binding.bot_command_id);
-          }
-        }
-        for (const [slashName, botCommandId] of plannedNames) {
-          const clash = this.ctx.storage.sql
-            .exec("SELECT 1 FROM channel_command_names WHERE channel_id=? AND slash_name=? AND bot_command_id!=?", channelId, slashName, botCommandId)
-            .toArray()[0];
-          if (clash) {
-            return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NAME_CONFLICT", message: `slash token already in use: ${slashName}` } }) };
-          }
-        }
-
-        this.ctx.storage.sql.exec("UPDATE bot_installations SET status='active', updated_by=?, updated_at=? WHERE bot_id=?", userId, now, botId);
-        // re-enable bindings per policy (default: all enabled)
-        for (const binding of bindingRows) {
-          const policyEntry = policy[binding.bot_command_id];
-          const enabled = typeof policyEntry === "boolean" ? policyEntry : typeof policyEntry === "object" && policyEntry !== null && typeof (policyEntry as { enabled?: unknown }).enabled === "boolean" ? (policyEntry as { enabled: boolean }).enabled : true;
-          this.ctx.storage.sql.exec("UPDATE channel_command_bindings SET status=? WHERE binding_id=?", enabled ? "enabled" : "disabled", binding.binding_id);
-          if (enabled) {
-            const aliases = JSON.parse(binding.aliases_json) as string[];
-            for (const slashName of [binding.name, ...aliases]) {
-              this.ctx.storage.sql.exec("INSERT INTO channel_command_names (channel_id, slash_name, bot_command_id, bot_id, kind, created_at) VALUES (?, ?, ?, ?, ?, ?)", channelId, slashName, binding.bot_command_id, botId, slashName === binding.name ? "canonical" : "alias", now);
-            }
-          } else {
-            this.ctx.storage.sql.exec("DELETE FROM channel_command_names WHERE channel_id=? AND bot_id=? AND bot_command_id=?", channelId, botId, binding.bot_command_id);
-          }
-        }
-      } else {
-        return { kind: "error" as const, j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "status must be active or removed" } }) };
-      }
+      this.ctx.storage.sql.exec("DELETE FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botId);
+      this.ctx.storage.sql.exec("DELETE FROM channel_command_bindings WHERE channel_id=? AND bot_id=?", channelId, botId);
+      this.ctx.storage.sql.exec("DELETE FROM channel_bot_event_subscriptions WHERE channel_id=? AND bot_id=?", channelId, botId);
+      this.ctx.storage.sql.exec("UPDATE bot_installations SET status='removed', updated_by=?, updated_at=? WHERE bot_id=?", userId, now, botId);
 
       const mv = meta.membership_version;
       const noticeId = this.nextEventId(nowMs);

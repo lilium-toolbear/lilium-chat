@@ -60,7 +60,7 @@ export async function installBotHandler(
   return c.json(out, 201, { "X-Request-Id": c.get("requestId") });
 }
 
-/** PATCH /api/chat/channels/:channel_id/bot-installations/:bot_id — enable/disable/uninstall a bot. */
+/** PATCH /api/chat/channels/:channel_id/bot-installations/:bot_id — uninstall a bot. */
 export async function updateBotInstallHandler(
   c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
 ): Promise<Response> {
