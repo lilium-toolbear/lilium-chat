@@ -36,6 +36,7 @@ describe("BotConnection baseline migrations (Phase 7)", () => {
       expect(tableExists(ctx, "bot_connection_state")).toBe(true);
       expect(tableExists(ctx, "bot_deliveries")).toBe(true);
       expect(indexExists(ctx, "idx_bot_deliveries_due")).toBe(true);
+      expect(indexExists(ctx, "idx_bot_deliveries_source_outbox")).toBe(true);
     });
     expect(await schemaVersion(stub)).toBe(BOT_CONNECTION_CURRENT_SCHEMA_VERSION);
   });
@@ -51,6 +52,19 @@ describe("BotConnection baseline migrations (Phase 7)", () => {
       expect(cols).toContain("bot_id");
       expect(cols).toContain("status");
       expect(cols).toContain("next_attempt_at");
+    });
+  });
+
+  it("delivery queue source outbox index covers (bot_id, source_outbox_id)", async () => {
+    const stub = connectionStub(`bot-source-idx-${crypto.randomUUID()}`);
+    await stub.fetch(new Request("https://x/ping"));
+    await withDoState(stub, (ctx) => {
+      const rows = ctx.storage.sql
+        .exec("PRAGMA index_info(idx_bot_deliveries_source_outbox)")
+        .toArray() as Array<{ name: string }>;
+      const cols = rows.map((r) => r.name);
+      expect(cols).toContain("bot_id");
+      expect(cols).toContain("source_outbox_id");
     });
   });
 });

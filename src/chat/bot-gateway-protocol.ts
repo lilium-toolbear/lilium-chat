@@ -58,7 +58,7 @@ function asObject(raw: string): Record<string, unknown> {
 
 export function parseHello(raw: string): ParsedHello {
   const obj = asObject(raw);
-  if (obj.type !== "hello" || typeof obj.api_version !== "string") {
+  if (obj.type !== "hello" || obj.api_version !== BOT_GATEWAY_API_VERSION) {
     throw new Error("not a hello frame");
   }
   const last = obj.last_received_delivery_id;
@@ -88,7 +88,7 @@ export function buildDeliveryFrame(delivery: Record<string, unknown>): BotDelive
 
 export function parseDeliveryResult(raw: string): ParsedDeliveryResult {
   const obj = asObject(raw);
-  if (obj.type !== "delivery_result" || typeof obj.api_version !== "string") {
+  if (obj.type !== "delivery_result" || obj.api_version !== BOT_GATEWAY_API_VERSION) {
     throw new Error("not a delivery_result frame");
   }
   if (typeof obj.delivery_id !== "string" || obj.delivery_id.length === 0) {

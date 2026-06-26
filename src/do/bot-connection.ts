@@ -141,11 +141,28 @@ export class BotConnection extends DurableObject<Env> {
       }
 
       const nowIso = this.nowIso();
-      const nowMs = Date.now();
-      const nowDue = String(nowMs);
-      const deliveryId = uuidv7();
+      const nowDue = String(Date.now());
+      let deliveryId = "";
+      let deliveryStatus = "pending";
+      let inserted = false;
 
       await this.ctx.storage.transaction(async () => {
+        const existing = this.ctx.storage.sql
+          .exec(
+            "SELECT delivery_id, status FROM bot_deliveries WHERE bot_id=? AND source_outbox_id=?",
+            botId,
+            body.outbox_id,
+          )
+          .toArray()[0] as
+          | { delivery_id: string; status: string }
+          | undefined;
+        if (existing) {
+          deliveryId = existing.delivery_id;
+          deliveryStatus = existing.status;
+          return;
+        }
+        deliveryId = uuidv7();
+        inserted = true;
         this.ctx.storage.sql.exec(
           "INSERT INTO bot_deliveries (delivery_id, bot_id, channel_id, kind, source_outbox_id, target_id, request_json, status, attempts, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           deliveryId,
@@ -166,14 +183,18 @@ export class BotConnection extends DurableObject<Env> {
       const state = this.ctx.storage.sql
         .exec("SELECT status FROM bot_connection_state WHERE bot_id=?", botId)
         .toArray()[0] as { status: string } | undefined;
-      if (state?.status === "connected") {
+      if (inserted && state?.status === "connected") {
         await this.trySendDelivery(botId, deliveryId, nowDue);
+        const row = this.ctx.storage.sql
+          .exec("SELECT status FROM bot_deliveries WHERE delivery_id=?", deliveryId)
+          .toArray()[0] as { status: string } | undefined;
+        deliveryStatus = row?.status ?? deliveryStatus;
       }
 
       await this.scheduleDeliveryAlarm();
       return Response.json({
         delivery_id: deliveryId,
-        status: state?.status ?? "disconnected",
+        status: deliveryStatus,
       });
     }
 

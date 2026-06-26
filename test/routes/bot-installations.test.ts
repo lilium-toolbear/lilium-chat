@@ -224,6 +224,20 @@ describe("POST /api/chat/channels/:id/bot-installations (7a-install)", () => {
     expect(r2.status).toBe(409);
     const body = (await r2.json()) as { error: { code: string } };
     expect(body.error.code).toBe("COMMAND_NAME_CONFLICT");
+    await withChannel(channelId, (ctx) => {
+      const botANames = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botIdA)
+        .toArray()[0] as { c: number | bigint };
+      const botBBindings = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM channel_command_bindings WHERE channel_id=? AND bot_id=?", channelId, botIdB)
+        .toArray()[0] as { c: number | bigint };
+      const botBNames = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botIdB)
+        .toArray()[0] as { c: number | bigint };
+      expect(Number(botANames.c)).toBe(2);
+      expect(Number(botBBindings.c)).toBe(0);
+      expect(Number(botBNames.c)).toBe(0);
+    });
   });
 
   it("returns 403 when a non-admin member tries to install", async () => {

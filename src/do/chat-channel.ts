@@ -3177,6 +3177,31 @@ export class ChatChannel extends DurableObject<Env> {
         return { kind: "error" as const, j: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner/admin may install bots" } }) };
       }
 
+      const enabledCommandSlashNames = new Set<string>();
+      for (const cmd of catalog.commands) {
+        const policyEntry = policy[cmd.bot_command_id];
+        const enabled = typeof policyEntry === "boolean"
+          ? policyEntry
+          : typeof policyEntry === "object" && policyEntry !== null && typeof (policyEntry as { enabled?: unknown }).enabled === "boolean"
+            ? (policyEntry as { enabled: boolean }).enabled
+            : cmd.default_enabled_on_install;
+        if (!enabled) continue;
+        for (const slashName of [cmd.name, ...cmd.aliases]) {
+          if (enabledCommandSlashNames.has(slashName)) {
+            return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NAME_CONFLICT", message: `slash token already in use: ${slashName}` } }) };
+          }
+          enabledCommandSlashNames.add(slashName);
+        }
+      }
+      for (const slashName of enabledCommandSlashNames) {
+        const clash = this.ctx.storage.sql
+          .exec("SELECT 1 FROM channel_command_names WHERE channel_id=? AND slash_name=? AND bot_id!=?", channelId, slashName, botId)
+          .toArray()[0];
+        if (clash) {
+          return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NAME_CONFLICT", message: `slash token already in use: ${slashName}` } }) };
+        }
+      }
+
       // Re-install = upsert: clear this bot's old bindings + names first.
       this.ctx.storage.sql.exec("DELETE FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botId);
       this.ctx.storage.sql.exec("DELETE FROM channel_command_bindings WHERE channel_id=? AND bot_id=?", channelId, botId);
@@ -3209,14 +3234,8 @@ export class ChatChannel extends DurableObject<Env> {
         );
 
         if (enabled) {
-          // canonical + alias name rows; conflict against OTHER bots' names.
+          // canonical + alias name rows; conflicts were checked before writes.
           for (const slashName of [cmd.name, ...cmd.aliases]) {
-            const clash = this.ctx.storage.sql
-              .exec("SELECT 1 FROM channel_command_names WHERE channel_id=? AND slash_name=?", channelId, slashName)
-              .toArray()[0];
-            if (clash) {
-              return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NAME_CONFLICT", message: `slash token already in use: ${slashName}` } }) };
-            }
             this.ctx.storage.sql.exec(
               "INSERT INTO channel_command_names (channel_id, slash_name, bot_command_id, bot_id, kind, created_at) VALUES (?, ?, ?, ?, ?, ?)",
               channelId, slashName, cmd.bot_command_id, botId, slashName === cmd.name ? "canonical" : "alias", now,
@@ -3365,11 +3384,34 @@ export class ChatChannel extends DurableObject<Env> {
         this.ctx.storage.sql.exec("DELETE FROM channel_bot_event_subscriptions WHERE channel_id=? AND bot_id=?", channelId, botId);
         this.ctx.storage.sql.exec("UPDATE bot_installations SET status='removed', updated_by=?, updated_at=? WHERE bot_id=?", userId, now, botId);
       } else if (newStatus === "active") {
-        this.ctx.storage.sql.exec("UPDATE bot_installations SET status='active', updated_by=?, updated_at=? WHERE bot_id=?", userId, now, botId);
-        // re-enable bindings per policy (default: all enabled)
         const bindingRows = this.ctx.storage.sql
           .exec("SELECT binding_id, bot_command_id, name, aliases_json FROM channel_command_bindings WHERE channel_id=? AND bot_id=?", channelId, botId)
           .toArray() as Array<{ binding_id: string; bot_command_id: string; name: string; aliases_json: string }>;
+        const plannedNames = new Map<string, string>();
+        for (const binding of bindingRows) {
+          const policyEntry = policy[binding.bot_command_id];
+          const enabled = typeof policyEntry === "boolean" ? policyEntry : typeof policyEntry === "object" && policyEntry !== null && typeof (policyEntry as { enabled?: unknown }).enabled === "boolean" ? (policyEntry as { enabled: boolean }).enabled : true;
+          if (!enabled) continue;
+          const aliases = JSON.parse(binding.aliases_json) as string[];
+          for (const slashName of [binding.name, ...aliases]) {
+            const existingCommandId = plannedNames.get(slashName);
+            if (existingCommandId && existingCommandId !== binding.bot_command_id) {
+              return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NAME_CONFLICT", message: `slash token already in use: ${slashName}` } }) };
+            }
+            plannedNames.set(slashName, binding.bot_command_id);
+          }
+        }
+        for (const [slashName, botCommandId] of plannedNames) {
+          const clash = this.ctx.storage.sql
+            .exec("SELECT 1 FROM channel_command_names WHERE channel_id=? AND slash_name=? AND bot_command_id!=?", channelId, slashName, botCommandId)
+            .toArray()[0];
+          if (clash) {
+            return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NAME_CONFLICT", message: `slash token already in use: ${slashName}` } }) };
+          }
+        }
+
+        this.ctx.storage.sql.exec("UPDATE bot_installations SET status='active', updated_by=?, updated_at=? WHERE bot_id=?", userId, now, botId);
+        // re-enable bindings per policy (default: all enabled)
         for (const binding of bindingRows) {
           const policyEntry = policy[binding.bot_command_id];
           const enabled = typeof policyEntry === "boolean" ? policyEntry : typeof policyEntry === "object" && policyEntry !== null && typeof (policyEntry as { enabled?: unknown }).enabled === "boolean" ? (policyEntry as { enabled: boolean }).enabled : true;
@@ -3377,8 +3419,6 @@ export class ChatChannel extends DurableObject<Env> {
           if (enabled) {
             const aliases = JSON.parse(binding.aliases_json) as string[];
             for (const slashName of [binding.name, ...aliases]) {
-              const clash = this.ctx.storage.sql.exec("SELECT 1 FROM channel_command_names WHERE channel_id=? AND slash_name=?", channelId, slashName).toArray()[0];
-              if (clash) return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NAME_CONFLICT", message: `slash token already in use: ${slashName}` } }) };
               this.ctx.storage.sql.exec("INSERT INTO channel_command_names (channel_id, slash_name, bot_command_id, bot_id, kind, created_at) VALUES (?, ?, ?, ?, ?, ?)", channelId, slashName, binding.bot_command_id, botId, slashName === binding.name ? "canonical" : "alias", now);
             }
           } else {
@@ -3476,6 +3516,16 @@ export class ChatChannel extends DurableObject<Env> {
         .toArray()[0] as { binding_id: string; bot_id: string; name: string; aliases_json: string } | undefined;
       if (!binding) return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NOT_FOUND", message: "command binding not found" } }) };
 
+      if (enabled) {
+        const aliases = JSON.parse(binding.aliases_json) as string[];
+        for (const slashName of [binding.name, ...aliases]) {
+          const clash = this.ctx.storage.sql
+            .exec("SELECT 1 FROM channel_command_names WHERE channel_id=? AND slash_name=? AND bot_command_id!=?", channelId, slashName, botCommandId)
+            .toArray()[0];
+          if (clash) return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NAME_CONFLICT", message: `slash token already in use: ${slashName}` } }) };
+        }
+      }
+
       this.ctx.storage.sql.exec(
         "UPDATE channel_command_bindings SET status=?, permission_override=?, updated_by=?, updated_at=? WHERE binding_id=?",
         enabled ? "enabled" : "disabled", permissionOverride, userId, now, binding.binding_id,
@@ -3484,10 +3534,6 @@ export class ChatChannel extends DurableObject<Env> {
       if (enabled) {
         const aliases = JSON.parse(binding.aliases_json) as string[];
         for (const slashName of [binding.name, ...aliases]) {
-          const clash = this.ctx.storage.sql
-            .exec("SELECT 1 FROM channel_command_names WHERE channel_id=? AND slash_name=? AND bot_command_id!=?", channelId, slashName, botCommandId)
-            .toArray()[0];
-          if (clash) return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NAME_CONFLICT", message: `slash token already in use: ${slashName}` } }) };
           this.ctx.storage.sql.exec(
             "INSERT INTO channel_command_names (channel_id, slash_name, bot_command_id, bot_id, kind, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(channel_id, slash_name) DO UPDATE SET bot_command_id=excluded.bot_command_id, bot_id=excluded.bot_id, kind=excluded.kind",
             channelId, slashName, botCommandId, binding.bot_id, slashName === binding.name ? "canonical" : "alias", now,

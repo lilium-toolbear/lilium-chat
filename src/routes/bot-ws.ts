@@ -14,13 +14,17 @@ export async function botWsUpgradeHandler(c: Context<{ Bindings: Env; Variables:
   }
 
   let botId: string;
+  let scopes: string[];
   try {
-    ({ bot_id: botId } = await verifyBotToken(c.env, token));
+    ({ bot_id: botId, scopes } = await verifyBotToken(c.env, token));
   } catch (err) {
     if (err instanceof ApiError) {
       return errorResponse(err, requestId);
     }
     return errorResponse(new ApiError("UNAUTHORIZED", "Invalid bot token"), requestId);
+  }
+  if (!scopes.includes("chat:runtime:connect")) {
+    return errorResponse(new ApiError("FORBIDDEN", "Missing scope: chat:runtime:connect"), requestId);
   }
 
   const upstream = new Request(c.req.raw, c.req.raw);

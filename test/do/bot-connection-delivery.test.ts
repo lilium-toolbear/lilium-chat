@@ -403,6 +403,64 @@ describe("BotConnection DO delivery queue (7b)", () => {
     });
   });
 
+  it("dedupes repeated enqueue for the same source outbox", async () => {
+    const botId = `bot-delivery-dedupe-${crypto.randomUUID()}`;
+    const stub = botConnectionStub(botId);
+    const payload = enqueuePayload({ outbox_id: `outbox-dedupe-${crypto.randomUUID()}` });
+
+    const first = await stub.fetch(
+      new Request("https://x/internal/enqueue-delivery", {
+        method: "POST",
+        headers: {
+          "X-Verified-Bot-Id": botId,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      }),
+    );
+    const second = await stub.fetch(
+      new Request("https://x/internal/enqueue-delivery", {
+        method: "POST",
+        headers: {
+          "X-Verified-Bot-Id": botId,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      }),
+    );
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    const firstBody = (await first.json()) as { delivery_id: string };
+    const secondBody = (await second.json()) as { delivery_id: string };
+    expect(secondBody.delivery_id).toBe(firstBody.delivery_id);
+
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(stub, async (instance: unknown) => {
+      const sql = (
+        instance as {
+          ctx: {
+            storage: {
+              sql: {
+                exec: (
+                  query: string,
+                  ...params: unknown[]
+                ) => { toArray: () => Array<{ c: number | bigint }> };
+              };
+            };
+          };
+        }
+      ).ctx.storage.sql;
+      const row = sql
+        .exec(
+          "SELECT COUNT(*) AS c FROM bot_deliveries WHERE bot_id=? AND source_outbox_id=?",
+          botId,
+          payload.outbox_id,
+        )
+        .toArray()[0];
+      expect(Number(row?.c ?? 0)).toBe(1);
+    });
+  });
+
   it("redelivers both pending and sent deliveries from alarm", async () => {
     const botId = `bot-delivery-redeliver-${crypto.randomUUID()}`;
     const stub = botConnectionStub(botId);

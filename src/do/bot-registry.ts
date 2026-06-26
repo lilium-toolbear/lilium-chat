@@ -145,7 +145,7 @@ export class BotRegistry extends DurableObject<Env> {
     }
 
     const validatedCommands: ValidatedCommand[] = [];
-    const commandNames = new Set<string>();
+    const slashTokens = new Set<string>();
     for (const c of body.commands) {
       const r = validateCommand(c as CommandInput);
       if (!r.ok || !r.value) {
@@ -154,13 +154,15 @@ export class BotRegistry extends DurableObject<Env> {
           { status: 422 },
         );
       }
-      if (commandNames.has(r.value.name)) {
-        return Response.json(
-          { error: { code: "INVALID_COMMAND_OPTIONS", message: `duplicate command: ${r.value.name}` } },
-          { status: 422 },
-        );
+      for (const token of [r.value.name, ...r.value.aliases]) {
+        if (slashTokens.has(token)) {
+          return Response.json(
+            { error: { code: "INVALID_COMMAND_OPTIONS", message: `duplicate slash token: ${token}` } },
+            { status: 422 },
+          );
+        }
+        slashTokens.add(token);
       }
-      commandNames.add(r.value.name);
       validatedCommands.push(r.value);
     }
 
@@ -493,7 +495,6 @@ export class BotRegistry extends DurableObject<Env> {
     }
 
     const OFFICIAL_BOT_ID = "00000000-0000-7000-8000-000000000601";
-    const OFFICIAL_BOT_TOKEN = "seed-official-bot-token";
     const now = new Date().toISOString();
 
     const seedCommands: Array<{
@@ -568,8 +569,8 @@ export class BotRegistry extends DurableObject<Env> {
       .toArray()[0] as { token_hash: string; revoked_at: string | null } | undefined;
 
     if (!existingToken) {
-      issuedToken = OFFICIAL_BOT_TOKEN;
-      const tokenHash = await hashBotToken(OFFICIAL_BOT_TOKEN);
+      issuedToken = `lcbot_${crypto.randomUUID()}_${crypto.randomUUID()}`;
+      const tokenHash = await hashBotToken(issuedToken);
       this.ctx.storage.sql.exec(
         `INSERT INTO bot_tokens (token_id, bot_id, token_hash, scopes, created_at, revoked_at)
          VALUES (?, ?, ?, ?, ?, NULL)`,
