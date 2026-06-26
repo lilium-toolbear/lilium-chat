@@ -41,10 +41,23 @@ describe("member.left → ChannelFanout drops the user", () => {
     const { runDurableObjectAlarm } = await import("cloudflare:test") as any;
     await runDurableObjectAlarm(sysStub);
 
-    const dump = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": sysId } }))).json()) as {
-      sessions: Array<{ user_id?: string }>;
-    };
-    expect(dump.sessions.filter((s) => s.user_id === userId)).toEqual([]);
+    // Poll for the unregister-user outbox row to be flushed into ChannelFanout. Under CI load
+    // the ChannelFanout sub-fetch inside the alarm can throw transiently (DO rpc timing),
+    // routing through bumpOutboxRetry which leaves the outbox row 'pending' with a backoff.
+    // Re-running the alarm retries the delivery. Same pattern as channel-fanout.test.ts.
+    let drained = false;
+    for (let i = 0; i < 60; i++) {
+      const dump = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": sysId } }))).json()) as {
+        sessions: Array<{ user_id?: string }>;
+      };
+      if (dump.sessions.filter((s) => s.user_id === userId).length === 0) {
+        drained = true;
+        break;
+      }
+      await runDurableObjectAlarm(sysStub);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(drained).toBe(true);
   });
 
   // P0-4: the deliver gate must drop an event for a user who has left, even before unregister outbox flushes.
