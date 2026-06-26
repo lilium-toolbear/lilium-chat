@@ -87,10 +87,13 @@ HTTP bootstrap / GET .../events → gap recovery (authoritative)
 - [ ] On stale reasons, DELETE fanout_leases
 - [ ] `/deliver` extended request/response per design §6
 
-### Task P3-3: Extend `/deliver` — no cursor update
+### Task P3-3: Extend `/deliver` — membership gate (P0)
 
-- [ ] Reject closed session / missing socket / expired lease
-- [ ] Optional membership re-check on version bump
+- [ ] Reject closed session / missing socket / expired lease / `live_channel_leases.status='closed'`
+- [ ] If `membership_version_at_event > lease.membership_version`: **MUST** re-check membership before `ws.send`
+- [ ] If not active: mark local lease `closed`, return `membership_not_active` (fanout deletes lease)
+- [ ] If active but version stale: bump `live_channel_leases.membership_version`, then deliver
+- [ ] Test: `test/do/user-connection-deliver-membership.test.ts`
 
 ---
 
@@ -100,10 +103,11 @@ HTTP bootstrap / GET .../events → gap recovery (authoritative)
 
 **Files:** `src/do/user-connection.ts`, `src/ws/frames.ts`, `test/do/user-connection-live-start.test.ts`
 
-- [ ] `session.live_start`: my-channels → leases → fanout upsert → ack; **no replay**
+- [ ] `session.live_start`: my-channels → leases (with `membership_version`) → fanout upsert → ack; **no replay**
 - [ ] Idempotent retry: no duplicate `(session_id, channel_id)` leases
-- [ ] `session.heartbeat`: refresh TTL; `SESSION_NOT_LIVE` if not started
+- [ ] `session.heartbeat`: reload my-channels; refresh only still-active leases; close + revoke non-active; **never** re-upsert `closed` leases; `SESSION_NOT_LIVE` if not started
 - [ ] Synchronous handling (no `waitUntil`)
+- [ ] Test: `test/do/user-connection-heartbeat-membership.test.ts` — removed member: heartbeat does not re-upsert fanout lease; local lease → `closed`; later event not delivered
 
 ### Task P4-2: Worker subprotocol v2
 
@@ -140,7 +144,9 @@ HTTP bootstrap / GET .../events → gap recovery (authoritative)
 - [ ] WS connect: no cross-DO I/O, no `waitUntil`
 - [ ] `session.live_start`: N leases, no historical events
 - [ ] `session.live_start` retry: no duplicate leases
-- [ ] `session.heartbeat`: refresh only, no replay
+- [ ] `session.heartbeat`: refresh only active memberships; no replay; no resurrect closed leases
+- [ ] Removed member: heartbeat closes local lease, no fanout upsert, no deliver
+- [ ] `/deliver` membership_not_active closes local lease; fanout deletes lease
 - [ ] Close: SQL-based cleanup, not attachment
 - [ ] Deliver stale → lease deleted
 - [ ] Expired lease not delivered
@@ -170,7 +176,8 @@ HTTP bootstrap / GET .../events → gap recovery (authoritative)
 | `src/routes/ws.ts` | v2 subprotocol |
 | `src/ws/frames.ts` | live_start / heartbeat ack types |
 | `src/errors.ts` | SESSION_NOT_LIVE |
-| `test/do/user-connection-*.test.ts` | New |
+| `test/do/user-connection-deliver-membership.test.ts` | New (P0) |
+| `test/do/user-connection-heartbeat-membership.test.ts` | New (P0) |
 | `test/integration/*.test.ts` | live_start flow |
 
 **Out of scope:** `channel.subscribe`, `pending_live_events`, ChatChannel mutation paths, Bot WS.

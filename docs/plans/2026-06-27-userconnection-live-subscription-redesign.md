@@ -1,6 +1,6 @@
 # UserConnection Live Fanout Redesign (Without WS Cursor Recovery)
 
-状态：设计稿（v1.1）
+状态：设计稿（v1.2）
 日期：2026-06-27
 范围：lilium-chat `UserConnection` / `ChannelFanout` WebSocket live push 架构重构
 权威来源：
@@ -96,14 +96,15 @@ CREATE TABLE IF NOT EXISTS live_sessions (
 );
 
 CREATE TABLE IF NOT EXISTS live_channel_leases (
-  session_id    TEXT NOT NULL,
-  channel_id    TEXT NOT NULL,
-  route_name    TEXT NOT NULL,
-  lease_id      TEXT NOT NULL,
-  status        TEXT NOT NULL CHECK (status IN ('active', 'closed')),
-  expires_at    TEXT NOT NULL,
-  created_at    TEXT NOT NULL,
-  updated_at    TEXT NOT NULL,
+  session_id           TEXT NOT NULL,
+  channel_id           TEXT NOT NULL,
+  route_name           TEXT NOT NULL,
+  lease_id             TEXT NOT NULL,
+  membership_version   INTEGER NOT NULL,
+  status               TEXT NOT NULL CHECK (status IN ('active', 'closed')),
+  expires_at           TEXT NOT NULL,
+  created_at           TEXT NOT NULL,
+  updated_at           TEXT NOT NULL,
   PRIMARY KEY (session_id, channel_id)
 );
 
@@ -135,7 +136,7 @@ Browser → UserConnection(session.live_start)
   ├─ UserDirectory /my-channels（active memberships）
   ├─ 对每个 active channel：
   │    ├─ resolve route_name
-  │    ├─ create or reuse live_channel_leases(session_id, channel_id)
+  │    ├─ create or reuse live_channel_leases(session_id, channel_id, membership_version)
   │    └─ ChannelFanout(channel_id) /lease-upsert
   ├─ live_sessions.status = 'live', live_started_at = now
   └─ command_ack
@@ -162,12 +163,18 @@ Ack payload：`{ session_id, subscribed_channel_count, lease_expires_at }`
 Browser → UserConnection(session.heartbeat)
   ├─ 校验 session open/live
   ├─ 更新 live_sessions.last_seen_at
-  ├─ 延长 active live_channel_leases.expires_at
-  ├─ ChannelFanout /lease-upsert（刷新）
+  ├─ 从 UserDirectory /my-channels 重载当前 active memberships
+  ├─ 对本地 status='active' 的 live_channel_leases：
+  │    ├─ 若 channel_id 不在 active set → 标 closed，best-effort /lease-revoke，不 upsert
+  │    └─ 若仍 active → 延长 expires_at；若 membership_version 升高则写回本地行并 upsert
   └─ command_ack { session_id, lease_expires_at }
 ```
 
-规则：不 replay、不检查 cursor、不 gap repair。Session 未 live → `SESSION_NOT_LIVE`。
+规则：
+
+- **不得** blind refresh 全部本地 active lease；刷新/upsert 前 **必须** 以当前 active membership 集过滤（或仅处理未被 `/deliver` 标 closed 的 lease，且 **不得** re-upsert `status='closed'` 行）。
+- 因 `membership_not_active` / `membership_stale` 被 ChannelFanout 删除的 lease，或本地已标 `closed` 的 lease，**不得**被 heartbeat 复活。
+- 不 replay、不检查 cursor、不 gap repair。Session 未 live → `SESSION_NOT_LIVE`。
 
 ### 4.3 无 `channel.subscribe`（v1）
 
@@ -229,10 +236,16 @@ CREATE INDEX IF NOT EXISTS idx_fanout_leases_expires
 
 `/deliver` 规则：
 
-- 查 `live_sessions`、`live_channel_leases`、WebSocket by `session_id`
+- 查 `live_sessions`、`live_channel_leases`（`status='active'`）、WebSocket by `session_id`
 - **不得**更新 replay cursor、不得 HTTP recovery、不得创建 lease
-- `membership_version_at_event > lease.membership_version` 时可选 re-check membership
-- 成功 → `{ delivered: true }`；失败 → `{ delivered: false, reason: "..." }`
+- 若 `membership_version_at_event > lease.membership_version`，**必须**在 `ws.send` 前 re-check 当前 membership（UserDirectory 或 ChatChannel summary）
+- 若 membership **不** active：
+  - `live_channel_leases(session_id, channel_id).status = 'closed'`
+  - 返回 `{ delivered: false, reason: "membership_not_active" }`
+- 若 membership 仍 active 但 version 落后：
+  - 将本地 `live_channel_leases.membership_version` 更新为当前 version（并 upsert fanout lease 可选，下次 heartbeat 也会同步）
+  - 通过 refreshed 授权检查后才 `ws.send`
+- 成功 → `{ delivered: true }`；其它失败 → `{ delivered: false, reason: "..." }`
 
 以下 `reason` 触发 ChannelFanout **删除 lease**：
 
@@ -249,14 +262,24 @@ CREATE INDEX IF NOT EXISTS idx_fanout_leases_expires
 
 清理失败时靠 lease TTL、过期 prune、deliver stale cleanup 收敛。
 
-## 8. 成员变更
+## 8. 成员变更与 `membership_version`
+
+`live_channel_leases.membership_version` 与 `fanout_leases.membership_version` 在 lease 创建/`session.live_start` 时取自 `UserDirectory /my-channels` 的 `membership_version`。
+
+**Version 更新策略（normative）：**
+
+| 场景 | 行为 |
+|---|---|
+| 成员仍 active，version 仅升高（role 变更等） | `/deliver` 或 `session.heartbeat` re-check 通过后 **写回** 本地 lease + fanout upsert 新 version |
+| 成员已 leave/remove | `/deliver` 或 `session.heartbeat` **标 closed** + revoke；不得再 upsert |
+| `session.live_start` 重试 | 复用 `(session_id, channel_id)` lease 行；若 version 变化则更新字段后 upsert |
 
 成员 join/leave 后 UserDirectory 投影更新。在线 session：
 
-- 新加入频道：下次 `session.heartbeat` 或客户端重发 `session.live_start` 可补 lease
-- 离开频道：最迟在下次 deliver 或 lease 过期时移除 stale lease
+- **新加入频道**：下次 `session.heartbeat`（重载 my-channels）或客户端重发 `session.live_start` 创建 lease
+- **离开频道**：**不得**依赖 lease TTL 单独收敛——`session.heartbeat` 必须关闭非 active lease；`/deliver` membership 失败也必须关闭本地 lease，防止 heartbeat 复活
 
-正确性不依赖即时 membership push；HTTP bootstrap 仍为权威。
+正确性不依赖即时 membership push；HTTP bootstrap 仍为权威。Live push 授权边界：**非 active 成员不得收到后续 live event**。
 
 ## 9. WS Live Event 语义
 
@@ -303,6 +326,8 @@ Event reducer：dedupe → 更新 sidebar；`channel_id === activeChannelId` 才
 8. WebSocket attachment 不是订阅列表的权威来源
 9. 前端 dedupe `(channel_id, event_id)`，用 HTTP 恢复
 10. 旧 live 路径（register-online、connect replay、WS cursor）已移除
+11. `/deliver` 在 version 落后时 **必须** re-check membership；非 active 必须关闭本地 lease 并拒绝投递
+12. `session.heartbeat` **不得** blind refresh 或复活 `closed`/membership 失败的 lease；必须对照当前 active memberships 过滤
 
 ## 13. 观测
 
