@@ -1033,12 +1033,22 @@ export class ChatChannel extends DurableObject<Env> {
 
       const b = (await request.json()) as { user_id: string };
       const userId = b.user_id;
-      const meta = this.ctx.storage.sql.exec("SELECT channel_id FROM channel_meta").toArray()[0] as { channel_id: string } | undefined;
+      const meta = this.ctx.storage.sql.exec("SELECT channel_id, kind FROM channel_meta").toArray()[0] as { channel_id: string; kind: string } | undefined;
       if (meta === undefined) {
         return new Response("not found", { status: 404 });
       }
       const now = this.nowIso();
       await this.markMemberLeftAndEnqueueFanoutUnregister(meta.channel_id, userId, now);
+      const mvAfter = (this.ctx.storage.sql.exec("SELECT membership_version FROM channel_meta WHERE channel_id=?", meta.channel_id).toArray()[0] as { membership_version: number }).membership_version;
+      this.ctx.storage.sql.exec(
+        "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+        `user_directory:leave:${meta.channel_id}:${userId}:${now}`,
+        userId,
+        JSON.stringify({ action: "leave", channel_id: meta.channel_id, kind: meta.kind, membership_version: mvAfter }),
+        now,
+        now,
+        now,
+      );
       await this.scheduleOutboxAlarm(now);
       return Response.json({ ok: true });
     }

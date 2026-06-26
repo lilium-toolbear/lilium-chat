@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { makeJwt, TEST_SECRET, getNamedDo } from "../helpers";
+import { liveStartAndAck } from "../ws-helpers";
+
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
 };
 
 interface FanoutDump {
-  sessions: Array<{ user_id?: string }>;
+  leases: Array<{ user_id?: string }>;
 }
 
 function nextMessage(ws: WebSocket, timeoutMs = 3000): Promise<string> {
@@ -40,11 +42,6 @@ describe("e2e: message.send → committed_ack → message.created self-receive",
         body: JSON.stringify({ user_id: userId }),
       }),
     );
-    // /internal/join wrote a user_directory outbox row; flush it via the ChatChannel alarm so
-    // UserDirectory.my_channels has the row BEFORE we upgrade the WS. registerOnlineOnConnect
-    // reads my_channels once on connect — if the row is not yet flushed it subscribes to nothing
-    // and the ChannelFanout online_sessions poll below can never see the user. Same race that
-    // member-left-unsubscribe.test.ts guards against with an explicit pre-connect alarm flush.
     const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
     await runDurableObjectAlarm(sysStub);
     const sysId = (await (await sysStub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }))).json() as {
@@ -56,23 +53,24 @@ describe("e2e: message.send → committed_ack → message.created self-receive",
         headers: {
           Upgrade: "websocket",
           Origin: "https://lilium.kuma.homes",
-          "Sec-WebSocket-Protocol": `lilium.chat.v1, bearer.${token}`,
+          "Sec-WebSocket-Protocol": `lilium.chat.v2, bearer.${token}`,
         },
       }),
       testEnv as typeof env,
       { waitUntil: () => {}, passThroughOnException: () => {} } as any,
     );
     expect(res.status).toBe(101);
-    expect(res.headers.get("Sec-WebSocket-Protocol")).toBe("lilium.chat.v1");
+    expect(res.headers.get("Sec-WebSocket-Protocol")).toBe("lilium.chat.v2");
     const ws = res.webSocket as WebSocket;
     ws.accept();
+    await liveStartAndAck(ws);
 
     const fanoutStub = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], sysId);
     let registered = false;
     for (let i = 0; i < 40; i++) {
       const dumpResponse = await fanoutStub.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": sysId } }));
       const dump = (await dumpResponse.json()) as FanoutDump;
-      if (dump.sessions.some((s) => s.user_id === userId)) {
+      if (dump.leases.some((s) => s.user_id === userId)) {
         registered = true;
         break;
       }

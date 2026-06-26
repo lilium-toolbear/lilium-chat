@@ -26,6 +26,20 @@ export type CommandAckFrame =
       command_id: string;
       status: "committed";
       payload: { channel_id: string; last_read_event_id: string; unread_count: number };
+    }
+  | {
+      frame_type: "command_ack";
+      command: "session.live_start";
+      command_id: string;
+      status: "committed";
+      payload: { session_id: string; subscribed_channel_count: number; lease_expires_at: string };
+    }
+  | {
+      frame_type: "command_ack";
+      command: "session.heartbeat";
+      command_id: string;
+      status: "committed";
+      payload: { session_id: string; lease_expires_at: string };
     };
 
 export interface CommandErrorFrame {

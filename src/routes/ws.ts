@@ -16,7 +16,7 @@ function parseSubprotocol(header: string | null | undefined): ParsedSubprotocol 
   let api = false;
   let token: string | null = null;
   for (const p of parts) {
-    if (p === "lilium.chat.v1") api = true;
+    if (p === "lilium.chat.v2") api = true;
     else if (p.startsWith("bearer.")) token = p.slice("bearer.".length);
   }
   return { api, token };

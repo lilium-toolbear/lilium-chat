@@ -42,11 +42,11 @@ describe("wsUpgradeHandler", () => {
       req: {
         header: (h: string) =>
           h === "Sec-WebSocket-Protocol"
-            ? "lilium.chat.v1"
+            ? "lilium.chat.v2"
             : h === "Origin"
               ? ALLOWED_ORIGIN
               : null,
-        raw: upgradeReq({ subprotocol: "lilium.chat.v1" }),
+        raw: upgradeReq({ subprotocol: "lilium.chat.v2" }),
       },
       env: ({ ...env, JWT_SECRET: TEST_SECRET } as Env),
       get: () => undefined,
@@ -59,7 +59,7 @@ describe("wsUpgradeHandler", () => {
     const uid = "00000000-0000-7000-8000-000000000202";
     const token = await makeJwt({ sub: uid });
     const req = upgradeReq({
-      subprotocol: `lilium.chat.v1, bearer.${token}`,
+      subprotocol: `lilium.chat.v2, bearer.${token}`,
       origin: "http://127.0.0.1:5174",
     });
     const res = await wsUpgradeHandler({
@@ -78,7 +78,7 @@ describe("wsUpgradeHandler", () => {
     const uid = "00000000-0000-7000-8000-000000000203";
     const token = await makeJwt({ sub: uid });
     const req = upgradeReq({
-      subprotocol: `lilium.chat.v1, bearer.${token}`,
+      subprotocol: `lilium.chat.v2, bearer.${token}`,
       origin: "http://127.0.0.1:3334",
     });
     const res = await wsUpgradeHandler({
@@ -101,11 +101,11 @@ describe("wsUpgradeHandler", () => {
           h === "Upgrade"
             ? "websocket"
             : h === "Sec-WebSocket-Protocol"
-              ? `lilium.chat.v1, bearer.${token}`
+              ? `lilium.chat.v2, bearer.${token}`
               : h === "Origin"
                 ? "https://evil.example"
                 : null,
-        raw: upgradeReq({ subprotocol: `lilium.chat.v1, bearer.${token}`, origin: "https://evil.example" }),
+        raw: upgradeReq({ subprotocol: `lilium.chat.v2, bearer.${token}`, origin: "https://evil.example" }),
       },
       env: ({ ...env, JWT_SECRET: TEST_SECRET } as Env),
       get: () => undefined,
@@ -122,11 +122,11 @@ describe("wsUpgradeHandler", () => {
           h === "Upgrade"
             ? "websocket"
             : h === "Sec-WebSocket-Protocol"
-              ? `lilium.chat.v1, bearer.${token}`
+              ? `lilium.chat.v2, bearer.${token}`
               : h === "Origin"
                 ? ALLOWED_ORIGIN
                 : null,
-        raw: upgradeReq({ subprotocol: `lilium.chat.v1, bearer.${token}` }),
+        raw: upgradeReq({ subprotocol: `lilium.chat.v2, bearer.${token}` }),
       },
       env: ({ ...env, JWT_SECRET: TEST_SECRET } as Env),
       get: () => undefined,
@@ -140,7 +140,7 @@ describe("wsUpgradeHandler", () => {
   it("proxies upgrade to UserConnection DO for a valid self-session (101)", async () => {
     const uid = "00000000-0000-7000-8000-000000000201";
     const token = await makeJwt({ sub: uid });
-    const req = upgradeReq({ subprotocol: `lilium.chat.v1, bearer.${token}` });
+    const req = upgradeReq({ subprotocol: `lilium.chat.v2, bearer.${token}` });
     const res = await wsUpgradeHandler({
       req: {
         header: (h: string) => req.headers.get(h),

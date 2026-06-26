@@ -1,5 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import { handleSchemaVersionRequest } from "./sql-migrations";
+import { migrateUserConnectionSchema } from "./migrations/user-connection";
 import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame } from "../ws/frames";
 import { channelRouteNameFor } from "../chat/system-channel";
 import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditCommand, parseMessageRecallCommand, parseMessageSendCommand } from "../chat/command";
@@ -7,8 +9,6 @@ import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditC
 export interface ConnectionAttachment {
   user_id: string;
   session_id: string;
-  per_channel_cursors: Record<string, string>;
-  subscribed_channels: Record<string, number>;
   last_deliver?: string;
 }
 
@@ -25,19 +25,28 @@ interface SendError {
 
 interface DeliverResult {
   delivered: boolean;
-  dropped?: string;
+  reason?: string;
+  buffered?: boolean;
 }
 
-function parsePerChannelCursors(searchParams: string): Record<string, string> {
-  if (!searchParams) {
-    return {};
-  }
-  try {
-    const normalized = `${searchParams.replace(/-/g, "+").replace(/_/g, "/")}${"=".repeat((4 - (searchParams.length % 4)) % 4)}`;
-    return JSON.parse(atob(normalized)) as Record<string, string>;
-  } catch {
-    return {};
-  }
+interface LiveChannelLeaseRow {
+  session_id: string;
+  channel_id: string;
+  route_name: string;
+  lease_id: string;
+  membership_version: number;
+  status: string;
+  expires_at: string;
+}
+
+const LEASE_TTL_MS = 10 * 60 * 1000;
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function leaseExpiresAt(): string {
+  return new Date(Date.now() + LEASE_TTL_MS).toISOString();
 }
 
 function responseError(code: string, message: string, retryable = false): SendError {
@@ -96,11 +105,14 @@ function normalizeEventError(payload: unknown): SendError {
 export class UserConnection extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    // App-level ping/pong without waking the DO (CF hibernation billing best practice).
+    migrateUserConnectionSchema(this.ctx);
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
   async fetch(request: Request): Promise<Response> {
+    const schemaVersion = handleSchemaVersionRequest(this.ctx, "UserConnection", request);
+    if (schemaVersion) return schemaVersion;
+
     const url = new URL(request.url);
 
     if (url.pathname === "/ping") return Response.json({ ok: true });
@@ -108,15 +120,14 @@ export class UserConnection extends DurableObject<Env> {
     if (url.pathname === "/deliver") {
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       const body = (await request.json()) as {
+        lease_id?: string;
+        channel_id?: string;
         session_id?: string;
+        event_id?: string;
         event_json?: string;
         membership_version_at_event?: number;
       };
-      const result = await this.handleDeliver(
-        body.session_id ?? "",
-        body.event_json ?? "",
-        body.membership_version_at_event ?? 0,
-      );
+      const result = await this.handleDeliver(body);
       return Response.json(result);
     }
 
@@ -134,13 +145,20 @@ export class UserConnection extends DurableObject<Env> {
       return new Response("Expected Upgrade: websocket", { status: 426 });
     }
 
-    const perChannelCursors = parsePerChannelCursors(url.searchParams.get("cursors") ?? "");
     const sessionId = crypto.randomUUID();
+    const openedAt = nowIso();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO live_sessions (session_id, user_id, status, opened_at, last_seen_at)
+       VALUES (?, ?, 'open', ?, ?)`,
+      sessionId,
+      userId,
+      openedAt,
+      openedAt,
+    );
+
     const attachment: ConnectionAttachment = {
       user_id: userId,
       session_id: sessionId,
-      per_channel_cursors: perChannelCursors,
-      subscribed_channels: {},
     };
 
     const pair = new WebSocketPair();
@@ -148,28 +166,10 @@ export class UserConnection extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server, [`user-conn:${userId}`]);
     server.serializeAttachment(attachment);
 
-    this.ctx.waitUntil(
-      (async () => {
-        const subscribed = await this.registerOnlineOnConnect(userId, sessionId, perChannelCursors);
-        const ws = this.findSocketBySession(sessionId);
-        if (ws) {
-          const current = ws.deserializeAttachment() as ConnectionAttachment | null;
-          if (current) {
-            ws.serializeAttachment({
-              ...current,
-              subscribed_channels: { ...current.subscribed_channels, ...subscribed },
-            });
-          }
-        }
-      })(),
-    );
-
-    // Browsers require the server to select one offered subprotocol on 101.
-    // JWT auth uses bearer.<jwt> client-side only; echo the API version.
     return new Response(null, {
       status: 101,
       webSocket: client,
-      headers: { "Sec-WebSocket-Protocol": "lilium.chat.v1" },
+      headers: { "Sec-WebSocket-Protocol": "lilium.chat.v2" },
     });
   }
 
@@ -195,6 +195,16 @@ export class UserConnection extends DurableObject<Env> {
       return;
     }
 
+    if (frame.command === "session.live_start") {
+      await this.handleSessionLiveStart(ws, attachment, frame.command_id);
+      return;
+    }
+
+    if (frame.command === "session.heartbeat") {
+      await this.handleSessionHeartbeat(ws, attachment, frame.command_id);
+      return;
+    }
+
     if (frame.command === "channel.mark_read") {
       const channelId = frame.channel_id ?? "";
       if (!channelId) {
@@ -207,7 +217,6 @@ export class UserConnection extends DurableObject<Env> {
         sendCommandError(ws, frame.command_id, responseError("INVALID_MESSAGE", "last_read_event_id required"));
         return;
       }
-      // floor in UserDirectory
       const dir = this.env.USER_DIRECTORY.getByName(attachment.user_id);
       const rsRes = await dir.fetch(new Request("https://x/internal/read-state", {
         method: "POST", headers: { "X-Verified-User-Id": attachment.user_id, "Content-Type": "application/json" },
@@ -216,7 +225,6 @@ export class UserConnection extends DurableObject<Env> {
       if (rsRes.status === 403) { sendCommandError(ws, frame.command_id, responseError("FORBIDDEN", "not an active member")); return; }
       if (!rsRes.ok) { sendCommandError(ws, frame.command_id, responseError("CHAT_WORKER_UNAVAILABLE", "read-state failed")); return; }
       const floor = (await rsRes.json()) as { last_read_event_id: string; advanced: boolean };
-      // unread count from ChatChannel (best-effort)
       const routeName = await channelRouteNameFor(this.env, attachment.user_id, channelId);
       if (routeName === null) {
         sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found"));
@@ -225,9 +233,7 @@ export class UserConnection extends DurableObject<Env> {
       const chStub = this.env.CHAT_CHANNEL.getByName(routeName);
       const ucRes = await chStub.fetch(new Request(`https://x/internal/unread-count?after=${encodeURIComponent(floor.last_read_event_id)}`, { headers: { "X-Verified-User-Id": attachment.user_id } }));
       const unreadCount = ucRes.ok ? ((await ucRes.json()) as { unread_count: number }).unread_count : 0;
-      // ack (NO event_id)
       ws.send(JSON.stringify({ frame_type: "command_ack", command: "channel.mark_read", command_id: frame.command_id, status: "committed", payload: { channel_id: channelId, last_read_event_id: floor.last_read_event_id, unread_count: unreadCount } }));
-      // best-effort broadcast a user-local read_state_updated frame to the user's OTHER sessions
       if (floor.advanced) {
         for (const other of this.ctx.getWebSockets(`user-conn:${attachment.user_id}`)) {
           if (other === ws) continue;
@@ -249,8 +255,8 @@ export class UserConnection extends DurableObject<Env> {
       if (!parsed.ok) { sendCommandError(ws, frame.command_id, parsed.error); return; }
       const routeName = await channelRouteNameFor(this.env, attachment.user_id, channelId);
       if (routeName === null) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found")); return; }
-      const subscribed = await this.ensureSubscribed(attachment, ws, channelId);
-      if (!subscribed) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found or not a member")); return; }
+      const isMember = await this.ensureActiveMember(attachment.user_id, channelId);
+      if (!isMember) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found or not a member")); return; }
       try {
         const stub = this.env.CHAT_CHANNEL.getByName(routeName);
         const endpoint = frame.command === "message.edit" ? "/internal/message-edit" : frame.command === "message.recall" ? "/internal/message-recall" : "/internal/message-delete";
@@ -289,8 +295,8 @@ export class UserConnection extends DurableObject<Env> {
       return;
     }
 
-    const subscribed = await this.ensureSubscribed(attachment, ws, frame.channel_id);
-    if (!subscribed) {
+    const isMember = await this.ensureActiveMember(attachment.user_id, frame.channel_id);
+    if (!isMember) {
       sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found or not a member"));
       return;
     }
@@ -343,253 +349,464 @@ export class UserConnection extends DurableObject<Env> {
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
     const att = ws.deserializeAttachment() as ConnectionAttachment | null;
     if (!att) return;
-    await this.unregisterAll(att);
+    await this.closeSessionCleanup(att.session_id, "ws_close");
   }
 
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     const att = ws.deserializeAttachment() as ConnectionAttachment | null;
     if (!att) return;
-    await this.unregisterAll(att);
+    await this.closeSessionCleanup(att.session_id, "ws_error");
   }
 
   async alarm(): Promise<void> {}
 
   private findSocketBySession(sessionId: string): WebSocket | null {
     if (!sessionId) return null;
-    const sockets = this.ctx.getWebSockets() as WebSocket[];
-
-    for (const ws of sockets) {
+    for (const ws of this.ctx.getWebSockets() as WebSocket[]) {
       const att = ws.deserializeAttachment() as ConnectionAttachment | null;
       if (att?.session_id === sessionId) return ws;
     }
-
-    // Fail closed: no exact session_id match. ChannelFanout always passes a real
-    // target_session_id; a miss means the session is gone (closed/hibernated away). Returning
-    // null → /deliver reports not_connected → ChannelFanout marks the queue row delivered and
-    // stops retrying; the repair path for a rejoined session is cursor-based replay on reconnect.
-    // DO NOT fall back to an arbitrary socket — that could deliver a stale-session's event to a
-    // different live socket of the same user (access-control fail-open).
     return null;
   }
 
-  private async getChannelReplayAfterCursor(userId: string, routeName: string, fallbackCursor: string): Promise<string> {
-    if (fallbackCursor) return fallbackCursor;
-    const channel = this.env.CHAT_CHANNEL.getByName(routeName);
-    const summaryRes = await channel.fetch(new Request("https://x/internal/summary", {
-      headers: { "X-Verified-User-Id": userId },
-    }));
-    if (!summaryRes.ok) return "";
-    const summary = (await summaryRes.json()) as { last_event_id?: string | null };
-    return summary.last_event_id ?? "";
+  private getSessionRow(sessionId: string): { status: string; user_id: string } | null {
+    const row = this.ctx.storage.sql
+      .exec("SELECT status, user_id FROM live_sessions WHERE session_id=?", sessionId)
+      .toArray()[0] as { status: string; user_id: string } | undefined;
+    return row ?? null;
   }
 
-  private async registerChannelOnline(att: ConnectionAttachment, channelId: string, membershipVersion: number): Promise<void> {
+  private async fetchActiveChannels(userId: string): Promise<MyChannelRow[]> {
+    return this.fetchActiveChannelsFromDirectory(userId);
+  }
+
+  private async ensureActiveMember(userId: string, channelId: string): Promise<boolean> {
+    const channels = await this.fetchActiveChannelsFromDirectory(userId);
+    return channels.some((it) => it.channel_id === channelId);
+  }
+
+  private async confirmActiveMembership(
+    userId: string,
+    channelId: string,
+  ): Promise<{ active: boolean; membership_version: number }> {
+    const routeName = await channelRouteNameFor(this.env, userId, channelId);
+    if (routeName === null) return { active: false, membership_version: 0 };
+
+    const channel = this.env.CHAT_CHANNEL.getByName(routeName);
+    const res = await channel.fetch(new Request("https://x/internal/summary", {
+      headers: { "X-Verified-User-Id": userId },
+    }));
+    if (!res.ok) return { active: false, membership_version: 0 };
+
+    const body = await res.json() as { my_role?: string | null; membership_version?: number };
+    if (body.my_role == null) return { active: false, membership_version: 0 };
+    return { active: true, membership_version: body.membership_version ?? 0 };
+  }
+
+  private async fetchActiveChannelsFromDirectory(userId: string): Promise<MyChannelRow[]> {
+    const dir = this.env.USER_DIRECTORY.getByName(userId);
+    const dirRes = await dir.fetch(new Request("https://x/my-channels", {
+      headers: { "X-Verified-User-Id": userId },
+    }));
+    if (!dirRes.ok) return [];
+    const channels = (await dirRes.json()) as { items: MyChannelRow[] };
+    return channels.items ?? [];
+  }
+
+  private getLeaseRow(sessionId: string, channelId: string): LiveChannelLeaseRow | null {
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT session_id, channel_id, route_name, lease_id, membership_version, status, expires_at FROM live_channel_leases WHERE session_id=? AND channel_id=?",
+        sessionId,
+        channelId,
+      )
+      .toArray()[0] as LiveChannelLeaseRow | undefined;
+    return row ?? null;
+  }
+
+  private async upsertFanoutLease(
+    channelId: string,
+    leaseId: string,
+    userId: string,
+    sessionId: string,
+    membershipVersion: number,
+    expiresAt: string,
+  ): Promise<boolean> {
     const fanout = this.env.CHANNEL_FANOUT.getByName(channelId);
-    const res = await fanout.fetch(new Request("https://x/register-online", {
+    const res = await fanout.fetch(new Request("https://x/lease-upsert", {
       method: "POST",
       headers: {
         "X-Channel-Id": channelId,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        user_id: att.user_id,
-        session_id: att.session_id,
+        lease_id: leaseId,
+        user_id: userId,
+        session_id: sessionId,
         membership_version: membershipVersion,
+        expires_at: expiresAt,
       }),
     }));
-
-    if (!res.ok) return;
-
-    const ws = this.findSocketBySession(att.session_id);
-    if (!ws) return;
-    const current = ws.deserializeAttachment() as ConnectionAttachment | null;
-    if (!current) return;
-    ws.serializeAttachment({
-      ...current,
-      subscribed_channels: { ...current.subscribed_channels, [channelId]: membershipVersion },
-    });
+    return res.ok;
   }
 
-  private async registerOnlineOnConnect(
-    userId: string,
-    sessionId: string,
-    perChannelCursors: Record<string, string>,
-  ): Promise<Record<string, number>> {
-    const dir = this.env.USER_DIRECTORY.getByName(userId);
-    const dirRes = await dir.fetch(new Request("https://x/my-channels", {
-      headers: { "X-Verified-User-Id": userId },
-    }));
-    if (!dirRes.ok) return {};
-
-    const channels = (await dirRes.json()) as { items: MyChannelRow[] };
-    const subscribed: Record<string, number> = {};
-
-    for (const ch of channels.items ?? []) {
-      const routeName = await channelRouteNameFor(this.env, userId, ch.channel_id);
-      if (routeName === null) continue;
-
-      await this.registerChannelOnline(
-        {
-          user_id: userId,
-          session_id: sessionId,
-          per_channel_cursors: perChannelCursors,
-          subscribed_channels: {},
+  private async revokeFanoutLease(channelId: string, leaseId: string): Promise<void> {
+    const fanout = this.env.CHANNEL_FANOUT.getByName(channelId);
+    try {
+      await fanout.fetch(new Request("https://x/lease-revoke", {
+        method: "POST",
+        headers: {
+          "X-Channel-Id": channelId,
+          "Content-Type": "application/json",
         },
-        ch.channel_id,
-        ch.membership_version ?? 0,
-      );
-      subscribed[ch.channel_id] = ch.membership_version ?? 0;
-
-      const after = await this.getChannelReplayAfterCursor(
-        userId,
-        routeName,
-        perChannelCursors[ch.channel_id] ?? "",
-      );
-      const channel = this.env.CHAT_CHANNEL.getByName(routeName);
-      const replayRes = await channel.fetch(new Request(`https://x/internal/replay?after=${encodeURIComponent(after)}`, {
-        headers: { "X-Verified-User-Id": userId },
+        body: JSON.stringify({ lease_id: leaseId }),
       }));
-      if (!replayRes.ok) continue;
+    } catch {
+      // best-effort
+    }
+  }
 
-      const replay = (await replayRes.json()) as { events: Array<{ event_json: string }> };
-      const ws = this.findSocketBySession(sessionId);
-      if (!ws) continue;
-      const current = ws.deserializeAttachment() as ConnectionAttachment | null;
-      if (!current) continue;
+  private async upsertLocalLease(
+    sessionId: string,
+    userId: string,
+    channelId: string,
+    routeName: string,
+    membershipVersion: number,
+  ): Promise<{ lease_id: string; expires_at: string }> {
+    const ts = nowIso();
+    const expiresAt = leaseExpiresAt();
+    const existing = this.getLeaseRow(sessionId, channelId);
+    const leaseId = existing?.lease_id ?? crypto.randomUUID();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO live_channel_leases (
+        session_id, channel_id, route_name, lease_id, membership_version,
+        status, expires_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+      ON CONFLICT(session_id, channel_id) DO UPDATE SET
+        route_name=excluded.route_name,
+        membership_version=excluded.membership_version,
+        status='active',
+        expires_at=excluded.expires_at,
+        updated_at=excluded.updated_at`,
+      sessionId,
+      channelId,
+      routeName,
+      leaseId,
+      membershipVersion,
+      expiresAt,
+      ts,
+      ts,
+    );
+    return { lease_id: leaseId, expires_at: expiresAt };
+  }
 
-      for (const ev of replay.events ?? []) {
-        ws.send(ev.event_json);
-        const parsed = parseEventIdAndChannel(ev.event_json);
-        const nextAtt: ConnectionAttachment = {
-          ...current,
-          last_deliver: ev.event_json,
-          per_channel_cursors: {
-            ...current.per_channel_cursors,
-            [ch.channel_id]: parsed.event_id || current.per_channel_cursors[ch.channel_id] || "",
-          },
-        };
-        ws.serializeAttachment(nextAtt);
+  private async closeLocalLease(sessionId: string, channelId: string, leaseId: string): Promise<void> {
+    const ts = nowIso();
+    this.ctx.storage.sql.exec(
+      "UPDATE live_channel_leases SET status='closed', updated_at=? WHERE session_id=? AND channel_id=?",
+      ts,
+      sessionId,
+      channelId,
+    );
+    await this.revokeFanoutLease(channelId, leaseId);
+  }
+
+  private async syncLeasesForChannels(
+    sessionId: string,
+    userId: string,
+    channels: MyChannelRow[],
+  ): Promise<{ count: number; expires_at: string }> {
+    const activeMap = new Map(channels.map((ch) => [ch.channel_id, ch.membership_version ?? 0]));
+    const activeIds = new Set(activeMap.keys());
+    let latestExpires = leaseExpiresAt();
+
+    const localLeases = this.ctx.storage.sql
+      .exec(
+        "SELECT session_id, channel_id, route_name, lease_id, membership_version, status, expires_at FROM live_channel_leases WHERE session_id=?",
+        sessionId,
+      )
+      .toArray() as unknown as LiveChannelLeaseRow[];
+
+    for (const lease of localLeases) {
+      if (lease.status === "closed") continue;
+      if (!activeIds.has(lease.channel_id)) {
+        await this.closeLocalLease(sessionId, lease.channel_id, lease.lease_id);
       }
     }
 
-    return subscribed;
-  }
+    for (const ch of channels) {
+      const routeName = await channelRouteNameFor(this.env, userId, ch.channel_id);
+      if (routeName === null) continue;
 
-  private async ensureSubscribed(att: ConnectionAttachment, ws: WebSocket, channelId: string): Promise<boolean> {
-    const existing = att.subscribed_channels[channelId];
-    if (existing !== undefined) return true;
+      const existing = this.getLeaseRow(sessionId, ch.channel_id);
+      if (existing?.status === "closed") continue;
 
-    const routeName = await channelRouteNameFor(this.env, att.user_id, channelId);
-    if (routeName === null) return false;
+      const { lease_id: leaseId, expires_at: expiresAt } = await this.upsertLocalLease(
+        sessionId,
+        userId,
+        ch.channel_id,
+        routeName,
+        ch.membership_version ?? 0,
+      );
+      if (expiresAt > latestExpires) latestExpires = expiresAt;
 
-    const dir = this.env.USER_DIRECTORY.getByName(att.user_id);
-    const dirRes = await dir.fetch(new Request("https://x/my-channels", {
-      headers: { "X-Verified-User-Id": att.user_id },
-    }));
-    if (!dirRes.ok) return false;
-    const channels = (await dirRes.json()) as { items: MyChannelRow[] };
-    const row = channels.items?.find((it) => it.channel_id === channelId);
-    if (!row) return false;
-
-    await this.registerChannelOnline(att, channelId, row.membership_version ?? 0);
-
-    const current = ws.deserializeAttachment() as ConnectionAttachment | null;
-    if (!current) return true;
-    ws.serializeAttachment({ ...current, subscribed_channels: { ...current.subscribed_channels, [channelId]: row.membership_version ?? 0 } });
-    return true;
-  }
-
-  private async canDeliver(
-    attachment: ConnectionAttachment,
-    ws: WebSocket,
-    channelId: string,
-    membershipVersionAtEvent: number,
-  ): Promise<boolean> {
-    const subscribedVersion = attachment.subscribed_channels[channelId];
-    // subscribedVersion === undefined: the socket has no subscription record for this channel
-    // (e.g. registerOnlineOnConnect's waitUntil hasn't recorded it yet, or this is a direct
-    // replay-style deliver). findSocketBySession already guaranteed we're on the EXACT session
-    // ChannelFanout targeted, so delivering to this socket is not a cross-session leak; the
-    // user is a member (ChannelFanout only has an online_sessions row for members). Allow.
-    if (subscribedVersion === undefined) return true;
-    if (membershipVersionAtEvent <= subscribedVersion) return true;
-
-    // Event version exceeds the subscription snapshot — a member change happened after
-    // subscription. Re-check active membership before delivering; drop if no longer a member.
-    return this.confirmActiveMembershipAndBumpSubscription(attachment, ws, channelId, membershipVersionAtEvent);
-  }
-
-  private async confirmActiveMembershipAndBumpSubscription(
-    attachment: ConnectionAttachment,
-    ws: WebSocket,
-    channelId: string,
-    membershipVersionAtEvent: number,
-  ): Promise<boolean> {
-    const routeName = await channelRouteNameFor(this.env, attachment.user_id, channelId);
-    if (routeName === null) return false;
-
-    const channel = this.env.CHAT_CHANNEL.getByName(routeName);
-    const res = await channel.fetch(new Request("https://x/internal/summary", {
-      headers: { "X-Verified-User-Id": attachment.user_id },
-    }));
-    if (!res.ok) return false;
-
-    const body = await res.json() as { my_role?: string | null };
-    if (body.my_role == null) return false;
-
-    // Still an active member — record the subscription version so subsequent same-version
-    // events take the cheap path.
-    ws.serializeAttachment({ ...attachment, subscribed_channels: { ...attachment.subscribed_channels, [channelId]: membershipVersionAtEvent } });
-    return true;
-  }
-
-  private async handleDeliver(sessionId: string, eventJson: string, membershipVersionAtEvent: number): Promise<DeliverResult> {
-    const ws = this.findSocketBySession(sessionId);
-    if (!ws) return { delivered: false, dropped: "not_connected" };
-
-    const att = ws.deserializeAttachment() as ConnectionAttachment | null;
-    if (!att) return { delivered: false, dropped: "not_connected" };
-
-    const parsed = parseEventIdAndChannel(eventJson);
-    if (!parsed.channel_id || !parsed.event_id) {
-      return { delivered: false, dropped: "invalid_event" };
+      const ok = await this.upsertFanoutLease(
+        ch.channel_id,
+        leaseId,
+        userId,
+        sessionId,
+        ch.membership_version ?? 0,
+        expiresAt,
+      );
+      if (!ok) {
+        throw new Error("fanout lease upsert failed");
+      }
     }
 
-    const allowed = await this.canDeliver(att, ws, parsed.channel_id, membershipVersionAtEvent);
-    if (!allowed) return { delivered: false, dropped: "not_member" };
-
-    // Send synchronously: ChannelFanout marks the queue row 'delivered' on our 200 response,
-    // so the bytes MUST be on the wire (or buffered by the hibernating socket) before we return.
-    // Re-read attachment after canDeliver (it may have bumped the subscription version).
-    const current = ws.deserializeAttachment() as ConnectionAttachment | null;
-    const base = current ?? att;
-    ws.send(eventJson);
-    ws.serializeAttachment({
-      ...base,
-      last_deliver: eventJson,
-      per_channel_cursors: { ...base.per_channel_cursors, [parsed.channel_id]: parsed.event_id },
-    });
-    return { delivered: true };
+    return { count: channels.length, expires_at: latestExpires };
   }
 
-  private async unregisterAll(attachment: ConnectionAttachment): Promise<void> {
-    const channels = Object.keys(attachment.subscribed_channels);
-    await Promise.all(
-      channels.map(async (channelId) => {
-        const fanout = this.env.CHANNEL_FANOUT.getByName(channelId);
-        try {
-          await fanout.fetch(new Request("https://x/unregister-online", {
-            method: "POST",
-            headers: {
-              "X-Channel-Id": channelId,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ session_id: attachment.session_id }),
-          }));
-        } catch {
-          // ignore close-timeout/rpc teardown issues
-        }
-      }),
+  private async handleSessionLiveStart(ws: WebSocket, attachment: ConnectionAttachment, commandId: string): Promise<void> {
+    const session = this.getSessionRow(attachment.session_id);
+    if (!session || (session.status !== "open" && session.status !== "live")) {
+      sendCommandError(ws, commandId, responseError("SESSION_NOT_LIVE", "session is not open"));
+      return;
+    }
+
+    try {
+      const channels = await this.fetchActiveChannels(attachment.user_id);
+      const { count, expires_at: leaseExpires } = await this.syncLeasesForChannels(
+        attachment.session_id,
+        attachment.user_id,
+        channels,
+      );
+      const ts = nowIso();
+      this.ctx.storage.sql.exec(
+        `UPDATE live_sessions SET status='live', live_started_at=COALESCE(live_started_at, ?), last_seen_at=? WHERE session_id=?`,
+        ts,
+        ts,
+        attachment.session_id,
+      );
+      console.log("live_start_committed", {
+        session_id: attachment.session_id,
+        user_id: attachment.user_id,
+        subscribed_channel_count: count,
+      });
+      const ack: CommandAckFrame = {
+        frame_type: "command_ack",
+        command: "session.live_start",
+        command_id: commandId,
+        status: "committed",
+        payload: {
+          session_id: attachment.session_id,
+          subscribed_channel_count: count,
+          lease_expires_at: leaseExpires,
+        },
+      };
+      ws.send(JSON.stringify(ack));
+    } catch (err) {
+      sendCommandError(
+        ws,
+        commandId,
+        responseError("CHAT_WORKER_UNAVAILABLE", err instanceof Error ? err.message : "live start failed", true),
+      );
+    }
+  }
+
+  private async handleSessionHeartbeat(ws: WebSocket, attachment: ConnectionAttachment, commandId: string): Promise<void> {
+    const session = this.getSessionRow(attachment.session_id);
+    if (!session || session.status !== "live") {
+      sendCommandError(ws, commandId, responseError("SESSION_NOT_LIVE", "session live not started"));
+      return;
+    }
+
+    const channels = await this.fetchActiveChannels(attachment.user_id);
+    const activeMap = new Map(channels.map((ch) => [ch.channel_id, ch.membership_version ?? 0]));
+    const activeIds = new Set(activeMap.keys());
+    const ts = nowIso();
+    let latestExpires = leaseExpiresAt();
+
+    this.ctx.storage.sql.exec(
+      "UPDATE live_sessions SET last_seen_at=? WHERE session_id=?",
+      ts,
+      attachment.session_id,
     );
+
+    const localLeases = this.ctx.storage.sql
+      .exec(
+        "SELECT session_id, channel_id, route_name, lease_id, membership_version, status, expires_at FROM live_channel_leases WHERE session_id=?",
+        attachment.session_id,
+      )
+      .toArray() as unknown as LiveChannelLeaseRow[];
+
+    for (const lease of localLeases) {
+      if (lease.status === "closed") continue;
+
+      if (!activeIds.has(lease.channel_id)) {
+        await this.closeLocalLease(attachment.session_id, lease.channel_id, lease.lease_id);
+        continue;
+      }
+
+      const currentVersion = activeMap.get(lease.channel_id) ?? lease.membership_version;
+      const expiresAt = leaseExpiresAt();
+      if (expiresAt > latestExpires) latestExpires = expiresAt;
+
+      this.ctx.storage.sql.exec(
+        `UPDATE live_channel_leases SET expires_at=?, membership_version=?, updated_at=?, status='active'
+         WHERE session_id=? AND channel_id=? AND status='active'`,
+        expiresAt,
+        currentVersion,
+        ts,
+        attachment.session_id,
+        lease.channel_id,
+      );
+
+      await this.upsertFanoutLease(
+        lease.channel_id,
+        lease.lease_id,
+        attachment.user_id,
+        attachment.session_id,
+        currentVersion,
+        expiresAt,
+      );
+    }
+
+    for (const ch of channels) {
+      const existing = this.getLeaseRow(attachment.session_id, ch.channel_id);
+      if (existing) continue;
+
+      const routeName = await channelRouteNameFor(this.env, attachment.user_id, ch.channel_id);
+      if (routeName === null) continue;
+
+      const { lease_id: leaseId, expires_at: expiresAt } = await this.upsertLocalLease(
+        attachment.session_id,
+        attachment.user_id,
+        ch.channel_id,
+        routeName,
+        ch.membership_version ?? 0,
+      );
+      if (expiresAt > latestExpires) latestExpires = expiresAt;
+      await this.upsertFanoutLease(
+        ch.channel_id,
+        leaseId,
+        attachment.user_id,
+        attachment.session_id,
+        ch.membership_version ?? 0,
+        expiresAt,
+      );
+    }
+
+    const ack: CommandAckFrame = {
+      frame_type: "command_ack",
+      command: "session.heartbeat",
+      command_id: commandId,
+      status: "committed",
+      payload: {
+        session_id: attachment.session_id,
+        lease_expires_at: latestExpires,
+      },
+    };
+    ws.send(JSON.stringify(ack));
+  }
+
+  private async handleDeliver(body: {
+    lease_id?: string;
+    channel_id?: string;
+    session_id?: string;
+    event_id?: string;
+    event_json?: string;
+    membership_version_at_event?: number;
+  }): Promise<DeliverResult> {
+    const sessionId = body.session_id ?? "";
+    const channelId = body.channel_id ?? "";
+    const leaseId = body.lease_id ?? "";
+    const eventJson = body.event_json ?? "";
+    const membershipVersionAtEvent = body.membership_version_at_event ?? 0;
+
+    if (!sessionId) return { delivered: false, reason: "session_not_found" };
+
+    const session = this.getSessionRow(sessionId);
+    if (!session) return { delivered: false, reason: "session_not_found" };
+    if (session.status === "closed") return { delivered: false, reason: "session_closed" };
+
+    const parsed = parseEventIdAndChannel(eventJson);
+    const resolvedChannelId = channelId || parsed.channel_id;
+    if (!resolvedChannelId || !parsed.event_id) {
+      return { delivered: false, reason: "invalid_event" };
+    }
+
+    const lease = this.getLeaseRow(sessionId, resolvedChannelId);
+    if (!lease) return { delivered: false, reason: "lease_not_found" };
+    if (lease.status !== "active") return { delivered: false, reason: "lease_closed" };
+    if (leaseId && lease.lease_id !== leaseId) return { delivered: false, reason: "lease_not_found" };
+    if (lease.expires_at <= nowIso()) return { delivered: false, reason: "lease_closed" };
+
+    const ws = this.findSocketBySession(sessionId);
+    if (!ws) return { delivered: false, reason: "socket_not_found" };
+
+    if (membershipVersionAtEvent > lease.membership_version) {
+      const membership = await this.confirmActiveMembership(session.user_id, resolvedChannelId);
+      if (!membership.active) {
+        await this.closeLocalLease(sessionId, resolvedChannelId, lease.lease_id);
+        return { delivered: false, reason: "membership_not_active" };
+      }
+      const ts = nowIso();
+      const expiresAt = leaseExpiresAt();
+      this.ctx.storage.sql.exec(
+        "UPDATE live_channel_leases SET membership_version=?, expires_at=?, updated_at=? WHERE session_id=? AND channel_id=?",
+        membership.membership_version,
+        expiresAt,
+        ts,
+        sessionId,
+        resolvedChannelId,
+      );
+      await this.upsertFanoutLease(
+        resolvedChannelId,
+        lease.lease_id,
+        session.user_id,
+        sessionId,
+        membership.membership_version,
+        expiresAt,
+      );
+    }
+
+    try {
+      ws.send(eventJson);
+      const att = ws.deserializeAttachment() as ConnectionAttachment | null;
+      if (att) {
+        ws.serializeAttachment({ ...att, last_deliver: eventJson });
+      }
+      return { delivered: true };
+    } catch {
+      return { delivered: false, reason: "socket_send_failed" };
+    }
+  }
+
+  private async closeSessionCleanup(sessionId: string, reason: string): Promise<void> {
+    const leases = this.ctx.storage.sql
+      .exec(
+        "SELECT channel_id, lease_id FROM live_channel_leases WHERE session_id=? AND status='active'",
+        sessionId,
+      )
+      .toArray() as Array<{ channel_id: string; lease_id: string }>;
+
+    const ts = nowIso();
+    this.ctx.storage.sql.exec(
+      "UPDATE live_sessions SET status='closed', closed_at=?, close_reason=? WHERE session_id=?",
+      ts,
+      reason,
+      sessionId,
+    );
+    this.ctx.storage.sql.exec(
+      "UPDATE live_channel_leases SET status='closed', updated_at=? WHERE session_id=? AND status='active'",
+      ts,
+      sessionId,
+    );
+
+    await Promise.all(
+      leases.map(async (lease) => this.revokeFanoutLease(lease.channel_id, lease.lease_id)),
+    );
+
+    console.log("session_closed_cleanup", { session_id: sessionId, reason, lease_count: leases.length });
   }
 }
