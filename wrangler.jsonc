@@ -44,8 +44,12 @@
       "tag": "v1",
       "new_sqlite_classes": [
         "ChatChannel", "UserDirectory", "UserConnection", "ChannelDirectory",
-        "InviteDirectory", "BotRegistry", "ChannelFanout", "BotConnection"
+        "InviteDirectory", "BotRegistry", "ChannelFanout"
       ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["BotConnection"]
     }
   ],
 
