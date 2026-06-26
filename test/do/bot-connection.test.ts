@@ -52,6 +52,17 @@ function nextMessageOfType<T extends string>(ws: WebSocket, type: T, timeoutMs =
   });
 }
 
+async function withBotConnection(
+  stub: DurableObjectStub,
+  fn: (ctx: DurableObjectState) => void | Promise<void>,
+): Promise<void> {
+  const { runInDurableObject } = await import("cloudflare:test");
+  await runInDurableObject(stub, async (instance: unknown) => {
+    const ctx = (instance as { ctx: DurableObjectState }).ctx;
+    await fn(ctx);
+  });
+}
+
 async function waitForConnectionState(
   stub: DurableObjectStub,
   expected: string,
@@ -150,6 +161,129 @@ describe("BotConnection DO (7b-connection)", () => {
     expect(connectedState.status).toBe("connected");
     expect(connectedState.session_id).toBeTruthy();
     ws.close();
+  });
+
+  it("closes stale connected state when no matching websocket exists", async () => {
+    const botId = `bot-stale-row-${crypto.randomUUID()}`;
+    const stub = botConnectionStub(botId);
+    const now = new Date().toISOString();
+    const future = new Date(Date.now() + 60000).toISOString();
+    await stub.fetch(new Request("https://x/ping"));
+    await withBotConnection(stub, (ctx) => {
+      ctx.storage.sql.exec(
+        `INSERT INTO bot_connection_state (
+          bot_id, session_id, status, connected_at, disconnected_at, last_seen_at, expires_at
+        ) VALUES (?, ?, 'connected', ?, NULL, ?, ?)`,
+        botId,
+        "missing-session",
+        now,
+        now,
+        future,
+      );
+    });
+
+    const res = await stub.fetch(new Request("https://x/internal/connection-state"));
+    const state = (await res.json()) as { status: string; session_id: string | null };
+    expect(state.status).toBe("disconnected");
+    expect(state.session_id).toBeNull();
+
+    await withBotConnection(stub, (ctx) => {
+      const row = ctx.storage.sql
+        .exec("SELECT status, disconnected_at FROM bot_connection_state WHERE bot_id=?", botId)
+        .toArray()[0] as { status: string; disconnected_at: string | null } | undefined;
+      expect(row?.status).toBe("disconnected");
+      expect(row?.disconnected_at).toBeTruthy();
+    });
+  });
+
+  it("closes expired connected state on /internal/connection-state", async () => {
+    const botId = `bot-expired-state-${crypto.randomUUID()}`;
+    const { ws, stub } = await openConnection(botId);
+    ws.send(JSON.stringify({
+      type: "hello",
+      api_version: BOT_GATEWAY_API_VERSION,
+      last_received_delivery_id: null,
+    }));
+    await nextMessageOfType(ws, "ready");
+    await withBotConnection(stub, (ctx) => {
+      ctx.storage.sql.exec(
+        "UPDATE bot_connection_state SET expires_at=? WHERE bot_id=?",
+        new Date(Date.now() - 1000).toISOString(),
+        botId,
+      );
+    });
+
+    const res = await stub.fetch(new Request("https://x/internal/connection-state"));
+    const state = (await res.json()) as { status: string; session_id: string | null };
+    expect(state.status).toBe("disconnected");
+    expect(state.session_id).toBeNull();
+    ws.close();
+  });
+
+  it("keeps the new session connected when an old socket closes", async () => {
+    const botId = `bot-close-old-${crypto.randomUUID()}`;
+    const first = await openConnection(botId);
+    first.ws.send(JSON.stringify({
+      type: "hello",
+      api_version: BOT_GATEWAY_API_VERSION,
+      last_received_delivery_id: null,
+    }));
+    const firstReady = JSON.parse(await nextMessageOfType(first.ws, "ready")) as { session_id: string };
+
+    const second = await openConnection(botId);
+    second.ws.send(JSON.stringify({
+      type: "hello",
+      api_version: BOT_GATEWAY_API_VERSION,
+      last_received_delivery_id: null,
+    }));
+    const secondReady = JSON.parse(await nextMessageOfType(second.ws, "ready")) as { session_id: string };
+    expect(secondReady.session_id).not.toBe(firstReady.session_id);
+
+    first.ws.close();
+    const state = await waitForConnectionState(second.stub, "connected");
+    expect(state.session_id).toBe(secondReady.session_id);
+    second.ws.close();
+  });
+
+  it("does not refresh the current session from an old session ping", async () => {
+    const botId = `bot-stale-ping-${crypto.randomUUID()}`;
+    const first = await openConnection(botId);
+    first.ws.send(JSON.stringify({
+      type: "hello",
+      api_version: BOT_GATEWAY_API_VERSION,
+      last_received_delivery_id: null,
+    }));
+    await nextMessageOfType(first.ws, "ready");
+
+    const second = await openConnection(botId);
+    second.ws.send(JSON.stringify({
+      type: "hello",
+      api_version: BOT_GATEWAY_API_VERSION,
+      last_received_delivery_id: null,
+    }));
+    const secondReady = JSON.parse(await nextMessageOfType(second.ws, "ready")) as { session_id: string };
+    const fixedExpiry = new Date(Date.now() + 30000).toISOString();
+    await withBotConnection(second.stub, (ctx) => {
+      ctx.storage.sql.exec(
+        "UPDATE bot_connection_state SET expires_at=? WHERE bot_id=? AND session_id=?",
+        fixedExpiry,
+        botId,
+        secondReady.session_id,
+      );
+    });
+
+    first.ws.send(JSON.stringify({ type: "ping", api_version: BOT_GATEWAY_API_VERSION }));
+    await nextMessageOfType(first.ws, "pong");
+
+    await withBotConnection(second.stub, (ctx) => {
+      const row = ctx.storage.sql
+        .exec("SELECT session_id, expires_at FROM bot_connection_state WHERE bot_id=?", botId)
+        .toArray()[0] as { session_id: string; expires_at: string } | undefined;
+      expect(row?.session_id).toBe(secondReady.session_id);
+      expect(row?.expires_at).toBe(fixedExpiry);
+    });
+    first.ws.close();
+    second.ws.close();
   });
 
   it("replies delivery_result ack failed when delivery_result not implemented", async () => {

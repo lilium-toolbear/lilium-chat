@@ -1,11 +1,12 @@
 import {
   applyBaselineSchema,
+  columnExists,
   migrateSqlite,
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
 
-export const BOT_CONNECTION_CURRENT_SCHEMA_VERSION = 1;
+export const BOT_CONNECTION_CURRENT_SCHEMA_VERSION = 2026062701;
 
 // Phase 7 Bot Gateway WS RPC: BotConnection DO (by bot_id) holds the bot
 // runtime WebSocket hibernation state + the delivery queue. Delivery is
@@ -20,7 +21,8 @@ export const BOT_CONNECTION_BASELINE_SCHEMA: string[] = [
     status          TEXT NOT NULL,
     connected_at    TEXT,
     disconnected_at TEXT,
-    last_seen_at    TEXT
+    last_seen_at    TEXT,
+    expires_at      TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS bot_deliveries (
     delivery_id      TEXT PRIMARY KEY,
@@ -50,7 +52,19 @@ export const botConnectionBaseline: BaselineDetector = {
   },
 };
 
-export const botConnectionMigrations: SqlMigration[] = [];
+export const botConnectionMigrations: SqlMigration[] = [
+  {
+    version: BOT_CONNECTION_CURRENT_SCHEMA_VERSION,
+    name: "add bot connection lease expiry",
+    up(ctx) {
+      if (!columnExists(ctx, "bot_connection_state", "expires_at")) {
+        ctx.storage.sql.exec(
+          "ALTER TABLE bot_connection_state ADD COLUMN expires_at TEXT",
+        );
+      }
+    },
+  },
+];
 
 export function migrateBotConnectionSchema(ctx: DurableObjectState): void {
   migrateSqlite(ctx, "BotConnection", botConnectionBaseline, botConnectionMigrations);

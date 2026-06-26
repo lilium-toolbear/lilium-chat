@@ -35,6 +35,10 @@ describe("BotConnection baseline migrations (Phase 7)", () => {
     await withDoState(stub, (ctx) => {
       expect(tableExists(ctx, "bot_connection_state")).toBe(true);
       expect(tableExists(ctx, "bot_deliveries")).toBe(true);
+      const stateCols = ctx.storage.sql
+        .exec("PRAGMA table_info(bot_connection_state)")
+        .toArray() as Array<{ name: string }>;
+      expect(stateCols.map((r) => r.name)).toContain("expires_at");
       expect(indexExists(ctx, "idx_bot_deliveries_due")).toBe(true);
       expect(indexExists(ctx, "idx_bot_deliveries_source_outbox")).toBe(true);
     });

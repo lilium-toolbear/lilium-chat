@@ -461,6 +461,79 @@ describe("BotConnection DO delivery queue (7b)", () => {
     });
   });
 
+  it("closes stale connected state during enqueue when no websocket exists", async () => {
+    const botId = `bot-delivery-stale-online-${crypto.randomUUID()}`;
+    const stub = botConnectionStub(botId);
+    const now = new Date().toISOString();
+    await stub.fetch(new Request("https://x/ping"));
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(stub, async (instance: unknown) => {
+      const sql = (
+        instance as {
+          ctx: {
+            storage: {
+              sql: { exec: (query: string, ...params: unknown[]) => void };
+            };
+          };
+        }
+      ).ctx.storage.sql;
+      sql.exec(
+        `INSERT INTO bot_connection_state (
+          bot_id, session_id, status, connected_at, disconnected_at, last_seen_at, expires_at
+        ) VALUES (?, ?, 'connected', ?, NULL, ?, ?)`,
+        botId,
+        "missing-session",
+        now,
+        now,
+        new Date(Date.now() + 60000).toISOString(),
+      );
+    });
+
+    const payload = enqueuePayload();
+    const res = await stub.fetch(
+      new Request("https://x/internal/enqueue-delivery", {
+        method: "POST",
+        headers: {
+          "X-Verified-Bot-Id": botId,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { status: string };
+    expect(body.status).toBe("pending");
+
+    await runInDurableObject(stub, async (instance: unknown) => {
+      const sql = (
+        instance as {
+          ctx: {
+            storage: {
+              sql: {
+                exec: (
+                  query: string,
+                  ...params: unknown[]
+                ) => { toArray: () => Array<{ status: string; delivery_status: string }> };
+              };
+            };
+          };
+        }
+      ).ctx.storage.sql;
+      const row = sql
+        .exec(
+          `SELECT c.status, d.status AS delivery_status
+           FROM bot_connection_state c
+           JOIN bot_deliveries d ON d.bot_id = c.bot_id
+           WHERE c.bot_id=? AND d.source_outbox_id=?`,
+          botId,
+          payload.outbox_id,
+        )
+        .toArray()[0];
+      expect(row?.status).toBe("disconnected");
+      expect(row?.delivery_status).toBe("pending");
+    });
+  });
+
   it("redelivers both pending and sent deliveries from alarm", async () => {
     const botId = `bot-delivery-redeliver-${crypto.randomUUID()}`;
     const stub = botConnectionStub(botId);

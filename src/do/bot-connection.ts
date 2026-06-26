@@ -42,9 +42,17 @@ interface BotDeliveryRow {
   created_at: string;
 }
 
+interface BotConnectionStateRow {
+  bot_id: string;
+  status: string;
+  session_id: string | null;
+  expires_at: string | null;
+}
+
 const MAX_BOT_DELIVERY_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 1000;
 const MESSAGE_EVENT_TTL_MS = 30000;
+const CONNECTION_LEASE_TTL_MS = 60000;
 
 function deliveryPayloadFromJson(raw: string): Record<string, unknown> {
   const parsed = JSON.parse(raw);
@@ -100,13 +108,12 @@ export class BotConnection extends DurableObject<Env> {
 
     if (url.pathname === "/internal/connection-state") {
       const row = this.ctx.storage.sql
-        .exec("SELECT status, session_id FROM bot_connection_state LIMIT 1")
-        .toArray()[0] as
-        | { status: string; session_id: string | null }
-        | undefined;
+        .exec("SELECT bot_id, status, session_id, expires_at FROM bot_connection_state LIMIT 1")
+        .toArray()[0] as BotConnectionStateRow | undefined;
+      const connected = row ? this.healthyConnectedState(row.bot_id) : null;
       return Response.json({
-        status: row?.status ?? "disconnected",
-        session_id: row?.session_id ?? null,
+        status: connected ? "connected" : "disconnected",
+        session_id: connected?.session_id ?? null,
       });
     }
 
@@ -180,10 +187,7 @@ export class BotConnection extends DurableObject<Env> {
         );
       });
 
-      const state = this.ctx.storage.sql
-        .exec("SELECT status FROM bot_connection_state WHERE bot_id=?", botId)
-        .toArray()[0] as { status: string } | undefined;
-      if (inserted && state?.status === "connected") {
+      if (inserted && this.healthyConnectedState(botId)) {
         await this.trySendDelivery(botId, deliveryId, nowDue);
         const row = this.ctx.storage.sql
           .exec("SELECT status FROM bot_deliveries WHERE delivery_id=?", deliveryId)
@@ -222,17 +226,15 @@ export class BotConnection extends DurableObject<Env> {
 
   private connectionRow(
     botId: string,
-  ): { status: string; session_id: string } | null {
+  ): BotConnectionStateRow | null {
     const row = this.ctx.storage.sql
       .exec(
-        "SELECT status, session_id FROM bot_connection_state WHERE bot_id=?",
+        "SELECT bot_id, status, session_id, expires_at FROM bot_connection_state WHERE bot_id=?",
         botId,
       )
-      .toArray()[0] as
-      | { status: string; session_id: string | null }
-      | undefined;
+      .toArray()[0] as BotConnectionStateRow | undefined;
     if (!row) return null;
-    return { status: row.status, session_id: row.session_id ?? "" };
+    return row;
   }
 
   private activeSocketForBot(
@@ -252,6 +254,46 @@ export class BotConnection extends DurableObject<Env> {
     return null;
   }
 
+  private leaseExpiresAt(nowMs = Date.now()): string {
+    return new Date(nowMs + CONNECTION_LEASE_TTL_MS).toISOString();
+  }
+
+  private markDisconnected(botId: string, sessionId: string | null): void {
+    const now = this.nowIso();
+    if (sessionId) {
+      this.ctx.storage.sql.exec(
+        "UPDATE bot_connection_state SET status='disconnected', disconnected_at=?, expires_at=? WHERE bot_id=? AND session_id=?",
+        now,
+        now,
+        botId,
+        sessionId,
+      );
+      return;
+    }
+    this.ctx.storage.sql.exec(
+      "UPDATE bot_connection_state SET status='disconnected', disconnected_at=?, expires_at=? WHERE bot_id=?",
+      now,
+      now,
+      botId,
+    );
+  }
+
+  private healthyConnectedState(botId: string): { session_id: string; socket: WebSocket } | null {
+    const row = this.connectionRow(botId);
+    if (!row || row.status !== "connected" || !row.session_id) return null;
+    const expiresAtMs = Date.parse(row.expires_at ?? "");
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+      this.markDisconnected(botId, row.session_id);
+      return null;
+    }
+    const socket = this.activeSocketForBot(botId, row.session_id);
+    if (!socket) {
+      this.markDisconnected(botId, row.session_id);
+      return null;
+    }
+    return { session_id: row.session_id, socket };
+  }
+
   private async trySendDelivery(
     botId: string,
     deliveryId: string,
@@ -262,18 +304,11 @@ export class BotConnection extends DurableObject<Env> {
       .toArray()[0] as BotDeliveryRow | undefined;
     if (!row) return;
 
-    const connection = this.connectionRow(botId);
-    if (!connection || connection.status !== "connected") {
-      return;
-    }
-
-    const socket = this.activeSocketForBot(botId, connection.session_id);
-    if (!socket) {
-      return;
-    }
+    const connection = this.healthyConnectedState(botId);
+    if (!connection) return;
 
     try {
-      socket.send(JSON.stringify(botDeliveryFrameForWs(row)));
+      connection.socket.send(JSON.stringify(botDeliveryFrameForWs(row)));
       const nowIso = this.nowIso();
       this.ctx.storage.sql.exec(
         "UPDATE bot_deliveries SET status='sent', updated_at=?, next_attempt_at=? WHERE delivery_id=?",
@@ -373,20 +408,14 @@ export class BotConnection extends DurableObject<Env> {
         continue;
       }
 
-      const state = this.connectionRow(row.bot_id);
-      if (!state || state.status !== "connected") {
-        this.handleDeliverySendFailure(row, String(Date.now()));
-        continue;
-      }
-
-      const socket = this.activeSocketForBot(row.bot_id, state.session_id);
-      if (!socket) {
+      const state = this.healthyConnectedState(row.bot_id);
+      if (!state) {
         this.handleDeliverySendFailure(row, String(Date.now()));
         continue;
       }
 
       try {
-        socket.send(JSON.stringify(botDeliveryFrameForWs(row)));
+        state.socket.send(JSON.stringify(botDeliveryFrameForWs(row)));
         this.ctx.storage.sql.exec(
           "UPDATE bot_deliveries SET status='sent', attempts=?, updated_at=?, next_attempt_at=? WHERE delivery_id=?",
           row.attempts,
@@ -433,21 +462,25 @@ export class BotConnection extends DurableObject<Env> {
         const parsed = parseHello(message);
         void parsed.last_received_delivery_id;
         const now = new Date().toISOString();
+        const nowMs = Date.now();
+        const expiresAt = this.leaseExpiresAt(nowMs);
         const sessionId = uuidv7();
         this.ctx.storage.sql.exec(
           `INSERT INTO bot_connection_state (
-             bot_id, session_id, status, connected_at, disconnected_at, last_seen_at
-           ) VALUES (?, ?, 'connected', ?, NULL, ?)
+             bot_id, session_id, status, connected_at, disconnected_at, last_seen_at, expires_at
+           ) VALUES (?, ?, 'connected', ?, NULL, ?, ?)
            ON CONFLICT(bot_id) DO UPDATE SET
              session_id = excluded.session_id,
              status = 'connected',
              connected_at = excluded.connected_at,
              disconnected_at = NULL,
-             last_seen_at = excluded.last_seen_at`,
+             last_seen_at = excluded.last_seen_at,
+             expires_at = excluded.expires_at`,
           attachment.bot_id,
           sessionId,
           now,
           now,
+          expiresAt,
         );
         ws.serializeAttachment({
           bot_id: attachment.bot_id,
@@ -458,7 +491,7 @@ export class BotConnection extends DurableObject<Env> {
       }
 
       if (frame.type === "ping") {
-        this.touchConnected(attachment.bot_id);
+        this.touchConnected(attachment.bot_id, attachment.session_id);
         ws.send(JSON.stringify(buildPong()));
         return;
       }
@@ -509,9 +542,11 @@ export class BotConnection extends DurableObject<Env> {
       .toArray()[0] as { session_id: string | null } | undefined;
     if (row && row.session_id !== attachment.session_id) return;
     this.ctx.storage.sql.exec(
-      "UPDATE bot_connection_state SET status='disconnected', disconnected_at=? WHERE bot_id=?",
+      "UPDATE bot_connection_state SET status='disconnected', disconnected_at=?, expires_at=? WHERE bot_id=? AND session_id=?",
+      now,
       now,
       attachment.bot_id,
+      attachment.session_id,
     );
   }
 
@@ -519,10 +554,8 @@ export class BotConnection extends DurableObject<Env> {
     ws: WebSocket,
     parsed: ParsedDeliveryResult,
   ): Promise<void> {
-    this.touchConnected(
-      (ws.deserializeAttachment() as BotConnectionAttachment | null)?.bot_id ??
-        "",
-    );
+    const attachment = ws.deserializeAttachment() as BotConnectionAttachment | null;
+    this.touchConnected(attachment?.bot_id ?? "", attachment?.session_id);
     const now = this.nowIso();
     this.ctx.storage.sql.exec(
       "UPDATE bot_deliveries SET status='failed', updated_at=?, next_attempt_at=? WHERE delivery_id=? AND status IN ('pending', 'sent')",
@@ -540,13 +573,16 @@ export class BotConnection extends DurableObject<Env> {
     );
   }
 
-  touchConnected(botId: string): void {
-    if (!botId) return;
-    const now = new Date().toISOString();
+  touchConnected(botId: string, sessionId?: string): void {
+    if (!botId || !sessionId) return;
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
     this.ctx.storage.sql.exec(
-      "UPDATE bot_connection_state SET status='connected', last_seen_at=? WHERE bot_id=?",
+      "UPDATE bot_connection_state SET last_seen_at=?, expires_at=? WHERE bot_id=? AND session_id=? AND status='connected'",
       now,
+      this.leaseExpiresAt(nowMs),
       botId,
+      sessionId,
     );
   }
 
