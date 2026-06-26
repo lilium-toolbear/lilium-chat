@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import { Hono } from "hono";
 import { getNamedDo } from "../helpers";
 import { ApiError, errorResponse } from "../../src/errors";
+import type { Env as AppEnv } from "../../src/env";
 import {
   botRegistryStub,
   getBotIdentity,
@@ -76,7 +77,7 @@ afterEach(async () => {
 
 // Minimal Hono app to exercise getBotIdentity (auth + scope) end-to-end.
 function botIdentityApp(requiredScope: string) {
-  const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
+  const app = new Hono<{ Bindings: AppEnv; Variables: { requestId: string } }>();
   app.post("/probe", async (c) => {
     try {
       const { botId } = await getBotIdentity(c, requiredScope);
@@ -93,13 +94,13 @@ describe("BotRegistry token-verify + bot-get (7a-bot-identity)", () => {
   it("verifyBotToken resolves a valid active bot token to {bot_id, scopes}", async () => {
     const botId = `bot-ok-${crypto.randomUUID()}`;
     await seedBot({ botId, token: "secret-ok", scopes: ["chat:commands:manage", "chat:runtime:connect"] });
-    const id = await verifyBotToken(env, "secret-ok");
+    const id = await verifyBotToken(env as unknown as AppEnv, "secret-ok");
     expect(id.bot_id).toBe(botId);
     expect(id.scopes).toEqual(["chat:commands:manage", "chat:runtime:connect"]);
   });
 
   it("rejects an unknown token with UNAUTHORIZED", async () => {
-    await expect(verifyBotToken(env, "never-issued")).rejects.toMatchObject({
+    await expect(verifyBotToken(env as unknown as AppEnv, "never-issued")).rejects.toMatchObject({
       code: "UNAUTHORIZED",
     });
   });
@@ -107,7 +108,7 @@ describe("BotRegistry token-verify + bot-get (7a-bot-identity)", () => {
   it("rejects a revoked token with UNAUTHORIZED", async () => {
     const botId = `bot-revoked-${crypto.randomUUID()}`;
     await seedBot({ botId, token: "secret-revoked", revoked: true });
-    await expect(verifyBotToken(env, "secret-revoked")).rejects.toMatchObject({
+    await expect(verifyBotToken(env as unknown as AppEnv, "secret-revoked")).rejects.toMatchObject({
       code: "UNAUTHORIZED",
     });
   });
@@ -115,7 +116,7 @@ describe("BotRegistry token-verify + bot-get (7a-bot-identity)", () => {
   it("rejects a non-active bot with UNAUTHORIZED", async () => {
     const botId = `bot-disabled-${crypto.randomUUID()}`;
     await seedBot({ botId, token: "secret-disabled", status: "disabled" });
-    await expect(verifyBotToken(env, "secret-disabled")).rejects.toMatchObject({
+    await expect(verifyBotToken(env as unknown as AppEnv, "secret-disabled")).rejects.toMatchObject({
       code: "UNAUTHORIZED",
     });
   });

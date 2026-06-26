@@ -22,6 +22,17 @@ async function withRegistry(
   });
 }
 
+async function withChannel(
+  channelId: string,
+  fn: (ctx: DurableObjectState) => void | Promise<void>,
+): Promise<void> {
+  const { runInDurableObject } = await import("cloudflare:test");
+  await runInDurableObject(CHANNEL(channelId), async (instance: unknown) => {
+    const ctx = (instance as { ctx: DurableObjectState }).ctx;
+    await fn(ctx);
+  });
+}
+
 type SeedPermission = "member" | "admin" | "owner";
 
 type SeedCommand = {
@@ -313,6 +324,71 @@ describe("GET /api/chat/channels/:channel_id/commands (7a-commands-query)", () =
     expect(res.status).toBe(200);
     const body = (await res.json()) as { items: Array<unknown> };
     expect(body.items).toHaveLength(0);
+  });
+
+  it("keeps binding state unchanged when enabling would conflict with an existing slash token", async () => {
+    const ownerId = `owner-binding-conf-${crypto.randomUUID()}`;
+    const botIdA = `bot-binding-conf-a-${crypto.randomUUID()}`;
+    const botIdB = `bot-binding-conf-b-${crypto.randomUUID()}`;
+    const channelId = await createChannel(ownerId, "Binding Conflict");
+    await seedBotWithCatalog({
+      botId: botIdA,
+      displayName: "Enabled Bot",
+      commands: [
+        {
+          name: "ask",
+          aliases: ["ai"],
+          description: "Ask",
+          defaultMemberPermission: "member",
+          defaultEnabledOnInstall: true,
+        },
+      ],
+    });
+    await seedBotWithCatalog({
+      botId: botIdB,
+      displayName: "Disabled Bot",
+      commands: [
+        {
+          name: "ask",
+          aliases: ["assist"],
+          description: "Ask too",
+          defaultMemberPermission: "member",
+          defaultEnabledOnInstall: false,
+        },
+      ],
+    });
+
+    const installA = await browserReq(ownerId, "POST", `/api/chat/channels/${channelId}/bot-installations`, { bot_id: botIdA }, `key-bind-a-${crypto.randomUUID()}`);
+    expect(installA.status).toBe(201);
+    const installB = await browserReq(ownerId, "POST", `/api/chat/channels/${channelId}/bot-installations`, { bot_id: botIdB }, `key-bind-b-${crypto.randomUUID()}`);
+    expect(installB.status).toBe(201);
+
+    const botBCommandId = `cmd-${botIdB}-ask`;
+    const enableB = await browserReq(
+      ownerId,
+      "PATCH",
+      `/api/chat/channels/${channelId}/commands/${botBCommandId}`,
+      { enabled: true },
+      `key-bind-enable-${crypto.randomUUID()}`,
+    );
+    expect(enableB.status).toBe(409);
+    const body = (await enableB.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("COMMAND_NAME_CONFLICT");
+
+    await withChannel(channelId, (ctx) => {
+      const binding = ctx.storage.sql
+        .exec("SELECT status FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?", channelId, botBCommandId)
+        .toArray()[0] as { status: string } | undefined;
+      expect(binding?.status).toBe("disabled");
+      const botBNames = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botIdB)
+        .toArray()[0] as { c: number | bigint };
+      expect(Number(botBNames.c)).toBe(0);
+      const askOwner = ctx.storage.sql
+        .exec("SELECT bot_id FROM channel_command_names WHERE channel_id=? AND slash_name=?", channelId, "ask")
+        .toArray()[0] as { bot_id: string } | undefined;
+      expect(askOwner?.bot_id).toBe(botIdA);
+    });
   });
 
   it("uses bot summary from installation snapshot (no BotRegistry read during query)", async () => {

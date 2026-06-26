@@ -38,6 +38,8 @@ export const BOT_CONNECTION_BASELINE_SCHEMA: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_bot_deliveries_due
     ON bot_deliveries(bot_id, status, next_attempt_at)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_deliveries_source_outbox
+    ON bot_deliveries(bot_id, source_outbox_id)`,
 ];
 
 export const botConnectionBaseline: BaselineDetector = {

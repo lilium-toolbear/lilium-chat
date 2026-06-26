@@ -115,6 +115,17 @@ describe("GET /api/chat/bot/ws (7b-ws-route)", () => {
     expect(body.error.code).toBe("UNAUTHORIZED");
   });
 
+  it("returns 403 when chat:runtime:connect scope is missing", async () => {
+    const botId = `bot-upgrade-noscope-${crypto.randomUUID()}`;
+    const token = "secret-upgrade-noscope";
+    await seedBot({ botId, token, scopes: ["chat:commands:manage"] });
+
+    const res = await botWsUpgrade(token);
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("FORBIDDEN");
+  });
+
   it("returns 401 when Authorization is missing", async () => {
     const res = await botWsUpgrade();
     expect(res.status).toBe(401);

@@ -224,6 +224,20 @@ describe("POST /api/chat/channels/:id/bot-installations (7a-install)", () => {
     expect(r2.status).toBe(409);
     const body = (await r2.json()) as { error: { code: string } };
     expect(body.error.code).toBe("COMMAND_NAME_CONFLICT");
+    await withChannel(channelId, (ctx) => {
+      const botANames = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botIdA)
+        .toArray()[0] as { c: number | bigint };
+      const botBBindings = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM channel_command_bindings WHERE channel_id=? AND bot_id=?", channelId, botIdB)
+        .toArray()[0] as { c: number | bigint };
+      const botBNames = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botIdB)
+        .toArray()[0] as { c: number | bigint };
+      expect(Number(botANames.c)).toBe(2);
+      expect(Number(botBBindings.c)).toBe(0);
+      expect(Number(botBNames.c)).toBe(0);
+    });
   });
 
   it("returns 403 when a non-admin member tries to install", async () => {
@@ -251,10 +265,44 @@ describe("POST /api/chat/channels/:id/bot-installations (7a-install)", () => {
         .exec("SELECT COUNT(*) AS c FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botId)
         .toArray()[0] as { c: number | bigint };
       expect(Number(names.c)).toBe(0);
+      const bindings = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM channel_command_bindings WHERE channel_id=? AND bot_id=?", channelId, botId)
+        .toArray()[0] as { c: number | bigint };
+      expect(Number(bindings.c)).toBe(0);
       const subs = ctx.storage.sql
         .exec("SELECT COUNT(*) AS c FROM channel_bot_event_subscriptions WHERE channel_id=? AND bot_id=?", channelId, botId)
         .toArray()[0] as { c: number | bigint };
       expect(Number(subs.c)).toBe(0);
+    });
+  });
+
+  it("rejects status=active and uses POST reinstall to restore bindings", async () => {
+    const ownerId = `owner-active-restore-${crypto.randomUUID()}`;
+    const botId = `bot-active-restore-${crypto.randomUUID()}`;
+    const channelId = await createChannel(ownerId, "Active Restore Channel");
+    await seedBotWithCatalog({ botId });
+
+    const install = await browserReq(ownerId, "POST", `/api/chat/channels/${channelId}/bot-installations`, { bot_id: botId }, "key-active-install");
+    expect(install.status).toBe(201);
+    const uninstall = await browserReq(ownerId, "PATCH", `/api/chat/channels/${channelId}/bot-installations/${botId}`, { status: "removed" }, "key-active-remove");
+    expect(uninstall.status).toBe(200);
+
+    const active = await browserReq(ownerId, "PATCH", `/api/chat/channels/${channelId}/bot-installations/${botId}`, { status: "active" }, "key-active-unsupported");
+    expect(active.status).toBe(422);
+    const body = (await active.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("INVALID_MESSAGE");
+
+    const reinstall = await browserReq(ownerId, "POST", `/api/chat/channels/${channelId}/bot-installations`, { bot_id: botId }, "key-active-reinstall");
+    expect(reinstall.status).toBe(201);
+    await withChannel(channelId, (ctx) => {
+      const bindings = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM channel_command_bindings WHERE channel_id=? AND bot_id=?", channelId, botId)
+        .toArray()[0] as { c: number | bigint };
+      const names = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botId)
+        .toArray()[0] as { c: number | bigint };
+      expect(Number(bindings.c)).toBe(1);
+      expect(Number(names.c)).toBe(2);
     });
   });
 

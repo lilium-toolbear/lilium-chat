@@ -72,7 +72,7 @@ async function putBotCommands(token: string, body: unknown, idemKey: string): Pr
 describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
   it("seeds official bot catalog + token, token plaintext returned once", async () => {
     const first = await seedOfficial();
-    expect(first.token).toBe("seed-official-bot-token");
+    expect(first.token).toMatch(/^lcbot_[0-9a-f-]+_[0-9a-f-]+$/);
     expect(first.commands).toHaveLength(2);
 
     await withRegistry((ctx) => {
@@ -103,7 +103,8 @@ describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
     const second = await seedOfficial();
     expect(second.token).toBeNull();
 
-    const tokenHash = await hashBotToken("seed-official-bot-token");
+    if (first.token === null) throw new Error("official seed did not return token");
+    const tokenHash = await hashBotToken(first.token);
     await withRegistry((ctx) => {
       const tokenRows = ctx.storage.sql
         .exec("SELECT token_hash, revoked_at FROM bot_tokens WHERE bot_id=?", OFFICIAL_BOT_ID)
@@ -116,7 +117,7 @@ describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
 
   it("is idempotent and does not rotate command ids", async () => {
     const first = await seedOfficial();
-    expect(first.token).toBe("seed-official-bot-token");
+    expect(first.token).toMatch(/^lcbot_/);
     const firstIds = new Map(first.commands.map((c) => [c.name, c.bot_command_id]));
 
     const second = await seedOfficial();
@@ -135,7 +136,7 @@ describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
 
   it("catalog sync overrides seed definitions", async () => {
     const seed = await seedOfficial();
-    expect(seed.token).toBe("seed-official-bot-token");
+    expect(seed.token).toMatch(/^lcbot_/);
     if (seed.token === null) throw new Error("official seed did not return token");
 
     const syncRes = await putBotCommands(seed.token, {

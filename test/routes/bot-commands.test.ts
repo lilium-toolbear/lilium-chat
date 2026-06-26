@@ -187,6 +187,24 @@ describe("PUT /api/chat/bot/commands (7a-catalog-sync)", () => {
     expect(body.error.code).toBe("INVALID_COMMAND_OPTIONS");
   });
 
+  it("returns 422 when a command alias conflicts with another command name", async () => {
+    const botId = `cat-alias-conflict-${crypto.randomUUID()}`;
+    await seedBot({ botId, token: "secret-cat-alias-conflict" });
+    const res = await botPut(
+      "secret-cat-alias-conflict",
+      {
+        commands: [
+          { ...ASK_COMMAND, name: "foo", aliases: [] },
+          { ...ASK_COMMAND, name: "bar", aliases: ["foo"] },
+        ],
+      },
+      "key-alias-conflict",
+    );
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("INVALID_COMMAND_OPTIONS");
+  });
+
   it("returns 422 for non-message.created event_type", async () => {
     const botId = `cat-badcap-${crypto.randomUUID()}`;
     await seedBot({ botId, token: "secret-cat-badcap" });
