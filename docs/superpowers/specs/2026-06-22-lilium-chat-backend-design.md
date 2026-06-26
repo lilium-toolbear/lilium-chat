@@ -5,7 +5,7 @@
 范围：lilium-chat 仓库（Cloudflare Worker + Durable Object 纯后端）的实现设计
 参考：
 
-- `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（权威 Browser/Bot API contract v2.6，v4.0-aligned）
+- `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（权威 Browser/Bot API contract v2.9，v4.3-aligned）
 - `dzmm_archive/docs/plans/2026-06-21-toolbear-chat-api-contract.md`（原始 API contract v1，本设计 v2 有 cursor 形状偏离，见第 0.2 节）
 - `dzmm_archive/docs/plans/2026-06-20-lilium-chat-product-requirements.md`（PRD）
 - `dzmm_archive/docs/plans/2026-06-20-lilium-chat-technical-architecture.md`（技术架构）
@@ -184,7 +184,7 @@ Phase E 引入 personal sticker library，需在落地前明确 DO ownership。v
 
 ### 0.10 v4.3 修订：Phase 7 Bot Gateway WebSocket RPC
 
-Phase 7 bot runtime transport 不再以 HTTP callback 为主。改为 bot 主动向 Chat 发起 outbound WebSocket（`/api/chat/bot/ws`，bot token 鉴权），Chat 经此 WS 向 bot 推 delivery（`command_invocation` / `message_interaction` / `message_event`），bot 回 `delivery_result`（含 effects），Chat 回 `delivery_ack`。HTTP callback（Chat → bot `POST <bot_callback_url>` + HMAC 签名）降级为 **future transport**，Phase 7 不实现。v4.3 收口（contract v2.8 delta）：
+Phase 7 bot runtime transport 不再以 HTTP callback 为主。改为 bot 主动向 Chat 发起 outbound WebSocket（`/api/chat/bot/ws`，bot token 鉴权），Chat 经此 WS 向 bot 推 delivery（`command_invocation` / `message_interaction` / `message_event`），bot 回 `delivery_result`（含 effects），Chat 回 `delivery_ack`。HTTP callback（Chat → bot `POST <bot_callback_url>` + HMAC 签名）降级为 **future transport**，Phase 7 不实现。v4.3 收口（contract v2.9 delta）：
 
 - **新增 `BotConnection DO`（by `bot_id`）**：bot WebSocket hibernation（`ctx.acceptWebSocket`）、active bot connection/session、delivery 队列、`delivery_result` 处理、reconnect/redelivery/backpressure、把 `delivery_result` 的 effects 路由回源 `ChatChannel DO`。一个 `bot_id` Phase 7 单 active connection，新连接替换旧连接。Delivery at-least-once；BotConnection 持久化 `bot_deliveries` 后再推 socket；`delivery_result` 按 `delivery_id` 幂等；BotConnection 调源 `ChatChannel /internal/bot-delivery-result` 应用 effects。
 - **`BotRegistry DO` 收口为 singleton**（`getByName("registry")`）：token 原文→hash 不可反查 `bot_id`，bot API 入口只有 bearer token，验 token 前无法定位 by-bot_id DO。singleton SQLite 做 `SELECT ... WHERE token_hash=?`（`idx_bot_tokens_hash` UNIQUE）最简。bot 数量小，无热点。封装唯一 helper `botRegistryStub(env) = env.BOT_REGISTRY.get(env.BOT_REGISTRY.idFromName("registry"))`。BotRegistry 仍掌 bot 身份 + token hash + GLOBAL command catalog + aliases + event capabilities + bot profile。
@@ -254,7 +254,7 @@ External:
 ### 1.1 核心边界
 
 1. **lilium-chat 仓库纯后端**：Worker + DO + wrangler 配置。前端留在 `dzmm_archive/toolbear_ui/frontend`。
-2. **Worker 保持薄**：只做 JWT 自验、-Origin 校验、路由、ws upgrade 代理到 UserConnection DO。不存长期连接、不做业务规则、不做权限最终判断。
+2. **Worker 保持薄**：只做 JWT / bot token 自验、-Origin 校验、HTTP 路由、WS upgrade 代理到 `UserConnection DO`（Browser WS）或 `BotConnection DO`（Bot WS）。不存长期连接、不做业务规则、不做权限最终判断 (v4.3 delta)。
 3. **Profile**：Hyperdrive 直读 `users` 表，只读，隔离在 `resolveUserSummaries()`。DO 不持久化 display_name/avatar。
 4. **附件**：SeaweedFS presign PUT，浏览器直传，public read 不签。
 5. **实时**：WS subprotocol `lilium.chat.v1` + `bearer.<jwt>`。command/event 同一条 WS。event_id = per-channel 单调 UUIDv7，**客户端 per-channel cursor**。
@@ -1617,7 +1617,7 @@ GitHub Actions：`typecheck` + `test`，scripts 跟 game-worker 一致。
 
 验收：contract 12.7。
 
-### 阶段 7：Bot slash command 与 rich interaction（contract 12.8, v2.8）
+### 阶段 7：Bot slash command 与 rich interaction（contract 12.8, v2.9）
 
 交付：BotRegistry（singleton）全局身份 + token_hash + GLOBAL command catalog + aliases + event capabilities；BotConnection DO + Bot Gateway WS RPC（runtime transport，非 HTTP callback）；channel installation/binding + `command.invoke` + `interaction.submit` + 异步 `bot_delivery_outbox` delivery + effects + streaming + passive `message_event` 订阅 + bot 直接发消息。完整任务拆分见 `docs/superpowers/plans/2026-06-26-lilium-chat-phase-7.md`。
 
@@ -1629,7 +1629,7 @@ GitHub Actions：`typecheck` + `test`，scripts 跟 game-worker 一致。
 - 7f：bot 直接发消息 `POST /bot/channels/{channel_id}/messages`（bot token，可带 components，已安装+scope 校验）。
 - 7g (future, non-goal for 7a–7f)：完整旧 external_commands stateful_ws session 语义（session.start/started/update/input/timer/closed、effect 序列 + ack、resume active sessions、room mutex/exclusive game session）。basic Bot Gateway WS RPC 不含 stateful session；如需另起 phase。
 
-验收：contract 12.8 + §14 v2.8 addendum 不变量。
+验收：contract 12.8 + §14 v2.9 addendum 不变量。
 
 ### 关于 DM
 

@@ -1818,6 +1818,9 @@ Bot token scope：
 - `chat:commands:manage`
 - `chat:channels:read`
 - `chat:members:read`
+- `chat:runtime:connect` — 连接 Bot Gateway WS（`GET /api/chat/bot/ws`），接收 runtime delivery（v2.9 delta）
+
+`GET /api/chat/bot/ws` 必须有 `chat:runtime:connect` scope（v2.9 delta）。`PUT /api/chat/bot/commands` 需 `chat:commands:manage`；`POST /api/chat/bot/channels/{channel_id}/messages` 需 `chat:messages:write`。
 
 ### 9.2 Bot actor
 
@@ -1865,13 +1868,14 @@ Authorization: Bearer <bot_token>
 Idempotency-Key: client-key-bot-command-sync
 ```
 
-请求：
+请求 (v2.9 delta：补 `aliases` / `default_enabled_on_install` / `event_capabilities`)：
 
 ```json
 {
   "commands": [
     {
       "name": "ask",
+      "aliases": ["ai", "chat"],
       "description": "Ask the assistant",
       "options": [
         {
@@ -1901,13 +1905,35 @@ Idempotency-Key: client-key-bot-command-sync
           "description": "Target channel"
         }
       ],
-      "default_member_permission": "member"
+      "default_member_permission": "member",
+      "default_enabled_on_install": true
+    }
+  ],
+  "event_capabilities": [
+    {
+      "event_type": "message.created",
+      "default_enabled_on_install": false,
+      "default_filters": {
+        "message_types": ["text"],
+        "include_bot_messages": false,
+        "include_own_messages": false,
+        "only_when_mentioned": false
+      }
     }
   ]
 }
 ```
 
-响应：
+`PUT /bot/commands` only syncs the **global bot command catalog** (BotRegistry)。它 **不 enable 任何频道的 command** —— channel 内是否启用由 `POST /channels/{channel_id}/bot-installations` + `PATCH /channels/{channel_id}/commands/{bot_command_id}` 的 channel binding 层决定 (v2.9 delta)。
+
+字段：
+
+- `commands[].aliases`: 同一 `bot_command_id` 的 alternate slash triggers（不是独立 command）；`command.invoke` 用 `bot_command_id`，payload 带 `invoked_name`（canonical name 或 alias，见 §9.5）。
+- `commands[].default_member_permission`: 默认 `member`/`admin`/`owner`；channel binding 可用 `permission_override` 覆盖（见 §9.3 channel binding 段）。
+- `commands[].default_enabled_on_install`: 安装该 bot 到频道时是否默认 enable 此 command（channel binding 层读此默认值创建 binding）。
+- `event_capabilities[]`: bot 声明支持的被动 event 能力 + 默认 filters；Phase 7 仅 `event_type="message.created"`（见 §9.9）。安装时按 `default_enabled_on_install` 决定是否默认创建 `channel_bot_event_subscriptions` 行。
+
+响应 (v2.9 delta)：
 
 ```json
 {
@@ -1915,14 +1941,23 @@ Idempotency-Key: client-key-bot-command-sync
     {
       "bot_command_id": "00000000-0000-7000-8000-000000000701",
       "name": "ask",
+      "aliases": ["ai", "chat"],
       "enabled": true,
+      "default_enabled_on_install": true,
+      "updated_at": "2026-06-21T05:30:00Z"
+    }
+  ],
+  "event_capabilities": [
+    {
+      "event_type": "message.created",
+      "default_enabled_on_install": false,
       "updated_at": "2026-06-21T05:30:00Z"
     }
   ]
 }
 ```
 
-同一频道内 enabled command 名称不能冲突。冲突返回 `COMMAND_NAME_CONFLICT`。bot slash command 定义 id 字段名为 `bot_command_id`（与 Browser WS frame 的 `command_id` = durable operation id 区分）(v2.6 delta)。
+同一频道内 enabled command 名称不能冲突。**此冲突在 channel binding 层（`channel_command_names`）创建/更新时校验，不在 catalog sync 时校验** —— `PUT /bot/commands` 只写 BotRegistry catalog，不感知任何频道；`POST /channels/{channel_id}/bot-installations` 与 `PATCH /channels/{channel_id}/commands/{bot_command_id}` 在写 `channel_command_names` 时检测冲突并返回 `COMMAND_NAME_CONFLICT` (v2.9 delta)。bot slash command 定义 id 字段名为 `bot_command_id`（与 Browser WS frame 的 `command_id` = durable operation id 区分）(v2.6 delta)。
 
 slash command option 类型：
 
@@ -1944,29 +1979,45 @@ Browser API：
 GET /api/chat/channels/{channel_id}/commands?prefix=as
 ```
 
-响应：
+响应 (v2.9 delta：补 `aliases` / `matched_name` / `matched_kind` / `effective_member_permission`)：
 
 ```json
 {
   "items": [
     {
       "bot_command_id": "00000000-0000-7000-8000-000000000701",
-      "name": "ask",
-      "description": "Ask the assistant",
+      "name": "summarize",
+      "aliases": ["sum", "tl_dr"],
+      "matched_name": "sum",
+      "matched_kind": "alias",
+      "description": "Summarize recent messages",
       "bot": {
         "bot_id": "00000000-0000-7000-8000-000000000601",
         "display_name": "Lilium Bot",
         "avatar_url": null
       },
-      "options": []
+      "options": [],
+      "effective_member_permission": "member"
     }
   ]
 }
 ```
 
+字段与匹配规则 (v2.9 delta)：
+
+- `prefix` 匹配 canonical `name` 或 `aliases` 任一即返回该项。
+- `name`: canonical name（来自 `bot_commands.name`）。
+- `aliases`: 该 command 的 alternate slash triggers（来自 channel binding snapshot）。
+- `matched_name`: 实际命中 `prefix` 的 slash token（canonical name 或某个 alias）。
+- `matched_kind`: `canonical`（命中 canonical name）| `alias`（命中 alias）。
+- `effective_member_permission`: `permission_override ?? default_member_permission`（channel binding 的 override 优先于 catalog 默认）；与 caller role 比较，caller role 不足的 command 被过滤掉，不出现在 `items`。
+- `bot`: 来自 `bot_installations` snapshot（`bot_display_name`/`bot_avatar_url`），不为此查询回源 BotRegistry。
+
+`GET .../commands` 是 read cache（channel binding snapshot，catalog sync 后可能短暂 stale）；`command.invoke` 的 correctness source 是当前 BotRegistry catalog，不受此 stale 影响（见 §9.5）。
+
 ### 9.5 调用 slash command
 
-WebSocket command frame (v2.6 delta：payload 用 `bot_command_id`，移除 `client_invocation_id`；`command_id` 为 durable 幂等键)：
+WebSocket command frame (v2.6 delta：payload 用 `bot_command_id`，移除 `client_invocation_id`；`command_id` 为 durable 幂等键。v2.9 delta：payload 补 `invoked_name`)：
 
 ```json
 {
@@ -1976,6 +2027,7 @@ WebSocket command frame (v2.6 delta：payload 用 `bot_command_id`，移除 `cli
   "channel_id": "00000000-0000-7000-8000-000000000201",
   "payload": {
     "bot_command_id": "00000000-0000-7000-8000-000000000701",
+    "invoked_name": "sum",
     "options": {
       "prompt": {
         "type": "string",
@@ -1997,6 +2049,14 @@ WebSocket command frame (v2.6 delta：payload 用 `bot_command_id`，移除 `cli
   }
 }
 ```
+
+`invoked_name` 规则 (v2.9 delta)：
+
+- `invoked_name` 可选。如存在，必须是该 channel `channel_command_names` 中此 `bot_command_id` 的 canonical name 或 alias；不存在或不属于该 command → `COMMAND_NOT_FOUND`。
+- 如省略，服务端按 canonical name 处理。
+- `invoked_name` 参与 `request_hash` 计算（幂等冲突检测）：同 `command_id` + 异 `invoked_name` → `IDEMPOTENCY_CONFLICT`。
+- `command.invoke` correctness source 是当前 BotRegistry catalog（非 channel binding snapshot）：服务端 fetch 当前 `bot_commands` 行校验，disabled/deleted → `BOT_COMMAND_DISABLED`，`definition_hash` drift 用当前定义校验 options 并刷新 binding snapshot。
+- bot offline precheck：bot 未连接 Bot Gateway WS → `command_error` `BOT_OFFLINE`（`retryable=true`），不持久化 invocation。
 
 Worker 接受 command 并在事务提交后返回 committed_ack (v2.6 delta：ack 改为 payload-bearing；`command_id` 为 durable 幂等键)：
 
@@ -2204,7 +2264,7 @@ Server 下发 rich UI interaction：
 }
 ```
 
-Server 下发 passive message event（§9.9 订阅触发）：
+Server 下发 passive message event（§9.9 订阅触发）。`message` 为完整 Browser-visible Message 投影（§3.4），`sender` 按消息来源取 user 或 bot 形状（loop prevention 默认排除 bot 自己的消息，故 bot listener 通常收到的是 user sender）：
 
 ```json
 {
@@ -2220,7 +2280,14 @@ Server 下发 passive message event（§9.9 订阅触发）：
   "channel_id": "00000000-0000-7000-8000-000000000201",
   "message": {
     "message_id": "00000000-0000-7000-8000-000000000301",
-    "sender": {},
+    "sender": {
+      "kind": "user",
+      "user": {
+        "user_id": "00000000-0000-7000-8000-000000000101",
+        "display_name": "alice",
+        "avatar_url": null
+      }
+    },
     "type": "text",
     "format": "plain",
     "status": "normal",
@@ -2229,6 +2296,19 @@ Server 下发 passive message event（§9.9 订阅触发）：
     "components": [],
     "mentions": [],
     "created_at": "2026-06-26T00:00:00Z"
+  }
+}
+```
+
+若 sender 是 bot（如未设 `include_bot_messages=true` 且非订阅 bot 自己，但仍可能收到其它 bot 的消息），`sender` 形状为：
+
+```json
+"sender": {
+  "kind": "bot",
+  "bot": {
+    "bot_id": "00000000-0000-7000-8000-000000000602",
+    "display_name": "Other Bot",
+    "avatar_url": null
   }
 }
 ```
