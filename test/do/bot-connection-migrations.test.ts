@@ -1,0 +1,56 @@
+import { describe, it, expect } from "vitest";
+import { env } from "cloudflare:workers";
+import { getNamedDo } from "../helpers";
+import { indexExists, tableExists } from "../../src/do/sql-migrations";
+import { BOT_CONNECTION_CURRENT_SCHEMA_VERSION } from "../../src/do/migrations/bot-connection";
+
+function connectionStub(botId: string) {
+  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace, botId);
+}
+
+async function withDoState(
+  stub: DurableObjectStub,
+  fn: (ctx: DurableObjectState) => void | Promise<void>,
+): Promise<void> {
+  const { runInDurableObject } = await import("cloudflare:test");
+  await runInDurableObject(stub, async (instance: unknown) => {
+    const ctx = (instance as { ctx: DurableObjectState }).ctx;
+    await fn(ctx);
+  });
+}
+
+async function schemaVersion(stub: DurableObjectStub): Promise<number> {
+  const res = await stub.fetch(
+    new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
+  );
+  const body = (await res.json()) as { current_version: number };
+  return body.current_version;
+}
+
+describe("BotConnection baseline migrations (Phase 7)", () => {
+  it("fresh install creates connection state + delivery queue", async () => {
+    const stub = connectionStub(`bot-${crypto.randomUUID()}`);
+    await stub.fetch(new Request("https://x/ping"));
+
+    await withDoState(stub, (ctx) => {
+      expect(tableExists(ctx, "bot_connection_state")).toBe(true);
+      expect(tableExists(ctx, "bot_deliveries")).toBe(true);
+      expect(indexExists(ctx, "idx_bot_deliveries_due")).toBe(true);
+    });
+    expect(await schemaVersion(stub)).toBe(BOT_CONNECTION_CURRENT_SCHEMA_VERSION);
+  });
+
+  it("delivery queue due index covers (bot_id, status, next_attempt_at)", async () => {
+    const stub = connectionStub(`bot-idx-${crypto.randomUUID()}`);
+    await stub.fetch(new Request("https://x/ping"));
+    await withDoState(stub, (ctx) => {
+      const rows = ctx.storage.sql
+        .exec("PRAGMA index_info(idx_bot_deliveries_due)")
+        .toArray() as Array<{ name: string }>;
+      const cols = rows.map((r) => r.name);
+      expect(cols).toContain("bot_id");
+      expect(cols).toContain("status");
+      expect(cols).toContain("next_attempt_at");
+    });
+  });
+});

@@ -38,4 +38,42 @@ describe("spike: DO WebSocket hibernation restores attachment", () => {
     const res = await stub.fetch(new Request("https://x/ws", { headers: { Upgrade: "websocket" } }));
     expect(res.status).toBe(401);
   });
+
+  it("auto-responds to app-level ping without invoking webSocketMessage", async () => {
+    const userId = "00000000-0000-7000-8000-000000000302";
+    const stub = env.USER_CONNECTION.get(env.USER_CONNECTION.idFromName("hib-auto-ping"));
+    const res = await stub.fetch(
+      new Request("https://x/ws", {
+        headers: { Upgrade: "websocket", "X-Verified-User-Id": userId },
+      }),
+    );
+    expect(res.status).toBe(101);
+    const ws = res.webSocket as WebSocket;
+    ws.accept();
+
+    const { runInDurableObject } = (await import("cloudflare:test")) as unknown as {
+      runInDurableObject: (stub: unknown, cb: (instance: unknown, state: DurableObjectState) => Promise<void>) => Promise<void>;
+    };
+    await runInDurableObject(stub, async (_instance, state) => {
+      const pair = state.getWebSocketAutoResponse();
+      expect(pair).not.toBeNull();
+      expect(pair?.request).toBe("ping");
+      expect(pair?.response).toBe("pong");
+    });
+
+    const pong = await new Promise<string>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("timeout waiting for pong")), 5000);
+      ws.addEventListener(
+        "message",
+        (ev) => {
+          clearTimeout(t);
+          resolve(typeof ev.data === "string" ? ev.data : "");
+        },
+        { once: true },
+      );
+      ws.send("ping");
+    });
+    expect(pong).toBe("pong");
+    ws.close();
+  });
 });

@@ -467,7 +467,10 @@ export async function saveStickerHandler(c: Context<{ Bindings: Env; Variables: 
     }),
   }));
   if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to save sticker");
-  if (res.status === 404) throw new ApiError("STICKER_NOT_FOUND", "sticker source not found");
+  if (res.status === 404) {
+    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
+    throw new ApiError(e.error?.code ?? "STICKER_NOT_FOUND", e.error?.message ?? "sticker source not found");
+  }
   if (res.status === 409) {
     const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
     throw new ApiError(e.error?.code ?? "IDEMPOTENCY_CONFLICT", e.error?.message ?? "idempotency conflict");

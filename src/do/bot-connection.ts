@@ -1,0 +1,544 @@
+import { DurableObject } from "cloudflare:workers";
+import {
+  BOT_GATEWAY_API_VERSION,
+  buildDeliveryAck,
+  buildDeliveryFrame,
+  buildPong,
+  buildReady,
+  type BotDeliveryFrame,
+  parseDeliveryResult,
+  parseHello,
+  type ParsedDeliveryResult,
+} from "../chat/bot-gateway-protocol";
+import { uuidv7 } from "../ids/uuidv7";
+import { handleSchemaVersionRequest } from "./sql-migrations";
+import { migrateBotConnectionSchema } from "./migrations/bot-connection";
+import { runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "./scheduler";
+
+interface BotConnectionAttachment {
+  bot_id: string;
+  session_id: string;
+}
+
+interface EnqueueDeliveryInput {
+  outbox_id: string;
+  channel_id: string;
+  kind: "command_invocation" | "message_interaction" | "message_event";
+  target_id: string;
+  request_json: string;
+}
+
+interface BotDeliveryRow {
+  delivery_id: string;
+  bot_id: string;
+  channel_id: string;
+  kind: "command_invocation" | "message_interaction" | "message_event";
+  source_outbox_id: string;
+  target_id: string;
+  request_json: string;
+  status: string;
+  attempts: number;
+  next_attempt_at: string;
+  created_at: string;
+}
+
+const MAX_BOT_DELIVERY_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 1000;
+const MESSAGE_EVENT_TTL_MS = 30000;
+
+function deliveryPayloadFromJson(raw: string): Record<string, unknown> {
+  const parsed = JSON.parse(raw);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("invalid delivery request");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function botDeliveryFrameForWs(row: BotDeliveryRow): BotDeliveryFrame {
+  const payload = { ...deliveryPayloadFromJson(row.request_json) };
+  delete payload.type;
+  delete payload.api_version;
+  delete payload.delivery_id;
+  delete payload.kind;
+  delete payload.channel_id;
+  delete payload.target_id;
+  delete payload.source_outbox_id;
+
+  return buildDeliveryFrame({
+    ...payload,
+    delivery_id: row.delivery_id,
+    kind: row.kind,
+    channel_id: row.channel_id,
+  });
+}
+
+// Phase 7 Bot Gateway WebSocket RPC: BotConnection DO (by bot_id).
+//
+// Owns the bot runtime WebSocket (hibernation) + delivery queue. The bot
+// connects outbound to /api/chat/bot/ws; the Worker verifies the bot token via
+// BotRegistry and routes the accepted socket here. ChatChannel flushes
+// bot_delivery_outbox rows to /internal/enqueue-delivery; BotConnection
+// persists a bot_deliveries row, pushes a `delivery` frame, and routes the
+// bot's `delivery_result` back to the source ChatChannel
+// /internal/bot-delivery-result (effect application stays in ChatChannel).
+export class BotConnection extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    migrateBotConnectionSchema(this.ctx);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const schemaVersion = handleSchemaVersionRequest(
+      this.ctx,
+      "BotConnection",
+      request,
+    );
+    if (schemaVersion) return schemaVersion;
+
+    const url = new URL(request.url);
+    if (url.pathname === "/ping") return Response.json({ ok: true });
+
+    if (url.pathname === "/internal/connection-state") {
+      const row = this.ctx.storage.sql
+        .exec("SELECT status, session_id FROM bot_connection_state LIMIT 1")
+        .toArray()[0] as
+        | { status: string; session_id: string | null }
+        | undefined;
+      return Response.json({
+        status: row?.status ?? "disconnected",
+        session_id: row?.session_id ?? null,
+      });
+    }
+
+    if (url.pathname === "/internal/enqueue-delivery") {
+      if (request.method !== "POST")
+        return new Response("method not allowed", { status: 405 });
+      const botId = request.headers.get("X-Verified-Bot-Id");
+      if (!botId)
+        return new Response("missing verified bot id", { status: 401 });
+      let body: EnqueueDeliveryInput;
+      try {
+        body = (await request.json()) as EnqueueDeliveryInput;
+      } catch {
+        return new Response("invalid delivery payload", { status: 400 });
+      }
+
+      if (
+        typeof body?.outbox_id !== "string" ||
+        typeof body.channel_id !== "string" ||
+        (body.kind !== "command_invocation" &&
+          body.kind !== "message_interaction" &&
+          body.kind !== "message_event") ||
+        typeof body.target_id !== "string" ||
+        typeof body.request_json !== "string"
+      ) {
+        return new Response("invalid delivery payload", { status: 400 });
+      }
+      try {
+        deliveryPayloadFromJson(body.request_json);
+      } catch {
+        return new Response("invalid delivery payload", { status: 400 });
+      }
+
+      const nowIso = this.nowIso();
+      const nowMs = Date.now();
+      const nowDue = String(nowMs);
+      const deliveryId = uuidv7();
+
+      await this.ctx.storage.transaction(async () => {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO bot_deliveries (delivery_id, bot_id, channel_id, kind, source_outbox_id, target_id, request_json, status, attempts, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          deliveryId,
+          botId,
+          body.channel_id,
+          body.kind,
+          body.outbox_id,
+          body.target_id,
+          body.request_json,
+          "pending",
+          0,
+          nowDue,
+          nowIso,
+          nowIso,
+        );
+      });
+
+      const state = this.ctx.storage.sql
+        .exec("SELECT status FROM bot_connection_state WHERE bot_id=?", botId)
+        .toArray()[0] as { status: string } | undefined;
+      if (state?.status === "connected") {
+        await this.trySendDelivery(botId, deliveryId, nowDue);
+      }
+
+      await this.scheduleDeliveryAlarm();
+      return Response.json({
+        delivery_id: deliveryId,
+        status: state?.status ?? "disconnected",
+      });
+    }
+
+    const botId = request.headers.get("X-Verified-Bot-Id");
+    if (!botId) return new Response("missing verified bot id", { status: 401 });
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("Expected Upgrade: websocket", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = pair as unknown as [WebSocket, WebSocket];
+    this.ctx.acceptWebSocket(server, [botId]);
+    server.serializeAttachment({ bot_id: botId, session_id: "" });
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      headers: { "Sec-WebSocket-Protocol": BOT_GATEWAY_API_VERSION },
+    });
+  }
+
+  private nowIso(): string {
+    return new Date().toISOString();
+  }
+
+  private connectionRow(
+    botId: string,
+  ): { status: string; session_id: string } | null {
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT status, session_id FROM bot_connection_state WHERE bot_id=?",
+        botId,
+      )
+      .toArray()[0] as
+      | { status: string; session_id: string | null }
+      | undefined;
+    if (!row) return null;
+    return { status: row.status, session_id: row.session_id ?? "" };
+  }
+
+  private activeSocketForBot(
+    botId: string,
+    sessionId: string,
+  ): WebSocket | null {
+    const sockets = this.ctx.getWebSockets(botId) as WebSocket[];
+    for (const socket of sockets) {
+      const att =
+        socket.deserializeAttachment() as BotConnectionAttachment | null;
+      if (!att?.bot_id) continue;
+      if (att.bot_id !== botId) continue;
+      if (att.session_id && sessionId && att.session_id !== sessionId) continue;
+      if (!att.session_id && sessionId) continue;
+      return socket;
+    }
+    return null;
+  }
+
+  private async trySendDelivery(
+    botId: string,
+    deliveryId: string,
+    nowDue: string,
+  ): Promise<void> {
+    const row = this.ctx.storage.sql
+      .exec("SELECT * FROM bot_deliveries WHERE delivery_id=?", deliveryId)
+      .toArray()[0] as BotDeliveryRow | undefined;
+    if (!row) return;
+
+    const connection = this.connectionRow(botId);
+    if (!connection || connection.status !== "connected") {
+      return;
+    }
+
+    const socket = this.activeSocketForBot(botId, connection.session_id);
+    if (!socket) {
+      return;
+    }
+
+    try {
+      socket.send(JSON.stringify(botDeliveryFrameForWs(row)));
+      const nowIso = this.nowIso();
+      this.ctx.storage.sql.exec(
+        "UPDATE bot_deliveries SET status='sent', updated_at=?, next_attempt_at=? WHERE delivery_id=?",
+        nowIso,
+        String(Date.now() + RETRY_BACKOFF_MS),
+        deliveryId,
+      );
+    } catch {
+      this.handleDeliverySendFailure(row, nowDue);
+    }
+  }
+
+  private handleDeliverySendFailure(row: BotDeliveryRow, nowDue: string): void {
+    if (row.kind === "message_event") {
+      this.deferMessageEventUntilExpiry(row);
+      return;
+    }
+    this.bumpDeliveryRetry(row, nowDue);
+  }
+
+  private bumpDeliveryRetry(row: BotDeliveryRow, nowDue: string): void {
+    const attempts = Number(row.attempts ?? 0) + 1;
+    const now = this.nowIso();
+    if (attempts >= MAX_BOT_DELIVERY_ATTEMPTS) {
+      this.ctx.storage.sql.exec(
+        "UPDATE bot_deliveries SET status='failed', attempts=?, updated_at=?, next_attempt_at=? WHERE delivery_id=?",
+        attempts,
+        now,
+        nowDue,
+        row.delivery_id,
+      );
+      return;
+    }
+    this.ctx.storage.sql.exec(
+      "UPDATE bot_deliveries SET status='pending', attempts=?, updated_at=?, next_attempt_at=? WHERE delivery_id=?",
+      attempts,
+      now,
+      String(Date.now() + RETRY_BACKOFF_MS),
+      row.delivery_id,
+    );
+  }
+
+  private async scheduleDeliveryAlarm(): Promise<void> {
+    await scheduleNextAlarm(this.ctx, this.deliveryDueTables(async () => Promise.resolve()));
+  }
+
+  private isMessageEventExpired(row: BotDeliveryRow): boolean {
+    const createdAtMs = Date.parse(row.created_at);
+    if (!Number.isFinite(createdAtMs)) return false;
+    return Date.now() - createdAtMs > MESSAGE_EVENT_TTL_MS;
+  }
+
+  private messageEventExpiryMs(row: BotDeliveryRow): number {
+    const createdAtMs = Date.parse(row.created_at);
+    if (Number.isFinite(createdAtMs)) return createdAtMs + MESSAGE_EVENT_TTL_MS;
+    return Date.now() + MESSAGE_EVENT_TTL_MS;
+  }
+
+  private deferMessageEventUntilExpiry(row: BotDeliveryRow): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE bot_deliveries SET status='pending', updated_at=?, next_attempt_at=? WHERE delivery_id=?",
+      this.nowIso(),
+      String(this.messageEventExpiryMs(row)),
+      row.delivery_id,
+    );
+  }
+
+  private toDeliveryRow(row: unknown): BotDeliveryRow {
+    const typed = row as BotDeliveryRow;
+    return {
+      delivery_id: String(typed.delivery_id),
+      bot_id: String(typed.bot_id),
+      channel_id: String(typed.channel_id),
+      kind: typed.kind,
+      source_outbox_id: String(typed.source_outbox_id),
+      target_id: String(typed.target_id),
+      request_json: String(typed.request_json),
+      status: String(typed.status),
+      attempts: Number(typed.attempts ?? 0),
+      next_attempt_at: String(typed.next_attempt_at),
+      created_at: String(typed.created_at),
+    };
+  }
+
+  private async flushPendingAndSentDeliveries(
+    rows: BotDeliveryRow[],
+    nowMs: number,
+  ): Promise<void> {
+    for (const raw of rows) {
+      const row = this.toDeliveryRow(raw as unknown);
+      if (row.kind === "message_event" && this.isMessageEventExpired(row)) {
+        this.ctx.storage.sql.exec(
+          "UPDATE bot_deliveries SET status='expired', updated_at=? WHERE delivery_id=?",
+          this.nowIso(),
+          row.delivery_id,
+        );
+        continue;
+      }
+
+      const state = this.connectionRow(row.bot_id);
+      if (!state || state.status !== "connected") {
+        this.handleDeliverySendFailure(row, String(Date.now()));
+        continue;
+      }
+
+      const socket = this.activeSocketForBot(row.bot_id, state.session_id);
+      if (!socket) {
+        this.handleDeliverySendFailure(row, String(Date.now()));
+        continue;
+      }
+
+      try {
+        socket.send(JSON.stringify(botDeliveryFrameForWs(row)));
+        this.ctx.storage.sql.exec(
+          "UPDATE bot_deliveries SET status='sent', attempts=?, updated_at=?, next_attempt_at=? WHERE delivery_id=?",
+          row.attempts,
+          this.nowIso(),
+          String(nowMs + RETRY_BACKOFF_MS),
+          row.delivery_id,
+        );
+      } catch {
+        this.handleDeliverySendFailure(row, String(Date.now()));
+      }
+    }
+  }
+
+  private deliveryDueTables(handler: (rows: DueRow[]) => Promise<void>): DueTable[] {
+    return [
+      {
+        table: "bot_deliveries",
+        dueColumn: "next_attempt_at",
+        statusColumn: "status",
+        pendingStatus: "pending",
+        handler,
+      },
+      {
+        table: "bot_deliveries",
+        dueColumn: "next_attempt_at",
+        statusColumn: "status",
+        pendingStatus: "sent",
+        handler,
+      },
+    ];
+  }
+
+  async webSocketMessage(
+    ws: WebSocket,
+    message: string | ArrayBuffer,
+  ): Promise<void> {
+    const attachment =
+      ws.deserializeAttachment() as BotConnectionAttachment | null;
+    if (!attachment?.bot_id || typeof message !== "string") return;
+
+    try {
+      const frame = JSON.parse(message) as { type?: unknown };
+      if (frame.type === "hello") {
+        const parsed = parseHello(message);
+        void parsed.last_received_delivery_id;
+        const now = new Date().toISOString();
+        const sessionId = uuidv7();
+        this.ctx.storage.sql.exec(
+          `INSERT INTO bot_connection_state (
+             bot_id, session_id, status, connected_at, disconnected_at, last_seen_at
+           ) VALUES (?, ?, 'connected', ?, NULL, ?)
+           ON CONFLICT(bot_id) DO UPDATE SET
+             session_id = excluded.session_id,
+             status = 'connected',
+             connected_at = excluded.connected_at,
+             disconnected_at = NULL,
+             last_seen_at = excluded.last_seen_at`,
+          attachment.bot_id,
+          sessionId,
+          now,
+          now,
+        );
+        ws.serializeAttachment({
+          bot_id: attachment.bot_id,
+          session_id: sessionId,
+        });
+        ws.send(JSON.stringify(buildReady(attachment.bot_id, sessionId, now)));
+        return;
+      }
+
+      if (frame.type === "ping") {
+        this.touchConnected(attachment.bot_id);
+        ws.send(JSON.stringify(buildPong()));
+        return;
+      }
+
+      if (frame.type === "delivery_result") {
+        const parsed = parseDeliveryResult(message);
+        await this.handleDeliveryResult(ws, parsed);
+      }
+    } catch {
+      // Protocol parse failures are ignored at WS layer for this phase.
+    }
+  }
+
+  async webSocketClose(ws: WebSocket): Promise<void> {
+    const attachment = ws.deserializeAttachment() as {
+      bot_id?: string;
+      session_id?: string;
+    } | null;
+    if (!attachment?.bot_id) return;
+    await this.markDisconnectedIfCurrentAttachment({
+      bot_id: attachment.bot_id,
+      session_id: attachment.session_id,
+    });
+  }
+
+  async webSocketError(ws: WebSocket): Promise<void> {
+    const attachment = ws.deserializeAttachment() as {
+      bot_id?: string;
+      session_id?: string;
+    } | null;
+    if (!attachment?.bot_id) return;
+    await this.markDisconnectedIfCurrentAttachment({
+      bot_id: attachment.bot_id,
+      session_id: attachment.session_id,
+    });
+  }
+
+  private async markDisconnectedIfCurrentAttachment(attachment: {
+    bot_id: string;
+    session_id?: string;
+  }): Promise<void> {
+    const now = new Date().toISOString();
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT session_id FROM bot_connection_state WHERE bot_id=?",
+        attachment.bot_id,
+      )
+      .toArray()[0] as { session_id: string | null } | undefined;
+    if (row && row.session_id !== attachment.session_id) return;
+    this.ctx.storage.sql.exec(
+      "UPDATE bot_connection_state SET status='disconnected', disconnected_at=? WHERE bot_id=?",
+      now,
+      attachment.bot_id,
+    );
+  }
+
+  async handleDeliveryResult(
+    ws: WebSocket,
+    parsed: ParsedDeliveryResult,
+  ): Promise<void> {
+    this.touchConnected(
+      (ws.deserializeAttachment() as BotConnectionAttachment | null)?.bot_id ??
+        "",
+    );
+    const now = this.nowIso();
+    this.ctx.storage.sql.exec(
+      "UPDATE bot_deliveries SET status='failed', updated_at=?, next_attempt_at=? WHERE delivery_id=? AND status IN ('pending', 'sent')",
+      now,
+      String(Date.now()),
+      parsed.delivery_id,
+    );
+    ws.send(
+      JSON.stringify(
+        buildDeliveryAck(parsed.delivery_id, "failed", {
+          code: "BOT_EFFECT_INVALID",
+          message: "delivery_result not implemented yet",
+        }),
+      ),
+    );
+  }
+
+  touchConnected(botId: string): void {
+    if (!botId) return;
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      "UPDATE bot_connection_state SET status='connected', last_seen_at=? WHERE bot_id=?",
+      now,
+      botId,
+    );
+  }
+
+  async alarm(): Promise<void> {
+    const nowMs = Date.now();
+    const dueTables = this.deliveryDueTables(async (rows) => {
+      await this.flushPendingAndSentDeliveries(
+        rows.map((row) => this.toDeliveryRow(row)),
+        nowMs,
+      );
+    });
+
+    await runDueJobs(this.ctx, nowMs, dueTables);
+    await scheduleNextAlarm(this.ctx, dueTables);
+  }
+}

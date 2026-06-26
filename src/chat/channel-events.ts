@@ -58,6 +58,10 @@ export function buildSystemNoticePayload(raw: {
   notice_kind: string; actor_kind: string; actor_id: string;
   target_user_id: string | null; message_id: string | null;
   channel_changes: Record<string, { before: unknown; after: unknown }> | null;
+  /** Phase 7 bot setting notices (bot.installed / bot.updated / command.binding_updated / bot.subscription_updated). */
+  bot_id?: string | null;
+  bot_command_id?: string | null;
+  binding_changes?: Record<string, { before: unknown; after: unknown }> | null;
 }): Record<string, unknown> {
   return {
     notice_kind: raw.notice_kind,
@@ -66,6 +70,9 @@ export function buildSystemNoticePayload(raw: {
     target_user_id: raw.target_user_id,
     message_id: raw.message_id,
     channel_changes: raw.channel_changes,
+    bot_id: raw.bot_id ?? null,
+    bot_command_id: raw.bot_command_id ?? null,
+    binding_changes: raw.binding_changes ?? null,
   };
 }
 

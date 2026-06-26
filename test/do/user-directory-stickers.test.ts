@@ -325,6 +325,40 @@ describe("UserDirectory /internal/sticker-save + /internal/sticker-list + /inter
     expect(memberSaveBody.sticker.attachment.attachment_id).toBe(attachment_id);
   });
 
+  it("saves a channel-visible attachment from the system channel using client channel_id", async () => {
+    const { ensureSystemChannel, ensureSystemJoined, SYSTEM_CHANNEL_NAME } = await import("../../src/chat/system-channel");
+    const ownerId = "u-sticker-system-owner";
+    const memberId = "u-sticker-system-member";
+    const { channelId } = await ensureSystemChannel(env as unknown as Parameters<typeof ensureSystemChannel>[0]);
+    await ensureSystemJoined(env as unknown as Parameters<typeof ensureSystemJoined>[0], ownerId);
+    await ensureSystemJoined(env as unknown as Parameters<typeof ensureSystemJoined>[0], memberId);
+
+    const { attachment_id } = await presignAndFinalize(ownerId, fake);
+    const sysStub = chatStub(SYSTEM_CHANNEL_NAME);
+    const sendRes = await sysStub.fetch(
+      new Request("https://x/internal/message-send", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          command_id: `cmd-sticker-system-${ownerId}`,
+          dedupe_principal_key: `user:${ownerId}`,
+          type: "image",
+          text: "",
+          reply_to: null,
+          attachment_ids: [attachment_id],
+          mentions: [],
+          channel_id: channelId,
+        }),
+      }),
+    );
+    expect(sendRes.status).toBe(200);
+
+    const saveRes = await saveSticker(memberId, channelId, attachment_id, `op-${memberId}-system`);
+    expect(saveRes.status).toBe(200);
+    const saveBody = (await saveRes.json()) as { sticker: { attachment: { attachment_id: string } } };
+    expect(saveBody.sticker.attachment.attachment_id).toBe(attachment_id);
+  });
+
   it("rejects saving a recalled source message attachment via channel-visible path", async () => {
     const channelId = "ch-sticker-recalled";
     const ownerId = "u-sticker-recalled-owner";

@@ -36,9 +36,10 @@ export async function scheduleNextAlarm(ctx: DurableObjectState, dueTables: DueT
       `SELECT MIN(${table.dueColumn}) AS due FROM ${table.table} WHERE ${table.statusColumn} = ?`,
       table.pendingStatus,
     );
-    const row = cursor.toArray()[0] as { due: number | null } | undefined;
-    const due = row?.due ?? null;
-    if (due !== null && (nextDue === null || due < nextDue)) {
+    const row = cursor.toArray()[0] as { due: number | string | null } | undefined;
+    const rawDue = row?.due ?? null;
+    const due = typeof rawDue === "string" ? Number(rawDue) : rawDue;
+    if (due !== null && Number.isFinite(due) && (nextDue === null || due < nextDue)) {
       nextDue = due;
     }
   }

@@ -1,12 +1,14 @@
 import {
   applyBaselineSchema,
   columnExists,
+  indexExists,
   migrateSqlite,
+  tableExists,
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
 
-export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026062601;
+export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026062602;
 
 export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS channel_meta (
@@ -140,6 +142,215 @@ export const chatChannelMigrations: SqlMigration[] = [
       }
       if (!columnExists(ctx, "message_stickers", "blurhash")) {
         ctx.storage.sql.exec("ALTER TABLE message_stickers ADD COLUMN blurhash TEXT");
+      }
+    },
+  },
+  {
+    version: 2026062602,
+    name: "Phase 7 bot command bindings + delivery outbox + effects + event subscriptions + bot actor snapshot",
+    up(ctx) {
+      // baseline `commands` / `invocations` were unwritten shells (grep proof
+      // in Task 7a-migration Step 3 + test). Drop and rebuild with repurposed
+      // semantics: channel_command_bindings (read-cache snapshot of the
+      // BotRegistry catalog) + channel_command_names (slash token conflict
+      // domain) + command_invocations (invocation lifecycle).
+      ctx.storage.sql.exec("DROP TABLE IF EXISTS commands");
+      ctx.storage.sql.exec("DROP TABLE IF EXISTS invocations");
+
+      // bot message components + bot actor snapshot (only sender_kind='bot'
+      // rows write the bot_* columns; projectMessageForBrowser reads them so
+      // history/ack/event/replay/context all emit {kind:"bot", bot:{...}}
+      // without N BotRegistry fetches).
+      if (!columnExists(ctx, "messages", "components_json")) {
+        ctx.storage.sql.exec(
+          "ALTER TABLE messages ADD COLUMN components_json TEXT NOT NULL DEFAULT '[]'",
+        );
+      }
+      if (!columnExists(ctx, "messages", "sender_bot_display_name")) {
+        ctx.storage.sql.exec(
+          "ALTER TABLE messages ADD COLUMN sender_bot_display_name TEXT",
+        );
+      }
+      if (!columnExists(ctx, "messages", "sender_bot_avatar_url")) {
+        ctx.storage.sql.exec(
+          "ALTER TABLE messages ADD COLUMN sender_bot_avatar_url TEXT",
+        );
+      }
+
+      // bot_installations: per-channel install state + bot summary snapshot
+      // (so /commands can render bot fields without cross-DO fetches).
+      if (!columnExists(ctx, "bot_installations", "status")) {
+        ctx.storage.sql.exec(
+          "ALTER TABLE bot_installations ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+        );
+      }
+      if (!columnExists(ctx, "bot_installations", "updated_by")) {
+        ctx.storage.sql.exec("ALTER TABLE bot_installations ADD COLUMN updated_by TEXT");
+      }
+      if (!columnExists(ctx, "bot_installations", "updated_at")) {
+        ctx.storage.sql.exec("ALTER TABLE bot_installations ADD COLUMN updated_at TEXT");
+      }
+      if (!columnExists(ctx, "bot_installations", "bot_display_name")) {
+        ctx.storage.sql.exec(
+          "ALTER TABLE bot_installations ADD COLUMN bot_display_name TEXT NOT NULL DEFAULT ''",
+        );
+      }
+      if (!columnExists(ctx, "bot_installations", "bot_avatar_url")) {
+        ctx.storage.sql.exec("ALTER TABLE bot_installations ADD COLUMN bot_avatar_url TEXT");
+      }
+
+      // interactions: rich UI lifecycle (pending -> dispatched -> completed |
+      // failed | expired). Add completion tracking columns.
+      if (!columnExists(ctx, "interactions", "updated_at")) {
+        ctx.storage.sql.exec("ALTER TABLE interactions ADD COLUMN updated_at TEXT");
+      }
+      if (!columnExists(ctx, "interactions", "completed_at")) {
+        ctx.storage.sql.exec("ALTER TABLE interactions ADD COLUMN completed_at TEXT");
+      }
+      if (!columnExists(ctx, "interactions", "error_code")) {
+        ctx.storage.sql.exec("ALTER TABLE interactions ADD COLUMN error_code TEXT");
+      }
+
+      // channel_command_bindings: read-cache snapshot of the BotRegistry
+      // catalog row (correctness source for command.invoke is the CURRENT
+      // BotRegistry row, not this snapshot; drift is detected via
+      // definition_hash and the snapshot is refreshed in-place).
+      if (!tableExists(ctx, "channel_command_bindings")) {
+        ctx.storage.sql.exec(`CREATE TABLE channel_command_bindings (
+          binding_id               TEXT PRIMARY KEY,
+          channel_id               TEXT NOT NULL,
+          bot_id                   TEXT NOT NULL,
+          bot_command_id           TEXT NOT NULL,
+          status                   TEXT NOT NULL,
+          permission_override       TEXT,
+          name                     TEXT NOT NULL,
+          description              TEXT,
+          options_json             TEXT NOT NULL,
+          aliases_json             TEXT NOT NULL DEFAULT '[]',
+          default_member_permission TEXT NOT NULL,
+          definition_hash          TEXT NOT NULL,
+          created_by               TEXT NOT NULL,
+          created_at               TEXT NOT NULL,
+          updated_by               TEXT,
+          updated_at               TEXT NOT NULL,
+          UNIQUE (channel_id, bot_command_id)
+        )`);
+        ctx.storage.sql.exec(
+          "CREATE INDEX idx_bindings_channel_enabled ON channel_command_bindings(channel_id, status)",
+        );
+      }
+
+      // channel_command_names: the per-channel slash-token -> command map.
+      // Enabling a binding writes canonical + alias rows; disabling removes
+      // them. Same-channel enabled token conflict -> COMMAND_NAME_CONFLICT.
+      if (!tableExists(ctx, "channel_command_names")) {
+        ctx.storage.sql.exec(`CREATE TABLE channel_command_names (
+          channel_id     TEXT NOT NULL,
+          slash_name     TEXT NOT NULL,
+          bot_command_id TEXT NOT NULL,
+          bot_id         TEXT NOT NULL,
+          kind           TEXT NOT NULL,
+          created_at     TEXT NOT NULL,
+          PRIMARY KEY (channel_id, slash_name)
+        )`);
+      }
+
+      // command_invocations: invocation lifecycle. command_id is the Browser
+      // WS operation_id (durable idempotency key); idempotency SoT is
+      // idempotency_keys, the UNIQUE is secondary defense.
+      if (!tableExists(ctx, "command_invocations")) {
+        ctx.storage.sql.exec(`CREATE TABLE command_invocations (
+          invocation_id              TEXT PRIMARY KEY,
+          channel_id                 TEXT NOT NULL,
+          command_id                 TEXT NOT NULL,
+          invoker_user_id            TEXT NOT NULL,
+          bot_id                     TEXT NOT NULL,
+          bot_command_id             TEXT NOT NULL,
+          command_name               TEXT NOT NULL,
+          invoked_name               TEXT NOT NULL,
+          command_schema_version     INTEGER NOT NULL,
+          command_definition_hash    TEXT NOT NULL,
+          options_json               TEXT NOT NULL,
+          status                     TEXT NOT NULL,
+          error_code                 TEXT,
+          error_message              TEXT,
+          created_at                 TEXT NOT NULL,
+          updated_at                 TEXT NOT NULL,
+          completed_at               TEXT,
+          UNIQUE (channel_id, invoker_user_id, command_id)
+        )`);
+        ctx.storage.sql.exec(
+          "CREATE INDEX idx_invocations_status ON command_invocations(status, updated_at)",
+        );
+      }
+
+      // bot_delivery_outbox (renamed from bot_callback_outbox; transport is
+      // no longer HTTP callback-specific). ChatChannel alarm flushes these to
+      // BotConnection.enqueueDelivery. status aligns with projection_outbox
+      // naming; separate from invocation/interaction lifecycle status.
+      if (!tableExists(ctx, "bot_delivery_outbox")) {
+        ctx.storage.sql.exec(`CREATE TABLE bot_delivery_outbox (
+          outbox_id        TEXT PRIMARY KEY,
+          channel_id       TEXT NOT NULL,
+          bot_id           TEXT NOT NULL,
+          kind             TEXT NOT NULL,
+          invocation_id    TEXT,
+          interaction_id   TEXT,
+          event_id         TEXT,
+          request_json     TEXT NOT NULL,
+          status           TEXT NOT NULL DEFAULT 'pending',
+          attempts         INTEGER NOT NULL DEFAULT 0,
+          max_attempts     INTEGER NOT NULL DEFAULT 5,
+          last_error       TEXT,
+          failed_at        TEXT,
+          next_attempt_at  TEXT NOT NULL,
+          created_at       TEXT NOT NULL,
+          updated_at       TEXT NOT NULL
+        )`);
+        ctx.storage.sql.exec(
+          "CREATE INDEX idx_bot_delivery_due ON bot_delivery_outbox(status, next_attempt_at)",
+        );
+      }
+
+      // effect idempotency: PK = (channel_id, bot_id, client_effect_id) so
+      // delivery retries never reapply the same effect. outbox_id is a debug
+      // provenance column, not part of the PK. request_hash detects body drift.
+      if (!tableExists(ctx, "bot_effects_applied")) {
+        ctx.storage.sql.exec(`CREATE TABLE bot_effects_applied (
+          channel_id       TEXT NOT NULL,
+          bot_id           TEXT NOT NULL,
+          client_effect_id TEXT NOT NULL,
+          effect_type      TEXT NOT NULL,
+          request_hash     TEXT NOT NULL,
+          message_id       TEXT,
+          response_json    TEXT,
+          applied_at       TEXT NOT NULL,
+          outbox_id        TEXT,
+          PRIMARY KEY (channel_id, bot_id, client_effect_id)
+        )`);
+      }
+
+      // passive message_event subscriptions (§9.9). Phase 7 only
+      // event_type=message.created. observer/responder only.
+      if (!tableExists(ctx, "channel_bot_event_subscriptions")) {
+        ctx.storage.sql.exec(`CREATE TABLE channel_bot_event_subscriptions (
+          subscription_id TEXT PRIMARY KEY,
+          channel_id      TEXT NOT NULL,
+          bot_id          TEXT NOT NULL,
+          event_type      TEXT NOT NULL,
+          status          TEXT NOT NULL,
+          filters_json    TEXT NOT NULL,
+          created_by      TEXT NOT NULL,
+          created_at      TEXT NOT NULL,
+          updated_by      TEXT,
+          updated_at      TEXT NOT NULL,
+          UNIQUE(channel_id, bot_id, event_type)
+        )`);
+        if (!indexExists(ctx, "idx_channel_bot_event_subscriptions_enabled")) {
+          ctx.storage.sql.exec(
+            "CREATE INDEX idx_channel_bot_event_subscriptions_enabled ON channel_bot_event_subscriptions(channel_id, event_type, status)",
+          );
+        }
       }
     },
   },

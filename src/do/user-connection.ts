@@ -96,6 +96,8 @@ function normalizeEventError(payload: unknown): SendError {
 export class UserConnection extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    // App-level ping/pong without waking the DO (CF hibernation billing best practice).
+    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
   async fetch(request: Request): Promise<Response> {

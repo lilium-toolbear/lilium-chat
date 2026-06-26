@@ -139,7 +139,7 @@ describe("ChatChannel message lifecycle", () => {
     expect(r1.event_id).toBe(r2.event_id);
   });
 
-  it("recall: owner recalls own message -> status recalled, text null in projection", async () => {
+  it('recall: owner recalls own message -> status recalled, text null in projection', async () => {
     const { stub, messageId } = await setupAndSend("u-lc-4", "01a40004-0000-7000-8000-000000000001", "secret", "cmd-send-4");
     const res = await stub.fetch(new Request("https://x/internal/message-recall", {
       method: "POST",
@@ -152,6 +152,36 @@ describe("ChatChannel message lifecycle", () => {
     expect(body.message.text).toBeNull();
     expect(body.message.mentions).toEqual([]);
     expect(body.message.recalled_at).not.toBeNull();
+  });
+
+  it("history includes recalled tombstones but excludes deleted messages", async () => {
+    const channelId = "01a40004b-0000-7000-8000-000000000001";
+    const recalled = await setupAndSend("u-lc-4b", channelId, "recalled-msg", "cmd-send-4b");
+    const deleted = await setupAndSend("u-lc-4b", channelId, "deleted-msg", "cmd-send-4c");
+
+    const recallRes = await recalled.stub.fetch(new Request("https://x/internal/message-recall", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-lc-4b", "Content-Type": "application/json" },
+      body: JSON.stringify({ operation_id: "cmd-recall-4b", message_id: recalled.messageId, channel_id: channelId }),
+    }));
+    expect(recallRes.status).toBe(200);
+
+    const deleteRes = await deleted.stub.fetch(new Request("https://x/internal/message-delete", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-lc-4b", "Content-Type": "application/json" },
+      body: JSON.stringify({ operation_id: "cmd-delete-4b", message_id: deleted.messageId, channel_id: channelId }),
+    }));
+    expect(deleteRes.status).toBe(200);
+
+    const historyRes = await recalled.stub.fetch(
+      new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": "u-lc-4b" } }),
+    );
+    expect(historyRes.status).toBe(200);
+    const historyBody = (await historyRes.json()) as { items: Array<{ message_id: string; status: string }> };
+    const recalledRow = historyBody.items.find((item) => item.message_id === recalled.messageId);
+    const deletedRow = historyBody.items.find((item) => item.message_id === deleted.messageId);
+    expect(recalledRow?.status).toBe("recalled");
+    expect(deletedRow).toBeUndefined();
   });
 
   it("lifecycle state matrix: non-text edit and hidden message edits are rejected", async () => {
