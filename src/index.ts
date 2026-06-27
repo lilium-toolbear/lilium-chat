@@ -37,6 +37,7 @@ import {
   updateCommandBindingHandler,
   listChannelCommandsHandler,
 } from "./routes/bot-installations";
+import { openDmHandler } from "./routes/dms";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -73,6 +74,7 @@ app.onError((err, c) => {
 app.get("/api/chat/bootstrap", (c) => bootstrapHandler(c));
 app.get("/api/chat/ws", (c) => wsUpgradeHandler(c));
 app.get("/api/chat/channels", (c) => listChannelsHandler(c));
+app.post("/api/chat/dms", (c) => openDmHandler(c));
 app.post("/api/chat/channels", (c) => createChannelHandler(c));
 app.patch("/api/chat/channels/:channel_id", (c) => updateChannelHandler(c));
 app.post("/api/chat/channels/:channel_id/dissolve", (c) => dissolveChannelHandler(c));
@@ -114,4 +116,5 @@ export { InviteDirectory } from "./do/invite-directory";
 export { BotRegistry } from "./do/bot-registry";
 export { ChannelFanout } from "./do/channel-fanout";
 export { BotConnection } from "./do/bot-connection";
+export { DMDirectory } from "./do/dm-directory";
 export { SchedulerProbe } from "./do/scheduler-probe";

@@ -27,7 +27,8 @@
       { "name": "BOT_REGISTRY", "class_name": "BotRegistry" },
       { "name": "CHANNEL_FANOUT", "class_name": "ChannelFanout" },
       { "name": "BOT_CONNECTION", "class_name": "BotConnection" },
-      { "name": "SCHEDULER_PROBE", "class_name": "SchedulerProbe" }
+      { "name": "SCHEDULER_PROBE", "class_name": "SchedulerProbe" },
+      { "name": "DM_DIRECTORY", "class_name": "DMDirectory" }
     ]
   },
 
@@ -45,7 +46,7 @@
       "new_sqlite_classes": [
         "ChatChannel", "UserDirectory", "UserConnection", "ChannelDirectory",
         "InviteDirectory", "BotRegistry", "ChannelFanout", "BotConnection",
-        "SchedulerProbe"
+        "SchedulerProbe", "DMDirectory"
       ]
     }
   ]

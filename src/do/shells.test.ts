@@ -9,6 +9,7 @@ const DO_BINDINGS = [
   ["INVITE_DIRECTORY", "InviteDirectory"],
   ["BOT_REGISTRY", "BotRegistry"],
   ["CHANNEL_FANOUT", "ChannelFanout"],
+  ["DM_DIRECTORY", "DMDirectory"],
 ] as const;
 
 describe("DO shells", () => {
