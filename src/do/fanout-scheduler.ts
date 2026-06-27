@@ -1,33 +1,14 @@
 import { computeRetryBackoffMs } from "./retry-backoff";
 import { OUTBOX_MAX_ATTEMPTS } from "../contract/outbox";
-// Mirrors ChatChannel's outbox scheduler (scheduleOutboxAlarm / bumpOutboxRetry) but
-// targets fanout_queue rows.
+import { scheduleNextAlarm, isoDueTable, type DueTable } from "./scheduler";
 
-export function scheduleFanoutAlarm(ctx: DurableObjectState, nowIso: string): Promise<void> {
-  return (async () => {
-    const row = ctx.storage.sql
-      .exec("SELECT MIN(next_attempt_at) AS due FROM fanout_queue WHERE status='pending'")
-      .toArray()[0] as { due: string | null } | undefined;
-    const due = row?.due ?? null;
-    if (due === null) {
-      await ctx.storage.deleteAlarm();
-      return;
-    }
-
-    const dueMs = Date.parse(due);
-    if (Number.isNaN(dueMs)) {
-      await ctx.storage.deleteAlarm();
-      return;
-    }
-
-    const current = await ctx.storage.getAlarm();
-    if (current === null || dueMs < current) {
-      await ctx.storage.setAlarm(dueMs);
-      return;
-    }
-
-    void nowIso;
-  })();
+/** Schedules the earliest pending fanout_queue retry (ISO next_attempt_at). */
+export function scheduleFanoutAlarm(ctx: DurableObjectState, _nowIso?: string): Promise<void> {
+  void _nowIso;
+  const dueTables: DueTable[] = [
+    isoDueTable("fanout_queue", "next_attempt_at", "status", "pending", async () => Promise.resolve()),
+  ];
+  return scheduleNextAlarm(ctx, dueTables, { respectExistingAlarm: true });
 }
 
 export function bumpFanoutRetry(

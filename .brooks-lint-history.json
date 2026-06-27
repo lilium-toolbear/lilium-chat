@@ -14,5 +14,13 @@
     "findings": { "critical": 0, "warning": 4, "suggestion": 3 },
     "scope": "lilium-chat residual brooks-sweep findings",
     "note": "idempotency helpers, replay extraction, test probe gating, auth consolidation, retry backoff, test debt fixes"
+  },
+  {
+    "date": "2026-06-28",
+    "mode": "Decision Batch (D1/D5/D6/D4)",
+    "score": 88,
+    "findings": { "critical": 0, "warning": 0, "suggestion": 0 },
+    "scope": "UserDirectory attachment_id, unified scheduler, summary denorm, ChatChannel route split",
+    "note": "D1 attachment_id migration; D5 scheduler.ts ISO/respectExistingAlarm; D6 my_channels.summary_json outbox; D4 chat-channel/routes/* split"
   }
 ]

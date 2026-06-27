@@ -6,7 +6,7 @@ import {
   type SqlMigration,
 } from "../sql-migrations";
 
-export const USER_DIRECTORY_CURRENT_SCHEMA_VERSION = 2026062601;
+export const USER_DIRECTORY_CURRENT_SCHEMA_VERSION = 2026062802;
 
 export const USER_DIRECTORY_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS my_channels (
@@ -68,6 +68,23 @@ export const userDirectoryMigrations: SqlMigration[] = [
       }
       if (!columnExists(ctx, "personal_stickers", "blurhash")) {
         ctx.storage.sql.exec("ALTER TABLE personal_stickers ADD COLUMN blurhash TEXT");
+      }
+    },
+  },
+  {
+    version: 2026062802,
+    name: "add idempotency attachment_id and my_channels summary_json",
+    up(ctx) {
+      if (!columnExists(ctx, "idempotency_keys", "attachment_id")) {
+        ctx.storage.sql.exec("ALTER TABLE idempotency_keys ADD COLUMN attachment_id TEXT");
+      }
+      ctx.storage.sql.exec(
+        `UPDATE idempotency_keys SET attachment_id = channel_id, channel_id = NULL
+         WHERE operation IN ('attachment.presign', 'avatar.presign', 'attachment.finalize')
+           AND channel_id IS NOT NULL AND attachment_id IS NULL`,
+      );
+      if (!columnExists(ctx, "my_channels", "summary_json")) {
+        ctx.storage.sql.exec("ALTER TABLE my_channels ADD COLUMN summary_json TEXT");
       }
     },
   },

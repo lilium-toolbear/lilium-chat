@@ -4,12 +4,15 @@ import { uuidv7 } from "../ids/uuidv7";
 import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateUserDirectorySchema } from "./migrations/user-directory";
 import { projectAttachmentForBrowser, projectFinalizedAttachmentForBrowser, type AttachmentRow } from "../chat/attachment-projection";
+import { parseStoredChannelMetaProjection } from "../chat/channel-meta-projection";
+import type { ChannelMetaProjection } from "../contract/channel-api";
 import { presignPutUrl, headObjectKey, deleteObject } from "../s3/presign";
 import { attachmentObjectKey, attachmentPublicUrl, avatarObjectKey, avatarPublicUrl } from "../s3/object-key";
 import { HTTP_STATUS_BY_CODE } from "../errors";
 import { canonicalDmPairKey, isUuidString } from "../chat/dm-pair";
 import { resolveUserSummaries } from "../profile/resolve";
 import { idempotencyExpiresAt } from "../contract/idempotency";
+import { isoDueTable, runDueJobs, scheduleNextAlarm, type DueTable } from "./scheduler";
 
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const MAX_ATTACHMENT_SIZE_BYTES = 20 * 1024 * 1024; // 20 MiB
@@ -103,14 +106,23 @@ export class UserDirectory extends DurableObject<Env> {
       }
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       const rows = this.ctx.storage.sql
-        .exec("SELECT channel_id, kind, last_read_event_id, membership_version FROM my_channels WHERE user_id = ? AND status IN ('active', 'dissolved')", userId)
+        .exec("SELECT channel_id, kind, last_read_event_id, membership_version, summary_json FROM my_channels WHERE user_id = ? AND status IN ('active', 'dissolved')", userId)
         .toArray() as {
           channel_id: string;
           kind: string;
           last_read_event_id: string | null;
           membership_version: number;
+          summary_json: string | null;
         }[];
-      return Response.json({ items: rows });
+      return Response.json({
+        items: rows.map((row) => ({
+          channel_id: row.channel_id,
+          kind: row.kind,
+          last_read_event_id: row.last_read_event_id,
+          membership_version: row.membership_version,
+          summary: parseStoredChannelMetaProjection(row.summary_json),
+        })),
+      });
     }
 
     if (url.pathname === "/internal/upsert-channel") {
@@ -119,52 +131,84 @@ export class UserDirectory extends DurableObject<Env> {
       const now = new Date().toISOString();
 
       const body = (await request.json()) as {
-        action: "join" | "leave" | "dissolve";
+        action: "join" | "leave" | "dissolve" | "summary_update";
         channel_id: string;
-        kind: string;
+        kind?: string;
         membership_version: number;
+        summary?: ChannelMetaProjection;
       };
 
-      if (!body.channel_id || !body.kind) {
+      if (!body.channel_id) {
         return Response.json({ error: "invalid payload" }, { status: 400 });
       }
-      if (body.action !== "join" && body.action !== "leave" && body.action !== "dissolve") {
+      if (body.action !== "join" && body.action !== "leave" && body.action !== "dissolve" && body.action !== "summary_update") {
         return Response.json({ error: "unsupported action" }, { status: 400 });
       }
+
+      const summaryJson = body.summary ? JSON.stringify(body.summary) : null;
 
       return await this.ctx.storage.transaction(async () => {
         const existing = this.ctx.storage.sql
           .exec(
-            "SELECT status, left_at, membership_version FROM my_channels WHERE user_id = ? AND channel_id = ?",
+            "SELECT status, left_at, membership_version, summary_json FROM my_channels WHERE user_id = ? AND channel_id = ?",
             userId,
             body.channel_id,
           )
           .toArray()[0] as
-          | { status: string; left_at: string | null; membership_version: number }
+          | { status: string; left_at: string | null; membership_version: number; summary_json: string | null }
           | undefined;
 
+        if (body.action === "summary_update") {
+          if (!existing || existing.status !== "active") {
+            return Response.json({ ok: true });
+          }
+          if (summaryJson) {
+            this.ctx.storage.sql.exec(
+              "UPDATE my_channels SET summary_json=? WHERE user_id=? AND channel_id=?",
+              summaryJson,
+              userId,
+              body.channel_id,
+            );
+          }
+          return Response.json({ ok: true });
+        }
+
+        if (!body.kind) {
+          return Response.json({ error: "invalid payload" }, { status: 400 });
+        }
+
         if (existing && existing.membership_version >= body.membership_version) {
+          if (summaryJson && existing.status === "active") {
+            this.ctx.storage.sql.exec(
+              "UPDATE my_channels SET summary_json=? WHERE user_id=? AND channel_id=?",
+              summaryJson,
+              userId,
+              body.channel_id,
+            );
+          }
           return Response.json({ ok: true });
         }
 
         if (body.action === "join") {
           if (existing === undefined) {
             this.ctx.storage.sql.exec(
-              "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, left_at, removed_at, status, membership_version, last_read_event_id) VALUES (?, ?, ?, ?, NULL, NULL, 'active', ?, NULL)",
+              "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, left_at, removed_at, status, membership_version, last_read_event_id, summary_json) VALUES (?, ?, ?, ?, NULL, NULL, 'active', ?, NULL, ?)",
               userId,
               body.channel_id,
               body.kind,
               now,
               body.membership_version,
+              summaryJson,
             );
             return Response.json({ ok: true });
           }
 
           this.ctx.storage.sql.exec(
-            "UPDATE my_channels SET status='active', left_at=NULL, removed_at=NULL, membership_version=?, joined_at=COALESCE(joined_at, ?), kind=? WHERE user_id=? AND channel_id=?",
+            "UPDATE my_channels SET status='active', left_at=NULL, removed_at=NULL, membership_version=?, joined_at=COALESCE(joined_at, ?), kind=?, summary_json=COALESCE(?, summary_json) WHERE user_id=? AND channel_id=?",
             body.membership_version,
             now,
             body.kind,
+            summaryJson,
             userId,
             body.channel_id,
           );
@@ -174,20 +218,22 @@ export class UserDirectory extends DurableObject<Env> {
         if (body.action === "dissolve") {
           if (existing === undefined) {
             this.ctx.storage.sql.exec(
-              "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, left_at, removed_at, status, membership_version, last_read_event_id) VALUES (?, ?, ?, ?, NULL, NULL, 'dissolved', ?, NULL)",
+              "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, left_at, removed_at, status, membership_version, last_read_event_id, summary_json) VALUES (?, ?, ?, ?, NULL, NULL, 'dissolved', ?, NULL, ?)",
               userId,
               body.channel_id,
               body.kind,
               now,
               body.membership_version,
+              summaryJson,
             );
             return Response.json({ ok: true });
           }
 
           this.ctx.storage.sql.exec(
-            "UPDATE my_channels SET status='dissolved', left_at=NULL, removed_at=NULL, membership_version=?, kind=? WHERE user_id=? AND channel_id=?",
+            "UPDATE my_channels SET status='dissolved', left_at=NULL, removed_at=NULL, membership_version=?, kind=?, summary_json=COALESCE(?, summary_json) WHERE user_id=? AND channel_id=?",
             body.membership_version,
             body.kind,
+            summaryJson,
             userId,
             body.channel_id,
           );
@@ -841,11 +887,11 @@ export class UserDirectory extends DurableObject<Env> {
       const coord = (await this.ctx.storage.transaction(async () => {
         const row = this.ctx.storage.sql
           .exec(
-            `SELECT request_hash, status, channel_id, response_json FROM idempotency_keys WHERE operation='${presignOperation}' AND operation_id=?`,
+            `SELECT request_hash, status, attachment_id, response_json FROM idempotency_keys WHERE operation='${presignOperation}' AND operation_id=?`,
             idempotencyKey,
           )
           .toArray()[0] as
-          | { request_hash: string; status: string; channel_id: string | null; response_json: string | null }
+          | { request_hash: string; status: string; attachment_id: string | null; response_json: string | null }
           | undefined;
 
         if (row) {
@@ -855,8 +901,7 @@ export class UserDirectory extends DurableObject<Env> {
           if (row.status === "completed" && row.response_json) {
             return { kind: "cached" as const, responseJson: row.response_json };
           }
-          // pending / creating: reuse attachment_id (stored in channel_id column).
-          return { kind: "pending" as const, attachmentId: row.channel_id ?? "" };
+          return { kind: "pending" as const, attachmentId: row.attachment_id ?? "" };
         }
 
         const attachmentId = uuidv7();
@@ -886,7 +931,7 @@ export class UserDirectory extends DurableObject<Env> {
           now,
         );
         this.ctx.storage.sql.exec(
-          `INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('${presignOperation}', ?, ?, 'pending', ?, NULL, ?, ?, ?)`,
+          `INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, attachment_id, response_json, created_at, updated_at, expires_at) VALUES ('${presignOperation}', ?, ?, 'pending', ?, NULL, ?, ?, ?)`,
           idempotencyKey,
           requestHash,
           attachmentId,
@@ -944,7 +989,7 @@ export class UserDirectory extends DurableObject<Env> {
         );
       });
 
-      this.schedulePendingAlarm();
+      await this.schedulePendingAlarm();
       return new Response(responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
@@ -1017,7 +1062,7 @@ export class UserDirectory extends DurableObject<Env> {
             // No prior idempotency row but attachment is already finalized: create one so future retries hit cache.
             const expiresAt = idempotencyExpiresAt(Date.now());
             this.ctx.storage.sql.exec(
-              "INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('attachment.finalize', ?, ?, 'completed', ?, ?, ?, ?, ?)",
+              "INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, attachment_id, response_json, created_at, updated_at, expires_at) VALUES ('attachment.finalize', ?, ?, 'completed', ?, ?, ?, ?, ?)",
               idempotencyKey,
               requestHash,
               attachmentId,
@@ -1085,7 +1130,7 @@ export class UserDirectory extends DurableObject<Env> {
         const projection = projectFinalizedAttachmentForBrowser(finalizedRow!);
         const json = JSON.stringify({ attachment: projection });
         this.ctx.storage.sql.exec(
-          "INSERT OR REPLACE INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('attachment.finalize', ?, ?, 'completed', ?, ?, COALESCE((SELECT created_at FROM idempotency_keys WHERE operation='attachment.finalize' AND operation_id=?), ?), ?, ?)",
+          "INSERT OR REPLACE INTO idempotency_keys (operation, operation_id, request_hash, status, attachment_id, response_json, created_at, updated_at, expires_at) VALUES ('attachment.finalize', ?, ?, 'completed', ?, ?, COALESCE((SELECT created_at FROM idempotency_keys WHERE operation='attachment.finalize' AND operation_id=?), ?), ?, ?)",
           idempotencyKey,
           requestHash,
           attachmentId,
@@ -1098,7 +1143,7 @@ export class UserDirectory extends DurableObject<Env> {
         return json;
       });
 
-      this.schedulePendingAlarm();
+      await this.schedulePendingAlarm();
       return new Response(responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
@@ -1136,32 +1181,34 @@ export class UserDirectory extends DurableObject<Env> {
     return new Date().toISOString();
   }
 
-  private schedulePendingAlarm(): void {
-    const earliest = this.ctx.storage.sql
-      .exec("SELECT expires_at FROM pending_attachments WHERE status='pending' ORDER BY expires_at ASC LIMIT 1")
-      .toArray()[0] as { expires_at: string } | undefined;
-    if (earliest) {
-      this.ctx.storage.setAlarm(new Date(earliest.expires_at).getTime());
-    } else {
-      this.ctx.storage.deleteAlarm();
-    }
+  private pendingAttachmentDueTables(
+    handler: (rows: Array<{ attachment_id: string; storage_key: string }>) => Promise<void>,
+  ): DueTable[] {
+    return [
+      isoDueTable("pending_attachments", "expires_at", "status", "pending", async (rows) => {
+        await handler(rows as unknown as Array<{ attachment_id: string; storage_key: string }>);
+      }),
+    ];
+  }
+
+  private async schedulePendingAlarm(): Promise<void> {
+    await scheduleNextAlarm(this.ctx, this.pendingAttachmentDueTables(async () => Promise.resolve()), {
+      respectExistingAlarm: true,
+    });
   }
 
   async alarm(): Promise<void> {
     const now = this.nowIso();
-    const expired = this.ctx.storage.sql
-      .exec("SELECT attachment_id, storage_key FROM pending_attachments WHERE status='pending' AND expires_at <= ?", now)
-      .toArray() as { attachment_id: string; storage_key: string }[];
-
-    for (const row of expired) {
-      try {
-        await deleteObject(this.env, row.storage_key);
-      } catch {
-        // GC best-effort: object may already be gone.
+    await runDueJobs(this.ctx, now, this.pendingAttachmentDueTables(async (expired) => {
+      for (const row of expired) {
+        try {
+          await deleteObject(this.env, row.storage_key);
+        } catch {
+          // GC best-effort: object may already be gone.
+        }
+        this.ctx.storage.sql.exec("DELETE FROM pending_attachments WHERE attachment_id=?", row.attachment_id);
       }
-      this.ctx.storage.sql.exec("DELETE FROM pending_attachments WHERE attachment_id=?", row.attachment_id);
-    }
-
-    this.schedulePendingAlarm();
+    }));
+    await this.schedulePendingAlarm();
   }
 }

@@ -1,11 +1,14 @@
 /** Default max delivery attempts for projection_outbox and fanout_queue rows. */
 export const OUTBOX_MAX_ATTEMPTS = 5;
 
+import type { ChannelMetaProjection } from "./channel-api";
+
 export interface UserDirectoryJoinOutboxPayload {
   action: "join";
   channel_id: string;
   kind: string;
   membership_version: number;
+  summary?: ChannelMetaProjection;
 }
 
 export interface UserDirectoryLeaveOutboxPayload {
@@ -20,12 +23,21 @@ export interface UserDirectoryDissolveOutboxPayload {
   channel_id: string;
   kind: string;
   membership_version: number;
+  summary?: ChannelMetaProjection;
+}
+
+export interface UserDirectorySummaryUpdateOutboxPayload {
+  action: "summary_update";
+  channel_id: string;
+  membership_version: number;
+  summary: ChannelMetaProjection;
 }
 
 export type UserDirectoryOutboxPayload =
   | UserDirectoryJoinOutboxPayload
   | UserDirectoryLeaveOutboxPayload
-  | UserDirectoryDissolveOutboxPayload;
+  | UserDirectoryDissolveOutboxPayload
+  | UserDirectorySummaryUpdateOutboxPayload;
 
 export interface ChannelFanoutUnregisterOutboxPayload {
   action: "unregister-user";

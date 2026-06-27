@@ -11,7 +11,7 @@ export async function listChannelsHandler(c: Context<{ Bindings: Env; Variables:
   const dirStub = env.USER_DIRECTORY.getByName(userId);
   const dirRes = await dirStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
   const myChannels = dirRes.ok
-    ? ((await dirRes.json()) as { items: Array<{ channel_id: string; kind: string; last_read_event_id: string | null; membership_version: number }> }).items
+    ? ((await dirRes.json()) as { items: Array<import("../chat/channel-list").MyChannelIndexRow> }).items
     : [];
   const items = await inflateMyChannelSummaries({
     env,
