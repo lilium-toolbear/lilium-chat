@@ -1,7 +1,46 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo as _g } from "../helpers";
+import { getNamedDo as _g, fakeS3AvatarPublicPath, fakeS3PublicPath } from "../helpers";
+import { setTestS3Client } from "../../src/s3/presign";
+import { FakeS3 } from "../fake-s3";
 void _g;
+
+function udStub(userId: string) {
+  return _g(env.USER_DIRECTORY as unknown as Parameters<typeof _g>[0], userId);
+}
+
+async function presignAndFinalizeAvatar(userId: string, fake: FakeS3): Promise<{ attachment_id: string; url: string }> {
+  const key = `idem-avatar-${userId}`;
+  const presignRes = await udStub(userId).fetch(
+    new Request("https://x/internal/avatar-presign", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": key, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: "avatar.png",
+        mime_type: "image/png",
+        size_bytes: 12345,
+        width: 512,
+        height: 512,
+        blurhash: "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
+      }),
+    }),
+  );
+  expect(presignRes.status).toBe(200);
+  const presignBody = (await presignRes.json()) as { attachment_id: string };
+  fake.objects.set(fakeS3AvatarPublicPath(presignBody.attachment_id), { contentType: "image/png", contentLength: 12345 });
+
+  const finalizeRes = await udStub(userId).fetch(
+    new Request("https://x/internal/attachment-finalize", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": `${key}-fin`, "Content-Type": "application/json" },
+      body: JSON.stringify({ attachment_id: presignBody.attachment_id }),
+    }),
+  );
+  expect(finalizeRes.status).toBe(200);
+  const finalizeBody = (await finalizeRes.json()) as { attachment: { attachment_id: string; url: string; kind: string } };
+  expect(finalizeBody.attachment.kind).toBe("avatar");
+  return { attachment_id: finalizeBody.attachment.attachment_id, url: finalizeBody.attachment.url };
+}
 
 async function makeChannel(channelId: string) {
   const stub = _g(env.CHAT_CHANNEL as unknown as Parameters<typeof _g>[0], channelId);
@@ -14,6 +53,12 @@ async function makeChannel(channelId: string) {
 }
 
 describe("ChatChannel /internal/update-channel", () => {
+  let fake: FakeS3;
+  beforeEach(() => {
+    fake = new FakeS3();
+    setTestS3Client(fake);
+  });
+
   it("updates title + topic and writes channel.updated + system.notice", async () => {
     const stub = await makeChannel("0193aaaa-0000-7000-8000-000000000001");
     const res = await stub.fetch(new Request("https://x/internal/update-channel", {
@@ -53,6 +98,81 @@ describe("ChatChannel /internal/update-channel", () => {
     await stub.fetch(new Request("https://x/internal/update-channel", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-up-4", channel_id: cid, title: "A" }) }));
     const r2 = await stub.fetch(new Request("https://x/internal/update-channel", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-up-4", channel_id: cid, title: "B" }) }));
     expect(r2.status).toBe(409);
+  });
+
+  it("updates avatar_url from a finalized avatar_attachment_id", async () => {
+    const cid = "0193eeee-0000-7000-8000-000000000001";
+    const ownerId = "u-up-owner";
+    const stub = await makeChannel(cid);
+    const { attachment_id: attachmentId, url: avatarUrl } = await presignAndFinalizeAvatar(ownerId, fake);
+
+    const res = await stub.fetch(new Request("https://x/internal/update-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-up-avatar", channel_id: cid, avatar_attachment_id: attachmentId }),
+    }));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { channel: { avatar_url: string | null } };
+    expect(body.channel.avatar_url).toBe(avatarUrl);
+
+    const summaryRes = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": ownerId } }));
+    expect(summaryRes.status).toBe(200);
+    expect(((await summaryRes.json()) as { avatar_url: string | null }).avatar_url).toBe(avatarUrl);
+  });
+
+  it("clears avatar_url when avatar_attachment_id is null", async () => {
+    const cid = "0193efef-0000-7000-8000-000000000001";
+    const ownerId = "u-up-owner";
+    const stub = await makeChannel(cid);
+    const { attachment_id: attachmentId } = await presignAndFinalizeAvatar(ownerId, fake);
+    await stub.fetch(new Request("https://x/internal/update-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-up-avatar-set", channel_id: cid, avatar_attachment_id: attachmentId }),
+    }));
+
+    const res = await stub.fetch(new Request("https://x/internal/update-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-up-avatar-clear", channel_id: cid, avatar_attachment_id: null }),
+    }));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { channel: { avatar_url: string | null } }).channel.avatar_url).toBeNull();
+  });
+
+  it("rejects message image attachment for channel avatar update", async () => {
+    const cid = "0193f0f0-0000-7000-8000-000000000001";
+    const ownerId = "u-up-owner";
+    const stub = await makeChannel(cid);
+    const key = `idem-msg-img-${ownerId}`;
+    const presignRes = await udStub(ownerId).fetch(
+      new Request("https://x/internal/attachment-presign", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": ownerId, "Idempotency-Key": key, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: "photo.png",
+          mime_type: "image/png",
+          size_bytes: 12345,
+        }),
+      }),
+    );
+    expect(presignRes.status).toBe(200);
+    const { attachment_id: attachmentId } = (await presignRes.json()) as { attachment_id: string };
+    fake.objects.set(fakeS3PublicPath(attachmentId, "photo.png"), { contentType: "image/png", contentLength: 12345 });
+    await udStub(ownerId).fetch(
+      new Request("https://x/internal/attachment-finalize", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": ownerId, "Idempotency-Key": `${key}-fin`, "Content-Type": "application/json" },
+        body: JSON.stringify({ attachment_id: attachmentId }),
+      }),
+    );
+
+    const res = await stub.fetch(new Request("https://x/internal/update-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-up-avatar-reject", channel_id: cid, avatar_attachment_id: attachmentId }),
+    }));
+    expect(res.status).toBe(415);
   });
 });
 

@@ -1,5 +1,5 @@
 import { SignJWT } from "jose";
-import { attachmentObjectKey } from "../src/s3/object-key";
+import { attachmentObjectKey, avatarObjectKey } from "../src/s3/object-key";
 import type { Env } from "../src/env";
 
 export const TEST_SECRET = "test-jwt-secret-do-not-use-in-prod";
@@ -9,6 +9,10 @@ export const TEST_S3_BUCKET = "s3.kuma.homes";
 /** FakeS3 map key for weed path after nginx bucket-prefix injection. */
 export function fakeS3PublicPath(attachmentId: string, filename = "img.png", mimeType = "image/png"): string {
   return `/${TEST_S3_BUCKET}/${attachmentObjectKey(attachmentId, filename, mimeType)}`;
+}
+
+export function fakeS3AvatarPublicPath(attachmentId: string, filename = "avatar.png", mimeType = "image/png"): string {
+  return `/${TEST_S3_BUCKET}/${avatarObjectKey(attachmentId, filename, mimeType)}`;
 }
 
 export function getNamedDo(binding: DurableObjectNamespace, name: string): DurableObjectStub {

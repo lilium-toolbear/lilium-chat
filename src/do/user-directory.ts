@@ -5,7 +5,7 @@ import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateUserDirectorySchema } from "./migrations/user-directory";
 import { projectAttachmentForBrowser, projectFinalizedAttachmentForBrowser, type AttachmentRow } from "../chat/attachment-projection";
 import { presignPutUrl, headObjectKey, deleteObject } from "../s3/presign";
-import { attachmentObjectKey, attachmentPublicUrl } from "../s3/object-key";
+import { attachmentObjectKey, attachmentPublicUrl, avatarObjectKey, avatarPublicUrl } from "../s3/object-key";
 import { HTTP_STATUS_BY_CODE } from "../errors";
 import { canonicalDmPairKey, isUuidString } from "../chat/dm-pair";
 import { resolveUserSummaries } from "../profile/resolve";
@@ -795,9 +795,11 @@ export class UserDirectory extends DurableObject<Env> {
       return new Response(result.responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
-    if (url.pathname === "/internal/attachment-presign") {
+    if (url.pathname === "/internal/attachment-presign" || url.pathname === "/internal/avatar-presign") {
       const userId = request.headers.get("X-Verified-User-Id");
       if (userId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
+      const uploadKind = url.pathname === "/internal/avatar-presign" ? "avatar" : "image";
+      const presignOperation = uploadKind === "avatar" ? "avatar.presign" : "attachment.presign";
       const body = (await request.json()) as {
         filename?: string;
         mime_type?: string;
@@ -838,7 +840,7 @@ export class UserDirectory extends DurableObject<Env> {
       const coord = (await this.ctx.storage.transaction(async () => {
         const row = this.ctx.storage.sql
           .exec(
-            "SELECT request_hash, status, channel_id, response_json FROM idempotency_keys WHERE operation='attachment.presign' AND operation_id=?",
+            `SELECT request_hash, status, channel_id, response_json FROM idempotency_keys WHERE operation='${presignOperation}' AND operation_id=?`,
             idempotencyKey,
           )
           .toArray()[0] as
@@ -857,15 +859,20 @@ export class UserDirectory extends DurableObject<Env> {
         }
 
         const attachmentId = uuidv7();
-        const storageKey = attachmentObjectKey(attachmentId, filename, mimeType);
-        const publicUrl = attachmentPublicUrl(this.env.S3_PUBLIC_BASE, attachmentId, filename, mimeType);
+        const storageKey = uploadKind === "avatar"
+          ? avatarObjectKey(attachmentId, filename, mimeType)
+          : attachmentObjectKey(attachmentId, filename, mimeType);
+        const publicUrl = uploadKind === "avatar"
+          ? avatarPublicUrl(this.env.S3_PUBLIC_BASE, attachmentId, filename, mimeType)
+          : attachmentPublicUrl(this.env.S3_PUBLIC_BASE, attachmentId, filename, mimeType);
         this.ctx.storage.sql.exec(
           `INSERT INTO pending_attachments
             (attachment_id, owner_user_id, kind, filename, mime_type, size_bytes,
              width, height, blurhash, storage_key, url, status, expires_at, created_at)
-           VALUES (?, ?, 'image', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
           attachmentId,
           userId,
+          uploadKind,
           filename,
           mimeType,
           sizeBytes,
@@ -878,7 +885,7 @@ export class UserDirectory extends DurableObject<Env> {
           now,
         );
         this.ctx.storage.sql.exec(
-          "INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('attachment.presign', ?, ?, 'pending', ?, NULL, ?, ?, ?)",
+          `INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('${presignOperation}', ?, ?, 'pending', ?, NULL, ?, ?, ?)`,
           idempotencyKey,
           requestHash,
           attachmentId,
@@ -929,7 +936,7 @@ export class UserDirectory extends DurableObject<Env> {
 
       await this.ctx.storage.transaction(async () => {
         this.ctx.storage.sql.exec(
-          "UPDATE idempotency_keys SET status='completed', response_json=?, updated_at=? WHERE operation='attachment.presign' AND operation_id=?",
+          `UPDATE idempotency_keys SET status='completed', response_json=?, updated_at=? WHERE operation='${presignOperation}' AND operation_id=?`,
           responseJson,
           now,
           idempotencyKey,

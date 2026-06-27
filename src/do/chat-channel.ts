@@ -762,6 +762,8 @@ export class ChatChannel extends DurableObject<Env> {
         );
       }
 
+      const actorMap = await this.resolveActorMap([userId]);
+
       // Cheap pre-check: if operation_id present and the same operation already completed with the
       // same request_hash, return the cached response WITHOUT opening a transaction.
       if (operationId) {
@@ -851,11 +853,40 @@ export class ChatChannel extends DurableObject<Env> {
         );
 
         const eventId = this.nextEventId(nowMs);
-        this.ctx.storage.sql.exec(
-          "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, 'member.joined', ?, 'system', 'system', ?, ?, ?)",
-          eventId, channelId,
-          JSON.stringify({ channel_id: channelId, user_id: userId, membership_version: membershipVersion }),
-          membershipVersion, now,
+        this.persistEventAndFanout(
+          eventId,
+          "member.joined",
+          channelId,
+          now,
+          buildMemberJoinedPayload({
+            channel_id: channelId,
+            user_id: userId,
+            role: "member",
+            membership_version: membershipVersion,
+            actor_kind: "user",
+            actor_id: userId,
+          }),
+          membershipVersion,
+          now,
+          actorMap,
+        );
+        const noticeId = this.nextEventId(nowMs);
+        this.persistEventAndFanout(
+          noticeId,
+          "system.notice",
+          channelId,
+          now,
+          buildSystemNoticePayload({
+            notice_kind: "member.joined",
+            actor_kind: "user",
+            actor_id: userId,
+            target_user_id: userId,
+            message_id: null,
+            channel_changes: null,
+          }),
+          membershipVersion,
+          now,
+          actorMap,
         );
 
         await this.insertOutboxRow(
@@ -1315,6 +1346,12 @@ export class ChatChannel extends DurableObject<Env> {
           if (!row || row.status !== "finalized" || row.owner_user_id !== userId) {
             return Response.json(
               { error: { code: "UNSUPPORTED_ATTACHMENT_TYPE", message: "attachment not available", retryable: false } },
+              { status: 415 },
+            );
+          }
+          if (row.kind !== "image") {
+            return Response.json(
+              { error: { code: "UNSUPPORTED_ATTACHMENT_TYPE", message: "only message image attachments can be sent in chat", retryable: false } },
               { status: 415 },
             );
           }
@@ -2850,6 +2887,41 @@ export class ChatChannel extends DurableObject<Env> {
       const now = this.nowIso();
       const nowMs = Date.parse(now);
 
+      let pendingAvatarUrl: string | null | undefined;
+      if (b.avatar_attachment_id !== undefined) {
+        if (b.avatar_attachment_id === null) {
+          pendingAvatarUrl = null;
+        } else {
+          const userDir = this.env.USER_DIRECTORY.getByName(userId);
+          const attachmentRes = await userDir.fetch(
+            new Request(`https://x/internal/attachment-get?attachment_id=${encodeURIComponent(b.avatar_attachment_id)}`, {
+              headers: { "X-Verified-User-Id": userId },
+            }),
+          );
+          if (!attachmentRes.ok) {
+            return Response.json(
+              { error: { code: "UNSUPPORTED_ATTACHMENT_TYPE", message: "attachment not finalized", retryable: false } },
+              { status: 415 },
+            );
+          }
+          const attachmentBody = (await attachmentRes.json()) as { attachment: ChatAttachmentRow };
+          const attachmentRow = attachmentBody.attachment;
+          if (!attachmentRow || attachmentRow.status !== "finalized" || attachmentRow.owner_user_id !== userId) {
+            return Response.json(
+              { error: { code: "UNSUPPORTED_ATTACHMENT_TYPE", message: "attachment not available", retryable: false } },
+              { status: 415 },
+            );
+          }
+          if (attachmentRow.kind !== "avatar") {
+            return Response.json(
+              { error: { code: "UNSUPPORTED_ATTACHMENT_TYPE", message: "channel avatar must use the avatar upload namespace", retryable: false } },
+              { status: 415 },
+            );
+          }
+          pendingAvatarUrl = attachmentRow.url;
+        }
+      }
+
       // Presence-aware canonical request body: omitted field vs explicit null are DISTINCT.
       // `title:"x"` (only title set) must hash differently from `title:"x", topic:null`,
       // otherwise a second request that explicitly nulls `topic` would collide with an omit-topic
@@ -2878,8 +2950,8 @@ export class ChatChannel extends DurableObject<Env> {
         }
 
         const meta = this.ctx.storage.sql
-          .exec("SELECT kind, visibility, title, topic, avatar_url, status, created_at, member_count, membership_version FROM channel_meta WHERE channel_id=?", channelId)
-          .toArray()[0] as { kind: string; visibility: string; title: string; topic: string | null; avatar_url: string | null; status: string; created_at: string; member_count: number; membership_version: number } | undefined;
+          .exec("SELECT kind, visibility, title, topic, avatar_url, status, created_at, updated_at, member_count, membership_version FROM channel_meta WHERE channel_id=?", channelId)
+          .toArray()[0] as { kind: string; visibility: string; title: string; topic: string | null; avatar_url: string | null; status: string; created_at: string; updated_at: string; member_count: number; membership_version: number } | undefined;
         if (meta === undefined) {
           // channel gone → 404 CHANNEL_NOT_FOUND (NOT a conflict).
           return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
@@ -2896,43 +2968,62 @@ export class ChatChannel extends DurableObject<Env> {
         const newTitle = b.title !== undefined ? b.title : meta.title;
         const newTopic = b.topic !== undefined ? b.topic : meta.topic;
         const newVisibility = b.visibility !== undefined ? b.visibility : meta.visibility;
-        const newAvatarUrl = meta.avatar_url; // avatar_attachment_id processed in Phase 5
+        const newAvatarUrl = pendingAvatarUrl !== undefined ? pendingAvatarUrl : meta.avatar_url;
         if (b.title !== undefined && b.title !== meta.title) changes.title = { before: meta.title, after: b.title };
         if (b.topic !== undefined && b.topic !== meta.topic) changes.topic = { before: meta.topic, after: b.topic };
+        if (pendingAvatarUrl !== undefined && pendingAvatarUrl !== meta.avatar_url) {
+          changes.avatar_url = { before: meta.avatar_url, after: pendingAvatarUrl };
+        }
         if (b.visibility !== undefined && b.visibility !== meta.visibility) {
           if (!["private", "public_unlisted", "public_listed"].includes(b.visibility)) return { kind: "cached", responseJson: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "invalid visibility", retryable: false } }) };
           changes.visibility = { before: meta.visibility, after: b.visibility };
         }
 
-        this.ctx.storage.sql.exec(
-          "UPDATE channel_meta SET title=?, topic=?, visibility=?, avatar_url=?, updated_at=? WHERE channel_id=?",
-          newTitle, newTopic, newVisibility, newAvatarUrl, now, channelId,
-        );
+        const channel = {
+          channel_id: channelId,
+          kind: meta.kind,
+          visibility: newVisibility,
+          title: newTitle,
+          topic: newTopic,
+          avatar_url: newAvatarUrl,
+          member_count: meta.member_count,
+          status: meta.status,
+          created_at: meta.created_at,
+          updated_at: Object.keys(changes).length > 0 ? now : meta.updated_at,
+        };
 
-        const mv = meta.membership_version;
-        const updatedId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(updatedId, "channel.updated", channelId, now,
-          buildChannelUpdatedPayload({ channel_id: channelId, channel_changes: changes, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
-        const noticeId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(noticeId, "system.notice", channelId, now,
-          buildSystemNoticePayload({ notice_kind: "channel.updated", actor_kind: "user", actor_id: userId, target_user_id: null, message_id: null, channel_changes: changes }), mv, now, actorMap);
+        if (Object.keys(changes).length > 0) {
+          this.ctx.storage.sql.exec(
+            "UPDATE channel_meta SET title=?, topic=?, visibility=?, avatar_url=?, updated_at=? WHERE channel_id=?",
+            newTitle, newTopic, newVisibility, newAvatarUrl, now, channelId,
+          );
 
-        const channel = { channel_id: channelId, kind: meta.kind, visibility: newVisibility, title: newTitle, topic: newTopic, avatar_url: newAvatarUrl, member_count: meta.member_count, status: meta.status, created_at: meta.created_at, updated_at: now };
+          const mv = meta.membership_version;
+          const updatedId = this.nextEventId(nowMs);
+          this.persistEventAndFanout(updatedId, "channel.updated", channelId, now,
+            buildChannelUpdatedPayload({ channel_id: channelId, channel_changes: changes, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
+          const noticeId = this.nextEventId(nowMs);
+          this.persistEventAndFanout(noticeId, "system.notice", channelId, now,
+            buildSystemNoticePayload({ notice_kind: "channel.updated", actor_kind: "user", actor_id: userId, target_user_id: null, message_id: null, channel_changes: changes }), mv, now, actorMap);
+        }
+
         const responseJson = JSON.stringify({ channel });
         this.ctx.storage.sql.exec(
           "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.update', ?, ?, ?, 'completed', ?, ?)",
           userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt,
         );
         // channel_directory projection: visibility transitions + public title/topic/avatar updates.
-        if (meta.visibility === "public_listed" && newVisibility !== "public_listed") {
-          // public → private/public_unlisted: remove from directory
-          this.insertOutboxRowForChannelDirectory(channelId, "delete", null, now);
-        } else if (meta.visibility !== "public_listed" && newVisibility === "public_listed") {
-          // non-public → public_listed: add to directory with current full snapshot
-          this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
-        } else if (meta.visibility === "public_listed" && newVisibility === "public_listed") {
-          // public → public: re-project (title/topic/avatar changed)
-          this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
+        if (Object.keys(changes).length > 0) {
+          if (meta.visibility === "public_listed" && newVisibility !== "public_listed") {
+            // public → private/public_unlisted: remove from directory
+            this.insertOutboxRowForChannelDirectory(channelId, "delete", null, now);
+          } else if (meta.visibility !== "public_listed" && newVisibility === "public_listed") {
+            // non-public → public_listed: add to directory with current full snapshot
+            this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
+          } else if (meta.visibility === "public_listed" && newVisibility === "public_listed") {
+            // public → public: re-project (title/topic/avatar changed)
+            this.insertOutboxRowForChannelDirectory(channelId, "upsert", this.readChannelDirectorySnapshot(channelId, now), now);
+          }
         }
         // both non-public → no outbox write
         return { kind: "ok", channel };

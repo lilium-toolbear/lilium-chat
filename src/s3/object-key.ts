@@ -2,6 +2,7 @@ import { s3PublicObjectUrl } from "./url";
 
 /** Object key prefix inside the s3.kuma.homes bucket. */
 export const ATTACHMENT_NAMESPACE = "chat/attachments";
+export const AVATAR_NAMESPACE = "chat/avatars";
 
 const EXT_BY_MIME: Record<string, string> = {
   "image/png": "png",
@@ -25,9 +26,17 @@ export function attachmentFileExtension(filename: string, mimeType: string): str
   return EXT_BY_MIME[mimeType] ?? "bin";
 }
 
-export function attachmentObjectKey(attachmentId: string, filename: string, mimeType: string): string {
+function namespacedObjectKey(namespace: string, attachmentId: string, filename: string, mimeType: string): string {
   const ext = attachmentFileExtension(filename, mimeType);
-  return `${ATTACHMENT_NAMESPACE}/${attachmentId}.${ext}`;
+  return `${namespace}/${attachmentId}.${ext}`;
+}
+
+export function attachmentObjectKey(attachmentId: string, filename: string, mimeType: string): string {
+  return namespacedObjectKey(ATTACHMENT_NAMESPACE, attachmentId, filename, mimeType);
+}
+
+export function avatarObjectKey(attachmentId: string, filename: string, mimeType: string): string {
+  return namespacedObjectKey(AVATAR_NAMESPACE, attachmentId, filename, mimeType);
 }
 
 export function attachmentPublicUrl(
@@ -37,4 +46,13 @@ export function attachmentPublicUrl(
   mimeType: string,
 ): string {
   return s3PublicObjectUrl(publicBase, attachmentObjectKey(attachmentId, filename, mimeType));
+}
+
+export function avatarPublicUrl(
+  publicBase: string,
+  attachmentId: string,
+  filename: string,
+  mimeType: string,
+): string {
+  return s3PublicObjectUrl(publicBase, avatarObjectKey(attachmentId, filename, mimeType));
 }

@@ -50,6 +50,24 @@ function uniqId(label: string): string {
   return `0199cf00-0000-7000-8000-${label.padStart(12, "0")}`;
 }
 
+async function countSystemNoticeEvents(channelId: string, noticeKind: string): Promise<number> {
+  let n = 0;
+  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
+  await runInDurableObject(stub, async (instance: unknown) => {
+    const row = (instance as {
+      ctx: { storage: { sql: { exec: (q: string, ...p: unknown[]) => { toArray: () => Array<{ c: number | bigint }> } } } };
+    }).ctx.storage.sql
+      .exec(
+        "SELECT COUNT(*) AS c FROM events WHERE channel_id=? AND event_type='system.notice' AND payload_json LIKE ?",
+        channelId,
+        `%"notice_kind":"${noticeKind}"%`,
+      )
+      .toArray()[0];
+    n = Number(row?.c ?? 0);
+  });
+  return n;
+}
+
 async function createChannel(opts: { channelId: string; ownerId: string; visibility: string; title?: string; kind?: string }) {
   const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], opts.channelId);
   const res = await stub.fetch(new Request("https://x/internal/create-channel", {
@@ -91,6 +109,8 @@ describe("ChatChannel /internal/join", () => {
     expect(m!.role).toBe("member");
     const evCount = await countMemberJoinedEvents(channelId, "u-b1-joiner-1");
     expect(evCount).toBe(1);
+    const noticeCount = await countSystemNoticeEvents(channelId, "member.joined");
+    expect(noticeCount).toBe(1);
     // idempotency row written (principal-scoped on the joiner)
     const idem = await getIdemRows(channelId, "u-b1-joiner-1", "op-join-1");
     expect(idem.length).toBe(1);

@@ -2,9 +2,13 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
-import { uuidv7 } from "../ids/uuidv7";
 
-export async function presignUploadHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+type UploadNamespace = "attachment" | "avatar";
+
+async function presignUpload(
+  c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
+  namespace: UploadNamespace,
+): Promise<Response> {
   const auth = c.req.header("Authorization") ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (!token) throw new ApiError("UNAUTHORIZED", "Not authenticated");
@@ -25,9 +29,10 @@ export async function presignUploadHandler(c: Context<{ Bindings: Env; Variables
     throw new ApiError("INVALID_MESSAGE", "filename, mime_type and size_bytes are required");
   }
 
+  const internalPath = namespace === "avatar" ? "/internal/avatar-presign" : "/internal/attachment-presign";
   const stub = c.env.USER_DIRECTORY.getByName(userId);
   const res = await stub.fetch(
-    new Request("https://x/internal/attachment-presign", {
+    new Request(`https://x${internalPath}`, {
       method: "POST",
       headers: { "X-Verified-User-Id": userId, "Idempotency-Key": idempotencyKey, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -55,7 +60,9 @@ export async function presignUploadHandler(c: Context<{ Bindings: Env; Variables
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
-export async function finalizeUploadHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+async function finalizeUpload(
+  c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
+): Promise<Response> {
   const auth = c.req.header("Authorization") ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (!token) throw new ApiError("UNAUTHORIZED", "Not authenticated");
@@ -89,4 +96,20 @@ export async function finalizeUploadHandler(c: Context<{ Bindings: Env; Variable
 
   const out = await res.json() as Record<string, unknown>;
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
+}
+
+export async function presignUploadHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  return presignUpload(c, "attachment");
+}
+
+export async function finalizeUploadHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  return finalizeUpload(c);
+}
+
+export async function presignAvatarUploadHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  return presignUpload(c, "avatar");
+}
+
+export async function finalizeAvatarUploadHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
+  return finalizeUpload(c);
 }

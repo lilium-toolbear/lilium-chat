@@ -237,4 +237,22 @@ describe("UserDirectory attachment presign + finalize", () => {
     });
     expect(gone).toBe(true);
   });
+
+  it("presign creates a pending avatar upload under chat/avatars", async () => {
+    const stub = udStub("u-avatar-1");
+    const res = await stub.fetch(
+      new Request("https://x/internal/avatar-presign", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": "u-avatar-1", "Idempotency-Key": "idem-avatar-1", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: "avatar.png",
+          mime_type: "image/png",
+          size_bytes: 12345,
+        }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { attachment_id: string; upload_url: string };
+    expect(body.upload_url).toContain(`chat/avatars/${body.attachment_id}.png`);
+  });
 });
