@@ -138,6 +138,15 @@ export async function listChannelCommandsHandler(
   if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
   const prefix = c.req.query("prefix") ?? "";
   const stub = env.CHAT_CHANNEL.getByName(channelId);
+  const summaryRes = await stub.fetch(new Request("https://x/internal/summary", {
+    headers: { "X-Verified-User-Id": userId },
+  }));
+  if (summaryRes.ok) {
+    const summary = await summaryRes.json() as { kind?: string };
+    if (summary.kind === "dm") {
+      return c.json({ items: [] }, 200, { "X-Request-Id": c.get("requestId") });
+    }
+  }
   const res = await stub.fetch(
     new Request(
       `https://x/internal/channel-commands?channel_id=${encodeURIComponent(channelId)}&user_id=${encodeURIComponent(userId)}&prefix=${encodeURIComponent(prefix)}`,
