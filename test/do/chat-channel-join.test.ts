@@ -166,7 +166,7 @@ describe("ChatChannel /internal/join", () => {
     expect(e.error.code).toBe("CHANNEL_DISSOLVED");
   });
 
-  it("join kind='dm' channel → 403 FORBIDDEN", async () => {
+  it("join kind='dm' channel → 409 UNSUPPORTED_CHANNEL_KIND", async () => {
     // Create a DM-kind channel by directly inserting channel_meta via runInDurableObject.
     const channelId = uniqId("b10701");
     const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
@@ -185,9 +185,9 @@ describe("ChatChannel /internal/join", () => {
       );
     });
     const res = await join(stub, "u-b1-stranger-7", "op-dm-7");
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(409);
     const e = (await res.json()) as { error: { code: string } };
-    expect(e.error.code).toBe("FORBIDDEN");
+    expect(e.error.code).toBe("UNSUPPORTED_CHANNEL_KIND");
   });
 
   it("already-active-member join → 200, returns existing joined_at/membership_version/existing role (NOT reset), no duplicate event, no count bump, idempotency row IS written", async () => {
