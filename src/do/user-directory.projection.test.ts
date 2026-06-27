@@ -37,6 +37,15 @@ describe("UserDirectory projection", () => {
     expect(body.items.find((r) => r.channel_id === "ch-p-2")).toBeUndefined();
   });
 
+  it("dissolve marks status=dissolved and keeps channel in my_channels", async () => {
+    await upsert({ action: "join", channel_id: "ch-p-dissolve", kind: "channel", membership_version: 1 });
+    await upsert({ action: "dissolve", channel_id: "ch-p-dissolve", kind: "channel", membership_version: 2 });
+    const stub = getNamedDo(userDirectory, userId);
+    const res = await stub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
+    const body = await res.json() as { items: Array<{ channel_id: string }> };
+    expect(body.items.find((r) => r.channel_id === "ch-p-dissolve")).toBeDefined();
+  });
+
   it("re-applying same membership_version is idempotent (no duplicate, no error)", async () => {
     await upsert({ action: "join", channel_id: "ch-p-3", kind: "channel", membership_version: 5 });
     await upsert({ action: "join", channel_id: "ch-p-3", kind: "channel", membership_version: 5 });

@@ -102,7 +102,7 @@ export class UserDirectory extends DurableObject<Env> {
       }
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       const rows = this.ctx.storage.sql
-        .exec("SELECT channel_id, kind, last_read_event_id, membership_version FROM my_channels WHERE user_id = ? AND status = 'active'", userId)
+        .exec("SELECT channel_id, kind, last_read_event_id, membership_version FROM my_channels WHERE user_id = ? AND status IN ('active', 'dissolved')", userId)
         .toArray() as {
           channel_id: string;
           kind: string;
@@ -118,7 +118,7 @@ export class UserDirectory extends DurableObject<Env> {
       const now = new Date().toISOString();
 
       const body = (await request.json()) as {
-        action: "join" | "leave";
+        action: "join" | "leave" | "dissolve";
         channel_id: string;
         kind: string;
         membership_version: number;
@@ -127,7 +127,7 @@ export class UserDirectory extends DurableObject<Env> {
       if (!body.channel_id || !body.kind) {
         return Response.json({ error: "invalid payload" }, { status: 400 });
       }
-      if (body.action !== "join" && body.action !== "leave") {
+      if (body.action !== "join" && body.action !== "leave" && body.action !== "dissolve") {
         return Response.json({ error: "unsupported action" }, { status: 400 });
       }
 
@@ -163,6 +163,29 @@ export class UserDirectory extends DurableObject<Env> {
             "UPDATE my_channels SET status='active', left_at=NULL, removed_at=NULL, membership_version=?, joined_at=COALESCE(joined_at, ?), kind=? WHERE user_id=? AND channel_id=?",
             body.membership_version,
             now,
+            body.kind,
+            userId,
+            body.channel_id,
+          );
+          return Response.json({ ok: true });
+        }
+
+        if (body.action === "dissolve") {
+          if (existing === undefined) {
+            this.ctx.storage.sql.exec(
+              "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, left_at, removed_at, status, membership_version, last_read_event_id) VALUES (?, ?, ?, ?, NULL, NULL, 'dissolved', ?, NULL)",
+              userId,
+              body.channel_id,
+              body.kind,
+              now,
+              body.membership_version,
+            );
+            return Response.json({ ok: true });
+          }
+
+          this.ctx.storage.sql.exec(
+            "UPDATE my_channels SET status='dissolved', left_at=NULL, removed_at=NULL, membership_version=?, kind=? WHERE user_id=? AND channel_id=?",
+            body.membership_version,
             body.kind,
             userId,
             body.channel_id,
@@ -404,7 +427,7 @@ export class UserDirectory extends DurableObject<Env> {
         const row = this.ctx.storage.sql
           .exec("SELECT last_read_event_id, status FROM my_channels WHERE user_id=? AND channel_id=?", userId, b.channel_id)
           .toArray()[0] as { last_read_event_id: string | null; status: string } | undefined;
-        if (!row || row.status !== "active") return { forbidden: true };
+        if (!row || (row.status !== "active" && row.status !== "dissolved")) return { forbidden: true };
 
         const current = row.last_read_event_id;
         if (current === null || b.last_read_event_id > current) {

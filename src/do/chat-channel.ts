@@ -98,7 +98,9 @@ export class ChatChannel extends DurableObject<Env> {
   }
 
   private liveMembershipReason(action: string | undefined): string {
-    return action === "leave" ? "channel_left" : "channel_joined";
+    if (action === "leave") return "channel_left";
+    if (action === "dissolve") return "channel_dissolved";
+    return "channel_joined";
   }
 
   private async notifyLiveMembershipChanged(
@@ -2398,7 +2400,7 @@ export class ChatChannel extends DurableObject<Env> {
             "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
             `user_directory:dissolve:${channelId}:${member.user_id}:${now}`,
             member.user_id,
-            JSON.stringify({ action: "leave", channel_id: channelId, kind: mvRow?.kind ?? "channel", membership_version: mv }),
+            JSON.stringify({ action: "dissolve", channel_id: channelId, kind: mvRow?.kind ?? "channel", membership_version: mv }),
             now,
             now,
             now,
@@ -3082,12 +3084,18 @@ export class ChatChannel extends DurableObject<Env> {
 
         const meta = this.ctx.storage.sql.exec("SELECT status, visibility, membership_version, kind, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; visibility: string; membership_version: number; kind: string; created_by: string } | undefined;
         if (!meta) return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
-        if (meta.status === "dissolved") return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
         const callerRole = this.activeRole(channelId, userId);
         const isSelf = b.user_id === userId;
-        if (!isSelf && callerRole !== "owner") return { kind: "cached", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner may remove others", retryable: false } }) };
-        // Owner invariant (P1-6): the owner cannot self-leave (no owner-transfer in Phase 3; dissolve is the owner exit).
-        if (isSelf && b.user_id === meta.created_by) return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "owner cannot leave; dissolve the channel or transfer ownership in a future phase", retryable: false } }) };
+        if (meta.status === "dissolved") {
+          if (!isSelf) {
+            return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
+          }
+        } else if (!isSelf && callerRole !== "owner") {
+          return { kind: "cached", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner may remove others", retryable: false } }) };
+        } else if (isSelf && b.user_id === meta.created_by) {
+          // Owner invariant (P1-6): active channels require dissolve/transfer before owner self-leave.
+          return { kind: "cached", j: JSON.stringify({ error: { code: "INVALID_MESSAGE", message: "owner cannot leave; dissolve the channel or transfer ownership in a future phase", retryable: false } }) };
+        }
         const target = this.ctx.storage.sql.exec("SELECT role FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", channelId, b.user_id).toArray()[0] as { role: string } | undefined;
         if (!target) return { kind: "cached", j: JSON.stringify({ error: { code: "MEMBER_NOT_FOUND", message: "target not an active member", retryable: false } }) };
 

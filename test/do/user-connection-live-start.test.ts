@@ -300,7 +300,7 @@ describe("UserConnection session.live_start", () => {
     }));
   });
 
-  it("closes affected member leases after channel dissolve", async () => {
+  it("keeps live leases after channel dissolve while my_channels retains the tombstone", async () => {
     const channelId = crypto.randomUUID();
     const ownerId = "u-live-dis-owner";
     const memberId = "u-live-dis-member";
@@ -348,21 +348,14 @@ describe("UserConnection session.live_start", () => {
           .toArray()[0] as { status: string } | undefined;
         status = row?.status ?? "";
       });
-      if (status === "closed") break;
+      if (status === "active") break;
     }
-    expect(status).toBe("closed");
+    expect(status).toBe("active");
 
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
-    let remainingLeaseCount = 0;
-    for (let i = 0; i < 5; i++) {
-      const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-        headers: { "X-Channel-Id": channelId },
-      }))).json()) as { leases: Array<{ user_id: string }> };
-      remainingLeaseCount = dump.leases.filter((l) => l.user_id === memberId).length;
-      if (remainingLeaseCount === 0) break;
-      await runDurableObjectAlarm(fanout);
-    }
-    expect(remainingLeaseCount).toBe(0);
+    const dir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], memberId);
+    const myRes = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": memberId } }));
+    const myBody = await myRes.json() as { items: Array<{ channel_id: string }> };
+    expect(myBody.items.some((row) => row.channel_id === channelId)).toBe(true);
 
     ws.close();
   });

@@ -103,6 +103,77 @@ describe("ChatChannel /internal/dissolve", () => {
     expect(send.status).toBe(409);
     expect(((await send.json()) as { error: { code: string } }).error.code).toBe("CHANNEL_DISSOLVED");
   });
+
+  it("dissolve keeps members in my_channels with dissolved tombstone and preserves history reads", async () => {
+    const cid = "0194eeee-0000-7000-8000-000000000001";
+    const memberId = "u-dis-member-keep";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-dis-add", channel_id: cid, user_id: memberId, role: "member" }),
+    }));
+    await stub.fetch(new Request("https://x/internal/message-send", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" },
+      body: JSON.stringify({ command_id: "cm-dis-history", dedupe_principal_key: "user:u-up-owner", type: "text", text: "before dissolve", reply_to: null, mentions: [], channel_id: cid }),
+    }));
+    await stub.fetch(new Request("https://x/internal/dissolve", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-dis-keep", channel_id: cid }),
+    }));
+
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(stub, async (instance) => { await (instance as { alarm: () => Promise<void> }).alarm(); });
+
+    const dir = _g(env.USER_DIRECTORY as unknown as Parameters<typeof _g>[0], memberId);
+    const myRes = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": memberId } }));
+    const myBody = await myRes.json() as { items: Array<{ channel_id: string }> };
+    expect(myBody.items.some((row) => row.channel_id === cid)).toBe(true);
+
+    const summaryRes = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": memberId } }));
+    expect(summaryRes.status).toBe(200);
+    expect(((await summaryRes.json()) as { status: string }).status).toBe("dissolved");
+
+    const messagesRes = await stub.fetch(new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": memberId } }));
+    expect(messagesRes.status).toBe(200);
+    const messagesBody = await messagesRes.json() as { items: Array<{ text: string | null }> };
+    expect(messagesBody.items.some((item) => item.text === "before dissolve")).toBe(true);
+  });
+
+  it("dissolved channel allows self-leave and removes member from my_channels", async () => {
+    const cid = "0194ffff-0000-7000-8000-000000000001";
+    const memberId = "u-dis-leave-member";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-dis-leave-add", channel_id: cid, user_id: memberId, role: "member" }),
+    }));
+    await stub.fetch(new Request("https://x/internal/dissolve", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-dis-leave", channel_id: cid }),
+    }));
+
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(stub, async (instance) => { await (instance as { alarm: () => Promise<void> }).alarm(); });
+
+    const leaveRes = await stub.fetch(new Request("https://x/internal/members-remove", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-dis-leave-member", channel_id: cid, user_id: memberId }),
+    }));
+    expect(leaveRes.status).toBe(200);
+
+    await runInDurableObject(stub, async (instance) => { await (instance as { alarm: () => Promise<void> }).alarm(); });
+
+    const dir = _g(env.USER_DIRECTORY as unknown as Parameters<typeof _g>[0], memberId);
+    const myRes = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": memberId } }));
+    const myBody = await myRes.json() as { items: Array<{ channel_id: string }> };
+    expect(myBody.items.some((row) => row.channel_id === cid)).toBe(false);
+  });
 });
 
 describe("ChatChannel members CRUD", () => {
