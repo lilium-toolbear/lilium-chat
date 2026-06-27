@@ -1,3 +1,6 @@
+/** Default max delivery attempts for projection_outbox and fanout_queue rows. */
+export const OUTBOX_MAX_ATTEMPTS = 5;
+
 export interface UserDirectoryJoinOutboxPayload {
   action: "join";
   channel_id: string;

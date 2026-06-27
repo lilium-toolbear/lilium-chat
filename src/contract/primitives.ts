@@ -10,6 +10,10 @@ export interface UserSummary {
   avatar_url: string | null;
 }
 
+export function fallbackUserDisplayName(userId: string): string {
+  return `user-${userId.slice(0, 8)}`;
+}
+
 export type ChannelKind = "channel" | "dm";
 export type ChannelVisibility = "private" | "public_unlisted" | "public_listed";
 export type ChannelRole = "owner" | "admin" | "member";

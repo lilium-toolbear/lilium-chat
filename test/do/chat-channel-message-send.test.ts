@@ -1,7 +1,28 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 
-import { getNamedDo, setupOwnedChannelForUser } from "../helpers";
+import { setupOwnedChannelForUser } from "../helpers";
+
+const { runInDurableObject } = await import("cloudflare:test") as {
+  runInDurableObject: (stub: unknown, cb: (instance: unknown) => Promise<void>) => Promise<void>;
+};
+
+type OutboxRow = {
+  target_kind: string;
+  status: string;
+};
+
+async function listProjectionOutbox(stub: DurableObjectStub): Promise<OutboxRow[]> {
+  let out: OutboxRow[] = [];
+  await runInDurableObject(stub, async (instance: unknown) => {
+    out = (instance as {
+      ctx: { storage: { sql: { exec: (q: string) => { toArray: () => OutboxRow[] } } } };
+    }).ctx.storage.sql
+      .exec("SELECT target_kind, status FROM projection_outbox ORDER BY created_at ASC")
+      .toArray();
+  });
+  return out;
+}
 
 async function setupChannelAndJoin(userId: string): Promise<{ stub: DurableObjectStub; channelId: string }> {
   return setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
@@ -33,6 +54,10 @@ describe("ChatChannel /internal/message-send", () => {
     expect(out.message.command_id).toBe("cm-1");
     expect(out.message.sender).toBeDefined();
     expect(out.message.sender).toHaveProperty("user");
+
+    const outbox = await listProjectionOutbox(stub);
+    expect(outbox.some((r) => r.target_kind === "channel_fanout" && r.status === "pending")).toBe(true);
+    expect(outbox.some((r) => r.target_kind === "channel_directory" && r.status === "pending")).toBe(true);
   });
 
   it("rejects a non-member with FORBIDDEN", async () => {

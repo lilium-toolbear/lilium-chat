@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import { createTestDmChannel, makeJwt, TEST_SECRET } from "../helpers";
 
@@ -31,9 +31,9 @@ async function api(token: string, method: string, path: string, body?: unknown, 
 describe("DM forbidden HTTP mutations", () => {
   let channelId = "";
 
-  it("seeds a dm channel", async () => {
-    const { channelId: id } = await createTestDmChannel(env, USER_A, USER_B, USER_A);
-    channelId = id;
+  beforeAll(async () => {
+    const result = await createTestDmChannel(env, USER_A, USER_B, USER_A);
+    channelId = result.channelId;
     expect(channelId).toBeTruthy();
   });
 

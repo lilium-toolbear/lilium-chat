@@ -1,13 +1,14 @@
 import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
-import { verifyBrowserJwt } from "../auth/jwt";
 import { resolveUserSummaries, type UserSummary } from "../profile/resolve";
 import { projectMessagesForBrowser } from "../chat/sender";
-import { inflateChannelSummaryForViewer } from "../chat/channel-summary";
+import { inflateMyChannelSummaries } from "../chat/channel-list";
+import { fallbackUserDisplayName } from "../contract/primitives";
 import type { MessageStickerSnapshot } from "../chat/message-projection";
-import type { MessageRow } from "../do/chat-channel";
+import type { MessageRow } from "../contract/persisted";
 import type { AttachmentRow } from "../chat/attachment-projection";
+import { getIdentity } from "./auth";
 interface MyChannel {
   channel_id: string;
   kind: string;
@@ -52,41 +53,23 @@ interface ChannelSummary {
 }
 
 function fallbackMe(user_id: string): UserSummary {
-  return { user_id, display_name: `user-${user_id.slice(0, 8)}`, avatar_url: null };
+  return { user_id, display_name: fallbackUserDisplayName(user_id), avatar_url: null };
 }
 
 export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
-  const auth = c.req.header("Authorization") ?? "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!token) throw new ApiError("UNAUTHORIZED", "Not authenticated");
-  const { user_id } = await verifyBrowserJwt(token, c.env.JWT_SECRET);
+  const { userId: user_id, env } = await getIdentity(c);
 
-  const dirStub = c.env.USER_DIRECTORY.getByName(user_id);
+  const dirStub = env.USER_DIRECTORY.getByName(user_id);
   const dirRes = await dirStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": user_id } }));
   const myChannels = dirRes.ok
     ? ((await dirRes.json()) as { items: MyChannel[] }).items
     : [];
 
-  const channelSummaries = await Promise.all(
-    myChannels.map(async (mc) => {
-      const stub = c.env.CHAT_CHANNEL.getByName(mc.channel_id);
-      const summaryRes = await stub.fetch(new Request("https://x/internal/summary", {
-        headers: { "X-Verified-User-Id": user_id },
-      }));
-      if (!summaryRes.ok) return null;
-      const summary = (await summaryRes.json()) as Parameters<typeof inflateChannelSummaryForViewer>[0]["summary"];
-
-      const inflated = await inflateChannelSummaryForViewer({
-        summary,
-        viewerUserId: user_id,
-        myChannelRow: { last_read_event_id: mc.last_read_event_id },
-        env: c.env,
-      });
-      return inflated as unknown as ChannelSummary;
-    }),
-  );
-
-  const channels = channelSummaries.filter((it): it is ChannelSummary => it !== null);
+  const channels = await inflateMyChannelSummaries({
+    env,
+    viewerUserId: user_id,
+    myChannels,
+  }) as unknown as ChannelSummary[];
   const requestedChannelId = new URL(c.req.url).searchParams.get("channel_id");
   const activeChannel = requestedChannelId
     ? channels.find((ch) => ch.channel_id === requestedChannelId)

@@ -55,7 +55,7 @@ describe("e2e: message.send → committed_ack → message.created self-receive",
     const fanoutStub = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
     let registered = false;
     for (let i = 0; i < 40; i++) {
-      const dumpResponse = await fanoutStub.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": channelId } }));
+      const dumpResponse = await fanoutStub.fetch(new Request("https://x/dump", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }));
       const dump = (await dumpResponse.json()) as FanoutDump;
       if (dump.leases.some((s) => s.user_id === userId)) {
         registered = true;

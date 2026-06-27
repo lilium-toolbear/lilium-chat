@@ -1,6 +1,6 @@
-import type { MessageRow } from "../do/chat-channel";
+import type { MessageRow } from "../contract/persisted";
 import type { Mention, MessageImageAttachment, WireChatMessage } from "../contract/message";
-import type { UserSummary } from "../contract/primitives";
+import { fallbackUserDisplayName, type UserSummary } from "../contract/primitives";
 
 export interface MessageMention {
   user_id: string;
@@ -44,7 +44,7 @@ export function projectMessageForBrowser(
   if (row.sender_kind === "user" && row.sender_user_id) {
     const u = opts.senderSummary ?? {
       user_id: row.sender_user_id,
-      display_name: `user-${row.sender_user_id.slice(0, 8)}`,
+      display_name: fallbackUserDisplayName(row.sender_user_id),
       avatar_url: null,
     };
     sender = { kind: "user", user: u };

@@ -12,7 +12,7 @@ describe("UserConnection thin WS connect", () => {
     const { stub } = await upgradeUserConnection(userId);
 
     const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Channel-Id": channelId },
+      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
     }))).json()) as { leases: unknown[] };
     expect(dump.leases.length).toBe(0);
 

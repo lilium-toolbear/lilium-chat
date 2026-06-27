@@ -101,6 +101,29 @@ export interface PersistedMessageSnapshot {
   recalled_at: string | null;
 }
 
+/** SQLite `messages` row shape — shared between DO storage and chat projection. */
+export interface MessageRow {
+  message_id: string;
+  command_id: string;
+  channel_id: string;
+  sender_kind: string;
+  sender_user_id: string | null;
+  sender_bot_id: string | null;
+  type: string;
+  format: string;
+  status: string;
+  text: string | null;
+  reply_to: string | null;
+  reply_snapshot_json: string | null;
+  stream_state: string;
+  created_at: string;
+  updated_at: string;
+  edited_at: string | null;
+  deleted_at: string | null;
+  deleted_by: string | null;
+  recalled_at: string | null;
+}
+
 export interface MessagePersistedPayload {
   message: PersistedMessageSnapshot;
 }

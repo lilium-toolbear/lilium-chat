@@ -13,7 +13,7 @@ describe("UserConnection close race cleanup", () => {
     await liveStartAndAck(ws);
 
     const dumpBefore = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Channel-Id": channelId },
+      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
     }))).json()) as { leases: Array<{ session_id: string }> };
     expect(dumpBefore.leases.some((l) => l.session_id === sessionId)).toBe(true);
 
@@ -21,7 +21,7 @@ describe("UserConnection close race cleanup", () => {
     await new Promise((r) => setTimeout(r, 150));
 
     const dumpAfter = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Channel-Id": channelId },
+      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
     }))).json()) as { leases: Array<{ session_id: string }> };
     expect(dumpAfter.leases.some((l) => l.session_id === sessionId)).toBe(false);
     void stub;

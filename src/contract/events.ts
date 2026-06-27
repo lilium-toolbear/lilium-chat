@@ -76,6 +76,28 @@ export type DomainTimelineEventType = (typeof DOMAIN_TIMELINE_EVENT_TYPES)[numbe
 const DOMAIN_TIMELINE_EVENT_TYPE_SET = new Set<string>(DOMAIN_TIMELINE_EVENT_TYPES);
 const CHAT_EVENT_TYPE_SET = new Set<string>(CHAT_EVENT_TYPES);
 
+/** Event types replay re-projects against current message.status. */
+export const REPLAY_MESSAGE_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "message.created",
+  "message.updated",
+  "message.recalled",
+  "message.deleted",
+]);
+
+/** Management events replay resolves actor refs to live UserSummary. */
+export const REPLAY_MANAGEMENT_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "channel.created",
+  "channel.updated",
+  "channel.dissolved",
+  "member.joined",
+  "member.left",
+  "member.removed",
+  "member.role_updated",
+  "bot.installed",
+  "bot.updated",
+  "command.binding_updated",
+]);
+
 export function isDomainTimelineEventType(type: string): type is DomainTimelineEventType {
   return DOMAIN_TIMELINE_EVENT_TYPE_SET.has(type);
 }

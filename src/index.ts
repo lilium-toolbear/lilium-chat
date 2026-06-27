@@ -106,7 +106,7 @@ app.patch("/api/chat/channels/:channel_id/bot-installations/:bot_id", (c) => upd
 app.patch("/api/chat/channels/:channel_id/commands/:bot_command_id", (c) => updateCommandBindingHandler(c));
 app.get("/api/chat/channels/:channel_id/commands", (c) => listChannelCommandsHandler(c));
 app.all("/api/chat/*", (c) => {
-  throw new ApiError("CHANNEL_NOT_FOUND", "not implemented in phase 0", { httpStatus: 404 });
+  throw new ApiError("CHANNEL_NOT_FOUND", "route not found", { httpStatus: 404 });
 });
 
 export default app;

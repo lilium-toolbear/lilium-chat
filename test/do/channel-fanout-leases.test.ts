@@ -44,7 +44,7 @@ describe("ChannelFanout leases", () => {
     expect(enq.status).toBe(200);
 
     const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Channel-Id": channelId },
+      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
     }))).json()) as { queue: Array<{ target_session_id: string }> };
     expect(dump.queue.length).toBe(1);
     expect(dump.queue[0]?.target_session_id).toBe("s-1");
@@ -117,7 +117,7 @@ describe("ChannelFanout leases", () => {
     for (let i = 0; i < 40; i++) {
       await runDurableObjectAlarm(fanout);
       const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-        headers: { "X-Channel-Id": channelId },
+        headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
       }))).json()) as { leases: Array<{ lease_id: string }>; queue: Array<{ status: string }> };
       if (!dump.leases.some((l) => l.lease_id === "lease-stale")) {
         leaseGone = true;

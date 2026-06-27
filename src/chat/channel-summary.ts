@@ -1,6 +1,6 @@
 import type { Env } from "../env";
 import type { ChannelSummaryApi } from "../contract/channel-api";
-import type { UserSummary } from "../contract/primitives";
+import { fallbackUserDisplayName, type UserSummary } from "../contract/primitives";
 import { resolveUserSummaries } from "../profile/resolve";
 
 export interface ChannelSummaryFromDo {
@@ -29,7 +29,7 @@ export interface MyChannelListFields {
 export type { UserSummary };
 
 function fallbackDisplayName(userId: string): string {
-  return `user-${userId.slice(0, 8)}`;
+  return fallbackUserDisplayName(userId);
 }
 
 export async function inflateChannelSummaryForViewer(input: {

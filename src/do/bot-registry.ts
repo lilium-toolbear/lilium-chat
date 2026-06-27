@@ -3,6 +3,7 @@ import type { Env } from "../env";
 import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateBotRegistrySchema } from "./migrations/bot-registry";
 import { uuidv7 } from "../ids/uuidv7";
+import { idempotencyExpiresAt } from "../contract/idempotency";
 import {
   canonicalCommandDefinition,
   commandsRequestHash,
@@ -199,7 +200,7 @@ export class BotRegistry extends DurableObject<Env> {
     });
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
-    const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+    const idemExpiresAt = idempotencyExpiresAt(nowMs);
     const operation = "bot.commands.sync";
     const operationId = body.idempotency_key;
 

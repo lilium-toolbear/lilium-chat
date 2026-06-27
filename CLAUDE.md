@@ -67,7 +67,7 @@ Authoritative design references, in priority order:
 3. `docs/superpowers/plans/*.md` — phase implementation plans. Each phase is executed
    task-by-task via the SDD workflow (see "Workflow" below).
 
-### DO topology (8 classes, all SQLite-backed)
+### DO topology (9 production classes + SchedulerProbe in test, all SQLite-backed)
 
 The Worker (`src/index.ts`) is a thin Hono router. It authenticates JWTs and proxies to
 DOs by name. WS upgrades (`src/routes/ws.ts`) verify the JWT, extract `user_id`, and forward
@@ -91,7 +91,17 @@ it via the `X-Verified-User-Id` header to a `UserConnection` DO named by `user_i
 - **`InviteDirectory`** (single global DO, name `shared`) — invite-code → channel_id index
   (invite codes are URL-opaque, so they need a global index DO).
 - **`BotRegistry`** (single global DO) — global bot identity + token hash store.
-- **`SchedulerProbe`** — test-only DO (declared only in `wrangler.test.jsonc`).
+- **`BotConnection`** (named by `bot_id`) — bot WebSocket hibernation, delivery queue, and
+  outbound event fan-in from `ChatChannel` outbox (`target_kind='bot_connection'`).
+- **`DMDirectory`** (single global DO, name `shared`) — canonical DM pair → channel_id index
+  for idempotent DM open/create flows.
+- **`SchedulerProbe`** — test-only DO (declared only in `wrangler.test.jsonc`; used to
+  validate `scheduleNextAlarm` / `runDueJobs` without touching production DOs).
+
+Production `wrangler.jsonc` binds 9 DO classes. The test worker adds **`SchedulerProbe`**
+as a 10th class. Internal test probe routes (`/internal/outbox-pending`, `ChannelFanout`
+`/dump`, `UserConnection` `/test-last-deliver`) require both `ALLOW_INTERNAL_TEST_ROUTES=1`
+(test worker var only) and `X-Test-Only: 1`.
 
 ### Load-bearing invariants (do not violate without reading spec §0)
 

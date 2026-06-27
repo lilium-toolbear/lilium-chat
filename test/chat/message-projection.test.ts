@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { projectMessageForBrowser } from "../../src/chat/message-projection";
-import type { MessageRow } from "../../src/do/chat-channel";
+import type { MessageRow } from "../../src/contract/persisted";
 
 const baseRow = (over: Partial<MessageRow> = {}): MessageRow => ({
   message_id: "m1", command_id: "cmd1", channel_id: "c1",

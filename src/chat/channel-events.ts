@@ -12,7 +12,7 @@ import type {
   ReadStateUpdatedPersistedPayload,
 } from "../contract/persisted";
 import type { ManagementWirePayload } from "../contract/wire-frames";
-import type { UserSummary } from "../contract/primitives";
+import { fallbackUserDisplayName, type UserSummary } from "../contract/primitives";
 
 export type { UserSummary };
 
@@ -176,7 +176,7 @@ export function buildCommandBindingUpdatedPayload(raw: {
 }
 
 function fallbackUserSummary(userId: string): UserSummary {
-  return { user_id: userId, display_name: `user-${userId.slice(0, 8)}`, avatar_url: null };
+  return { user_id: userId, display_name: fallbackUserDisplayName(userId), avatar_url: null };
 }
 
 // Wire projection: resolve actor (and target_user) refs to UserSummary at output time.

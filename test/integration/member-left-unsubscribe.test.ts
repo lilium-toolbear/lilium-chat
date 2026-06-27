@@ -34,7 +34,7 @@ describe("member.left → ChannelFanout drops the user", () => {
     let drained = false;
     for (let i = 0; i < 60; i++) {
       await runDurableObjectAlarm(channelStub);
-      const dump = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": channelId } }))).json()) as {
+      const dump = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as {
         leases: Array<{ user_id?: string }>;
       };
       if (dump.leases.filter((s) => s.user_id === userId).length === 0) {
@@ -112,7 +112,7 @@ describe("member.left → ChannelFanout drops the user", () => {
     expect(db.reason).toBe("membership_not_active");
 
     await new Promise((r) => setTimeout(r, 150));
-    const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Channel-Id": channelId } }))).json()) as {
+    const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as {
       event_json?: string;
     };
     expect(probe.event_json ?? "").not.toContain('"e-after-leave"');
@@ -148,7 +148,7 @@ describe("member.left → ChannelFanout drops the user", () => {
     expect(db.reason).toBe("session_not_found");
 
     await new Promise((r) => setTimeout(r, 150));
-    const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Channel-Id": channelId } }))).json()) as { event_json?: string };
+    const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as { event_json?: string };
     expect(probe.event_json ?? "").not.toContain('"e-stale-session"');
     ws.close();
   });

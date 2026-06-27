@@ -5,6 +5,7 @@ import { migrateUserConnectionSchema } from "./migrations/user-connection";
 import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame, type UserEventFrame } from "../ws/frames";
 import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditCommand, parseMessageRecallCommand, parseMessageSendCommand } from "../chat/command";
 import type { MessageMutationAckPayload, MessageMutationInternalRequest } from "../contract/idempotency";
+import { requireTestOnly } from "./do-errors";
 
 export interface ConnectionAttachment {
   user_id: string;
@@ -158,6 +159,8 @@ export class UserConnection extends DurableObject<Env> {
     }
 
     if (url.pathname === "/test-last-deliver") {
+      const gate = requireTestOnly(request, this.env);
+      if (gate) return gate;
       const sockets = this.ctx.getWebSockets();
       const first = sockets[0] as WebSocket | undefined;
       if (!first) return Response.json({ event_json: null });
@@ -416,8 +419,8 @@ export class UserConnection extends DurableObject<Env> {
   }
 
   private async ensureActiveMember(userId: string, channelId: string): Promise<boolean> {
-    const channels = await this.fetchActiveChannelsFromDirectory(userId);
-    return channels.some((it) => it.channel_id === channelId);
+    const membership = await this.confirmActiveMembership(userId, channelId);
+    return membership.active;
   }
 
   private async confirmActiveMembership(

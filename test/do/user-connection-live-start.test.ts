@@ -28,7 +28,7 @@ describe("UserConnection session.live_start", () => {
 
     const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
     const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Channel-Id": channelId },
+      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
     }))).json()) as { leases: Array<{ session_id: string }> };
     expect(dump.leases.some((l) => l.session_id === sessionId)).toBe(true);
 
@@ -92,7 +92,7 @@ describe("UserConnection session.live_start", () => {
 
     const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
     const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Channel-Id": channelId },
+      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
     }))).json()) as { leases: Array<{ session_id: string; user_id: string }> };
     expect(dump.leases.some((l) => l.session_id === sessionId && l.user_id === memberId)).toBe(true);
 
@@ -184,7 +184,7 @@ describe("UserConnection session.live_start", () => {
 
     const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
     const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Channel-Id": channelId },
+      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
     }))).json()) as { leases: Array<{ session_id: string; user_id: string }> };
     expect(dump.leases.filter((l) => l.user_id === memberId)).toHaveLength(0);
 
@@ -461,7 +461,7 @@ describe("UserConnection session.heartbeat membership", () => {
     expect(JSON.parse(hbRaw).frame_type).toBe("command_ack");
 
     const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Channel-Id": channelId },
+      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
     }))).json()) as { leases: Array<{ session_id: string }> };
     expect(dump.leases.some((l) => l.session_id === sessionId)).toBe(false);
 

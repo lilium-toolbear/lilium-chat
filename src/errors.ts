@@ -79,3 +79,20 @@ export function errorResponse(err: ApiError, requestId: string): Response {
     },
   );
 }
+
+/** DO-internal JSON error envelope (no request_id). */
+export function doErrorResponse(
+  code: string,
+  message: string,
+  opts?: { retryable?: boolean; httpStatus?: number },
+): Response {
+  const retryable = opts?.retryable ?? false;
+  const httpStatus = opts?.httpStatus ?? HTTP_STATUS_BY_CODE[code] ?? 500;
+  return Response.json({ error: { code, message, retryable } }, { status: httpStatus });
+}
+
+export function idempotencyConflictResponse(
+  message = "operation_id reused with different body",
+): Response {
+  return doErrorResponse("IDEMPOTENCY_CONFLICT", message, { retryable: false, httpStatus: 409 });
+}

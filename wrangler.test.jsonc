@@ -14,7 +14,8 @@
     "S3_BUCKET": "s3.kuma.homes",
     "S3_PUBLIC_BASE": "https://s3.kuma.homes",
     "S3_REGION": "us-east-1",
-    "SENTRY_ENVIRONMENT": "test"
+    "SENTRY_ENVIRONMENT": "test",
+    "ALLOW_INTERNAL_TEST_ROUTES": "1"
   },
 
   "durable_objects": {

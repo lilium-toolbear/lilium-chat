@@ -1,6 +1,6 @@
 import type { MessagePersistedPayload } from "../contract/persisted";
 import type { MessageProjectionEventPayload } from "../contract/events";
-import type { UserSummary } from "../contract/primitives";
+import { fallbackUserDisplayName, type UserSummary } from "../contract/primitives";
 import type { WireChatMessage } from "../contract/message";
 import { buildWireEventFrame, type EventFrame } from "../contract/wire-frames";
 import type { ChatEventPayloadByType, ChatEventType } from "../contract/events";
@@ -95,7 +95,7 @@ export async function resolveSenderForLiveBroadcast(
     const map = await resolveUserSummaries([sender.user_id]);
     const u = map.get(sender.user_id) ?? {
       user_id: sender.user_id,
-      display_name: `user-${sender.user_id.slice(0, 8)}`,
+      display_name: fallbackUserDisplayName(sender.user_id),
       avatar_url: null,
     };
     resolvedSender = { kind: "user", user: u };

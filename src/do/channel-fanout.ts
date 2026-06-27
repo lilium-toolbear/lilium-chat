@@ -3,6 +3,7 @@ import type { Env } from "../env";
 import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateChannelFanoutSchema } from "./migrations/channel-fanout";
 import { bumpFanoutRetry, scheduleFanoutAlarm } from "./fanout-scheduler";
+import { requireTestOnly } from "./do-errors";
 
 const LEASE_TTL_MS = 10 * 60 * 1000;
 
@@ -203,6 +204,8 @@ export class ChannelFanout extends DurableObject<Env> {
     }
 
     if (url.pathname === "/dump") {
+      const gate = requireTestOnly(request, this.env);
+      if (gate) return gate;
       const leases = this.ctx.storage.sql.exec("SELECT * FROM fanout_leases WHERE channel_id=?", channelId).toArray();
       const sessions = this.ctx.storage.sql.exec("SELECT * FROM online_sessions WHERE channel_id=?", channelId).toArray();
       const events = this.ctx.storage.sql.exec("SELECT * FROM fanout_events WHERE channel_id=?", channelId).toArray();

@@ -28,9 +28,12 @@ import type {
   ManagementPersistedPayload,
   ManagementPersistedPayloadByType,
   MessagePersistedPayload,
+  MessageRow,
 } from "../contract/persisted";
-import { isChatEventType, type ChatEventPayloadByType, type ChatEventType } from "../contract/events";
+import { buildReplayEventsResponse } from "../chat/replay-projection";
+import type { ChatEventPayloadByType } from "../contract/events";
 import type { MessageImageAttachment, WireChatMessage } from "../contract/message";
+import { idempotencyExpiresAt } from "../contract/idempotency";
 import type { MessageMutationAckPayload, MessageMutationIdempotencyEnvelope } from "../contract/idempotency";
 import type { ChannelMetaProjection, ChannelUpdatePresentFields, MemberProjection } from "../contract/channel-api";
 import type { DissolvedChannelProjection } from "../contract/channel";
@@ -38,6 +41,15 @@ import type {
   ProjectionOutboxPayload,
   ChannelDirectorySnapshotFields,
 } from "../contract/outbox";
+import { OUTBOX_MAX_ATTEMPTS } from "../contract/outbox";
+import {
+  checkPrincipalIdempotencyInTxn,
+  principalIdempotencyConflictResponse,
+  readCompletedPrincipalIdempotency,
+  writeCompletedPrincipalIdempotency,
+} from "../chat/principal-idempotency";
+import { bumpQueueRetry } from "./retry-backoff";
+import { idempotencyConflictResponse, requireTestOnly } from "./do-errors";
 import type {
   CommandBindingProjection,
   BotEventSubscriptionProjection,
@@ -49,53 +61,13 @@ import { personalInviteCode } from "../chat/invite-code";
 import { HTTP_STATUS_BY_CODE } from "../errors";
 import { resolveUserSummaries } from "../profile/resolve";
 import { botRegistryStub } from "../auth/bot";
+import { fallbackUserDisplayName } from "../contract/primitives";
 
 interface OutboxRow {
   outbox_id: string;
   target_kind: string;
   target_key: string;
   payload_json: string;
-}
-
-export interface MessageRow {
-  message_id: string;
-  command_id: string;
-  channel_id: string;
-  sender_kind: string;
-  sender_user_id: string | null;
-  sender_bot_id: string | null;
-  type: string;
-  format: string;
-  status: string;
-  text: string | null;
-  reply_to: string | null;
-  reply_snapshot_json: string | null;
-  stream_state: string;
-  created_at: string;
-  updated_at: string;
-  edited_at: string | null;
-  deleted_at: string | null;
-  deleted_by: string | null;
-  recalled_at: string | null;
-}
-
-interface ReplayEventRow {
-  event_id: string;
-  event_type: string;
-  payload_json: string;
-  occurred_at: string;
-}
-
-interface ReplaySqlEventRow {
-  event_id: unknown;
-  event_type: unknown;
-  payload_json: unknown;
-  occurred_at: unknown;
-}
-
-interface ReplayEnvelope {
-  event_id: string;
-  event_json: string;
 }
 
 export class ChatChannel extends DurableObject<Env> {
@@ -363,16 +335,18 @@ export class ChatChannel extends DurableObject<Env> {
   }): Promise<Response> {
     const now = this.nowIso();
     const nowMs = Date.parse(now);
-    const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
 
     // v4.0 cheap pre-check: if this exact operation+user+body already completed, return cached ack
     // without resolving user summaries or opening a transaction.
-    const preCheck = this.ctx.storage.sql
-      .exec("SELECT response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation=? AND operation_id=? AND request_hash=? AND response_json IS NOT NULL AND response_json != ''",
-        input.userId, input.operation, input.operationId, input.requestHash)
-      .toArray()[0] as { response_json: string } | undefined;
-    if (preCheck) {
-      const cached = JSON.parse(preCheck.response_json) as MessageMutationIdempotencyEnvelope;
+    const preCheckJson = readCompletedPrincipalIdempotency(this.ctx.storage.sql, {
+      principalKind: "user",
+      principalId: input.userId,
+      operation: input.operation,
+      operationId: input.operationId,
+      requestHash: input.requestHash,
+    });
+    if (preCheckJson) {
+      const cached = JSON.parse(preCheckJson) as MessageMutationIdempotencyEnvelope;
       if (cached.payload && cached.payload.event_id && cached.payload.message) {
         return Response.json({
           channel_id: cached.payload.channel_id ?? input.channelId,
@@ -406,14 +380,15 @@ export class ChatChannel extends DurableObject<Env> {
         j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }),
       };
 
-      const idem = this.ctx.storage.sql
-        .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation=? AND operation_id=?",
-          input.userId, input.operation, input.operationId)
-        .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
-      if (idem) {
-        if (idem.request_hash !== input.requestHash) return { kind: "conflict" };
-        return { kind: "cached", responseJson: idem.response_json ?? "{}" };
-      }
+      const idemCheck = checkPrincipalIdempotencyInTxn(this.ctx.storage.sql, {
+        principalKind: "user",
+        principalId: input.userId,
+        operation: input.operation,
+        operationId: input.operationId,
+        requestHash: input.requestHash,
+      });
+      if (idemCheck.kind === "conflict") return { kind: "conflict" };
+      if (idemCheck.kind === "cached") return { kind: "cached", responseJson: idemCheck.responseJson };
 
       const row = this.ctx.storage.sql
         .exec(
@@ -566,15 +541,20 @@ export class ChatChannel extends DurableObject<Env> {
         payload: { channel_id: input.channelId, event_id: eventId, message: liveMessage },
       });
 
-      this.ctx.storage.sql.exec(
-        "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, ?, ?, ?, ?, 'completed', ?, ?)",
-        input.userId, input.operation, input.operationId, input.requestHash, fullAckJson, now, idemExpiresAt,
-      );
+      writeCompletedPrincipalIdempotency(this.ctx.storage.sql, {
+        principalKind: "user",
+        principalId: input.userId,
+        operation: input.operation,
+        operationId: input.operationId,
+        requestHash: input.requestHash,
+        responseJson: fullAckJson,
+        nowIso: now,
+      });
       return { kind: "ok", responseJson: fullAckJson };
     });
 
     if (txResult.kind === "conflict") {
-      return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: HTTP_STATUS_BY_CODE.IDEMPOTENCY_CONFLICT ?? 409 });
+      return principalIdempotencyConflictResponse();
     }
     if (txResult.kind === "cached") {
       // unwrap the full command_ack JSON → return {channel_id, event_id, message} (the internal
@@ -585,7 +565,7 @@ export class ChatChannel extends DurableObject<Env> {
         return Response.json({ channel_id: cached.payload.channel_id ?? input.channelId, event_id: cached.payload.event_id, message: cached.payload.message });
       }
       // malformed/empty cached entry — treat as conflict (shouldn't happen with in-txn full-ack write)
-      return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: HTTP_STATUS_BY_CODE.IDEMPOTENCY_CONFLICT ?? 409 });
+      return idempotencyConflictResponse();
     }
     if (txResult.kind === "error") {
       return this.cachedResponse(txResult.j);
@@ -656,34 +636,14 @@ export class ChatChannel extends DurableObject<Env> {
   }
 
   private async bumpOutboxRetry(outboxId: string, nowIso: string, error: string): Promise<void> {
-    const row = this.ctx.storage.sql
-      .exec("SELECT attempts, max_attempts FROM projection_outbox WHERE outbox_id=?", outboxId)
-      .toArray()[0] as { attempts: number | null; max_attempts: number | null } | undefined;
-    const attempts = row?.attempts ?? 0;
-    const maxAttempts = row?.max_attempts ?? 5;
-    const nextAttempts = attempts + 1;
-
-    if (nextAttempts >= maxAttempts) {
-      this.ctx.storage.sql.exec(
-        "UPDATE projection_outbox SET status='dead_letter', attempts=?, last_error=?, failed_at=?, updated_at=? WHERE outbox_id=?",
-        nextAttempts,
-        error,
-        nowIso,
-        nowIso,
-        outboxId,
-      );
-      return;
-    }
-
-    const backoffMs = 1000 * Math.pow(2, attempts);
-    this.ctx.storage.sql.exec(
-      "UPDATE projection_outbox SET status='pending', attempts=?, last_error=?, next_attempt_at=?, updated_at=? WHERE outbox_id=?",
-      nextAttempts,
-      error,
-      new Date(Date.parse(nowIso) + backoffMs).toISOString(),
+    bumpQueueRetry(this.ctx.storage.sql, {
+      table: "projection_outbox",
+      idColumn: "outbox_id",
+      id: outboxId,
       nowIso,
-      outboxId,
-    );
+      error,
+      maxAttempts: OUTBOX_MAX_ATTEMPTS,
+    });
   }
 
   private async flushSingleInviteDirectoryOutbox(outboxId: string, nowIso: string): Promise<boolean> {
@@ -746,7 +706,7 @@ export class ChatChannel extends DurableObject<Env> {
       const callerUserId = request.headers.get("X-Verified-User-Id") ?? userId;
       const now = this.nowIso();
       const nowMs = Date.parse(now);
-      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(nowMs);
       const operationId = typeof b.operation_id === "string" && b.operation_id !== "" ? b.operation_id : null;
       // request_hash for join is just {user_id, channel_id} — the only body fields that matter.
       // The differentiator between branches is the membership state at execution time, not the body.
@@ -932,6 +892,8 @@ export class ChatChannel extends DurableObject<Env> {
     }
 
     if (url.pathname === "/internal/outbox-pending") {
+      const gate = requireTestOnly(request, this.env);
+      if (gate) return gate;
       const targetKind = url.searchParams.get("target_kind");
       const rows = targetKind === null
         ? this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM projection_outbox WHERE status='pending'")
@@ -1135,60 +1097,6 @@ export class ChatChannel extends DurableObject<Env> {
       );
       await this.scheduleOutboxAlarm(now);
       return Response.json({ ok: true });
-    }
-
-    if (url.pathname === "/spike-create") {
-      const b = (await request.json()) as { message_id: string; event_id: string; text: string };
-      const now = this.nowIso();
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO messages (message_id, command_id, dedupe_principal_key, channel_id, sender_kind, type, status, text, created_at, updated_at) VALUES (?, 'c', 'user:x', 'replay-1', 'user', 'text', 'normal', ?, ?, ?)",
-        b.message_id,
-        b.text,
-        now,
-        now,
-      );
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO events (event_id, event_type, channel_id, payload_json, occurred_at) VALUES (?, 'message.created', 'replay-1', ?, ?)",
-        b.event_id,
-        JSON.stringify({ message_id: b.message_id, text: b.text }),
-        now,
-      );
-      return new Response("ok");
-    }
-
-    if (url.pathname === "/spike-delete") {
-      const b = (await request.json()) as { message_id: string };
-      const now = this.nowIso();
-      this.ctx.storage.sql.exec("UPDATE messages SET status='deleted', deleted_at=? WHERE message_id=?", now, b.message_id);
-      this.ctx.storage.sql.exec(
-        "INSERT INTO events (event_id, event_type, channel_id, payload_json, occurred_at) VALUES (?, 'message.deleted', 'replay-1', ?, ?)",
-        "e-r-del",
-        JSON.stringify({ message_id: b.message_id, status: "deleted" }),
-        now,
-      );
-      return new Response("ok");
-    }
-
-    if (url.pathname === "/spike-replay") {
-      const after = url.searchParams.get("after") ?? "";
-      const rows = this.ctx.storage.sql.exec(
-        "SELECT event_id, event_type, payload_json FROM events WHERE event_id > ? ORDER BY event_id",
-        after,
-      ).toArray() as Array<{ event_id: string; event_type: string; payload_json: string }>;
-      const out: Array<{ event_id: string; event_type: string }> = [];
-      for (const r of rows) {
-        if (r.event_type === "message.created") {
-          const p = JSON.parse(r.payload_json) as { message_id: string };
-          const statusRow = this.ctx.storage.sql.exec("SELECT status FROM messages WHERE message_id=?", p.message_id).toArray()[0] as
-            | { status: string }
-            | undefined;
-          if (statusRow && (statusRow.status === "deleted" || statusRow.status === "recalled")) {
-            continue;
-          }
-        }
-        out.push({ event_id: r.event_id, event_type: r.event_type });
-      }
-      return Response.json({ events: out });
     }
 
     if (url.pathname === "/internal/message-send") {
@@ -1431,7 +1339,7 @@ export class ChatChannel extends DurableObject<Env> {
         text: messageRowForProjection.text,
       });
       const payloadJson = JSON.stringify(persistedPayload);
-      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(nowMs);
 
       type SendResult =
         | { kind: "created"; response_json: string }
@@ -1770,7 +1678,7 @@ export class ChatChannel extends DurableObject<Env> {
       const requestHash = JSON.stringify({ target_user_id: b.target_user_id, previous_owner_role: b.previous_owner_role });
       const now = this.nowIso();
       const nowMs = Date.parse(now);
-      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(nowMs);
       const actorMap = await this.resolveActorMap([userId, b.target_user_id]);
 
       const preCheck = this.ctx.storage.sql
@@ -1931,7 +1839,7 @@ export class ChatChannel extends DurableObject<Env> {
         return Response.json({ error: { code: "INVALID_MESSAGE", message: "max_uses must be a non-negative integer or null", retryable: false } }, { status: 422 });
       }
 
-      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(nowMs);
       const expiresAt = new Date(nowMs + rawExpires * 1000).toISOString();
       const maxUses: number | null = rawMaxUses;
 
@@ -2173,7 +2081,7 @@ export class ChatChannel extends DurableObject<Env> {
       const now = this.nowIso();
       const nowMs = Date.parse(now);
       const requestHash = JSON.stringify({ channel_id: channelId, invite_code: inviteCode });
-      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(nowMs);
 
       type TxResult =
         | { kind: "conflict" }
@@ -2368,7 +2276,7 @@ export class ChatChannel extends DurableObject<Env> {
       const now = this.nowIso();
       const nowMs = Date.parse(now);
       const requestHash = "{}";
-      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(nowMs);
       const actorMap = await this.resolveActorMap([userId]);
 
       const txResult = await this.ctx.storage.transaction(async (): Promise<
@@ -2448,190 +2356,12 @@ export class ChatChannel extends DurableObject<Env> {
     if (url.pathname === "/internal/replay") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       const after = url.searchParams.get("after") ?? "";
-      const meta = this.ctx.storage.sql.exec("SELECT channel_id, visibility FROM channel_meta LIMIT 1").toArray()[0] as
-        | { channel_id: string; visibility: string }
-        | undefined;
-      if (meta === undefined) return Response.json({ events: [] });
-      const member = userId
-        ? (this.ctx.storage.sql.exec(
-            "SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL",
-            meta.channel_id,
-            userId,
-          ).toArray()[0] as { x: number } | undefined)
-        : undefined;
-      if (!member && meta.visibility === "private") {
-        return new Response("forbidden", { status: 403 });
-      }
-
-      const rows = this.ctx.storage.sql
-        .exec(
-          "SELECT event_id, event_type, payload_json, occurred_at FROM events WHERE channel_id=? AND event_id > ? ORDER BY event_id",
-          meta.channel_id,
-          after,
-        )
-        .toArray() as unknown as ReplaySqlEventRow[];
-      const parsedRows: ReplayEventRow[] = rows.map((row) => ({
-        event_id: typeof row.event_id === "string" ? row.event_id : String(row.event_id ?? ""),
-        event_type: typeof row.event_type === "string" ? row.event_type : String(row.event_type ?? ""),
-        payload_json: typeof row.payload_json === "string" ? row.payload_json : "",
-        occurred_at: typeof row.occurred_at === "string" ? row.occurred_at : "",
-      }));
-      const messageReplayTypes = new Set(["message.created", "message.updated", "message.recalled", "message.deleted"]);
-      const managementTypes = new Set([
-        "channel.created",
-        "channel.updated",
-        "channel.dissolved",
-        "member.joined",
-        "member.left",
-        "member.role_updated",
-        "bot.installed",
-        "bot.updated",
-        "command.binding_updated",
-      ]);
-      const userIdsToResolve: string[] = [];
-      for (const r of parsedRows) {
-        if (messageReplayTypes.has(r.event_type)) {
-          try {
-            const p = JSON.parse(r.payload_json) as { message?: { message_id?: string } };
-            const messageId = p.message?.message_id;
-            if (messageId) {
-              const messageRow = this.ctx.storage.sql
-                .exec("SELECT sender_kind, sender_user_id FROM messages WHERE message_id=?", messageId)
-                .toArray()[0] as { sender_kind: string; sender_user_id: string | null } | undefined;
-              if (messageRow?.sender_kind === "user" && messageRow.sender_user_id) {
-                userIdsToResolve.push(messageRow.sender_user_id);
-              }
-            }
-          } catch {
-            // ignore malformed payload
-          }
-          continue;
-        }
-        if (managementTypes.has(r.event_type)) {
-          try {
-            const p = JSON.parse(r.payload_json) as {
-              actor_kind?: string;
-              actor_id?: string;
-              target_user_id?: string | null;
-              user_id?: string;
-              inviter_user_id?: string;
-            };
-            if (p.actor_kind === "user" && typeof p.actor_id === "string" && p.actor_id) userIdsToResolve.push(p.actor_id);
-            if (typeof p.target_user_id === "string" && p.target_user_id) userIdsToResolve.push(p.target_user_id);
-            if (typeof p.user_id === "string" && p.user_id) userIdsToResolve.push(p.user_id);
-            if (typeof p.inviter_user_id === "string" && p.inviter_user_id) userIdsToResolve.push(p.inviter_user_id);
-          } catch {
-            // ignore malformed payload
-          }
-        }
-      }
-
-      const rawMap = await resolveUserSummaries(Array.from(new Set(userIdsToResolve)), this.env);
-      const liveSenderMap = new Map<string, LiveUserSummary>();
-      const liveMap = new Map<string, LiveUserSummary>();
-      for (const [id, summary] of rawMap) {
-        const resolved = {
-          user_id: summary.user_id,
-          display_name: summary.display_name ?? `user-${id.slice(0, 8)}`,
-          avatar_url: summary.avatar_url,
-        };
-        liveMap.set(id, resolved);
-        liveSenderMap.set(id, resolved);
-      }
-      const out: Array<ReplayEnvelope> = [];
-
-      for (const r of parsedRows) {
-        let persistedPayload: MessagePersistedPayload | ManagementPersistedPayload | unknown = {};
-        try {
-          persistedPayload = JSON.parse(r.payload_json) as MessagePersistedPayload | ManagementPersistedPayload;
-        } catch {
-          persistedPayload = {};
-        }
-
-        let wirePayload: ChatEventPayloadByType[ChatEventType] | unknown =
-          persistedPayload;
-
-        if (messageReplayTypes.has(r.event_type)) {
-          try {
-            const messagePersisted = persistedPayload as MessagePersistedPayload;
-            const p = messagePersisted.message;
-            const messageId = typeof p?.message_id === "string" ? p.message_id : "";
-            if (!messageId) {
-              continue;
-            }
-            const messageRow = this.ctx.storage.sql
-              .exec(
-                "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE message_id=?",
-                messageId,
-              )
-              .toArray()[0] as MessageRow | undefined;
-            if (!messageRow) {
-              continue;
-            }
-            if (r.event_type === "message.created" && (messageRow.status === "deleted" || messageRow.status === "recalled")) {
-              continue;
-            }
-            const senderSummary = messageRow.sender_kind === "user" && messageRow.sender_user_id
-              ? liveSenderMap.get(messageRow.sender_user_id) ?? undefined
-              : undefined;
-            // Load this message's mentions for the projection (edited preserves mentions;
-            // deleted/recalled builder forces [] anyway).
-            const replayMentionRows = this.ctx.storage.sql
-              .exec("SELECT user_id, start, end_ AS end FROM mentions WHERE message_id=?", messageRow.message_id)
-              .toArray() as Array<{ user_id: string; start: number; end: number }>;
-            const replayMentions = replayMentionRows.map((m) => ({ user_id: m.user_id, start: m.start, end: m.end }));
-            const replayAttachmentRows = this.ctx.storage.sql
-              .exec(
-                `SELECT a.attachment_id, a.owner_user_id, a.kind, a.filename, a.mime_type, a.size_bytes, a.width, a.height, a.blurhash, a.storage_key, a.url, a.status, a.created_at
-                 FROM message_attachments ma
-                 JOIN attachments a ON a.attachment_id = ma.attachment_id
-                 WHERE ma.message_id=?`,
-                messageRow.message_id,
-              )
-              .toArray() as unknown as ChatAttachmentRow[];
-            const replayAttachments = replayAttachmentRows
-              .map(projectAttachmentForBrowser)
-              .filter((a): a is NonNullable<ReturnType<typeof projectAttachmentForBrowser>> => a !== null);
-            const replayStickerRow = this.ctx.storage.sql
-              .exec(
-                "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash FROM message_stickers WHERE message_id=?",
-                messageRow.message_id,
-              )
-              .toArray()[0] as unknown as MessageStickerSnapshot | undefined;
-            wirePayload = { message: projectMessageForBrowser(messageRow, { senderSummary, mentions: replayMentions, attachments: replayAttachments, sticker: replayStickerRow ?? null }) };
-          } catch {
-            // malformed payload or missing payload message_id
-          }
-        } else if (managementTypes.has(r.event_type) && r.event_type !== "read_state.updated") {
-          wirePayload = resolveActorWithMap(persistedPayload as ManagementPersistedPayload, liveMap);
-        }
-
-        const eventJson = isChatEventType(r.event_type)
-          ? JSON.stringify(
-              buildEventFrame({
-                event_id: r.event_id,
-                type: r.event_type,
-                channel_id: meta.channel_id,
-                occurred_at: r.occurred_at,
-                payload: wirePayload as ChatEventPayloadByType[typeof r.event_type],
-              }),
-            )
-          : JSON.stringify({
-              frame_type: "event",
-              api_version: "lilium.chat.v1",
-              event_id: r.event_id,
-              type: r.event_type,
-              channel_id: meta.channel_id,
-              occurred_at: r.occurred_at,
-              payload: wirePayload,
-            });
-
-        out.push({
-          event_id: r.event_id,
-          event_json: eventJson,
-        });
-      }
-      return Response.json({ events: out });
+      return buildReplayEventsResponse({
+        sql: this.ctx.storage.sql,
+        env: this.env,
+        userId,
+        after,
+      });
     }
 
     if (url.pathname === "/internal/create-channel") {
@@ -2945,7 +2675,7 @@ export class ChatChannel extends DurableObject<Env> {
       if (b.avatar_attachment_id !== undefined) present.avatar_attachment_id = b.avatar_attachment_id;
       if (b.visibility !== undefined) present.visibility = b.visibility;
       const requestHash = JSON.stringify(present);
-      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(nowMs);
 
       const actorMap = await this.resolveActorMap([userId]);
 
@@ -3060,7 +2790,7 @@ export class ChatChannel extends DurableObject<Env> {
       const now = this.nowIso();
       const nowMs = Date.parse(now);
       const requestHash = JSON.stringify({ user_id: b.user_id, role: b.role });
-      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(nowMs);
       const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
       const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "cached"; j: string } | { kind: "conflict" } | { kind: "ok"; member: MemberProjection & { channel_id: string } }> => {
@@ -3126,7 +2856,7 @@ export class ChatChannel extends DurableObject<Env> {
       const now = this.nowIso();
       const nowMs = Date.parse(now);
       const requestHash = JSON.stringify({ user_id: b.user_id, role: b.role });
-      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(nowMs);
       const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
       const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "conflict" } | { kind: "cached"; j: string } | { kind: "ok"; member: MemberProjection & { channel_id: string } }> => {
@@ -3172,7 +2902,7 @@ export class ChatChannel extends DurableObject<Env> {
       const now = this.nowIso();
       const nowMs = Date.parse(now);
       const requestHash = JSON.stringify({ user_id: b.user_id });
-      const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(nowMs);
       const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
       const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "conflict" } | { kind: "cached"; j: string } | { kind: "ok" }> => {
@@ -3454,7 +3184,7 @@ export class ChatChannel extends DurableObject<Env> {
     const operation = "bot.install";
     const now = this.nowIso();
     const nowMs = Date.parse(now);
-    const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+    const idemExpiresAt = idempotencyExpiresAt(nowMs);
 
     // initial_command_policy: { [bot_command_id]: { enabled: boolean, permission_override?: string } | boolean }
     // false-y / absent -> use catalog default_enabled_on_install.
@@ -3679,7 +3409,7 @@ export class ChatChannel extends DurableObject<Env> {
     const operation = "bot.install_update";
     const now = this.nowIso();
     const nowMs = Date.parse(now);
-    const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+    const idemExpiresAt = idempotencyExpiresAt(nowMs);
     if (newStatus !== "removed") {
       return this.botInstallError("INVALID_MESSAGE", "status must be removed");
     }
@@ -3777,7 +3507,7 @@ export class ChatChannel extends DurableObject<Env> {
     const operation = "bot.command_binding_update";
     const now = this.nowIso();
     const nowMs = Date.parse(now);
-    const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+    const idemExpiresAt = idempotencyExpiresAt(nowMs);
     const requestHash = JSON.stringify({ bot_command_id: botCommandId, enabled, permission_override: permissionOverride });
 
     const preCheck = this.ctx.storage.sql

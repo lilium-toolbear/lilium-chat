@@ -87,7 +87,7 @@ describe("ChannelFanout DO", () => {
     }));
     expect(enq.status).toBe(200);
 
-    const dump1 = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": channelId } }))).json()) as {
+    const dump1 = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as {
       queue: Array<{ target_session_id: string; status: string }>;
     };
     expect(dump1.queue.length).toBe(1);
@@ -98,7 +98,7 @@ describe("ChannelFanout DO", () => {
 
     let delivered = false;
     for (let i = 0; i < 60; i++) {
-      const dump2 = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": channelId } }))).json()) as {
+      const dump2 = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as {
         queue: Array<{ target_session_id: string; status: string; attempts?: number; last_error?: string | null }>;
       };
       const row = dump2.queue.at(0);
@@ -114,7 +114,7 @@ describe("ChannelFanout DO", () => {
     }
     expect(delivered).toBe(true);
 
-    const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver"))).json()) as { event_json: string | null };
+    const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1" } }))).json()) as { event_json: string | null };
     expect(probe.event_json).toContain('"event_id":"e-1"');
 
     ws.close();
@@ -144,7 +144,7 @@ describe("ChannelFanout DO", () => {
     }));
     expect(drop.status).toBe(200);
 
-    const dump = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": channelId } }))).json()) as {
+    const dump = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as {
       leases: Array<{ user_id: string }>;
       queue: Array<{ target_user_id: string; status: string }>;
     };
@@ -173,7 +173,7 @@ describe("ChannelFanout DO", () => {
       }));
     }
 
-    const dump = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Channel-Id": channelId } }))).json()) as {
+    const dump = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as {
       queue: Array<{ event_id: string }>;
     };
     expect(dump.queue.filter((q) => q.event_id === "e-3").length).toBe(1);

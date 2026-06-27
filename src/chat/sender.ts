@@ -1,10 +1,10 @@
 import type { Env } from "../env";
 import { resolveUserSummaries } from "../profile/resolve";
-import type { MessageRow } from "../do/chat-channel";
+import type { MessageRow } from "../contract/persisted";
 import { projectMessageForBrowser, type MessageMention, type MessageStickerSnapshot } from "./message-projection";
 import { projectAttachmentForBrowser, type AttachmentRow } from "./attachment-projection";
 import type { MessageImageAttachment } from "../contract/message";
-import type { UserSummary } from "../contract/primitives";
+import { fallbackUserDisplayName, type UserSummary } from "../contract/primitives";
 
 // v4.0: history/bootstrap projection goes through the ONE shared projectMessageForBrowser
 // (addendum J) — same serializer as message.send ack + message.created event + replay. The DO
@@ -29,8 +29,8 @@ export async function projectMessagesForBrowser(
       // profile/resolve UserSummary.display_name is string | null; projectMessageForBrowser's
       // UserSummary.display_name is string — fall back to user-<shortid> when null.
       senderSummary = raw
-        ? { user_id: raw.user_id, display_name: raw.display_name ?? `user-${row.sender_user_id.slice(0, 8)}`, avatar_url: raw.avatar_url }
-        : { user_id: row.sender_user_id, display_name: `user-${row.sender_user_id.slice(0, 8)}`, avatar_url: null };
+        ? { user_id: raw.user_id, display_name: raw.display_name ?? fallbackUserDisplayName(row.sender_user_id), avatar_url: raw.avatar_url }
+        : { user_id: row.sender_user_id, display_name: fallbackUserDisplayName(row.sender_user_id), avatar_url: null };
     }
     const attachmentRows = attachmentsByMessage[row.message_id] ?? [];
     const attachments = attachmentRows

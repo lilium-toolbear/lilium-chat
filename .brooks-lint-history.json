@@ -1,0 +1,18 @@
+[
+  {
+    "date": "2026-06-28",
+    "mode": "Full Sweep",
+    "score": 62,
+    "findings": { "critical": 1, "warning": 9, "suggestion": 5 },
+    "scope": "lilium-chat (~201 tracked files)",
+    "note": "initial sweep; 12 safe fixes applied"
+  },
+  {
+    "date": "2026-06-28",
+    "mode": "Residual Findings Pass",
+    "score": 78,
+    "findings": { "critical": 0, "warning": 4, "suggestion": 3 },
+    "scope": "lilium-chat residual brooks-sweep findings",
+    "note": "idempotency helpers, replay extraction, test probe gating, auth consolidation, retry backoff, test debt fixes"
+  }
+]

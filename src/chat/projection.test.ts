@@ -29,7 +29,9 @@ describe("projection outbox delivery (reviewer P0-1)", () => {
     const res = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
     const body = await res.json() as { items: Array<{ channel_id: string }> };
     expect(body.items.find((r) => r.channel_id === channel_id)).toBeDefined();
-    const probe = await stub.fetch(new Request("https://x/internal/outbox-pending?target_kind=user_directory"));
+    const probe = await stub.fetch(new Request("https://x/internal/outbox-pending?target_kind=user_directory", {
+      headers: { "X-Test-Only": "1" },
+    }));
     const pb = await probe.json() as { count: number };
     expect(pb.count).toBe(0);
   });

@@ -27,7 +27,9 @@ describe("ChatChannel /internal/create-dm", () => {
     expect(members.items.every((m) => m.role === "member")).toBe(true);
     expect(members.items.map((m) => m.user_id).sort()).toEqual([USER_A, USER_B].sort());
 
-    const outboxRes = await stub.fetch(new Request("https://x/internal/outbox-pending?target_kind=channel_directory"));
+    const outboxRes = await stub.fetch(new Request("https://x/internal/outbox-pending?target_kind=channel_directory", {
+      headers: { "X-Test-Only": "1" },
+    }));
     const outbox = await outboxRes.json() as { count: number };
     expect(outbox.count).toBe(0);
 
@@ -56,7 +58,9 @@ describe("ChatChannel /internal/create-dm", () => {
 
   it("writes user_directory outbox rows with kind=dm", async () => {
     const { stub } = await createTestDmChannel(env, USER_A, USER_B, USER_A);
-    const outboxRes = await stub.fetch(new Request("https://x/internal/outbox-pending?target_kind=user_directory"));
+    const outboxRes = await stub.fetch(new Request("https://x/internal/outbox-pending?target_kind=user_directory", {
+      headers: { "X-Test-Only": "1" },
+    }));
     const outbox = await outboxRes.json() as { count: number };
     expect(outbox.count).toBeGreaterThanOrEqual(0);
   });

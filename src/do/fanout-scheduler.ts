@@ -1,4 +1,5 @@
-// Earliest-wins alarm scheduler + retry/backoff for the ChannelFanout fanout_queue.
+import { computeRetryBackoffMs } from "./retry-backoff";
+import { OUTBOX_MAX_ATTEMPTS } from "../contract/outbox";
 // Mirrors ChatChannel's outbox scheduler (scheduleOutboxAlarm / bumpOutboxRetry) but
 // targets fanout_queue rows.
 
@@ -39,7 +40,7 @@ export function bumpFanoutRetry(
     .exec("SELECT attempts, max_attempts FROM fanout_queue WHERE queue_id=?", queueId)
     .toArray()[0] as { attempts: number | null; max_attempts: number | null } | undefined;
   const attempts = row?.attempts ?? 0;
-  const maxAttempts = row?.max_attempts ?? 5;
+  const maxAttempts = row?.max_attempts ?? OUTBOX_MAX_ATTEMPTS;
   const next = attempts + 1;
 
   if (next >= maxAttempts) {
@@ -53,7 +54,7 @@ export function bumpFanoutRetry(
     return;
   }
 
-  const backoffMs = 1000 * Math.pow(2, attempts);
+  const backoffMs = computeRetryBackoffMs(attempts);
   ctx.storage.sql.exec(
     "UPDATE fanout_queue SET status='pending', attempts=?, last_error=?, next_attempt_at=? WHERE queue_id=?",
     next,

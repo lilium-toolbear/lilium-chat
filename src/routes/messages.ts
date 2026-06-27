@@ -4,7 +4,7 @@ import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 import { projectMessagesForBrowser } from "../chat/sender";
 import type { MessageStickerSnapshot } from "../chat/message-projection";
-import type { MessageRow } from "../do/chat-channel";
+import type { MessageRow } from "../contract/persisted";
 import type { AttachmentRow } from "../chat/attachment-projection";
 
 export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {

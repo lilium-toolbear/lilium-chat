@@ -3,7 +3,7 @@ import type { Env } from "../env";
 import type { UserSummary } from "../profile/resolve";
 import { projectMessagesForBrowser } from "./sender";
 import { resolveUserSummaries } from "../profile/resolve";
-import type { MessageRow } from "../do/chat-channel";
+import type { MessageRow } from "../contract/persisted";
 import type { AttachmentRow } from "./attachment-projection";
 
 

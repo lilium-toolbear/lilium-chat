@@ -9,6 +9,7 @@ import { attachmentObjectKey, attachmentPublicUrl, avatarObjectKey, avatarPublic
 import { HTTP_STATUS_BY_CODE } from "../errors";
 import { canonicalDmPairKey, isUuidString } from "../chat/dm-pair";
 import { resolveUserSummaries } from "../profile/resolve";
+import { idempotencyExpiresAt } from "../contract/idempotency";
 
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const MAX_ATTACHMENT_SIZE_BYTES = 20 * 1024 * 1024; // 20 MiB
@@ -221,7 +222,7 @@ export class UserDirectory extends DurableObject<Env> {
         visibility: b.visibility ?? "private", initial_members: b.initial_members ?? [],
       });
       const now = new Date().toISOString();
-      const expiresAt = new Date(Date.parse(now) + 24 * 60 * 60 * 1000).toISOString();
+      const expiresAt = idempotencyExpiresAt(Date.parse(now));
 
       // Txn 1: resolve idempotency state + mint channel_id (if new).
       const coord = await this.ctx.storage.transaction(async () => {
@@ -295,7 +296,7 @@ export class UserDirectory extends DurableObject<Env> {
 
       const requestHash = JSON.stringify({ recipient_user_id: b.recipient_user_id });
       const now = new Date().toISOString();
-      const expiresAt = new Date(Date.parse(now) + 24 * 60 * 60 * 1000).toISOString();
+      const expiresAt = idempotencyExpiresAt(Date.parse(now));
 
       const coord = await this.ctx.storage.transaction(async () => {
         const row = this.ctx.storage.sql
@@ -499,7 +500,7 @@ export class UserDirectory extends DurableObject<Env> {
 
       const requestHash = JSON.stringify({ channel_id: channelId, attachment_id: attachmentId });
       const now = this.nowIso();
-      const idemExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(Date.now());
 
       type SaveCoord =
         | { kind: "conflict" }
@@ -738,7 +739,7 @@ export class UserDirectory extends DurableObject<Env> {
 
       const requestHash = JSON.stringify({ sticker_id: stickerId });
       const now = this.nowIso();
-      const idemExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const idemExpiresAt = idempotencyExpiresAt(Date.now());
       const responseJson = JSON.stringify({ sticker_id: stickerId, deleted: true });
 
       const result = await this.ctx.storage.transaction(async () => {
@@ -827,7 +828,7 @@ export class UserDirectory extends DurableObject<Env> {
 
       const requestHash = JSON.stringify({ filename, mimeType, sizeBytes, width, height, blurhash });
       const now = this.nowIso();
-      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const expiresAt = idempotencyExpiresAt(Date.now());
       const idemExpiresAt = expiresAt;
 
       type PresignCoord =
@@ -1014,7 +1015,7 @@ export class UserDirectory extends DurableObject<Env> {
           const responseJson = JSON.stringify({ attachment: projection });
           if (!idem) {
             // No prior idempotency row but attachment is already finalized: create one so future retries hit cache.
-            const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+            const expiresAt = idempotencyExpiresAt(Date.now());
             this.ctx.storage.sql.exec(
               "INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('attachment.finalize', ?, ?, 'completed', ?, ?, ?, ?, ?)",
               idempotencyKey,
@@ -1092,7 +1093,7 @@ export class UserDirectory extends DurableObject<Env> {
           idempotencyKey,
           now,
           now,
-          new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+          idempotencyExpiresAt(Date.now()),
         );
         return json;
       });

@@ -57,7 +57,7 @@ describe("UserConnection DO", () => {
     const received = await receivedPromise;
     expect(JSON.parse(received).event_id).toBe("e-d1");
 
-    const probe = await (await stub.fetch(new Request("https://x/test-last-deliver"))).json() as { event_json: string | null };
+    const probe = await (await stub.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1" } }))).json() as { event_json: string | null };
     expect(probe.event_json).toContain('"event_id":"e-d1"');
     ws.close();
   });
@@ -88,7 +88,7 @@ describe("UserConnection DO", () => {
     expect(body.delivered).toBe(false);
     expect(body.reason).toBe("session_not_found");
 
-    const probe = await (await stub.fetch(new Request("https://x/test-last-deliver"))).json() as { event_json: string | null };
+    const probe = await (await stub.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1" } }))).json() as { event_json: string | null };
     expect(probe.event_json ?? "").not.toContain('"e-stale"');
     ws.close();
   });
@@ -180,6 +180,41 @@ describe("UserConnection DO", () => {
     ws.send(JSON.stringify({ ...base, command_id: "c-different" }));
     const ack2 = JSON.parse(await nextAck(ws));
     expect(ack2.payload.message.message_id).not.toBe(ack1.payload.message.message_id);
+    ws.close();
+  });
+
+  it("webSocketMessage returns command_error IDEMPOTENCY_CONFLICT on same command_id with different text", async () => {
+    const userId = "u-uc-idem-conflict";
+    const { channelId } = await joinTestChannel(userId);
+
+    const { ws } = await upgradeUserConnection(userId);
+    const basePayload = {
+      type: "text",
+      reply_to_message_id: null,
+      attachment_ids: [] as string[],
+      mentions: [] as string[],
+    };
+
+    ws.send(JSON.stringify({
+      frame_type: "command",
+      command: "message.send",
+      command_id: "c-conflict",
+      channel_id: channelId,
+      payload: { ...basePayload, text: "first" },
+    }));
+    const ack1 = JSON.parse(await nextAck(ws));
+    expect(ack1.frame_type).toBe("command_ack");
+
+    ws.send(JSON.stringify({
+      frame_type: "command",
+      command: "message.send",
+      command_id: "c-conflict",
+      channel_id: channelId,
+      payload: { ...basePayload, text: "different" },
+    }));
+    const err = JSON.parse(await nextAck(ws));
+    expect(err.frame_type).toBe("command_error");
+    expect(err.error.code).toBe("IDEMPOTENCY_CONFLICT");
     ws.close();
   });
 });
