@@ -269,17 +269,6 @@ export class UserDirectory extends DurableObject<Env> {
       if (!b.idempotency_key) {
         return Response.json({ error: { code: "INVALID_MESSAGE", message: "idempotency_key required", retryable: false } }, { status: 422 });
       }
-      if (!b.recipient_user_id || !isUuidString(b.recipient_user_id)) {
-        return Response.json({ error: { code: "INVALID_DM_TARGET", message: "invalid recipient_user_id", retryable: false } }, { status: 422 });
-      }
-      if (b.recipient_user_id === currentUserId) {
-        return Response.json({ error: { code: "INVALID_DM_TARGET", message: "cannot open DM with yourself", retryable: false } }, { status: 422 });
-      }
-
-      const recipientMap = await resolveUserSummaries([b.recipient_user_id], this.env);
-      if (!recipientMap.has(b.recipient_user_id)) {
-        return Response.json({ error: { code: "DM_TARGET_NOT_FOUND", message: "recipient user not found", retryable: false } }, { status: 404 });
-      }
 
       const requestHash = JSON.stringify({ recipient_user_id: b.recipient_user_id });
       const now = new Date().toISOString();
@@ -297,14 +286,10 @@ export class UserDirectory extends DurableObject<Env> {
           if (row.status === "completed" && row.response_json) {
             return { kind: "cached" as const, responseJson: row.response_json };
           }
-          return { kind: "creating" as const };
+          return { kind: "resume" as const };
         }
 
-        this.ctx.storage.sql.exec(
-          "INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('dm.open', ?, ?, 'creating', NULL, NULL, ?, ?, ?)",
-          b.idempotency_key, requestHash, now, now, expiresAt,
-        );
-        return { kind: "creating" as const };
+        return { kind: "new" as const };
       });
 
       if (coord.kind === "conflict") {
@@ -314,6 +299,30 @@ export class UserDirectory extends DurableObject<Env> {
         return Response.json({ kind: "cached", response: JSON.parse(coord.responseJson) });
       }
 
+      if (coord.kind === "new") {
+        if (!b.recipient_user_id || !isUuidString(b.recipient_user_id)) {
+          return Response.json({ error: { code: "INVALID_DM_TARGET", message: "invalid recipient_user_id", retryable: false } }, { status: 422 });
+        }
+        if (b.recipient_user_id === currentUserId) {
+          return Response.json({ error: { code: "INVALID_DM_TARGET", message: "cannot open DM with yourself", retryable: false } }, { status: 422 });
+        }
+
+        const recipientMap = await resolveUserSummaries([b.recipient_user_id], this.env);
+        if (!recipientMap.has(b.recipient_user_id)) {
+          return Response.json({ error: { code: "DM_TARGET_NOT_FOUND", message: "recipient user not found", retryable: false } }, { status: 404 });
+        }
+
+        await this.ctx.storage.transaction(async () => {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('dm.open', ?, ?, 'creating', NULL, NULL, ?, ?, ?)",
+            b.idempotency_key, requestHash, now, now, expiresAt,
+          );
+        });
+      }
+
+      if (!b.recipient_user_id || !isUuidString(b.recipient_user_id)) {
+        return Response.json({ error: { code: "INVALID_DM_TARGET", message: "invalid recipient_user_id", retryable: false } }, { status: 422 });
+      }
       const { pair_key, user_low, user_high } = canonicalDmPairKey(currentUserId, b.recipient_user_id);
       const dmStub = this.env.DM_DIRECTORY.getByName(pair_key);
       const dmRes = await dmStub.fetch(new Request("https://x/internal/get-or-create-dm", {

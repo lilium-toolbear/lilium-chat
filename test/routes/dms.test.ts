@@ -65,7 +65,7 @@ describe("POST /api/chat/dms", () => {
     expect(b2.channel.channel_id).toBe(b1.channel.channel_id);
   });
 
-  it("missing Idempotency-Key returns 400", async () => {
+  it("missing Idempotency-Key returns 422 INVALID_MESSAGE (codebase convention)", async () => {
     const SELF = (await import("../../src/index")).default;
     const testEnv = { ...env, JWT_SECRET: TEST_SECRET };
     const token = await makeJwt({ sub: USER_A });
@@ -75,6 +75,20 @@ describe("POST /api/chat/dms", () => {
       body: JSON.stringify({ recipient_user_id: USER_B }),
     }), testEnv as typeof env, { waitUntil: () => {}, passThroughOnException: () => {} } as never);
     expect(res.status).toBe(422);
+    const body = await res.json() as { error: { code: string } };
+    expect(body.error.code).toBe("INVALID_MESSAGE");
+  });
+
+  it("unknown recipient returns 404 DM_TARGET_NOT_FOUND", async () => {
+    const { resolveUserSummaries } = await import("../../src/profile/resolve");
+    const unknown = "00000000-0000-7000-8000-000000009999";
+    vi.mocked(resolveUserSummaries).mockImplementationOnce(async () => new Map());
+
+    const token = await makeJwt({ sub: USER_A });
+    const res = await postDms(token, unknown, "http-dm-unknown");
+    expect(res.status).toBe(404);
+    const body = await res.json() as { error: { code: string } };
+    expect(body.error.code).toBe("DM_TARGET_NOT_FOUND");
   });
 
   it("self-DM returns 422 INVALID_DM_TARGET", async () => {

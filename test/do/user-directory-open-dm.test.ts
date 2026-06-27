@@ -81,4 +81,55 @@ describe("UserDirectory /internal/open-dm", () => {
     expect(replayBody.kind).toBe("cached");
     expect(replayBody.response.channel.channel_id).toBe(needs.channel_id);
   });
+
+  it("completed replay skips profile resolve", async () => {
+    const { resolveUserSummaries } = await import("../../src/profile/resolve");
+    let resolveCalls = 0;
+    vi.mocked(resolveUserSummaries).mockImplementation(async (userIds) => {
+      resolveCalls++;
+      const map = new Map<string, { user_id: string; display_name: string; avatar_url: null }>();
+      for (const id of userIds) {
+        map.set(id, { user_id: id, display_name: `User ${id.slice(-4)}`, avatar_url: null });
+      }
+      return map;
+    });
+
+    const { res, stub } = await openDm(USER_A, USER_B, "dm-key-cached-no-resolve");
+    const needs = await res.json() as { kind: string; channel_id: string; joined_at: string; role: string };
+    const cachedResponse = {
+      channel: { channel_id: needs.channel_id, kind: "dm" },
+      membership: { role: "member", joined_at: needs.joined_at },
+    };
+    await stub.fetch(new Request("https://x/internal/open-dm-complete", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": USER_A, "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "dm-key-cached-no-resolve", response_json: JSON.stringify(cachedResponse) }),
+    }));
+
+    const callsBeforeReplay = resolveCalls;
+    const replay = await openDm(USER_A, USER_B, "dm-key-cached-no-resolve");
+    expect(replay.res.status).toBe(200);
+    const replayBody = await replay.res.json() as { kind: string };
+    expect(replayBody.kind).toBe("cached");
+    expect(resolveCalls).toBe(callsBeforeReplay);
+  });
+
+  it("unknown recipient returns 404 DM_TARGET_NOT_FOUND", async () => {
+    const { resolveUserSummaries } = await import("../../src/profile/resolve");
+    const unknown = "00000000-0000-7000-8000-000000009999";
+    vi.mocked(resolveUserSummaries).mockImplementationOnce(async () => new Map());
+
+    const { res } = await openDm(USER_A, unknown, "dm-key-unknown");
+    expect(res.status).toBe(404);
+    const body = await res.json() as { error: { code: string } };
+    expect(body.error.code).toBe("DM_TARGET_NOT_FOUND");
+  });
+
+  it("same key + self recipient after prior different recipient returns 409 IDEMPOTENCY_CONFLICT", async () => {
+    await openDm(USER_A, USER_B, "dm-key-self-after-b");
+    const { res } = await openDm(USER_A, USER_A, "dm-key-self-after-b");
+    expect(res.status).toBe(409);
+    const body = await res.json() as { error: { code: string } };
+    expect(body.error.code).toBe("IDEMPOTENCY_CONFLICT");
+  });
 });

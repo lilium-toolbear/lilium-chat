@@ -74,7 +74,7 @@ export async function openDmHandler(c: Context<{ Bindings: Env; Variables: { req
     membership: { role: internal.role, joined_at: internal.joined_at },
   };
 
-  await dirStub.fetch(new Request("https://x/internal/open-dm-complete", {
+  const completeRes = await dirStub.fetch(new Request("https://x/internal/open-dm-complete", {
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -82,6 +82,7 @@ export async function openDmHandler(c: Context<{ Bindings: Env; Variables: { req
       response_json: JSON.stringify(response),
     }),
   }));
+  if (!completeRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "dm open completion failed");
 
   return c.json(response, 200, { "X-Request-Id": c.get("requestId") });
 }
