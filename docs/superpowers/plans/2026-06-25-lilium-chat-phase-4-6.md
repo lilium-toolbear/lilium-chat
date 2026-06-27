@@ -918,7 +918,7 @@ Before C2, add an `invite_directory` branch to `ChatChannel.alarm()` (after `cha
 
 ### C-corr-2: contract-aligned create/accept shapes (P0-8)
 
-- **Create** (`POST /channels/{id}/invites`): request includes `expires_in_seconds` (TTL) + `max_uses` (nullable). Handler: `expires_at = now + expires_in_seconds` (server default if omitted, e.g. 7d). Response: `{ invite_code, invite_url, expires_at, max_uses }` (the contract shape — NOT just `{invite_code, expires_at}`). `invite_url` is the Browser-visible accept URL built from the origin + invite_code.
+- **Create** (`POST /channels/{id}/invites`): request includes `expires_in_seconds` (TTL) + `max_uses` (nullable). Handler: `expires_at = now + expires_in_seconds` (server default if omitted, e.g. 7d). Response: `{ invite_code, invite_url, expires_at, max_uses }` (the contract shape — NOT just `{invite_code, expires_at}`). `invite_url` is the Browser-visible SPA accept URL: `{API_BASE_URL}/chat/invites/{invite_code}` (frontend origin from `wrangler.jsonc` `API_BASE_URL`, e.g. `https://lilium.kuma.homes` — not the Worker request origin `chat.kuma.homes`).
 - **Accept** (`POST /invites/{code}/accept`): response is `{ channel: {...channel summary...}, membership: { role, joined_at, status } }` (the contract shape). `role` is `member` (invite join); `joined_at` server-set; `status: "active"`. The plan's `{ channel_id, membership: { status } }` is WRONG — fix the C4 test + route output.
 
 Update the C2/C4 tests to assert these shapes (request `expires_in_seconds` + `max_uses`; response `{invite_code, invite_url, expires_at, max_uses}` for create; `{channel, membership:{role, joined_at, status}}` for accept).

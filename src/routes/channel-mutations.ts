@@ -273,7 +273,7 @@ export async function createInviteHandler(c: Context<{ Bindings: Env; Variables:
   }
 
   const out = await res.json() as { invite_code: string; expires_at: string; max_uses: number | null };
-  const base = new URL(c.req.url).origin;
+  const base = env.API_BASE_URL.replace(/\/$/, "");
   return c.json({
     invite_code: out.invite_code,
     invite_url: `${base}/chat/invites/${out.invite_code}`,

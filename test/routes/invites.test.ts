@@ -40,7 +40,7 @@ describe("POST /api/chat/channels/:id/invites", () => {
     const body = (await res.json()) as { invite_code: string; invite_url: string; expires_at: string; max_uses: number | null };
     expect(body.invite_code).toBeTypeOf("string");
     expect(body.invite_code.length).toBeGreaterThan(0);
-    expect(body.invite_url).toBe(`https://chat.kuma.homes/chat/invites/${body.invite_code}`);
+    expect(body.invite_url).toBe(`https://lilium.kuma.homes/chat/invites/${body.invite_code}`);
     expect(body.max_uses).toBeNull();
     expect(typeof body.expires_at).toBe("string");
     const expiresAt = Date.parse(body.expires_at);

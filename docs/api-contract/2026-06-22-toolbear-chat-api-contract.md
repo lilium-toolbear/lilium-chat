@@ -1,6 +1,6 @@
 # ToolBear Chat Browser/Bot API Contract
 
-状态：实现前 API contract（v2.13，v4.4-aligned —— … + 2026-06-27 DM addendum：`POST /api/chat/dms`、详见 `docs/api-contract/2026-06-27-dm-api-contract-addendum.md`）
+状态：实现前 API contract（v2.15，v4.4-aligned —— … + 2026-06-27 DM addendum：`POST /api/chat/dms`、详见 `docs/api-contract/2026-06-27-dm-api-contract-addendum.md`）
 日期：2026-06-22
 范围：lilium-chat 后端（Cloudflare Worker + Durable Object）的 browser/bot-facing wire shape
 权威来源：
@@ -55,6 +55,7 @@
 - **v2.12 (2026-06-27)**：Phase 8 live membership resync delta。Membership mutation 在 `UserDirectory /my-channels` projection 可见后按 `affected_user_id` 通知 `UserConnection /internal/live-memberships-changed`，主动为已有 live sessions 建立/关闭 leases；新增 Browser-visible user-scoped hint frame `user_event my_channels_changed`（非 timeline、非权威、漏收安全）。Heartbeat 保留为 fallback convergence，不再是新频道订阅/踢出/解散收敛主路径。
 - **v2.14 (2026-06-27)**：v4.4 delta — 移除默认 system channel。`GET /bootstrap` 及 `GET /channels` **不再** lazy-create 或 lazy-join 系统公共频道；新用户返回空 `channels`（§4.1 空列表示例为 norm）。所有 ChatChannel DO name = `channel_id`（§5.2b 删除 `system-general` 路由例外）。用户须通过创建频道、公开目录 join、邀请或被添加成员获得 membership。
 - **v2.13 (2026-06-27)**：DM delta（完整规范见 **`docs/api-contract/2026-06-27-dm-api-contract-addendum.md`**，实现前以 addendum 为准）。新增 `POST /api/chat/dms` get-or-create 一对一 DM；`ChannelSummary.dm_peer`；`dm.open` 幂等由 `UserDirectory(current_user_id)` 协调（同 `Idempotency-Key` 异 `recipient_user_id` → `409 IDEMPOTENCY_CONFLICT`）；pair 唯一性由 `DMDirectory(pair_key)` 协调；`POST /dms` 响应必须返回完整 `ChannelSummary`（含 `unread_count` / `last_message_*`）；DM 禁用频道管理/Bot 路径返回 `409 UNSUPPORTED_CHANNEL_KIND`（`GET .../commands` on DM 返回空列表例外）。`POST /channels` 仍只创建 `kind=channel`。
+- **v2.15 (2026-06-28)**：`invite_url` 修正为 SPA 前端域名（`API_BASE_URL`，如 `https://lilium.kuma.homes`），不再使用 Worker API host（`chat.kuma.homes`）。§5.8 响应示例与说明同步。
 
 ## 1. 边界
 
@@ -880,11 +881,13 @@ Idempotency-Key: client-key-invite-create
 ```json
 {
   "invite_code": "invite-code-abc123",
-  "invite_url": "https://chat.kuma.homes/chat/invites/invite-code-abc123",
+  "invite_url": "https://lilium.kuma.homes/chat/invites/invite-code-abc123",
   "expires_at": "2026-06-28T05:30:00Z",
   "max_uses": null
 }
 ```
+
+`invite_url` 是 Browser 可打开的 SPA 邀请页 URL，由 Worker 配置 `API_BASE_URL`（ToolBear 前端 origin，如 `https://lilium.kuma.homes`）与 `/chat/invites/{invite_code}` 拼接而成；**不是** Worker API host（`chat.kuma.homes`）。
 
 邀请码原文只返回一次。邀请码明文存储在服务端（可重复使用），按 principal 不命名空间化（邀请码是频道级凭据）(v2 delta)。
 
