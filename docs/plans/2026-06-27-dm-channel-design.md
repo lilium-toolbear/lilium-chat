@@ -1,6 +1,6 @@
 # DM Channel Design (`kind="dm"`)
 
-状态：设计稿 v1.0  
+状态：设计稿 v1.1  
 日期：2026-06-27  
 范围：lilium-chat 一对一私聊（DM）后端实现设计  
 权威来源：
@@ -14,7 +14,7 @@
 
 DM **不是**独立 timeline 或新消息模型。DM 是 `ChatChannel` 上 `channel_meta.kind = 'dm'` 的双人私有频道特例。
 
-唯一新增的后端基础设施是 **`DMDirectory` DO**，按 canonical user pair 分片，负责 get-or-create、pair 唯一性、幂等与 A↔B 并发去重。
+新增 **`DMDirectory` DO**（按 canonical user pair 分片）负责 pair 唯一性与 A↔B 并发 get-or-create。**`UserDirectory(current_user_id)`** 负责 `operation=dm.open` 的 operation idempotency（与 `POST /channels` create 同类问题：`recipient_user_id` 不在 URL，不能把幂等 solely 放在 pair-scoped DO）。
 
 消息、附件、read-state、history、events、fanout、WS live 全部复用现有 channel-scoped 路径。`UserDirectory.my_channels` 已预留 `kind` 字段，继续承载 DM 列表与 read-state。
 
@@ -52,7 +52,19 @@ pair_key  = `${user_low}:${user_high}`
 
 路由：`env.DM_DIRECTORY.getByName(pair_key)`。
 
-**不用 `UserDirectory(creator)` 协调 DM 创建。** 原因与普通 channel create 相同但更强：DM 创建 URL 没有 `channel_id`，且 A→B / B→A 并发必须收敛到同一 channel。若只放在创建者 `UserDirectory`，会产生两个不同 DM。
+**职责拆分（P0-1）：**
+
+```text
+UserDirectory(current_user_id)
+  owns operation idempotency for operation=dm.open
+  catches same Idempotency-Key + different recipient_user_id -> IDEMPOTENCY_CONFLICT
+
+DMDirectory(pair_key)
+  owns pair uniqueness and A<->B concurrent get-or-create
+  does NOT own cross-recipient idempotency
+```
+
+不能把 pair 唯一性移到 `UserDirectory`：A→B 与 B→A 会路由到不同 `UserDirectory`，仍需要 `DMDirectory(pair_key)` 收敛到同一 `channel_id`。
 
 ### 1.1 Wrangler / 迁移
 
@@ -73,19 +85,6 @@ CREATE TABLE dm_pairs (
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 );
-
-CREATE TABLE idempotency_keys (
-  principal_kind TEXT NOT NULL,
-  principal_id   TEXT NOT NULL,
-  operation      TEXT NOT NULL,
-  operation_id   TEXT NOT NULL,
-  request_hash   TEXT NOT NULL,
-  response_json  TEXT,
-  status         TEXT NOT NULL,
-  created_at     TEXT NOT NULL,
-  expires_at     TEXT NOT NULL,
-  PRIMARY KEY (principal_kind, principal_id, operation, operation_id)
-);
 ```
 
 索引建议：
@@ -94,9 +93,9 @@ CREATE TABLE idempotency_keys (
 CREATE INDEX idx_dm_pairs_channel_id ON dm_pairs(channel_id);
 ```
 
-`operation` 固定为 `dm.open`。幂等语义与 contract §2.5 一致：同 `(principal_kind, principal_id, operation, operation_id)` + 同 `request_hash` → 缓存响应；异 `request_hash` → `409 IDEMPOTENCY_CONFLICT`。
+`DMDirectory` **不**存放 `operation=dm.open` 的 `idempotency_keys`。该表复用现有 `UserDirectory.idempotency_keys`（与 `channel.create` 同 DO）。
 
-`status=creating` 崩溃窗口：retry 重调同一 `ChatChannel(channel_id).createDm`（`channel_meta` 存在性即幂等 guard），再标 `active` + 写 `response_json`。
+`dm_pairs.status=creating` 崩溃窗口：retry 重调同一 `ChatChannel(channel_id).createDm`（`channel_meta` 存在性即幂等 guard），再标 `active`。完整 HTTP 响应缓存在 **UserDirectory** 的 idempotency 行 `response_json`。
 
 内部保护：若 `pair_key` 已绑定 `channel_id` A，并发另一路径试图绑定 `channel_id` B → 返回 `500` 或内部 `DM_PAIR_CONFLICT`（不暴露给 Browser；实现层 assert + dead-letter 日志）。
 
@@ -107,21 +106,28 @@ Worker POST /api/chat/dms
   └─ verify Browser JWT → current_user_id
   └─ parse body { recipient_user_id }
   └─ reject recipient_user_id == current_user_id → 422 INVALID_DM_TARGET
-  └─ resolve recipient via Hyperdrive users table
-       └─ not found → 404 DM_TARGET_NOT_FOUND
-  └─ pair_key = canonical(current_user_id, recipient_user_id)
-  └─ DMDirectory(pair_key).openDm(...)
-       ├─ idempotency check (principal=user:current_user_id, operation=dm.open)
-       ├─ if dm_pairs row exists (status=active): inflate existing channel summary → return
-       ├─ if status=creating: resume or wait same channel_id path
-       ├─ mint channel_id (UUIDv7) — DO name = channel_id
-       ├─ insert dm_pairs (status=creating)
-       ├─ ChatChannel(channel_id).createDm({ user_a, user_b, created_by })
-       ├─ mark dm_pairs status=active, persist response_json
+  └─ UserDirectory(current_user_id).openDmWithIdempotency(operation_id, recipient_user_id)
+       ├─ idempotency check (operation=dm.open)
+       │    ├─ same key + different recipient -> 409 IDEMPOTENCY_CONFLICT
+       │    ├─ same key + same recipient completed -> cached response_json
+       │    └─ reserve processing row (status=creating)
+       ├─ resolve recipient via Hyperdrive users table
+       │    └─ not found -> 404 DM_TARGET_NOT_FOUND (fail idempotency row)
+       ├─ pair_key = canonical(current_user_id, recipient_user_id)
+       ├─ DMDirectory(pair_key).getOrCreateDm(...)
+       │    ├─ if dm_pairs active: return channel_id
+       │    ├─ if status=creating: resume same channel_id path
+       │    ├─ mint channel_id (UUIDv7)
+       │    ├─ insert dm_pairs (status=creating)
+       │    ├─ ChatChannel(channel_id).createDm({ user_a, user_b, created_by })
+       │    └─ mark dm_pairs status=active
+       ├─ Worker inflate full ChannelSummary (§3.3) for current_user_id
+       ├─ store response_json in UserDirectory idempotency row -> completed
        └─ return { channel, membership }
 ```
 
-`openDm` 内部 HTTP 路径建议：`POST /internal/open-dm`。
+`UserDirectory` 内部路径建议：`POST /internal/open-dm`。  
+`DMDirectory` 内部路径建议：`POST /internal/get-or-create-dm`。
 
 ### 3.1 ChatChannel.createDm
 
@@ -170,6 +176,22 @@ role       = 'member'   -- 双方恒为 member
 
 bootstrap / `GET /channels` / `GET /channels/{id}` / `POST /dms` 响应均走同一 inflate 逻辑。
 
+### 3.3 `POST /dms` 响应必须完整 `ChannelSummary`
+
+`POST /dms` 的 `channel` 对象 **必须** 包含主 contract `ChannelSummary` 的全部列表字段，禁止省略：
+
+```json
+{
+  "unread_count": 0,
+  "last_read_event_id": null,
+  "last_message_preview": null,
+  "last_message_at": null,
+  "last_event_id": null
+}
+```
+
+新建 DM、重开已有 DM、幂等缓存重放三种路径返回同形。若写了不可见 `channel.created` event，可令 `last_event_id` 为该 event；否则 `null`。`unread_count` 新建时为 `0`。
+
 ## 4. 权限矩阵
 
 ### 4.1 DM 允许
@@ -190,7 +212,9 @@ bootstrap / `GET /channels` / `GET /channels/{id}` / `POST /dms` 响应均走同
 
 ### 4.2 DM 禁止 → `UNSUPPORTED_CHANNEL_KIND`
 
-对 `channel_meta.kind='dm'` 的 channel，以下 mutation 在 `ChatChannel` 入口统一拒绝（HTTP 409 或 422，code=`UNSUPPORTED_CHANNEL_KIND`）：
+对 `channel_meta.kind='dm'` 的 channel，禁用 mutation **统一** 返回 **`409 UNSUPPORTED_CHANNEL_KIND`**，`retryable=false`。不使用 422。
+
+频道管理 mutation：
 
 ```text
 PATCH  /api/chat/channels/{dm_id}
@@ -201,9 +225,24 @@ POST   /api/chat/channels/{dm_id}/members
 PATCH  /api/chat/channels/{dm_id}/members/{user_id}
 DELETE /api/chat/channels/{dm_id}/members/{user_id}
 POST   /api/chat/channels/{dm_id}/owner-transfer
-POST   /api/chat/channels/{dm_id}/bot-installations*
-PATCH  /api/chat/channels/{dm_id}/bot-installations*
-PATCH  /api/chat/channels/{dm_id}/commands/*
+POST   /api/chat/channels/{dm_id}/bot-installations
+PATCH  /api/chat/channels/{dm_id}/bot-installations/{bot_id}
+PATCH  /api/chat/channels/{dm_id}/commands/{bot_command_id}
+PATCH  .../bot-installations/{bot_id}/event-subscriptions/message.created
+POST   /api/chat/bot/channels/{dm_id}/messages
+```
+
+Bot / slash（v1 不进 DM，即使残留 binding 也须收口）：
+
+```text
+GET  /api/chat/channels/{dm_id}/commands
+     -> 200 { "items": [] }
+
+WS   command.invoke   (channel_id 为 dm)
+     -> command_error { code: "UNSUPPORTED_CHANNEL_KIND", retryable: false }
+
+WS   interaction.submit (channel_id 为 dm)
+     -> command_error { code: "UNSUPPORTED_CHANNEL_KIND", retryable: false }
 ```
 
 `GET /api/chat/channels/directory` **永远不返回** `kind=dm`（`ChannelDirectory` 只索引 `public_listed` + `kind=channel`）。
@@ -255,9 +294,11 @@ UserDirectory flush → notify UserConnection /internal/live-memberships-changed
 ### Phase DM-1：后端核心
 
 - `DMDirectory` DO + migration + binding
+- `UserDirectory.openDmWithIdempotency`（`operation=dm.open` 幂等 + 完整响应缓存）
 - `POST /api/chat/dms` Worker route
 - `ChatChannel.createDm`
 - pair 并发去重测试（A→B / B→A / 双并发）
+- 同 Idempotency-Key 异 recipient → `IDEMPOTENCY_CONFLICT` 测试
 - `UserDirectory` projection flush
 - live `my_channels_changed` 通知
 
@@ -294,8 +335,12 @@ UserDirectory flush → notify UserConnection /internal/live-memberships-changed
 [ ] recipient 在线 → my_channels_changed + live resync
 [ ] DM 中 message.send fanout 双方
 [ ] GET /channels/directory 不含 kind=dm
-[ ] PATCH/dissolve/join/invites/members on DM → UNSUPPORTED_CHANNEL_KIND
+[ ] PATCH/dissolve/join/invites/members on DM → 409 UNSUPPORTED_CHANNEL_KIND
+[ ] GET .../commands on DM -> { items: [] }
+[ ] WS command.invoke / interaction.submit on DM -> UNSUPPORTED_CHANNEL_KIND
+[ ] POST /bot/channels/{dm_id}/messages -> 409 UNSUPPORTED_CHANNEL_KIND
 [ ] DM 中不能 admin delete 对方消息
+[ ] POST /dms 响应含完整 ChannelSummary 列表字段
 [ ] ChannelSummary title/avatar/dm_peer 为 viewer-specific 投影
 [ ] channel_meta 不持久化对方 display name
 ```

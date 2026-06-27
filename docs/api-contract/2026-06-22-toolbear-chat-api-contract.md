@@ -1,6 +1,6 @@
 # ToolBear Chat Browser/Bot API Contract
 
-状态：实现前 API contract（v2.12，v4.4-aligned —— … + 2026-06-27 Phase 8 Live Fanout + live membership resync：`session.live_start` 全频道 live push（无 WS replay/cursor）、`lilium.chat.v2`、HTTP 权威恢复、`user_event my_channels_changed` hint）
+状态：实现前 API contract（v2.13，v4.4-aligned —— … + 2026-06-27 DM addendum：`POST /api/chat/dms`、详见 `docs/api-contract/2026-06-27-dm-api-contract-addendum.md`）
 日期：2026-06-22
 范围：lilium-chat 后端（Cloudflare Worker + Durable Object）的 browser/bot-facing wire shape
 权威来源：
@@ -53,6 +53,7 @@
 - **v2.10 (2026-06-26)**：Phase 7 bot runtime transport 改为 Bot Gateway WebSocket RPC（不再以 HTTP callback 为主运行时）。具体：§9 头部 bullet 改写（bot runtime = bot 主动连 `/api/chat/bot/ws`，HTTP callback 降级为 future transport）；§9.1 bot token scope 新增 `chat:runtime:connect`；§9.3 `PUT /bot/commands` request 补 `aliases`/`default_enabled_on_install`/`event_capabilities`，明确 catalog sync 不 enable 任何频道、slash token 冲突在 channel binding 层；§9.4 查询响应补 `aliases`/`matched_name`/`matched_kind`/`effective_member_permission` + prefix 匹配规则；§9.5 `command.invoke` payload 补 `invoked_name`（optional，canonical|alias）；§9.7 整节重写为 Bot Gateway WS RPC（hello/ready → delivery → delivery_result → delivery_ack 帧协议，三类 delivery kind = `command_invocation` / `message_interaction` / `message_event`，at-least-once + `delivery_id` 去重 + `(channel_id, bot_id, client_effect_id)` effect 幂等，offline policy，`message_event` sender 完整投影）；新增 §9.9 passive `message_event` 订阅（`PATCH /api/chat/channels/{channel_id}/bot-installations/{bot_id}/event-subscriptions/message.created`，Phase 7 仅 `message.created`，observer/responder only，无 consume/stop-propagation）；§1.1 路由总览补 bot runtime + bot 管理 + 被动订阅端点；§11 错误码表补 `BOT_OFFLINE`、`BOT_EFFECT_INVALID`、`BOT_EFFECT_CONFLICT`，`BOT_CALLBACK_UNAVAILABLE` 语义收窄为 future HTTP transport 预留。`PUT /api/chat/bot/commands` 与 `POST /api/chat/bot/channels/{channel_id}/messages` 保留为 bot 主动 outbound HTTP（管理/主动发送），不要求 bot 暴露 HTTP endpoint。Browser WS（`/api/chat/ws` + ToolBear browser JWT + `UserConnection DO`）与 Bot WS（`/api/chat/bot/ws` + bot token + `BotConnection DO`）分离，不复用。
 - **v2.11 (2026-06-27)**：Phase 8 Live Fanout redesign（无 WS cursor recovery）。具体：Browser WS 子协议 **`lilium.chat.v1` → `lilium.chat.v2`（breaking）**；§10.1 connect 只建 live session，**不** replay、**不**解析 `?cursors=`、**不**隐式订阅；新增 §5.11 `session.live_start`、§5.12 `session.heartbeat`；§10.5/§10.6；**v1 无 `channel.subscribe`**；§5.5 read-state 澄清；§6.1b `GET .../events`；§12.11；§15 addendum（含 membership re-check 与 heartbeat 不得复活 stale lease）。设计：`docs/plans/2026-06-27-userconnection-live-subscription-redesign.md`。
 - **v2.12 (2026-06-27)**：Phase 8 live membership resync delta。Membership mutation 在 `UserDirectory /my-channels` projection 可见后按 `affected_user_id` 通知 `UserConnection /internal/live-memberships-changed`，主动为已有 live sessions 建立/关闭 leases；新增 Browser-visible user-scoped hint frame `user_event my_channels_changed`（非 timeline、非权威、漏收安全）。Heartbeat 保留为 fallback convergence，不再是新频道订阅/踢出/解散收敛主路径。
+- **v2.13 (2026-06-27)**：DM delta（完整规范见 **`docs/api-contract/2026-06-27-dm-api-contract-addendum.md`**，实现前以 addendum 为准）。新增 `POST /api/chat/dms` get-or-create 一对一 DM；`ChannelSummary.dm_peer`；`dm.open` 幂等由 `UserDirectory(current_user_id)` 协调（同 `Idempotency-Key` 异 `recipient_user_id` → `409 IDEMPOTENCY_CONFLICT`）；pair 唯一性由 `DMDirectory(pair_key)` 协调；`POST /dms` 响应必须返回完整 `ChannelSummary`（含 `unread_count` / `last_message_*`）；DM 禁用频道管理/Bot 路径返回 `409 UNSUPPORTED_CHANNEL_KIND`（`GET .../commands` on DM 返回空列表例外）。`POST /channels` 仍只创建 `kind=channel`。
 
 ## 1. 边界
 
@@ -70,6 +71,7 @@ ToolBear 前端只调用 `/api/chat/*` Browser API。该路径由 Cloudflare Wor
 | GET | `/api/chat/channels` | 频道列表 | §5.1 |
 | GET | `/api/chat/channels/{channel_id}` | 频道详情 | §5.2 |
 | POST | `/api/chat/channels` | 创建频道 (v2.4 delta) | §5.2b |
+| POST | `/api/chat/dms` | get-or-create 一对一 DM (v2.13 delta，详见 DM addendum) | addendum §2 |
 | POST | `/api/chat/channels/{channel_id}/dissolve` | 解散群聊 (v2.2 delta) | §5.4 |
 | GET | `/api/chat/channels/directory` | 公开频道目录 (v2.9 delta：URL 由 `/channels/{channel_id}/public-catalog` 改为无 channel_id 的 `/channels/directory`) | §5.6 |
 | POST | `/api/chat/channels/{channel_id}/join` | 加入公开频道 | §5.7 |

@@ -1,6 +1,6 @@
 # DM API Contract Addendum
 
-状态：实现前 API contract addendum v1.0  
+状态：实现前 API contract addendum v1.1  
 日期：2026-06-27  
 范围：`POST /api/chat/dms`、`ChannelSummary.dm_peer`、DM 禁用矩阵、错误码、权限  
 权威来源：
@@ -13,13 +13,16 @@
 
 ## 修订摘要
 
-| 维度 | 合并前 (v2.12) | DM addendum (v1.0) |
+| 维度 | 合并前 (v2.12) | DM addendum (v1.1) |
 |---|---|---|
 | DM 创建 | 不暴露 | **`POST /api/chat/dms`** get-or-create |
 | 可见性证明 | — | **v1 不要求**共同频道、`source_channel_id`、隐私开关、黑名单 |
-| Pair 唯一性 | — | canonical pair；A↔B 同一 `channel_id` |
+| Pair 唯一性 | — | `DMDirectory(pair_key)`；A↔B 同一 `channel_id` |
+| `dm.open` 幂等 | — | **`UserDirectory(current_user_id)`**；同 key 异 recipient → `IDEMPOTENCY_CONFLICT` |
+| `POST /dms` 响应 | — | **完整 `ChannelSummary`**（含 unread / last_message_*，禁止省略） |
 | `ChannelSummary` | `kind: channel \| dm` 枚举已有，无 `dm_peer` | 新增 **`dm_peer?: UserSummary`** |
-| 频道管理 on DM | 部分隐式（join 已 403） | 显式 **`UNSUPPORTED_CHANNEL_KIND`** 矩阵 |
+| 频道管理 on DM | 部分隐式（join 已 403） | **`409 UNSUPPORTED_CHANNEL_KIND`**（唯一 HTTP status） |
+| Bot on DM | 未收口 | commands 空列表；invoke/interaction/bot-send 禁用 |
 | 错误码 | — | `INVALID_DM_TARGET`, `DM_TARGET_NOT_FOUND`, `UNSUPPORTED_CHANNEL_KIND` |
 
 ## 1. 路由总览（增量）
@@ -82,6 +85,11 @@ v1 语义：
       "display_name": "Alice",
       "avatar_url": "https://example.com/avatar.png"
     },
+    "unread_count": 0,
+    "last_read_event_id": null,
+    "last_message_preview": null,
+    "last_message_at": null,
+    "last_event_id": null,
     "created_at": "2026-06-27T12:00:00Z",
     "updated_at": "2026-06-27T12:00:00Z"
   },
@@ -92,13 +100,13 @@ v1 语义：
 }
 ```
 
-`channel` 形状与 `ChannelSummary` / `ChannelDetail` 一致（见 §3）。对 `kind="dm"`：
+`channel` 形状与主 contract §3.2 `ChannelSummary` **完全一致**（见 §3）。对 `kind="dm"`：
 
 - `role` 恒为 `member`（双方无 owner/admin）。
 - `title` 与 `avatar_url` 为 **viewer-specific 投影**：等于 `dm_peer` 的 `display_name` / `avatar_url`，由服务端按当前 JWT `user_id` 实时 resolve，**不**把某一方看到的标题持久化为公共频道标题。
 - `visibility` 恒为 `private`。
 - `member_count` 恒为 `2`。
-- 响应不含 `unread_count` / `last_message_*`（首次创建时）；已有 DM 重开时 Worker 可附带与 `GET /channels/{id}` 相同的列表字段（实现可选，但至少含 §3 必填字段）。
+- **`unread_count` / `last_read_event_id` / `last_message_preview` / `last_message_at` / `last_event_id` 必须存在**（新建 DM 时分别为 `0` / `null` / `null` / `null` / `null` 或 `last_event_id` 为 `channel.created` event id）。禁止按「首次创建 / 重开」省略字段。幂等缓存 `response_json` 存此完整形状。
 
 ### 2.3 Pair 唯一性与幂等
 
@@ -108,13 +116,27 @@ pair_key = canonical(min(current_user_id, recipient_user_id), max(...))
 
 - A 向 B 打开与 B 向 A 打开 **必须返回同一 `channel_id`**。
 - 已存在 active DM 时返回已有 channel（get-or-create），不创建第二个。
-- 幂等由 `DMDirectory(pair_key)` 协调（非 `UserDirectory(creator)`，非 Worker 现场 mint 的无状态重试）。
+
+**两层职责（不可合并到单一 DO）：**
+
+```text
+UserDirectory(current_user_id)
+  operation=dm.open idempotency (HTTP Idempotency-Key)
+  same key + same recipient -> cached full response
+  same key + different recipient -> 409 IDEMPOTENCY_CONFLICT
+
+DMDirectory(pair_key)
+  pair uniqueness + A<->B concurrent get-or-create
+  does NOT see cross-recipient idempotency keys
+```
+
+原因：同 `Idempotency-Key` 换 `recipient_user_id` 会路由到不同 `DMDirectory`，pair-scoped DO 无法检测冲突——与 `POST /channels` 无 `channel_id` 时不能把 create 幂等放在 `ChatChannel` 是同类结构性问题。
 
 幂等规则（与主 contract §2.5 一致）：
 
 - `principal_kind=user`, `principal_id=current_user_id`, `operation=dm.open`, `operation_id=Idempotency-Key`
-- 同 key + 同 `request_hash`（同 `recipient_user_id`）→ 返回缓存的完整响应
-- 同 key + 异 `request_hash`（换了 `recipient_user_id`）→ `409 IDEMPOTENCY_CONFLICT`
+- 同 key + 同 `request_hash`（同 `recipient_user_id`）→ 返回 `UserDirectory` 缓存的完整 `response_json`
+- 同 key + 异 `request_hash`（换了 `recipient_user_id`）→ `409 IDEMPOTENCY_CONFLICT`（由 `UserDirectory` 检测）
 
 ### 2.4 创建副作用
 
@@ -207,7 +229,9 @@ ack / event payload 形状不变：`{ channel_id, event_id, message }`。
 
 ## 4. DM 禁用端点矩阵
 
-对 `channel_meta.kind="dm"` 的 `channel_id`，以下端点 **必须** 返回 `409 UNSUPPORTED_CHANNEL_KIND`（`retryable: false`）：
+对 `channel_meta.kind="dm"` 的 `channel_id`，以下 HTTP mutation **必须** 返回 **`409 UNSUPPORTED_CHANNEL_KIND`**（`retryable: false`）。**禁止** 使用 422。
+
+频道管理：
 
 ```text
 PATCH  /api/chat/channels/{channel_id}
@@ -222,6 +246,20 @@ POST   /api/chat/channels/{channel_id}/bot-installations
 PATCH  /api/chat/channels/{channel_id}/bot-installations/{bot_id}
 PATCH  /api/chat/channels/{channel_id}/commands/{bot_command_id}
 PATCH  .../bot-installations/{bot_id}/event-subscriptions/message.created
+POST   /api/chat/bot/channels/{channel_id}/messages
+```
+
+Bot / slash（v1 不进 DM）：
+
+```text
+GET  /api/chat/channels/{channel_id}/commands
+     -> 200 { "items": [] }   （不是 409）
+
+WS   command.invoke
+     -> command_error { code: "UNSUPPORTED_CHANNEL_KIND", retryable: false }
+
+WS   interaction.submit
+     -> command_error { code: "UNSUPPORTED_CHANNEL_KIND", retryable: false }
 ```
 
 读端点仍可用（成员列表在 DM 中返回 2 人；用于 @mention suggest）：
@@ -248,7 +286,7 @@ GET /api/chat/channels/{channel_id}/members/{user_id}
 - 修改频道 title / topic / avatar / visibility
 - 邀请链接、公开 join、成员 add/remove/role、owner transfer、dissolve
 - **管理员删除他人消息**：`message.delete` 仅 sender 本人；`kind=dm` 时 owner/admin 路径关闭
-- Bot install / command binding / passive subscription（v1）
+- Bot install / command binding / passive subscription / invoke / interaction / bot direct message（v1）
 - 公开目录曝光
 
 ## 6. 错误码（增量）
@@ -259,7 +297,7 @@ GET /api/chat/channels/{channel_id}/members/{user_id}
 |---:|---|---|
 | 422 | `INVALID_DM_TARGET` | 给自己发 DM，或 `recipient_user_id` 格式非法 |
 | 404 | `DM_TARGET_NOT_FOUND` | 目标用户不存在 |
-| 409 | `UNSUPPORTED_CHANNEL_KIND` | 对 `kind=dm` 调用了 §4 禁用 mutation |
+| 409 | `UNSUPPORTED_CHANNEL_KIND` | 对 `kind=dm` 调用了 §4 禁用 HTTP mutation；`retryable: false` |
 
 `DM_NOT_ALLOWED`：**v1 不定义**（预留给未来隐私/黑名单 phase）。
 
@@ -274,9 +312,10 @@ GET /api/chat/channels/{channel_id}/members/{user_id}
 ### 验收（contract 层）
 
 ```text
-[ ] POST /dms 请求/响应形状与 §2 一致
+[ ] POST /dms 请求/响应形状与 §2 一致（含完整 ChannelSummary 列表字段）
+[ ] 同 Idempotency-Key 异 recipient -> IDEMPOTENCY_CONFLICT（UserDirectory 层）
 [ ] ChannelSummary.dm_peer 在 bootstrap/list/detail 出现
-[ ] §4 禁用矩阵有对应集成测试
+[ ] §4 禁用矩阵有对应集成测试（含 bot/slash）
 [ ] §6 错误码在 errors.ts + HTTP_STATUS_BY_CODE 注册
-[ ] 主 contract「DM 不暴露」措辞更新
+[ ] 主 contract v2.13 修订记录与路由表已指向本 addendum
 ```
