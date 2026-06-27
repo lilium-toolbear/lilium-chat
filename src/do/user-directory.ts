@@ -4,8 +4,6 @@ import { uuidv7 } from "../ids/uuidv7";
 import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateUserDirectorySchema } from "./migrations/user-directory";
 import { projectAttachmentForBrowser, projectFinalizedAttachmentForBrowser, type AttachmentRow } from "../chat/attachment-projection";
-import { parseStoredChannelMetaProjection } from "../chat/channel-meta-projection";
-import type { ChannelMetaProjection } from "../contract/channel-api";
 import { presignPutUrl, headObjectKey, deleteObject } from "../s3/presign";
 import { attachmentObjectKey, attachmentPublicUrl, avatarObjectKey, avatarPublicUrl } from "../s3/object-key";
 import { HTTP_STATUS_BY_CODE } from "../errors";
@@ -106,23 +104,14 @@ export class UserDirectory extends DurableObject<Env> {
       }
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       const rows = this.ctx.storage.sql
-        .exec("SELECT channel_id, kind, last_read_event_id, membership_version, summary_json FROM my_channels WHERE user_id = ? AND status IN ('active', 'dissolved')", userId)
+        .exec("SELECT channel_id, kind, last_read_event_id, membership_version FROM my_channels WHERE user_id = ? AND status IN ('active', 'dissolved')", userId)
         .toArray() as {
           channel_id: string;
           kind: string;
           last_read_event_id: string | null;
           membership_version: number;
-          summary_json: string | null;
         }[];
-      return Response.json({
-        items: rows.map((row) => ({
-          channel_id: row.channel_id,
-          kind: row.kind,
-          last_read_event_id: row.last_read_event_id,
-          membership_version: row.membership_version,
-          summary: parseStoredChannelMetaProjection(row.summary_json),
-        })),
-      });
+      return Response.json({ items: rows });
     }
 
     if (url.pathname === "/internal/upsert-channel") {
@@ -131,84 +120,52 @@ export class UserDirectory extends DurableObject<Env> {
       const now = new Date().toISOString();
 
       const body = (await request.json()) as {
-        action: "join" | "leave" | "dissolve" | "summary_update";
+        action: "join" | "leave" | "dissolve";
         channel_id: string;
-        kind?: string;
+        kind: string;
         membership_version: number;
-        summary?: ChannelMetaProjection;
       };
 
-      if (!body.channel_id) {
+      if (!body.channel_id || !body.kind) {
         return Response.json({ error: "invalid payload" }, { status: 400 });
       }
-      if (body.action !== "join" && body.action !== "leave" && body.action !== "dissolve" && body.action !== "summary_update") {
+      if (body.action !== "join" && body.action !== "leave" && body.action !== "dissolve") {
         return Response.json({ error: "unsupported action" }, { status: 400 });
       }
-
-      const summaryJson = body.summary ? JSON.stringify(body.summary) : null;
 
       return await this.ctx.storage.transaction(async () => {
         const existing = this.ctx.storage.sql
           .exec(
-            "SELECT status, left_at, membership_version, summary_json FROM my_channels WHERE user_id = ? AND channel_id = ?",
+            "SELECT status, left_at, membership_version FROM my_channels WHERE user_id = ? AND channel_id = ?",
             userId,
             body.channel_id,
           )
           .toArray()[0] as
-          | { status: string; left_at: string | null; membership_version: number; summary_json: string | null }
+          | { status: string; left_at: string | null; membership_version: number }
           | undefined;
 
-        if (body.action === "summary_update") {
-          if (!existing || existing.status !== "active") {
-            return Response.json({ ok: true });
-          }
-          if (summaryJson) {
-            this.ctx.storage.sql.exec(
-              "UPDATE my_channels SET summary_json=? WHERE user_id=? AND channel_id=?",
-              summaryJson,
-              userId,
-              body.channel_id,
-            );
-          }
-          return Response.json({ ok: true });
-        }
-
-        if (!body.kind) {
-          return Response.json({ error: "invalid payload" }, { status: 400 });
-        }
-
         if (existing && existing.membership_version >= body.membership_version) {
-          if (summaryJson && existing.status === "active") {
-            this.ctx.storage.sql.exec(
-              "UPDATE my_channels SET summary_json=? WHERE user_id=? AND channel_id=?",
-              summaryJson,
-              userId,
-              body.channel_id,
-            );
-          }
           return Response.json({ ok: true });
         }
 
         if (body.action === "join") {
           if (existing === undefined) {
             this.ctx.storage.sql.exec(
-              "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, left_at, removed_at, status, membership_version, last_read_event_id, summary_json) VALUES (?, ?, ?, ?, NULL, NULL, 'active', ?, NULL, ?)",
+              "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, left_at, removed_at, status, membership_version, last_read_event_id) VALUES (?, ?, ?, ?, NULL, NULL, 'active', ?, NULL)",
               userId,
               body.channel_id,
               body.kind,
               now,
               body.membership_version,
-              summaryJson,
             );
             return Response.json({ ok: true });
           }
 
           this.ctx.storage.sql.exec(
-            "UPDATE my_channels SET status='active', left_at=NULL, removed_at=NULL, membership_version=?, joined_at=COALESCE(joined_at, ?), kind=?, summary_json=COALESCE(?, summary_json) WHERE user_id=? AND channel_id=?",
+            "UPDATE my_channels SET status='active', left_at=NULL, removed_at=NULL, membership_version=?, joined_at=COALESCE(joined_at, ?), kind=? WHERE user_id=? AND channel_id=?",
             body.membership_version,
             now,
             body.kind,
-            summaryJson,
             userId,
             body.channel_id,
           );
@@ -218,22 +175,20 @@ export class UserDirectory extends DurableObject<Env> {
         if (body.action === "dissolve") {
           if (existing === undefined) {
             this.ctx.storage.sql.exec(
-              "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, left_at, removed_at, status, membership_version, last_read_event_id, summary_json) VALUES (?, ?, ?, ?, NULL, NULL, 'dissolved', ?, NULL, ?)",
+              "INSERT INTO my_channels (user_id, channel_id, kind, joined_at, left_at, removed_at, status, membership_version, last_read_event_id) VALUES (?, ?, ?, ?, NULL, NULL, 'dissolved', ?, NULL)",
               userId,
               body.channel_id,
               body.kind,
               now,
               body.membership_version,
-              summaryJson,
             );
             return Response.json({ ok: true });
           }
 
           this.ctx.storage.sql.exec(
-            "UPDATE my_channels SET status='dissolved', left_at=NULL, removed_at=NULL, membership_version=?, kind=?, summary_json=COALESCE(?, summary_json) WHERE user_id=? AND channel_id=?",
+            "UPDATE my_channels SET status='dissolved', left_at=NULL, removed_at=NULL, membership_version=?, kind=? WHERE user_id=? AND channel_id=?",
             body.membership_version,
             body.kind,
-            summaryJson,
             userId,
             body.channel_id,
           );

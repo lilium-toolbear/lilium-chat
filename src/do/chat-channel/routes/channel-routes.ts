@@ -329,7 +329,7 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
       );
       host.insertUserDirectoryOutbox(
         userId,
-        host.userDirectoryJoinPayload(userId, channelId, meta.kind, mv),
+        { action: "join", channel_id: channelId, kind: meta.kind, membership_version: mv },
         now,
         `user_directory:join:${channelId}:${userId}:${now}`,
       );
@@ -462,14 +462,14 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
       // user_directory join projections (creator + each initial member)
       host.insertUserDirectoryOutbox(
         creatorUserId,
-        host.userDirectoryJoinPayload(creatorUserId, channelId, "channel", ownerMv),
+        { action: "join", channel_id: channelId, kind: "channel", membership_version: ownerMv },
         now,
         `user_directory:join:${channelId}:${creatorUserId}:${now}`,
       );
       for (const im of initialMembers) {
         host.insertUserDirectoryOutbox(
           im.user_id,
-          host.userDirectoryJoinPayload(im.user_id, channelId, "channel", finalMv),
+          { action: "join", channel_id: channelId, kind: "channel", membership_version: finalMv },
           now,
           `user_directory:join:${channelId}:${im.user_id}:${now}`,
         );
@@ -587,7 +587,7 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
       for (const userId of [userA, userB]) {
         host.insertUserDirectoryOutbox(
           userId,
-          host.userDirectoryJoinPayload(userId, channelId, "dm", membershipVersion),
+          { action: "join", channel_id: channelId, kind: "dm", membership_version: membershipVersion },
           now,
           `user_directory:join:${channelId}:${userId}:${now}`,
         );
@@ -775,10 +775,6 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
       return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
     }
     if (txResult.kind === "ok") {
-      const mvRow = host.ctx.storage.sql
-        .exec("SELECT membership_version FROM channel_meta WHERE channel_id=?", channelId)
-        .toArray()[0] as { membership_version: number };
-      host.enqueueUserDirectorySummaryUpdates(now, mvRow.membership_version);
       await host.scheduleOutboxAlarm(now);
       return Response.json({ channel: txResult.channel }, { status: 200 });
     }

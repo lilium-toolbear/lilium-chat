@@ -400,10 +400,6 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
       return Response.json({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }, { status: 409 });
     }
     if (txResult.kind === "created") {
-      const mvRow = host.ctx.storage.sql
-        .exec("SELECT membership_version FROM channel_meta WHERE channel_id=?", channelId)
-        .toArray()[0] as { membership_version: number };
-      host.enqueueUserDirectorySummaryUpdates(now, mvRow.membership_version);
       await host.scheduleOutboxAlarm(now);
       // Return the same projection committed to idempotency_keys + the outbox — no post-txn recompute.
       const ackPayload = JSON.parse(txResult.response_json) as MessageMutationIdempotencyEnvelope;

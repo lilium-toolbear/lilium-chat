@@ -81,12 +81,3 @@ export function buildChannelMetaProjectionForMember(
     dm_peer_user_id: dmPeerUserId,
   };
 }
-
-export function parseStoredChannelMetaProjection(raw: string | null): ChannelMetaProjection | null {
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as ChannelMetaProjection;
-  } catch {
-    return null;
-  }
-}

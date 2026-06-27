@@ -155,7 +155,7 @@ export async function dispatchMembershipRoutes(host: ChatChannelHost, request: R
 
       host.insertUserDirectoryOutbox(
         userId,
-        host.userDirectoryJoinPayload(userId, channelId, meta.kind, membershipVersion),
+        { action: "join", channel_id: channelId, kind: meta.kind, membership_version: membershipVersion },
         now,
         `user_directory:join:${channelId}:${userId}:${now}`,
       );
@@ -427,7 +427,7 @@ export async function dispatchMembershipRoutes(host: ChatChannelHost, request: R
       for (const member of activeMembers) {
         host.insertUserDirectoryOutbox(
           member.user_id,
-          host.userDirectoryDissolvePayload(member.user_id, channelId, mvRow?.kind ?? "channel", mv),
+          { action: "dissolve", channel_id: channelId, kind: mvRow?.kind ?? "channel", membership_version: mv },
           now,
           `user_directory:dissolve:${channelId}:${member.user_id}:${now}`,
         );
@@ -499,7 +499,7 @@ export async function dispatchMembershipRoutes(host: ChatChannelHost, request: R
       host.persistEventAndFanout(joinedId, "member.joined", channelId, now, buildMemberJoinedPayload({ channel_id: channelId, user_id: b.user_id, role: b.role, membership_version: mv, actor_kind: "user", actor_id: userId, join_source: "admin_add" }), mv, now, actorMap);
       host.insertUserDirectoryOutbox(
         b.user_id,
-        host.userDirectoryJoinPayload(b.user_id, channelId, meta.kind, mv),
+        { action: "join", channel_id: channelId, kind: meta.kind, membership_version: mv },
         now,
         `user_directory:join:${channelId}:${b.user_id}:${now}`,
       );
@@ -554,7 +554,7 @@ export async function dispatchMembershipRoutes(host: ChatChannelHost, request: R
       host.persistEventAndFanout(updatedId, "member.role_updated", channelId, now, buildMemberRoleUpdatedPayload({ channel_id: channelId, user_id: b.user_id, before_role: beforeRole, after_role: b.role, membership_version: mv, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
       host.insertUserDirectoryOutbox(
         b.user_id,
-        host.userDirectoryJoinPayload(b.user_id, channelId, meta.kind, mv),
+        { action: "join", channel_id: channelId, kind: meta.kind, membership_version: mv },
         now,
         `user_directory:membership:${channelId}:${b.user_id}:${now}`,
       );

@@ -37,18 +37,6 @@ export interface ChatChannelHost {
     nowIso: string,
     outboxId: string,
   ): void;
-  userDirectoryJoinPayload(
-    userId: string,
-    channelId: string,
-    kind: string,
-    membershipVersion: number,
-  ): UserDirectoryOutboxPayload;
-  userDirectoryDissolvePayload(
-    userId: string,
-    channelId: string,
-    kind: string,
-    membershipVersion: number,
-  ): UserDirectoryOutboxPayload;
   insertOutboxRowForChannelDirectory(
     channelId: string,
     action: "upsert" | "delete",
@@ -79,7 +67,6 @@ export interface ChatChannelHost {
   activeRole(channelId: string, userId: string): string | null;
   assertNotDissolved(status: string): { code: string; message: string } | null;
   flushSingleInviteDirectoryOutbox(outboxId: string, nowIso: string): Promise<boolean>;
-  enqueueUserDirectorySummaryUpdates(nowIso: string, membershipVersion: number): void;
   handleBotInstall(request: Request): Promise<Response>;
   handleBotInstallUpdate(request: Request): Promise<Response>;
   handleCommandBindingUpdate(request: Request): Promise<Response>;

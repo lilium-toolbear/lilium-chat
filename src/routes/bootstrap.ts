@@ -14,7 +14,6 @@ interface MyChannel {
   kind: string;
   last_read_event_id: string | null;
   membership_version: number;
-  summary?: import("../contract/channel-api").ChannelMetaProjection | null;
 }
 
 interface SummaryPayload {

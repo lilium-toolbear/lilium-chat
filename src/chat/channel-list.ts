@@ -1,7 +1,6 @@
 import type { Env } from "../env";
 import type { ChannelSummaryApi } from "../contract/channel-api";
-import type { ChannelMetaProjection } from "../contract/channel-api";
-import { inflateChannelSummaryForViewer } from "./channel-summary";
+import { inflateChannelSummaryForViewer, type ChannelSummaryFromDo } from "./channel-summary";
 
 export interface MyChannelIndexRow {
   channel_id: string;
@@ -9,7 +8,6 @@ export interface MyChannelIndexRow {
   last_read_event_id: string | null;
   membership_version: number;
   unread_count?: number;
-  summary?: ChannelMetaProjection | null;
 }
 
 export async function inflateMyChannelSummaries(input: {
@@ -19,11 +17,16 @@ export async function inflateMyChannelSummaries(input: {
 }): Promise<ChannelSummaryApi[]> {
   const items = await Promise.all(
     input.myChannels.map(async (mc) => {
-      if (!mc.summary) {
-        return null;
-      }
+      const stub = input.env.CHAT_CHANNEL.getByName(mc.channel_id);
+      const res = await stub.fetch(
+        new Request("https://x/internal/summary", {
+          headers: { "X-Verified-User-Id": input.viewerUserId },
+        }),
+      );
+      if (!res.ok) return null;
+      const summary = (await res.json()) as ChannelSummaryFromDo;
       return inflateChannelSummaryForViewer({
-        summary: mc.summary,
+        summary,
         viewerUserId: input.viewerUserId,
         myChannelRow: {
           last_read_event_id: mc.last_read_event_id,

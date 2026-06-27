@@ -51,7 +51,6 @@ import {
 import { bumpQueueRetry } from "./retry-backoff";
 import { idempotencyConflictResponse, requireTestOnly } from "./do-errors";
 import { isoDueTable, runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "./scheduler";
-import { buildChannelMetaProjectionForMember } from "../chat/channel-meta-projection";
 import type { UserDirectoryOutboxPayload } from "../contract/outbox";
 import type {
   CommandBindingProjection,
@@ -646,65 +645,6 @@ export class ChatChannel extends DurableObject<Env> {
       nowIso,
       nowIso,
     );
-  }
-
-  private userDirectoryJoinPayload(
-    userId: string,
-    channelId: string,
-    kind: string,
-    membershipVersion: number,
-  ): UserDirectoryOutboxPayload {
-    const summary = buildChannelMetaProjectionForMember(this.ctx.storage.sql, userId);
-    return {
-      action: "join",
-      channel_id: channelId,
-      kind,
-      membership_version: membershipVersion,
-      ...(summary ? { summary } : {}),
-    };
-  }
-
-  private userDirectoryDissolvePayload(
-    userId: string,
-    channelId: string,
-    kind: string,
-    membershipVersion: number,
-  ): UserDirectoryOutboxPayload {
-    const summary = buildChannelMetaProjectionForMember(this.ctx.storage.sql, userId);
-    return {
-      action: "dissolve",
-      channel_id: channelId,
-      kind,
-      membership_version: membershipVersion,
-      ...(summary ? { summary } : {}),
-    };
-  }
-
-  private enqueueUserDirectorySummaryUpdates(nowIso: string, membershipVersion: number): void {
-    const meta = this.ctx.storage.sql
-      .exec("SELECT channel_id, kind FROM channel_meta LIMIT 1")
-      .toArray()[0] as { channel_id: string; kind: string } | undefined;
-    if (!meta) return;
-
-    const members = this.ctx.storage.sql
-      .exec("SELECT user_id FROM members WHERE channel_id=? AND left_at IS NULL", meta.channel_id)
-      .toArray() as { user_id: string }[];
-
-    for (const member of members) {
-      const summary = buildChannelMetaProjectionForMember(this.ctx.storage.sql, member.user_id);
-      if (!summary) continue;
-      this.insertUserDirectoryOutbox(
-        member.user_id,
-        {
-          action: "summary_update",
-          channel_id: meta.channel_id,
-          membership_version: membershipVersion,
-          summary,
-        },
-        nowIso,
-        `user_directory:summary:${meta.channel_id}:${member.user_id}:${nowIso}:${Math.random()}`,
-      );
-    }
   }
 
   private async bumpOutboxRetry(outboxId: string, nowIso: string, error: string): Promise<void> {
@@ -1388,9 +1328,7 @@ export class ChatChannel extends DurableObject<Env> {
           } catch {
             payload = {};
           }
-          if (payload.action !== "summary_update") {
-            await this.notifyLiveMembershipChanged(r.target_key, payload);
-          }
+          await this.notifyLiveMembershipChanged(r.target_key, payload);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           await this.bumpOutboxRetry(r.outbox_id, nowIso, msg);
