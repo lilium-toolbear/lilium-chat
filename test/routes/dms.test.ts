@@ -108,6 +108,30 @@ describe("POST /api/chat/dms", () => {
     expect(b2.channel.channel_id).toBe(b1.channel.channel_id);
   });
 
+  it("completed idempotent replay returns byte-identical body without profile resolve", async () => {
+    const { resolveUserSummaries } = await import("../../src/profile/resolve");
+    let resolveCalls = 0;
+    vi.mocked(resolveUserSummaries).mockImplementation(async (userIds) => {
+      resolveCalls++;
+      const map = new Map<string, { user_id: string; display_name: string; avatar_url: null }>();
+      for (const id of userIds) {
+        map.set(id, { user_id: id, display_name: `User ${id.slice(-4)}`, avatar_url: null });
+      }
+      return map;
+    });
+
+    const token = await makeJwt({ sub: USER_A });
+    const r1 = await postDms(token, USER_B, "http-dm-idem-bytes");
+    expect(r1.status).toBe(200);
+    const bodyText1 = await r1.text();
+
+    const callsBeforeReplay = resolveCalls;
+    const r2 = await postDms(token, USER_B, "http-dm-idem-bytes");
+    expect(r2.status).toBe(200);
+    expect(await r2.text()).toBe(bodyText1);
+    expect(resolveCalls).toBe(callsBeforeReplay);
+  });
+
   it("projects dm to recipient my_channels after outbox flush", async () => {
     const token = await makeJwt({ sub: USER_A });
     const res = await postDms(token, USER_B, "http-dm-proj");

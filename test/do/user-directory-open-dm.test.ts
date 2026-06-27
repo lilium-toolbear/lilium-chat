@@ -132,4 +132,43 @@ describe("UserDirectory /internal/open-dm", () => {
     const body = await res.json() as { error: { code: string } };
     expect(body.error.code).toBe("IDEMPOTENCY_CONFLICT");
   });
+
+  it("resume creating row without response_json re-enters orchestration", async () => {
+    const first = await openDm(USER_A, USER_B, "dm-key-resume");
+    expect(first.res.status).toBe(200);
+    const firstBody = await first.res.json() as { kind: string; channel_id: string };
+    expect(firstBody.kind).toBe("needs_inflate");
+
+    const second = await openDm(USER_A, USER_B, "dm-key-resume");
+    expect(second.res.status).toBe(200);
+    const secondBody = await second.res.json() as { kind: string; channel_id: string };
+    expect(secondBody.kind).toBe("needs_inflate");
+    expect(secondBody.channel_id).toBe(firstBody.channel_id);
+  });
+
+  it("resume creating row then complete then cached replay", async () => {
+    const { res, stub } = await openDm(USER_A, USER_B, "dm-key-resume-complete");
+    const needs = await res.json() as { kind: string; channel_id: string; joined_at: string };
+    expect(needs.kind).toBe("needs_inflate");
+
+    const resume = await openDm(USER_A, USER_B, "dm-key-resume-complete");
+    const resumeBody = await resume.res.json() as { kind: string; channel_id: string };
+    expect(resumeBody.kind).toBe("needs_inflate");
+    expect(resumeBody.channel_id).toBe(needs.channel_id);
+
+    const cachedResponse = {
+      channel: { channel_id: needs.channel_id, kind: "dm" },
+      membership: { role: "member", joined_at: needs.joined_at },
+    };
+    await stub.fetch(new Request("https://x/internal/open-dm-complete", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": USER_A, "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "dm-key-resume-complete", response_json: JSON.stringify(cachedResponse) }),
+    }));
+
+    const replay = await openDm(USER_A, USER_B, "dm-key-resume-complete");
+    const replayBody = await replay.res.json() as { kind: string; response: typeof cachedResponse };
+    expect(replayBody.kind).toBe("cached");
+    expect(replayBody.response.channel.channel_id).toBe(needs.channel_id);
+  });
 });
