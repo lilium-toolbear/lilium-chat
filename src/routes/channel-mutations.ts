@@ -1,7 +1,13 @@
 import type { Context } from "hono";
+import type {
+  ChannelMetaProjection,
+  CreateChannelApiResponse,
+  DissolveChannelApiResponse,
+} from "../contract/channel-api";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
+import type { ChannelSummaryFromDo } from "../chat/channel-summary";
 import { resolveUserSummaries } from "../profile/resolve";
 
 export async function getIdentity(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<{ userId: string; env: Env }> {
@@ -49,7 +55,7 @@ export async function createChannelHandler(c: Context<{ Bindings: Env; Variables
   }
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "channel create failed");
 
-  const out = await res.json() as Record<string, unknown>;
+  const out = await res.json() as CreateChannelApiResponse;
   return c.json(out, 201, { "X-Request-Id": c.get("requestId") });
 }
 
@@ -81,7 +87,7 @@ export async function updateChannelHandler(c: Context<{ Bindings: Env; Variables
   if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to update channel");
   if (res.status === 404) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "channel update failed");
-  const out = await res.json() as Record<string, unknown>;
+  const out = await res.json() as { channel: ChannelMetaProjection };
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
@@ -104,7 +110,7 @@ export async function dissolveChannelHandler(c: Context<{ Bindings: Env; Variabl
   if (res.status === 403) throw new ApiError("FORBIDDEN", "only owner may dissolve");
   if (res.status === 404) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "dissolve failed");
-  const out = await res.json() as Record<string, unknown>;
+  const out = await res.json() as DissolveChannelApiResponse;
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
@@ -517,7 +523,7 @@ export async function joinChannelHandler(c: Context<{ Bindings: Env; Variables: 
   // channel field is re-inflated per call and may differ in transient fields like title/avatar).
   const summaryRes = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
   if (!summaryRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "channel summary failed");
-  const s = (await summaryRes.json()) as Record<string, unknown>;
+  const s = (await summaryRes.json()) as ChannelSummaryFromDo;
 
   const channel = {
     channel_id: s.channel_id,

@@ -1,25 +1,23 @@
-import type { EventFrame } from "../ws/frames";
+import type { MessagePersistedPayload } from "../contract/persisted";
+import type { MessageProjectionEventPayload } from "../contract/events";
+import type { UserSummary } from "../contract/primitives";
+import type { WireChatMessage } from "../contract/message";
+import { buildWireEventFrame, type EventFrame } from "../contract/wire-frames";
+import type { ChatEventPayloadByType, ChatEventType } from "../contract/events";
 
-export function buildEventFrame(args: {
+export type { UserSummary };
+
+export function buildEventFrame<T extends ChatEventType>(args: {
   event_id: string;
-  type: string;
+  type: T;
   channel_id: string;
   occurred_at: string;
-  payload: Record<string, unknown>;
+  payload: ChatEventPayloadByType[T];
 }): EventFrame {
-  return {
-    frame_type: "event",
-    api_version: "lilium.chat.v1",
-    event_id: args.event_id,
-    type: args.type,
-    channel_id: args.channel_id,
-    occurred_at: args.occurred_at,
-    payload: args.payload,
-  };
+  return buildWireEventFrame(args) as EventFrame;
 }
 
 // Per design spec §3.5: PERSISTED event payloads store actor REFERENCES, not UserSummary.
-// (events.payload_json stores the shape produced below — sender as {kind, user_id, bot_id}.)
 export function buildMessageCreatedPayload(raw: {
   message_id: string;
   command_id: string;
@@ -40,13 +38,17 @@ export function buildMessageCreatedPayload(raw: {
   type: string;
   format: string;
   text: string | null;
-}): Record<string, unknown> {
+}): MessagePersistedPayload {
   let replySnapshot: unknown = null;
   if (raw.reply_snapshot_json) {
-    try { replySnapshot = JSON.parse(raw.reply_snapshot_json); } catch { replySnapshot = null; }
+    try {
+      replySnapshot = JSON.parse(raw.reply_snapshot_json);
+    } catch {
+      replySnapshot = null;
+    }
   }
 
-    return {
+  return {
     message: {
       message_id: raw.message_id,
       command_id: raw.command_id,
@@ -76,52 +78,20 @@ export function buildMessageCreatedPayload(raw: {
   };
 }
 
-export function buildMessageLifecyclePayload(raw: {
-  message_id: string;
-  command_id: string;
-  channel_id: string;
-  sender_kind: string;
-  sender_user_id: string | null;
-  sender_bot_id: string | null;
-  status: string;
-  created_at: string;
-  updated_at: string;
-  edited_at: string | null;
-  deleted_at: string | null;
-  deleted_by: string | null;
-  recalled_at: string | null;
-  stream_state: string;
-  reply_to: string | null;
-  reply_snapshot_json: string | null;
-  type: string;
-  format: string;
-  text: string | null;
-}): Record<string, unknown> {
+export function buildMessageLifecyclePayload(raw: Parameters<typeof buildMessageCreatedPayload>[0]): MessagePersistedPayload {
   return buildMessageCreatedPayload(raw);
 }
 
-// Per design spec §3.5: the LIVE broadcast (wire) projection resolves UserSummary at output
-// time. The persisted payload keeps the sender ref; this function takes that persisted payload
-// and returns a NEW payload with sender replaced by { kind:'user', user: UserSummary } so the
-// client never has to render a bare user_id. (For bot senders, resolution is deferred to Phase 7;
-// the bot ref is passed through unchanged here.)
-//
-// `resolveUserSummaries` is injected so this module stays unit-testable without Hyperdrive.
-export interface UserSummary {
-  user_id: string;
-  display_name: string;
-  avatar_url: string | null;
-}
 export type ResolveUserSummaries = (userIds: string[]) => Promise<Map<string, UserSummary>>;
 
+// Per design spec §3.5: the LIVE broadcast (wire) projection resolves UserSummary at output time.
 export async function resolveSenderForLiveBroadcast(
-  payload: Record<string, unknown>,
+  payload: MessagePersistedPayload,
   resolveUserSummaries: ResolveUserSummaries,
-): Promise<Record<string, unknown>> {
-  const message = (payload.message as { sender?: { kind?: string; user_id?: string | null; bot_id?: string | null } } | undefined);
-  const sender = message?.sender;
-  let resolvedSender: Record<string, unknown>;
-  if (sender?.kind === "user" && sender.user_id) {
+): Promise<MessageProjectionEventPayload> {
+  const sender = payload.message.sender;
+  let resolvedSender: WireChatMessage["sender"];
+  if (sender.kind === "user" && sender.user_id) {
     const map = await resolveUserSummaries([sender.user_id]);
     const u = map.get(sender.user_id) ?? {
       user_id: sender.user_id,
@@ -129,14 +99,25 @@ export async function resolveSenderForLiveBroadcast(
       avatar_url: null,
     };
     resolvedSender = { kind: "user", user: u };
-  } else if (sender?.kind === "bot") {
-    // Phase 7 will resolve bot display_name/avatar from BotRegistry. Pass through for now.
+  } else if (sender.kind === "bot") {
     resolvedSender = { kind: "bot", bot_id: sender.bot_id };
   } else {
-    resolvedSender = (sender as Record<string, unknown>) ?? {};
+    resolvedSender = { kind: sender.kind };
   }
-  const baseMessage = (payload.message as Record<string, unknown> | undefined) ?? {};
+
   return {
-    message: { ...baseMessage, sender: resolvedSender },
+    message: {
+      ...payload.message,
+      sender: resolvedSender,
+      reply_snapshot: payload.message.reply_snapshot as WireChatMessage["reply_snapshot"],
+      type: payload.message.type as WireChatMessage["type"],
+      format: payload.message.format as WireChatMessage["format"],
+      status: payload.message.status as WireChatMessage["status"],
+      stream_state: payload.message.stream_state as WireChatMessage["stream_state"],
+      attachments: [],
+      sticker: null,
+      components: [],
+      mentions: [],
+    },
   };
 }

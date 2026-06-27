@@ -1,24 +1,19 @@
-export type Frame = CommandFrame | CommandAckFrame | CommandErrorFrame | EventFrame | ReadStateUpdatedFrame | UserEventFrame;
+import type { IncomingCommandFrame } from "../contract/commands";
+import type { WireChatMessage } from "../contract/message";
+import type { EventFrame } from "../contract/wire-frames";
 
-export interface CommandFrame {
-  frame_type: "command";
-  command: string;
-  command_id: string;
-  channel_id?: string;
-  payload: Record<string, unknown>;
-}
+export type { EventFrame } from "../contract/wire-frames";
+export type { IncomingCommandFrame as CommandFrame } from "../contract/commands";
 
-// v4.0: command_ack is payload-bearing + discriminated by `command`. The flat
-// {channel_id?, message_id?, event_id?...} shape is gone — clients read the
-// canonical result from `payload` (command-specific). Phase 4 acks (message.edit/
-// recall/delete) extend this union.
+export type Frame = IncomingCommandFrame | CommandAckFrame | CommandErrorFrame | EventFrame | ReadStateUpdatedFrame | UserEventFrame;
+
 export type CommandAckFrame =
   | {
       frame_type: "command_ack";
       command: "message.send" | "message.edit" | "message.recall" | "message.delete";
       command_id: string;
       status: "committed";
-      payload: { channel_id: string; event_id: string; message: Record<string, unknown> };
+      payload: { channel_id: string; event_id: string; message: WireChatMessage };
     }
   | {
       frame_type: "command_ack";
@@ -60,16 +55,6 @@ export interface UserEventFrame {
   event: "my_channels_changed";
   reason: string;
   changed_channel_id?: string;
-}
-
-export interface EventFrame {
-  frame_type: "event";
-  api_version: "lilium.chat.v1";
-  event_id: string;
-  type: string;
-  channel_id: string;
-  occurred_at: string;
-  payload: Record<string, unknown>;
 }
 
 export function parseFrame(text: string): Frame {

@@ -3,7 +3,8 @@ import { resolveUserSummaries } from "../profile/resolve";
 import type { MessageRow } from "../do/chat-channel";
 import { projectMessageForBrowser, type MessageMention, type MessageStickerSnapshot } from "./message-projection";
 import { projectAttachmentForBrowser, type AttachmentRow } from "./attachment-projection";
-import type { UserSummary } from "./event-broadcast";
+import type { MessageImageAttachment } from "../contract/message";
+import type { UserSummary } from "../contract/primitives";
 
 // v4.0: history/bootstrap projection goes through the ONE shared projectMessageForBrowser
 // (addendum J) — same serializer as message.send ack + message.created event + replay. The DO
@@ -17,7 +18,7 @@ export async function projectMessagesForBrowser(
   env: Env,
   attachmentsByMessage: Record<string, AttachmentRow[]> = {},
   stickersByMessage: Record<string, MessageStickerSnapshot> = {},
-): Promise<Record<string, unknown>[]> {
+): Promise<ProjectedMessage[]> {
   const senderUserIds = [...new Set(rows.filter((r) => r.sender_kind === "user" && r.sender_user_id).map((r) => r.sender_user_id as string))];
   const map = await resolveUserSummaries(senderUserIds, env);
 
@@ -32,7 +33,9 @@ export async function projectMessagesForBrowser(
         : { user_id: row.sender_user_id, display_name: `user-${row.sender_user_id.slice(0, 8)}`, avatar_url: null };
     }
     const attachmentRows = attachmentsByMessage[row.message_id] ?? [];
-    const attachments = attachmentRows.map(projectAttachmentForBrowser).filter((a): a is Record<string, unknown> => a !== null);
+    const attachments = attachmentRows
+      .map(projectAttachmentForBrowser)
+      .filter((a): a is MessageImageAttachment => a !== null);
     return projectMessageForBrowser(row, {
       senderSummary,
       mentions: mentionsByMessage[row.message_id] ?? [],

@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
+import type { ChannelSummaryApi } from "../contract/channel-api";
 import { inflateChannelSummaryForViewer } from "../chat/channel-summary";
 
 async function getIdentity(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<{ userId: string; env: Env }> {
@@ -33,7 +34,7 @@ export async function listChannelsHandler(c: Context<{ Bindings: Env; Variables:
       });
     }),
   );
-  const filtered = items.filter((it) => it !== null) as Array<Record<string, unknown>>;
+  const filtered = items.filter((it): it is ChannelSummaryApi => it !== null);
   return c.json({ items: filtered, next_cursor: null }, 200, { "X-Request-Id": c.get("requestId") });
 }
 

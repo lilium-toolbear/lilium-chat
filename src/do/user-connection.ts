@@ -4,6 +4,7 @@ import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateUserConnectionSchema } from "./migrations/user-connection";
 import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame, type UserEventFrame } from "../ws/frames";
 import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditCommand, parseMessageRecallCommand, parseMessageSendCommand } from "../chat/command";
+import type { MessageMutationAckPayload, MessageMutationInternalRequest } from "../contract/idempotency";
 
 export interface ConnectionAttachment {
   user_id: string;
@@ -278,12 +279,16 @@ export class UserConnection extends DurableObject<Env> {
       try {
         const stub = this.env.CHAT_CHANNEL.getByName(channelId);
         const endpoint = frame.command === "message.edit" ? "/internal/message-edit" : frame.command === "message.recall" ? "/internal/message-recall" : "/internal/message-delete";
-        const body: Record<string, unknown> = { operation_id: frame.command_id, message_id: parsed.command.message_id, channel_id: channelId };
+        const body: MessageMutationInternalRequest = {
+          operation_id: frame.command_id,
+          message_id: parsed.command.message_id,
+          channel_id: channelId,
+        };
         if (frame.command === "message.edit") body.text = parsed.command.text;
         if (frame.command === "message.delete") body.reason = parsed.command.reason ?? null;
         const res = await stub.fetch(new Request(`https://x${endpoint}`, { method: "POST", headers: { "X-Verified-User-Id": attachment.user_id, "Content-Type": "application/json" }, body: JSON.stringify(body) }));
         if (!res.ok) { const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } }; sendCommandError(ws, frame.command_id, responseError(e.error?.code ?? "CHAT_WORKER_UNAVAILABLE", e.error?.message ?? "mutation failed")); return; }
-        const out = await res.json() as { channel_id: string; event_id: string; message: Record<string, unknown> };
+        const out = await res.json() as MessageMutationAckPayload;
         ws.send(JSON.stringify({ frame_type: "command_ack", command: frame.command, command_id: frame.command_id, status: "committed", payload: { channel_id: out.channel_id, event_id: out.event_id, message: out.message } }));
       } catch (err) {
         sendCommandError(ws, frame.command_id, responseError("CHAT_WORKER_UNAVAILABLE", err instanceof Error ? err.message : "mutation failed"));
@@ -358,7 +363,7 @@ export class UserConnection extends DurableObject<Env> {
         return;
       }
 
-      const body = (await res.json()) as { channel_id: string; event_id: string; message: Record<string, unknown> };
+      const body = (await res.json()) as MessageMutationAckPayload;
       const ack = {
         frame_type: "command_ack",
         command_id: frame.command_id,

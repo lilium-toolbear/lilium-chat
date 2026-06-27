@@ -1,9 +1,17 @@
 import type { Context } from "hono";
+import type { FinalizedAttachmentProjection } from "../contract/message";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 
 type UploadNamespace = "attachment" | "avatar";
+
+interface UploadPresignResponse {
+  attachment_id: string;
+  upload_url: string;
+  upload_headers: Record<string, string>;
+  expires_at: string;
+}
 
 async function presignUpload(
   c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
@@ -56,7 +64,7 @@ async function presignUpload(
   }
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "upload presign failed");
 
-  const out = await res.json() as Record<string, unknown>;
+  const out = (await res.json()) as UploadPresignResponse;
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
@@ -94,7 +102,7 @@ async function finalizeUpload(
   }
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "upload finalize failed");
 
-  const out = await res.json() as Record<string, unknown>;
+  const out = (await res.json()) as { attachment: FinalizedAttachmentProjection };
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 

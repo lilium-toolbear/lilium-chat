@@ -23,6 +23,28 @@ import {
   buildCommandBindingUpdatedPayload,
   resolveActorWithMap,
 } from "../chat/channel-events";
+import type {
+  ManagementPersistedEventType,
+  ManagementPersistedPayload,
+  ManagementPersistedPayloadByType,
+  MessagePersistedPayload,
+} from "../contract/persisted";
+import { isChatEventType, type ChatEventPayloadByType, type ChatEventType } from "../contract/events";
+import type { MessageImageAttachment, WireChatMessage } from "../contract/message";
+import type { MessageMutationAckPayload, MessageMutationIdempotencyEnvelope } from "../contract/idempotency";
+import type { ChannelMetaProjection, ChannelUpdatePresentFields, MemberProjection } from "../contract/channel-api";
+import type { DissolvedChannelProjection } from "../contract/channel";
+import type {
+  ProjectionOutboxPayload,
+  ChannelDirectorySnapshotFields,
+} from "../contract/outbox";
+import type {
+  CommandBindingProjection,
+  BotEventSubscriptionProjection,
+  CommandPolicyMap,
+  EventSubscriptionPolicyMap,
+  MessageEventSubscriptionFilters,
+} from "../contract/bot-api";
 import { personalInviteCode } from "../chat/invite-code";
 import { HTTP_STATUS_BY_CODE } from "../errors";
 import { resolveUserSummaries } from "../profile/resolve";
@@ -64,6 +86,13 @@ interface ReplayEventRow {
   occurred_at: string;
 }
 
+interface ReplaySqlEventRow {
+  event_id: unknown;
+  event_type: unknown;
+  payload_json: unknown;
+  occurred_at: unknown;
+}
+
 interface ReplayEnvelope {
   event_id: string;
   event_json: string;
@@ -82,10 +111,10 @@ export class ChatChannel extends DurableObject<Env> {
   private async insertOutboxRow(
     targetKind: string,
     targetKey: string,
-    payload: Record<string, unknown>,
+    payload: ProjectionOutboxPayload,
     nowIso: string,
   ): Promise<void> {
-    const payloadOut = { ...payload } as Record<string, unknown>;
+    const payloadOut = { ...payload };
     const eventId = this.nextEventId(Date.parse(nowIso));
     this.ctx.storage.sql.exec(
       "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, 0, 5)",
@@ -205,13 +234,7 @@ export class ChatChannel extends DurableObject<Env> {
   // Returns title/avatar_url/member_count/status + last_message_at (from the latest visible message)
   // so every channel_directory upsert is a FULL snapshot (P0-3): a missing directory row is always
   // repairable by any subsequent call site (create/update/message.send/member delta).
-  private readChannelDirectorySnapshot(channelId: string, nowIso: string): {
-    title: string;
-    avatar_url: string | null;
-    member_count: number;
-    last_message_at: string | null;
-    status: string;
-  } | null {
+  private readChannelDirectorySnapshot(channelId: string, nowIso: string): ChannelDirectorySnapshotFields | null {
     const meta = this.ctx.storage.sql
       .exec("SELECT title, avatar_url, member_count, status FROM channel_meta WHERE channel_id=?", channelId)
       .toArray()[0] as { title: string; avatar_url: string | null; member_count: number; status: string } | undefined;
@@ -235,7 +258,7 @@ export class ChatChannel extends DurableObject<Env> {
   private insertOutboxRowForChannelDirectory(
     channelId: string,
     action: "upsert" | "delete",
-    snapshot: { title: string; avatar_url: string | null; member_count: number; last_message_at: string | null; status: string } | null,
+    snapshot: ChannelDirectorySnapshotFields | null,
     nowIso: string,
   ): void {
     if (action === "delete") {
@@ -349,7 +372,7 @@ export class ChatChannel extends DurableObject<Env> {
         input.userId, input.operation, input.operationId, input.requestHash)
       .toArray()[0] as { response_json: string } | undefined;
     if (preCheck) {
-      const cached = JSON.parse(preCheck.response_json) as { payload?: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } };
+      const cached = JSON.parse(preCheck.response_json) as MessageMutationIdempotencyEnvelope;
       if (cached.payload && cached.payload.event_id && cached.payload.message) {
         return Response.json({
           channel_id: cached.payload.channel_id ?? input.channelId,
@@ -557,7 +580,7 @@ export class ChatChannel extends DurableObject<Env> {
       // unwrap the full command_ack JSON → return {channel_id, event_id, message} (the internal
       // endpoint contract). The cached response_json is a full ack frame; the WS UserConnection
       // re-wraps it. This mirrors the cheap pre-check path + the message-send cached branch.
-      const cached = JSON.parse(txResult.responseJson) as { payload?: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } };
+      const cached = JSON.parse(txResult.responseJson) as MessageMutationIdempotencyEnvelope;
       if (cached.payload && cached.payload.event_id && cached.payload.message) {
         return Response.json({ channel_id: cached.payload.channel_id ?? input.channelId, event_id: cached.payload.event_id, message: cached.payload.message });
       }
@@ -569,7 +592,7 @@ export class ChatChannel extends DurableObject<Env> {
     }
 
     await this.scheduleOutboxAlarm(now);
-    const ack = JSON.parse(txResult.responseJson) as { payload?: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } };
+    const ack = JSON.parse(txResult.responseJson) as MessageMutationIdempotencyEnvelope;
     return Response.json({ channel_id: ack.payload?.channel_id ?? input.channelId, event_id: ack.payload?.event_id ?? "", message: ack.payload?.message ?? null });
   }
 
@@ -577,12 +600,12 @@ export class ChatChannel extends DurableObject<Env> {
   // LIVE-resolved frame. MUST run inside ctx.storage.transaction. The actor map is pre-resolved
   // BEFORE the txn (Hyperdrive is a network call). All event types reaching here carry actor_kind
   // (v4.0: read_state.updated is no longer a channel event — it's a user-local WS frame).
-  private persistEventAndFanout(
+  private persistEventAndFanout<T extends ManagementPersistedEventType>(
     eventId: string,
-    type: string,
+    type: T,
     channelId: string,
     occurredAt: string,
-    persistedPayload: Record<string, unknown>,
+    persistedPayload: ManagementPersistedPayloadByType[T],
     membershipVersion: number,
     nowIso: string,
     actorMap: Map<string, import("../chat/event-broadcast").UserSummary>,
@@ -596,7 +619,13 @@ export class ChatChannel extends DurableObject<Env> {
     // v4.0: read_state.updated is no longer a channel event (Task 4 moved read-state to a
     // user-local WS frame), so every event type reaching here carries actor_kind and is resolved.
     const livePayload = resolveActorWithMap(persistedPayload, actorMap);
-    const frame = buildEventFrame({ event_id: eventId, type, channel_id: channelId, occurred_at: occurredAt, payload: livePayload });
+    const frame = buildEventFrame({
+      event_id: eventId,
+      type,
+      channel_id: channelId,
+      occurred_at: occurredAt,
+      payload: livePayload as ChatEventPayloadByType[T],
+    });
     this.insertOutboxRowForFanout(channelId, eventId, JSON.stringify(frame), membershipVersion, nowIso);
   }
 
@@ -1247,7 +1276,7 @@ export class ChatChannel extends DurableObject<Env> {
           userId, b.command_id, requestHash)
         .toArray()[0] as { response_json: string } | undefined;
       if (preCheck) {
-        const cached = JSON.parse(preCheck.response_json) as { payload?: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } };
+        const cached = JSON.parse(preCheck.response_json) as MessageMutationIdempotencyEnvelope;
         if (cached.payload && cached.payload.event_id && cached.payload.message) {
           return Response.json({
             channel_id: cached.payload.channel_id ?? channelId,
@@ -1284,7 +1313,7 @@ export class ChatChannel extends DurableObject<Env> {
       // Phase 5 image messages: resolve finalized attachments from UserDirectory BEFORE the txn
       // (cross-DO fetch must not happen inside a storage transaction).
       let attachmentRows: ChatAttachmentRow[] = [];
-      let attachmentProjections: Record<string, unknown>[] = [];
+      let attachmentProjections: MessageImageAttachment[] = [];
       if (b.type === "image") {
         const ids = Array.isArray(b.attachment_ids) ? b.attachment_ids : [];
         if (ids.length === 0) {
@@ -1550,12 +1579,12 @@ export class ChatChannel extends DurableObject<Env> {
       if (txResult.kind === "created") {
         await this.scheduleOutboxAlarm(now);
         // Return the same projection committed to idempotency_keys + the outbox — no post-txn recompute.
-        const ackPayload = JSON.parse(txResult.response_json) as { payload: { channel_id: string; event_id: string; message: Record<string, unknown> } };
-        return Response.json(ackPayload.payload);
+        const ackPayload = JSON.parse(txResult.response_json) as MessageMutationIdempotencyEnvelope;
+        return Response.json(ackPayload.payload as MessageMutationAckPayload);
       }
       // cached: return the stored full ack payload exactly (addendum K). It was written complete in
       // the original transaction, so event_id is never "" and message is never null here.
-      const cached = JSON.parse(txResult.response_json) as { payload?: { channel_id?: string; event_id?: string; message?: Record<string, unknown> | null } };
+      const cached = JSON.parse(txResult.response_json) as MessageMutationIdempotencyEnvelope;
       return Response.json({
         channel_id: cached.payload?.channel_id ?? channelId,
         event_id: cached.payload?.event_id ?? "",
@@ -2345,7 +2374,7 @@ export class ChatChannel extends DurableObject<Env> {
       const txResult = await this.ctx.storage.transaction(async (): Promise<
         | { kind: "conflict" }
         | { kind: "cached"; responseJson: string }
-        | { kind: "dissolved"; channel: Record<string, unknown> }
+        | { kind: "dissolved"; channel: DissolvedChannelProjection }
       > => {
         const idem = this.ctx.storage.sql
           .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.dissolve' AND operation_id=?", userId, b.idempotency_key)
@@ -2440,7 +2469,7 @@ export class ChatChannel extends DurableObject<Env> {
           meta.channel_id,
           after,
         )
-        .toArray() as Array<Record<string, unknown>>;
+        .toArray() as unknown as ReplaySqlEventRow[];
       const parsedRows: ReplayEventRow[] = rows.map((row) => ({
         event_id: typeof row.event_id === "string" ? row.event_id : String(row.event_id ?? ""),
         event_type: typeof row.event_type === "string" ? row.event_type : String(row.event_type ?? ""),
@@ -2512,16 +2541,20 @@ export class ChatChannel extends DurableObject<Env> {
       const out: Array<ReplayEnvelope> = [];
 
       for (const r of parsedRows) {
-        let payload: Record<string, unknown> = {};
+        let persistedPayload: MessagePersistedPayload | ManagementPersistedPayload | unknown = {};
         try {
-          payload = JSON.parse(r.payload_json) as Record<string, unknown>;
+          persistedPayload = JSON.parse(r.payload_json) as MessagePersistedPayload | ManagementPersistedPayload;
         } catch {
-          payload = {};
+          persistedPayload = {};
         }
+
+        let wirePayload: ChatEventPayloadByType[ChatEventType] | unknown =
+          persistedPayload;
 
         if (messageReplayTypes.has(r.event_type)) {
           try {
-            const p = payload.message as { message_id?: string } | undefined;
+            const messagePersisted = persistedPayload as MessagePersistedPayload;
+            const p = messagePersisted.message;
             const messageId = typeof p?.message_id === "string" ? p.message_id : "";
             if (!messageId) {
               continue;
@@ -2558,32 +2591,44 @@ export class ChatChannel extends DurableObject<Env> {
               .toArray() as unknown as ChatAttachmentRow[];
             const replayAttachments = replayAttachmentRows
               .map(projectAttachmentForBrowser)
-              .filter((a): a is Record<string, unknown> => a !== null);
+              .filter((a): a is NonNullable<ReturnType<typeof projectAttachmentForBrowser>> => a !== null);
             const replayStickerRow = this.ctx.storage.sql
               .exec(
                 "SELECT sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash FROM message_stickers WHERE message_id=?",
                 messageRow.message_id,
               )
               .toArray()[0] as unknown as MessageStickerSnapshot | undefined;
-            payload = { message: projectMessageForBrowser(messageRow, { senderSummary, mentions: replayMentions, attachments: replayAttachments, sticker: replayStickerRow ?? null }) };
+            wirePayload = { message: projectMessageForBrowser(messageRow, { senderSummary, mentions: replayMentions, attachments: replayAttachments, sticker: replayStickerRow ?? null }) };
           } catch {
             // malformed payload or missing payload message_id
           }
         } else if (managementTypes.has(r.event_type) && r.event_type !== "read_state.updated") {
-          payload = resolveActorWithMap(payload, liveMap);
+          wirePayload = resolveActorWithMap(persistedPayload as ManagementPersistedPayload, liveMap);
         }
 
-        out.push({
-          event_id: r.event_id,
-          event_json: JSON.stringify(
-            buildEventFrame({
+        const eventJson = isChatEventType(r.event_type)
+          ? JSON.stringify(
+              buildEventFrame({
+                event_id: r.event_id,
+                type: r.event_type,
+                channel_id: meta.channel_id,
+                occurred_at: r.occurred_at,
+                payload: wirePayload as ChatEventPayloadByType[typeof r.event_type],
+              }),
+            )
+          : JSON.stringify({
+              frame_type: "event",
+              api_version: "lilium.chat.v1",
               event_id: r.event_id,
               type: r.event_type,
               channel_id: meta.channel_id,
               occurred_at: r.occurred_at,
-              payload,
-            }),
-          ),
+              payload: wirePayload,
+            });
+
+        out.push({
+          event_id: r.event_id,
+          event_json: eventJson,
         });
       }
       return Response.json({ events: out });
@@ -2626,7 +2671,12 @@ export class ChatChannel extends DurableObject<Env> {
 
       // Build all persisted payloads + event ids + live frames up front (sync), then write in one txn.
       const ownerMv = 1;
-      const events: Array<{ id: string; type: string; payload: Record<string, unknown>; mv: number }> = [];
+      const events: Array<{
+        id: string;
+        type: ManagementPersistedEventType;
+        payload: ManagementPersistedPayload;
+        mv: number;
+      }> = [];
       const channelCreatedId = this.nextEventId(nowMs);
       events.push({ id: channelCreatedId, type: "channel.created", payload: buildChannelCreatedPayload({ channel_id: channelId, kind: "channel", visibility, title, actor_kind: "user", actor_id: creatorUserId }), mv: ownerMv });
       const memberJoinedCreatorId = this.nextEventId(nowMs);
@@ -2643,8 +2693,8 @@ export class ChatChannel extends DurableObject<Env> {
       const memberCount = 1 + initialMembers.length;
 
       const result = await this.ctx.storage.transaction(async (): Promise<
-        | { kind: "cached"; channel: Record<string, unknown>; joinedAt: string }
-        | { kind: "created"; channel: Record<string, unknown>; joinedAt: string }
+        | { kind: "cached"; channel: ChannelMetaProjection; joinedAt: string }
+        | { kind: "created"; channel: ChannelMetaProjection; joinedAt: string }
       > => {
         const existing = this.ctx.storage.sql.exec("SELECT channel_id FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { channel_id: string } | undefined;
         if (existing !== undefined) {
@@ -2733,8 +2783,8 @@ export class ChatChannel extends DurableObject<Env> {
       const membershipVersion = 1;
 
       const result = await this.ctx.storage.transaction(async (): Promise<
-        | { kind: "cached"; channel: Record<string, unknown>; joinedAtByUser: Record<string, string> }
-        | { kind: "created"; channel: Record<string, unknown>; joinedAtByUser: Record<string, string> }
+        | { kind: "cached"; channel: ChannelMetaProjection; joinedAtByUser: Record<string, string> }
+        | { kind: "created"; channel: ChannelMetaProjection; joinedAtByUser: Record<string, string> }
       > => {
         const existing = this.ctx.storage.sql
           .exec("SELECT channel_id FROM channel_meta WHERE channel_id=?", channelId)
@@ -2889,7 +2939,7 @@ export class ChatChannel extends DurableObject<Env> {
       // `title:"x"` (only title set) must hash differently from `title:"x", topic:null`,
       // otherwise a second request that explicitly nulls `topic` would collide with an omit-topic
       // request and wrongly register as cached/conflict. Capture exactly the keys the client sent.
-      const present: Record<string, unknown> = {};
+      const present: ChannelUpdatePresentFields = {};
       if (b.title !== undefined) present.title = b.title;
       if (b.topic !== undefined) present.topic = b.topic;
       if (b.avatar_attachment_id !== undefined) present.avatar_attachment_id = b.avatar_attachment_id;
@@ -2902,7 +2952,7 @@ export class ChatChannel extends DurableObject<Env> {
       const txResult = await this.ctx.storage.transaction(async (): Promise<
         | { kind: "conflict" }
         | { kind: "cached"; responseJson: string }
-        | { kind: "ok"; channel: Record<string, unknown> }
+        | { kind: "ok"; channel: ChannelMetaProjection }
       > => {
         const idem = this.ctx.storage.sql
           .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.update' AND operation_id=?", userId, b.idempotency_key)
@@ -3013,7 +3063,7 @@ export class ChatChannel extends DurableObject<Env> {
       const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
       const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
-      const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "cached"; j: string } | { kind: "conflict" } | { kind: "ok"; member: Record<string, unknown> }> => {
+      const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "cached"; j: string } | { kind: "conflict" } | { kind: "ok"; member: MemberProjection & { channel_id: string } }> => {
         const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.add' AND operation_id=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
@@ -3079,7 +3129,7 @@ export class ChatChannel extends DurableObject<Env> {
       const idemExpiresAt = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
       const actorMap = await this.resolveActorMap([userId, b.user_id]);
 
-      const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "conflict" } | { kind: "cached"; j: string } | { kind: "ok"; member: Record<string, unknown> }> => {
+      const tx = await this.ctx.storage.transaction(async (): Promise<{ kind: "conflict" } | { kind: "cached"; j: string } | { kind: "ok"; member: MemberProjection & { channel_id: string } }> => {
         const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.role' AND operation_id=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
@@ -3105,7 +3155,7 @@ export class ChatChannel extends DurableObject<Env> {
 
         const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: b.role } });
         this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.role', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
-        return { kind: "ok", member: { channel_id: channelId, user_id: b.user_id, role: b.role } };
+        return { kind: "ok", member: { channel_id: channelId, user_id: b.user_id, role: b.role } as MemberProjection & { channel_id: string } };
       });
       if (tx.kind === "conflict") return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
       if (tx.kind === "ok") await this.scheduleOutboxAlarm(now);
@@ -3408,9 +3458,9 @@ export class ChatChannel extends DurableObject<Env> {
 
     // initial_command_policy: { [bot_command_id]: { enabled: boolean, permission_override?: string } | boolean }
     // false-y / absent -> use catalog default_enabled_on_install.
-    const policy = (b.initial_command_policy ?? {}) as Record<string, unknown>;
+    const policy = (b.initial_command_policy ?? {}) as CommandPolicyMap;
     // initial_event_subscriptions: { [event_type]: { enabled: boolean, filters?: object } | boolean }
-    const initialSubs = (b.initial_event_subscriptions ?? {}) as Record<string, unknown>;
+    const initialSubs = (b.initial_event_subscriptions ?? {}) as EventSubscriptionPolicyMap;
 
     const requestHash = JSON.stringify({ bot_id: botId, initial_command_policy: policy, initial_event_subscriptions: initialSubs });
 
@@ -3492,7 +3542,7 @@ export class ChatChannel extends DurableObject<Env> {
       this.ctx.storage.sql.exec("DELETE FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botId);
       this.ctx.storage.sql.exec("DELETE FROM channel_command_bindings WHERE channel_id=? AND bot_id=?", channelId, botId);
 
-      const bindings: Array<Record<string, unknown>> = [];
+      const bindings: CommandBindingProjection[] = [];
       for (const cmd of catalog.commands) {
         const policyEntry = policy[cmd.bot_command_id];
         const enabled = typeof policyEntry === "boolean"
@@ -3538,7 +3588,7 @@ export class ChatChannel extends DurableObject<Env> {
       }
 
       // event subscriptions: per initial_event_subscriptions or catalog default.
-      const subscriptions: Array<Record<string, unknown>> = [];
+      const subscriptions: BotEventSubscriptionProjection[] = [];
       for (const cap of catalog.event_capabilities) {
         const subEntry = initialSubs[cap.event_type];
         const enabled = typeof subEntry === "boolean"
@@ -3546,9 +3596,16 @@ export class ChatChannel extends DurableObject<Env> {
           : typeof subEntry === "object" && subEntry !== null && typeof (subEntry as { enabled?: unknown }).enabled === "boolean"
             ? (subEntry as { enabled: boolean }).enabled
             : cap.default_enabled_on_install;
-        const filters = typeof subEntry === "object" && subEntry !== null && typeof (subEntry as { filters?: unknown }).filters === "object"
+        const filters: MessageEventSubscriptionFilters | unknown = typeof subEntry === "object" && subEntry !== null && typeof (subEntry as { filters?: unknown }).filters === "object"
           ? (subEntry as { filters: unknown }).filters
           : cap.filters;
+        const defaultFilters: MessageEventSubscriptionFilters = {
+          message_types: ["text"],
+          include_bot_messages: false,
+          include_own_messages: false,
+          only_when_mentioned: false,
+        };
+        const resolvedFilters: MessageEventSubscriptionFilters = (filters ?? defaultFilters) as MessageEventSubscriptionFilters;
         const subId = uuidv7(nowMs);
         this.ctx.storage.sql.exec(
           `INSERT INTO channel_bot_event_subscriptions (
@@ -3560,10 +3617,10 @@ export class ChatChannel extends DurableObject<Env> {
              updated_by=excluded.created_by, updated_at=excluded.updated_at`,
           subId, channelId, botId, cap.event_type,
           enabled ? "enabled" : "disabled",
-          JSON.stringify(filters ?? { message_types: ["text"], include_bot_messages: false, include_own_messages: false, only_when_mentioned: false }),
+          JSON.stringify(resolvedFilters),
           userId, now, now,
         );
-        subscriptions.push({ subscription_id: subId, event_type: cap.event_type, status: enabled ? "enabled" : "disabled", filters: filters ?? { message_types: ["text"], include_bot_messages: false, include_own_messages: false, only_when_mentioned: false } });
+        subscriptions.push({ subscription_id: subId, event_type: cap.event_type, status: enabled ? "enabled" : "disabled", filters: resolvedFilters });
       }
 
       // upsert bot_installations

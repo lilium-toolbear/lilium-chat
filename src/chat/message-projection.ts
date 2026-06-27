@@ -1,16 +1,7 @@
 import type { MessageRow } from "../do/chat-channel";
-import type { UserSummary } from "./event-broadcast";
+import type { Mention, MessageImageAttachment, WireChatMessage } from "../contract/message";
+import type { UserSummary } from "../contract/primitives";
 
-// The ONE shared Browser-visible message projection (v4.0 addendum J).
-// Used by history pagination, message.send ack, message.created event,
-// and (Phase 4) edit/recall/delete acks/events + context read.
-// Deleted/recalled safety filtering lives HERE — callers must not re-filter.
-//
-// Caller composes the inputs the builder cannot derive from a single row:
-//   - senderSummary: pre-resolved via resolveUserSummaries (before the txn for in-txn ack/event)
-//   - mentions / attachments / components: the caller already has them (send: from the request body;
-//     history/replay: from the mentions table / attachments table). When Phase 5/7 land, extend
-//     THIS builder's opts — never build a second ad-hoc serializer.
 export interface MessageMention {
   user_id: string;
   start: number;
@@ -33,21 +24,23 @@ export function projectMessageForBrowser(
   opts: {
     senderSummary?: UserSummary | null;
     mentions?: MessageMention[];
-    attachments?: unknown[];
+    attachments?: MessageImageAttachment[];
     sticker?: MessageStickerSnapshot | null;
-    components?: unknown[];
+    components?: WireChatMessage["components"];
   } = {},
-): Record<string, unknown> {
+): WireChatMessage {
   const hidden = row.status === "deleted" || row.status === "recalled";
 
-  let replySnapshot: unknown = null;
+  let replySnapshot: WireChatMessage["reply_snapshot"] = null;
   if (row.reply_snapshot_json) {
-    try { replySnapshot = JSON.parse(row.reply_snapshot_json); } catch { replySnapshot = null; }
+    try {
+      replySnapshot = JSON.parse(row.reply_snapshot_json) as WireChatMessage["reply_snapshot"];
+    } catch {
+      replySnapshot = null;
+    }
   }
 
-  // Sender projection. Persisted payloads store sender as a ref (_user_id); the live
-  // ack/event projection resolves UserSummary at output time (design §3.5).
-  let sender: Record<string, unknown>;
+  let sender: WireChatMessage["sender"];
   if (row.sender_kind === "user" && row.sender_user_id) {
     const u = opts.senderSummary ?? {
       user_id: row.sender_user_id,
@@ -66,17 +59,17 @@ export function projectMessageForBrowser(
     command_id: row.command_id,
     channel_id: row.channel_id,
     sender,
-    type: row.type,
-    format: row.format,
-    status: row.status,
-    stream_state: row.stream_state,
+    type: row.type as WireChatMessage["type"],
+    format: row.format as WireChatMessage["format"],
+    status: row.status as WireChatMessage["status"],
+    stream_state: row.stream_state as WireChatMessage["stream_state"],
     text: hidden ? null : row.text,
     reply_to: row.reply_to,
     reply_snapshot: replySnapshot,
     attachments: hidden ? [] : (opts.attachments ?? []),
     sticker: hidden ? null : (opts.sticker ?? null),
     components: hidden ? [] : (opts.components ?? []),
-    mentions: hidden ? [] : (opts.mentions ?? []),
+    mentions: hidden ? [] : ((opts.mentions ?? []) as Mention[]),
     created_at: row.created_at,
     updated_at: row.updated_at,
     edited_at: row.edited_at,

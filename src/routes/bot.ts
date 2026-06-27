@@ -1,11 +1,8 @@
 import type { Context } from "hono";
+import type { BotCommandsSyncResponse } from "../contract/bot-api";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { botRegistryStub, getBotIdentity } from "../auth/bot";
-
-// Bot-token HTTP routes. These are bot -> Chat outbound HTTP (bot manages its
-// catalog, bot sends messages proactively). They do NOT require the bot to
-// expose an inbound HTTP endpoint — runtime delivery is the Bot Gateway WS.
 
 /** PUT /api/chat/bot/commands — sync the bot's global command catalog + event capabilities. */
 export async function putBotCommandsHandler(
@@ -45,6 +42,6 @@ export async function putBotCommandsHandler(
   }
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "commands sync failed");
 
-  const out = (await res.json()) as Record<string, unknown>;
+  const out = (await res.json()) as BotCommandsSyncResponse;
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }

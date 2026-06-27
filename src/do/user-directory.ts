@@ -557,7 +557,7 @@ export class UserDirectory extends DurableObject<Env> {
           }),
         );
         if (!res.ok) {
-          const failBody = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+          const failBody = (await res.json().catch(() => ({}))) as { error?: { code?: string; message?: string; retryable?: boolean } };
           return Response.json(failBody, { status: res.status });
         }
         const resBody = (await res.json()) as { attachment: StickerSourceAttachment };

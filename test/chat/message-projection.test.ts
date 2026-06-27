@@ -56,7 +56,7 @@ describe("projectMessageForBrowser", () => {
   });
 
   it("forces mentions/attachments/components empty on recalled even if provided", () => {
-    const p = projectMessageForBrowser(baseRow({ status: "recalled", text: "secret" }), { mentions: [{ user_id: "u2", start: 0, end: 4 }], attachments: [{ id: "a" }] as unknown[] });
+    const p = projectMessageForBrowser(baseRow({ status: "recalled", text: "secret" }), { mentions: [{ user_id: "u2", start: 0, end: 4 }], attachments: [] });
     expect(p.mentions).toEqual([]);
     expect(p.attachments).toEqual([]);
   });

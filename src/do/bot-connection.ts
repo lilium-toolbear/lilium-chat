@@ -5,7 +5,9 @@ import {
   buildDeliveryFrame,
   buildPong,
   buildReady,
+  type BotDeliveryBody,
   type BotDeliveryFrame,
+  type BotDeliveryRequestBody,
   parseDeliveryResult,
   parseHello,
   type ParsedDeliveryResult,
@@ -54,26 +56,21 @@ const RETRY_BACKOFF_MS = 1000;
 const MESSAGE_EVENT_TTL_MS = 30000;
 const CONNECTION_LEASE_TTL_MS = 60000;
 
-function deliveryPayloadFromJson(raw: string): Record<string, unknown> {
-  const parsed = JSON.parse(raw);
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+import { isRecord } from "../contract/utils";
+
+function deliveryPayloadFromJson(raw: string): BotDeliveryRequestBody {
+  const parsed: unknown = JSON.parse(raw);
+  if (!isRecord(parsed)) {
     throw new Error("invalid delivery request");
   }
-  return parsed as Record<string, unknown>;
+  return parsed;
 }
 
 function botDeliveryFrameForWs(row: BotDeliveryRow): BotDeliveryFrame {
-  const payload = { ...deliveryPayloadFromJson(row.request_json) };
-  delete payload.type;
-  delete payload.api_version;
-  delete payload.delivery_id;
-  delete payload.kind;
-  delete payload.channel_id;
-  delete payload.target_id;
-  delete payload.source_outbox_id;
+  const rest = deliveryPayloadFromJson(row.request_json);
 
   return buildDeliveryFrame({
-    ...payload,
+    ...rest,
     delivery_id: row.delivery_id,
     kind: row.kind,
     channel_id: row.channel_id,

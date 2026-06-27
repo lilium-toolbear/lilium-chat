@@ -1,5 +1,6 @@
 import type { Env } from "../env";
-import type { UserSummary } from "../profile/resolve";
+import type { ChannelSummaryApi } from "../contract/channel-api";
+import type { UserSummary } from "../contract/primitives";
 import { resolveUserSummaries } from "../profile/resolve";
 
 export interface ChannelSummaryFromDo {
@@ -25,6 +26,8 @@ export interface MyChannelListFields {
   unread_count?: number;
 }
 
+export type { UserSummary };
+
 function fallbackDisplayName(userId: string): string {
   return `user-${userId.slice(0, 8)}`;
 }
@@ -34,9 +37,9 @@ export async function inflateChannelSummaryForViewer(input: {
   viewerUserId: string;
   myChannelRow?: MyChannelListFields | null;
   env: Env;
-}): Promise<Record<string, unknown>> {
-  const { summary, viewerUserId, myChannelRow, env } = input;
-  const base: Record<string, unknown> = {
+}): Promise<ChannelSummaryApi> {
+  const { summary, myChannelRow, env } = input;
+  const base: ChannelSummaryApi = {
     channel_id: summary.channel_id,
     kind: summary.kind,
     visibility: summary.visibility,
@@ -66,11 +69,17 @@ export async function inflateChannelSummaryForViewer(input: {
 
   const profileMap = await resolveUserSummaries([peerUserId], env);
   const peer = profileMap.get(peerUserId);
-  const dmPeer: UserSummary = peer ?? {
-    user_id: peerUserId,
-    display_name: fallbackDisplayName(peerUserId),
-    avatar_url: null,
-  };
+  const dmPeer: UserSummary = peer
+    ? {
+        user_id: peer.user_id,
+        display_name: peer.display_name ?? fallbackDisplayName(peerUserId),
+        avatar_url: peer.avatar_url,
+      }
+    : {
+        user_id: peerUserId,
+        display_name: fallbackDisplayName(peerUserId),
+        avatar_url: null,
+      };
 
   return {
     ...base,

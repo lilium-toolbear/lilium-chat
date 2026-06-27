@@ -1,11 +1,12 @@
 import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
+import type { OpenDmApiResponse } from "../contract/channel-api";
 import { inflateChannelSummaryForViewer } from "../chat/channel-summary";
 import { getIdentity } from "./channel-mutations";
 
 type OpenDmInternalResponse =
-  | { kind: "cached"; response: { channel: Record<string, unknown>; membership: { role: string; joined_at: string } } }
+  | { kind: "cached"; response: OpenDmApiResponse }
   | { kind: "needs_inflate"; channel_id: string; joined_at: string; role: string };
 
 export async function openDmHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {

@@ -9,6 +9,8 @@ export type CommandOptionType =
   | "channel"
   | "role";
 
+import { isRecord } from "../contract/utils";
+
 const OPTION_TYPES: ReadonlySet<string> = new Set<CommandOptionType>([
   "string",
   "integer",
@@ -87,8 +89,8 @@ function ok<T>(value: T): { ok: true; value: T } {
 
 /** Validate a single command option per §9.3. */
 function validateOption(raw: unknown): ValidateResult<CommandOption> {
-  if (typeof raw !== "object" || raw === null) return fail("option must be an object");
-  const o = raw as Record<string, unknown>;
+  if (!isRecord(raw)) return fail("option must be an object");
+  const o = raw;
   if (typeof o.name !== "string" || o.name.length === 0) return fail("option.name required");
   if (typeof o.type !== "string" || !OPTION_TYPES.has(o.type)) {
     return fail(`option.type invalid: ${String(o.type)}`);
@@ -186,10 +188,10 @@ export function validateEventCapability(
   }
   const filters = { ...DEFAULT_FILTERS };
   if (input.default_filters !== undefined && input.default_filters !== null) {
-    if (typeof input.default_filters !== "object") {
+    if (!isRecord(input.default_filters)) {
       return fail("default_filters must be object");
     }
-    const f = input.default_filters as Record<string, unknown>;
+    const f = input.default_filters;
     if (f.message_types !== undefined) {
       if (!Array.isArray(f.message_types) || !f.message_types.every((s) => typeof s === "string")) {
         return fail("default_filters.message_types must be string[]");

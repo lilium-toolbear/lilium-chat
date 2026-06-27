@@ -1,4 +1,16 @@
-export const BOT_GATEWAY_API_VERSION = "lilium.chat.bot.v1";
+import {
+  BOT_GATEWAY_API_VERSION,
+  type BotDeliveryBody,
+  type BotDeliveryFrame,
+} from "../contract/bot-gateway";
+import { isRecord } from "../contract/utils";
+
+export {
+  BOT_GATEWAY_API_VERSION,
+  type BotDeliveryBody,
+  type BotDeliveryFrame,
+  type BotDeliveryRequestBody,
+} from "../contract/bot-gateway";
 
 export interface ParsedHello {
   type: "hello";
@@ -27,14 +39,6 @@ export interface BotReadyFrame {
   server_time: string;
 }
 
-export interface BotDeliveryFrame {
-  type: "delivery";
-  api_version: string;
-  delivery_id: string;
-  kind: "command_invocation" | "message_interaction" | "message_event";
-  [key: string]: unknown;
-}
-
 export interface BotPongFrame {
   type: "pong";
   api_version: string;
@@ -50,10 +54,10 @@ export interface BotDeliveryAck {
 
 function asObject(raw: string): Record<string, unknown> {
   const value = JSON.parse(raw);
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  if (!isRecord(value)) {
     throw new Error("invalid frame");
   }
-  return value as Record<string, unknown>;
+  return value;
 }
 
 export function parseHello(raw: string): ParsedHello {
@@ -78,12 +82,12 @@ export function buildReady(bot_id: string, session_id: string, server_time: stri
   };
 }
 
-export function buildDeliveryFrame(delivery: Record<string, unknown>): BotDeliveryFrame {
+export function buildDeliveryFrame(delivery: BotDeliveryBody): BotDeliveryFrame {
   return {
     type: "delivery",
     api_version: BOT_GATEWAY_API_VERSION,
     ...delivery,
-  } as BotDeliveryFrame;
+  };
 }
 
 export function parseDeliveryResult(raw: string): ParsedDeliveryResult {

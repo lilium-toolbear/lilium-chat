@@ -1,11 +1,29 @@
-import type { UserSummary, ResolveUserSummaries } from "./event-broadcast";
+import type {
+  BotInstalledPersistedPayload,
+  BotUpdatedPersistedPayload,
+  ChannelCreatedPersistedPayload,
+  ChannelDissolvedPersistedPayload,
+  ChannelUpdatedPersistedPayload,
+  CommandBindingUpdatedPersistedPayload,
+  ManagementPersistedPayload,
+  MemberJoinedPersistedPayload,
+  MemberLeftPersistedPayload,
+  MemberRoleUpdatedPersistedPayload,
+  ReadStateUpdatedPersistedPayload,
+} from "../contract/persisted";
+import type { ManagementWirePayload } from "../contract/wire-frames";
+import type { UserSummary } from "../contract/primitives";
 
-export type { UserSummary, ResolveUserSummaries };
+export type { UserSummary };
 
 export function buildChannelCreatedPayload(raw: {
-  channel_id: string; kind: string; visibility: string; title: string;
-  actor_kind: string; actor_id: string;
-}): Record<string, unknown> {
+  channel_id: string;
+  kind: string;
+  visibility: string;
+  title: string;
+  actor_kind: string;
+  actor_id: string;
+}): ChannelCreatedPersistedPayload {
   return {
     channel: { channel_id: raw.channel_id, kind: raw.kind, visibility: raw.visibility, title: raw.title },
     actor_kind: raw.actor_kind,
@@ -14,24 +32,44 @@ export function buildChannelCreatedPayload(raw: {
 }
 
 export function buildChannelUpdatedPayload(raw: {
-  channel_id: string; channel_changes: Record<string, { before: unknown; after: unknown }>;
-  actor_kind: string; actor_id: string;
-}): Record<string, unknown> {
-  return { channel_id: raw.channel_id, channel_changes: raw.channel_changes, actor_kind: raw.actor_kind, actor_id: raw.actor_id };
+  channel_id: string;
+  channel_changes: Record<string, { before: unknown; after: unknown }>;
+  actor_kind: string;
+  actor_id: string;
+}): ChannelUpdatedPersistedPayload {
+  return {
+    channel_id: raw.channel_id,
+    channel_changes: raw.channel_changes,
+    actor_kind: raw.actor_kind,
+    actor_id: raw.actor_id,
+  };
 }
 
 export function buildChannelDissolvedPayload(raw: {
-  channel_id: string; dissolved_at: string; actor_kind: string; actor_id: string;
-}): Record<string, unknown> {
-  return { channel_id: raw.channel_id, status: "dissolved", dissolved_at: raw.dissolved_at, actor_kind: raw.actor_kind, actor_id: raw.actor_id };
+  channel_id: string;
+  dissolved_at: string;
+  actor_kind: string;
+  actor_id: string;
+}): ChannelDissolvedPersistedPayload {
+  return {
+    channel_id: raw.channel_id,
+    status: "dissolved",
+    dissolved_at: raw.dissolved_at,
+    actor_kind: raw.actor_kind,
+    actor_id: raw.actor_id,
+  };
 }
 
 export function buildMemberJoinedPayload(raw: {
-  channel_id: string; user_id: string; role: string; membership_version: number;
-  actor_kind: string; actor_id: string;
+  channel_id: string;
+  user_id: string;
+  role: string;
+  membership_version: number;
+  actor_kind: string;
+  actor_id: string;
   join_source?: "invite" | "public" | "admin_add" | "initial" | null;
   inviter_user_id?: string | null;
-}): Record<string, unknown> {
+}): MemberJoinedPersistedPayload {
   return {
     channel_id: raw.channel_id,
     user_id: raw.user_id,
@@ -45,17 +83,34 @@ export function buildMemberJoinedPayload(raw: {
 }
 
 export function buildMemberRoleUpdatedPayload(raw: {
-  channel_id: string; user_id: string; before_role: string; after_role: string; membership_version: number;
-  actor_kind: string; actor_id: string;
-}): Record<string, unknown> {
-  return { channel_id: raw.channel_id, user_id: raw.user_id, before_role: raw.before_role, after_role: raw.after_role, membership_version: raw.membership_version, actor_kind: raw.actor_kind, actor_id: raw.actor_id };
+  channel_id: string;
+  user_id: string;
+  before_role: string;
+  after_role: string;
+  membership_version: number;
+  actor_kind: string;
+  actor_id: string;
+}): MemberRoleUpdatedPersistedPayload {
+  return {
+    channel_id: raw.channel_id,
+    user_id: raw.user_id,
+    before_role: raw.before_role,
+    after_role: raw.after_role,
+    membership_version: raw.membership_version,
+    actor_kind: raw.actor_kind,
+    actor_id: raw.actor_id,
+  };
 }
 
 export function buildMemberLeftPayload(raw: {
-  channel_id: string; user_id: string; role: string; membership_version: number;
-  actor_kind: string; actor_id: string;
+  channel_id: string;
+  user_id: string;
+  role: string;
+  membership_version: number;
+  actor_kind: string;
+  actor_id: string;
   leave_source?: "self" | "removed" | null;
-}): Record<string, unknown> {
+}): MemberLeftPersistedPayload {
   return {
     channel_id: raw.channel_id,
     user_id: raw.user_id,
@@ -68,22 +123,30 @@ export function buildMemberLeftPayload(raw: {
 }
 
 export function buildReadStateUpdatedPayload(raw: {
-  channel_id: string; user_id: string; last_read_event_id: string;
-}): Record<string, unknown> {
+  channel_id: string;
+  user_id: string;
+  last_read_event_id: string;
+}): ReadStateUpdatedPersistedPayload {
   return { channel_id: raw.channel_id, user_id: raw.user_id, last_read_event_id: raw.last_read_event_id };
 }
 
 export function buildBotInstalledPayload(raw: {
-  channel_id: string; bot_id: string; actor_kind: string; actor_id: string;
-}): Record<string, unknown> {
+  channel_id: string;
+  bot_id: string;
+  actor_kind: string;
+  actor_id: string;
+}): BotInstalledPersistedPayload {
   return { channel_id: raw.channel_id, bot_id: raw.bot_id, actor_kind: raw.actor_kind, actor_id: raw.actor_id };
 }
 
 export function buildBotUpdatedPayload(raw: {
-  channel_id: string; bot_id: string; status: string;
+  channel_id: string;
+  bot_id: string;
+  status: string;
   changes: Record<string, { before: unknown; after: unknown }> | null;
-  actor_kind: string; actor_id: string;
-}): Record<string, unknown> {
+  actor_kind: string;
+  actor_id: string;
+}): BotUpdatedPersistedPayload {
   return {
     channel_id: raw.channel_id,
     bot_id: raw.bot_id,
@@ -95,10 +158,13 @@ export function buildBotUpdatedPayload(raw: {
 }
 
 export function buildCommandBindingUpdatedPayload(raw: {
-  channel_id: string; bot_id: string; bot_command_id: string;
+  channel_id: string;
+  bot_id: string;
+  bot_command_id: string;
   binding_changes: Record<string, { before: unknown; after: unknown }>;
-  actor_kind: string; actor_id: string;
-}): Record<string, unknown> {
+  actor_kind: string;
+  actor_id: string;
+}): CommandBindingUpdatedPersistedPayload {
   return {
     channel_id: raw.channel_id,
     bot_id: raw.bot_id,
@@ -109,65 +175,72 @@ export function buildCommandBindingUpdatedPayload(raw: {
   };
 }
 
+function fallbackUserSummary(userId: string): UserSummary {
+  return { user_id: userId, display_name: `user-${userId.slice(0, 8)}`, avatar_url: null };
+}
+
 // Wire projection: resolve actor (and target_user) refs to UserSummary at output time.
 // System actor → actor: null (no resolution). Falls back to user-<shortid> when pg has no row.
 export function resolveActorWithMap(
-  payload: Record<string, unknown>,
+  payload: ManagementPersistedPayload,
   map: Map<string, UserSummary>,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...payload };
-  const actorKind = typeof out.actor_kind === "string" ? out.actor_kind : "";
-  const actorId = typeof out.actor_id === "string" ? out.actor_id : "";
+): ManagementWirePayload {
+  const { actor_kind, actor_id, ...rest } = payload as ManagementPersistedPayload & {
+    user_id?: string;
+    inviter_user_id?: string | null;
+    target_user_id?: string;
+  };
 
-  if (actorKind === "user" && actorId) {
-    const u = map.get(actorId) ?? { user_id: actorId, display_name: `user-${actorId.slice(0, 8)}`, avatar_url: null };
-    out.actor = u;
-  } else if (actorKind === "system") {
-    out.actor = null;
+  let actor: UserSummary | null | undefined;
+  if (actor_kind === "user" && actor_id) {
+    actor = map.get(actor_id) ?? fallbackUserSummary(actor_id);
+  } else if (actor_kind === "system") {
+    actor = null;
   }
-  delete out.actor_id;
-  delete out.actor_kind;
 
-  const targetUserId = typeof out.target_user_id === "string" ? out.target_user_id : null;
+  const withUser = rest as typeof rest & { user_id?: string; inviter_user_id?: string | null; target_user_id?: string };
+  const { user_id: subjectUserId, inviter_user_id: inviterUserId, target_user_id: targetUserId, ...tail } = withUser;
+
+  const wire: ManagementWirePayload = {
+    ...(tail as ManagementWirePayload),
+    ...(actor !== undefined ? { actor } : {}),
+  } as ManagementWirePayload;
+
   if (targetUserId) {
-    const u = map.get(targetUserId) ?? { user_id: targetUserId, display_name: `user-${targetUserId.slice(0, 8)}`, avatar_url: null };
-    out.target_user = u;
-  } else {
-    out.target_user = null;
+    (wire as { target_user?: UserSummary | null }).target_user =
+      map.get(targetUserId) ?? fallbackUserSummary(targetUserId);
+  } else if ("target_user_id" in withUser) {
+    (wire as { target_user?: UserSummary | null }).target_user = null;
   }
-  delete out.target_user_id;
 
-  const subjectUserId = typeof out.user_id === "string" ? out.user_id : null;
   if (subjectUserId) {
-    out.user = map.get(subjectUserId) ?? { user_id: subjectUserId, display_name: `user-${subjectUserId.slice(0, 8)}`, avatar_url: null };
-    delete out.user_id;
+    (wire as { user?: UserSummary }).user = map.get(subjectUserId) ?? fallbackUserSummary(subjectUserId);
   }
 
-  const inviterUserId = typeof out.inviter_user_id === "string" ? out.inviter_user_id : null;
   if (inviterUserId) {
-    out.inviter = map.get(inviterUserId) ?? { user_id: inviterUserId, display_name: `user-${inviterUserId.slice(0, 8)}`, avatar_url: null };
-    delete out.inviter_user_id;
+    (wire as { inviter?: UserSummary | null }).inviter =
+      map.get(inviterUserId) ?? fallbackUserSummary(inviterUserId);
   }
 
-  return out;
+  return wire;
 }
+
+export type ResolveUserSummaries = (userIds: string[]) => Promise<Map<string, UserSummary>>;
 
 // Async injected-resolver variant — used by unit tests. Prod code uses resolveActorWithMap
 // (sync) after pre-resolving via Hyperdrive BEFORE the DO transaction.
 export async function resolveActorForLiveBroadcast(
-  payload: Record<string, unknown>,
+  payload: ManagementPersistedPayload,
   resolveUserSummaries: ResolveUserSummaries,
-): Promise<Record<string, unknown>> {
+): Promise<ManagementWirePayload> {
   const ids: string[] = [];
-  const actorKind = typeof payload.actor_kind === "string" ? payload.actor_kind : "";
-  const actorId = typeof payload.actor_id === "string" ? payload.actor_id : "";
-  if (actorKind === "user" && actorId) ids.push(actorId);
-  const targetUserId = typeof payload.target_user_id === "string" ? payload.target_user_id : null;
-  if (targetUserId) ids.push(targetUserId);
-  const subjectUserId = typeof payload.user_id === "string" ? payload.user_id : null;
-  if (subjectUserId) ids.push(subjectUserId);
-  const inviterUserId = typeof payload.inviter_user_id === "string" ? payload.inviter_user_id : null;
-  if (inviterUserId) ids.push(inviterUserId);
+  if (payload.actor_kind === "user" && payload.actor_id) ids.push(payload.actor_id);
+  const withTarget = payload as ManagementPersistedPayload & { target_user_id?: string };
+  if (typeof withTarget.target_user_id === "string") ids.push(withTarget.target_user_id);
+  const withUser = payload as ManagementPersistedPayload & { user_id?: string };
+  if (typeof withUser.user_id === "string") ids.push(withUser.user_id);
+  const withInviter = payload as MemberJoinedPersistedPayload;
+  if (typeof withInviter.inviter_user_id === "string") ids.push(withInviter.inviter_user_id);
   const map = ids.length > 0 ? await resolveUserSummaries(ids) : new Map<string, UserSummary>();
   return resolveActorWithMap(payload, map);
 }

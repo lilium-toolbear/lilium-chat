@@ -1,4 +1,9 @@
 import type { Context } from "hono";
+import type {
+  BotInstallResponse,
+  BotInstallUpdateResponse,
+  CommandBindingUpdateResponse,
+} from "../contract/bot-api";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { getIdentity } from "./channel-mutations";
@@ -53,7 +58,7 @@ export async function installBotHandler(
     }),
   );
   if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE");
-  const out = (await res.json()) as Record<string, unknown>;
+  const out = (await res.json()) as BotInstallResponse;
   return c.json(out, 201, { "X-Request-Id": c.get("requestId") });
 }
 
@@ -89,7 +94,7 @@ export async function updateBotInstallHandler(
     }),
   );
   if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE");
-  const out = (await res.json()) as Record<string, unknown>;
+  const out = (await res.json()) as BotInstallUpdateResponse;
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
@@ -125,7 +130,7 @@ export async function updateCommandBindingHandler(
     }),
   );
   if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE");
-  const out = (await res.json()) as Record<string, unknown>;
+  const out = (await res.json()) as CommandBindingUpdateResponse;
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
@@ -154,6 +159,6 @@ export async function listChannelCommandsHandler(
     ),
   );
   if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE");
-  const out = (await res.json()) as Record<string, unknown>;
+  const out = (await res.json()) as { items: unknown[] };
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }

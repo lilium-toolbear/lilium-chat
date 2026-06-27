@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildEventFrame, buildMessageCreatedPayload, resolveSenderForLiveBroadcast } from "../../src/chat/event-broadcast";
+import type { MessageProjectionEventPayload } from "../../src/contract/events";
 
 describe("buildEventFrame", () => {
   it("produces the contract §10.4 envelope shape", () => {
@@ -8,7 +9,7 @@ describe("buildEventFrame", () => {
       type: "message.created",
       channel_id: "ch-1",
       occurred_at: "2026-06-21T05:30:00Z",
-      payload: { message: { message_id: "m-1" } },
+      payload: { message: { message_id: "m-1" } } as MessageProjectionEventPayload,
     });
     expect(f).toEqual({
       frame_type: "event",
@@ -55,7 +56,7 @@ describe("buildMessageCreatedPayload", () => {
     });
     // PERSISTED payload: sender is a ref, NOT a resolved UserSummary
     expect(p.message).toHaveProperty("sender");
-    expect((p.message as Record<string, unknown>).sender).toEqual({ kind: "user", user_id: "u-1", bot_id: null });
+    expect(p.message.sender).toEqual({ kind: "user", user_id: "u-1", bot_id: null });
     // no display_name / avatar_url in the persisted payload
     expect(JSON.stringify(p)).not.toContain("display_name");
   });

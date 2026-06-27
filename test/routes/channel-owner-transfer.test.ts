@@ -39,6 +39,13 @@ async function readReplay(channelId: string, viewerUserId: string): Promise<Arra
   return replay.events.map((evt) => JSON.parse(evt.event_json) as { type: string; payload: Record<string, unknown> });
 }
 
+function memberSubjectUserId(payload: Record<string, unknown>): string | undefined {
+  const user = payload.user as { user_id?: string } | undefined;
+  if (typeof user?.user_id === "string") return user.user_id;
+  if (typeof payload.user_id === "string") return payload.user_id;
+  return undefined;
+}
+
 describe("POST /api/chat/channels/:id/owner-transfer", () => {
   it("owner transfers to an active member; previous owner becomes admin and only one active owner exists", async () => {
     const create = await authedReq("u-ot-1", "POST", "/api/chat/channels", { title: "OT", visibility: "private", initial_members: [] }, "ck-create-ot1");
@@ -64,8 +71,8 @@ describe("POST /api/chat/channels/:id/owner-transfer", () => {
     const events = await readReplay(cid, "u-ot-2");
     const roleUpdated = events.filter((evt) => evt.type === "member.role_updated");
     expect(roleUpdated).toHaveLength(2);
-    expect(roleUpdated.some((evt) => evt.payload.user_id === "u-ot-1" && evt.payload.before_role === "owner" && evt.payload.after_role === "admin")).toBe(true);
-    expect(roleUpdated.some((evt) => evt.payload.user_id === "u-ot-2" && evt.payload.before_role === "member" && evt.payload.after_role === "owner")).toBe(true);
+    expect(roleUpdated.some((evt) => memberSubjectUserId(evt.payload) === "u-ot-1" && evt.payload.before_role === "owner" && evt.payload.after_role === "admin")).toBe(true);
+    expect(roleUpdated.some((evt) => memberSubjectUserId(evt.payload) === "u-ot-2" && evt.payload.before_role === "member" && evt.payload.after_role === "owner")).toBe(true);
   });
 
   it("non-owner cannot transfer", async () => {
