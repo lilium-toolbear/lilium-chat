@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
+import { inflateChannelSummaryForViewer } from "../chat/channel-summary";
 
 async function getIdentity(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<{ userId: string; env: Env }> {
   const auth = c.req.header("Authorization") ?? "";
@@ -22,22 +23,14 @@ export async function listChannelsHandler(c: Context<{ Bindings: Env; Variables:
     myChannels.map(async (mc) => {
       const stub = env.CHAT_CHANNEL.getByName(mc.channel_id);
       const res = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
-      const s = await res.json() as Record<string, unknown>;
-      return {
-        channel_id: s.channel_id,
-        kind: s.kind,
-        visibility: s.visibility,
-        title: s.title,
-        avatar_url: s.avatar_url,
-        member_count: s.member_count,
-        role: s.my_role,
-        status: s.status,
-        unread_count: 0,
-        last_read_event_id: mc.last_read_event_id,
-        last_message_preview: s.last_message_preview ?? null,
-        last_message_at: s.last_message_at ?? null,
-        last_event_id: s.last_event_id ?? null,
-      };
+      if (!res.ok) return null;
+      const s = await res.json() as Parameters<typeof inflateChannelSummaryForViewer>[0]["summary"];
+      return inflateChannelSummaryForViewer({
+        summary: s,
+        viewerUserId: userId,
+        myChannelRow: { last_read_event_id: mc.last_read_event_id },
+        env,
+      });
     }),
   );
   const filtered = items.filter((it) => it !== null) as Array<Record<string, unknown>>;
@@ -52,19 +45,12 @@ export async function channelDetailHandler(c: Context<{ Bindings: Env; Variables
   const res = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
   if (res.status === 403) throw new ApiError("FORBIDDEN", "not a member");
   if (!res.ok) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const s = await res.json() as Record<string, unknown>;
-  const channel = {
-    channel_id: s.channel_id,
-    kind: s.kind,
-    visibility: s.visibility,
-    title: s.title,
-    topic: s.topic,
-    avatar_url: s.avatar_url,
-    member_count: s.member_count,
-    role: s.my_role,
-    status: s.status,
-    created_at: s.created_at,
-    updated_at: s.updated_at,
-  };
+  const s = await res.json() as Parameters<typeof inflateChannelSummaryForViewer>[0]["summary"];
+  const channel = await inflateChannelSummaryForViewer({
+    summary: s,
+    viewerUserId: userId,
+    myChannelRow: null,
+    env,
+  });
   return c.json({ channel }, 200, { "X-Request-Id": c.get("requestId") });
 }

@@ -4,6 +4,7 @@ import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 import { resolveUserSummaries, type UserSummary } from "../profile/resolve";
 import { projectMessagesForBrowser } from "../chat/sender";
+import { inflateChannelSummaryForViewer } from "../chat/channel-summary";
 import type { MessageStickerSnapshot } from "../chat/message-projection";
 import type { MessageRow } from "../do/chat-channel";
 import type { AttachmentRow } from "../chat/attachment-projection";
@@ -73,26 +74,15 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
         headers: { "X-Verified-User-Id": user_id },
       }));
       if (!summaryRes.ok) return null;
-      const summary = (await summaryRes.json()) as SummaryPayload;
+      const summary = (await summaryRes.json()) as Parameters<typeof inflateChannelSummaryForViewer>[0]["summary"];
 
-      return {
-        channel_id: summary.channel_id,
-        kind: summary.kind,
-        visibility: summary.visibility,
-        title: summary.title,
-        topic: summary.topic,
-        avatar_url: summary.avatar_url,
-        member_count: summary.member_count,
-        status: summary.status,
-        created_at: summary.created_at,
-        updated_at: summary.updated_at,
-        unread_count: 0,
-        last_read_event_id: mc.last_read_event_id,
-        last_message_preview: summary.last_message_preview,
-        last_message_at: summary.last_message_at,
-        last_event_id: summary.last_event_id,
-        role: summary.my_role,
-      } as ChannelSummary;
+      const inflated = await inflateChannelSummaryForViewer({
+        summary,
+        viewerUserId: user_id,
+        myChannelRow: { last_read_event_id: mc.last_read_event_id },
+        env: c.env,
+      });
+      return inflated as unknown as ChannelSummary;
     }),
   );
 
