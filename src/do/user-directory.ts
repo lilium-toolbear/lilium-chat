@@ -7,6 +7,8 @@ import { projectAttachmentForBrowser, projectFinalizedAttachmentForBrowser, type
 import { presignPutUrl, headObjectKey, deleteObject } from "../s3/presign";
 import { attachmentObjectKey, attachmentPublicUrl } from "../s3/object-key";
 import { HTTP_STATUS_BY_CODE } from "../errors";
+import { canonicalDmPairKey, isUuidString } from "../chat/dm-pair";
+import { resolveUserSummaries } from "../profile/resolve";
 
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const MAX_ATTACHMENT_SIZE_BYTES = 20 * 1024 * 1024; // 20 MiB
@@ -258,6 +260,126 @@ export class UserDirectory extends DurableObject<Env> {
       });
 
       return new Response(createBody, { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+
+    if (url.pathname === "/internal/open-dm") {
+      const currentUserId = request.headers.get("X-Verified-User-Id");
+      if (currentUserId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
+      const b = (await request.json()) as { idempotency_key: string; recipient_user_id: string };
+      if (!b.idempotency_key) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "idempotency_key required", retryable: false } }, { status: 422 });
+      }
+      if (!b.recipient_user_id || !isUuidString(b.recipient_user_id)) {
+        return Response.json({ error: { code: "INVALID_DM_TARGET", message: "invalid recipient_user_id", retryable: false } }, { status: 422 });
+      }
+      if (b.recipient_user_id === currentUserId) {
+        return Response.json({ error: { code: "INVALID_DM_TARGET", message: "cannot open DM with yourself", retryable: false } }, { status: 422 });
+      }
+
+      const recipientMap = await resolveUserSummaries([b.recipient_user_id], this.env);
+      if (!recipientMap.has(b.recipient_user_id)) {
+        return Response.json({ error: { code: "DM_TARGET_NOT_FOUND", message: "recipient user not found", retryable: false } }, { status: 404 });
+      }
+
+      const requestHash = JSON.stringify({ recipient_user_id: b.recipient_user_id });
+      const now = new Date().toISOString();
+      const expiresAt = new Date(Date.parse(now) + 24 * 60 * 60 * 1000).toISOString();
+
+      const coord = await this.ctx.storage.transaction(async () => {
+        const row = this.ctx.storage.sql
+          .exec("SELECT request_hash, status, response_json FROM idempotency_keys WHERE operation='dm.open' AND operation_id=?", b.idempotency_key)
+          .toArray()[0] as { request_hash: string; status: string; response_json: string | null } | undefined;
+
+        if (row) {
+          if (row.request_hash !== requestHash) {
+            return { kind: "conflict" as const };
+          }
+          if (row.status === "completed" && row.response_json) {
+            return { kind: "cached" as const, responseJson: row.response_json };
+          }
+          return { kind: "creating" as const };
+        }
+
+        this.ctx.storage.sql.exec(
+          "INSERT INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('dm.open', ?, ?, 'creating', NULL, NULL, ?, ?, ?)",
+          b.idempotency_key, requestHash, now, now, expiresAt,
+        );
+        return { kind: "creating" as const };
+      });
+
+      if (coord.kind === "conflict") {
+        return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
+      }
+      if (coord.kind === "cached") {
+        return Response.json({ kind: "cached", response: JSON.parse(coord.responseJson) });
+      }
+
+      const { pair_key, user_low, user_high } = canonicalDmPairKey(currentUserId, b.recipient_user_id);
+      const dmStub = this.env.DM_DIRECTORY.getByName(pair_key);
+      const dmRes = await dmStub.fetch(new Request("https://x/internal/get-or-create-dm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_a: user_low, user_b: user_high, created_by: currentUserId }),
+      }));
+      if (!dmRes.ok) {
+        const text = await dmRes.text();
+        return new Response(text, { status: dmRes.status });
+      }
+      const dmBody = await dmRes.json() as { channel_id: string; status: "active" | "creating"; created: boolean };
+
+      const chStub = this.env.CHAT_CHANNEL.getByName(dmBody.channel_id);
+      const createRes = await chStub.fetch(new Request("https://x/internal/create-dm", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": currentUserId, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channel_id: dmBody.channel_id,
+          user_a: user_low,
+          user_b: user_high,
+          created_by: currentUserId,
+        }),
+      }));
+      if (!createRes.ok) {
+        const text = await createRes.text();
+        return new Response(text, { status: createRes.status });
+      }
+      const createBody = await createRes.json() as { joined_at_by_user: Record<string, string> };
+      const joinedAt = createBody.joined_at_by_user[currentUserId];
+      if (!joinedAt) {
+        return Response.json({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "missing joined_at for opener", retryable: true } }, { status: 503 });
+      }
+
+      if (dmBody.status === "creating") {
+        const completeRes = await dmStub.fetch(new Request("https://x/internal/complete-dm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pair_key, channel_id: dmBody.channel_id }),
+        }));
+        if (!completeRes.ok) {
+          const text = await completeRes.text();
+          return new Response(text, { status: completeRes.status });
+        }
+      }
+
+      return Response.json({
+        kind: "needs_inflate",
+        channel_id: dmBody.channel_id,
+        joined_at: joinedAt,
+        role: "member",
+      });
+    }
+
+    if (url.pathname === "/internal/open-dm-complete") {
+      const currentUserId = request.headers.get("X-Verified-User-Id");
+      if (currentUserId === null) return new Response("missing X-Verified-User-Id", { status: 403 });
+      const b = (await request.json()) as { idempotency_key: string; response_json: string };
+      const now = new Date().toISOString();
+      await this.ctx.storage.transaction(async () => {
+        this.ctx.storage.sql.exec(
+          "UPDATE idempotency_keys SET status='completed', response_json=?, updated_at=? WHERE operation='dm.open' AND operation_id=?",
+          b.response_json, now, b.idempotency_key,
+        );
+      });
+      return Response.json({ ok: true });
     }
 
     if (url.pathname === "/internal/read-state") {
