@@ -6,7 +6,7 @@
 权威来源：
 
 - 故障分析：`2026-06-26 UserConnection GB-sec / stale online_sessions` 调查结论
-- API contract：`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（v2.11）
+- API contract：`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（v2.12）
 - 实施计划：`docs/superpowers/plans/2026-06-27-lilium-chat-phase-8-live-subscription.md`
 
 ## 0. 设计目标

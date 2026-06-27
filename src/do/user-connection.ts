@@ -146,8 +146,15 @@ export class UserConnection extends DurableObject<Env> {
         changed_channel_id?: string;
         membership_version?: number;
       };
-      const result = await this.handleLiveMembershipsChanged(body);
-      return Response.json(result);
+      try {
+        const result = await this.handleLiveMembershipsChanged(body);
+        return Response.json(result);
+      } catch (err) {
+        return Response.json({
+          ok: false,
+          error: err instanceof Error ? err.message : "live membership resync failed",
+        }, { status: 503 });
+      }
     }
 
     if (url.pathname === "/test-last-deliver") {
@@ -427,7 +434,9 @@ export class UserConnection extends DurableObject<Env> {
     const dirRes = await dir.fetch(new Request("https://x/my-channels", {
       headers: { "X-Verified-User-Id": userId },
     }));
-    if (!dirRes.ok) return [];
+    if (!dirRes.ok) {
+      throw new Error(`user directory my-channels failed: ${dirRes.status}`);
+    }
     const channels = (await dirRes.json()) as { items: MyChannelRow[] };
     return channels.items ?? [];
   }
@@ -657,12 +666,22 @@ export class UserConnection extends DurableObject<Env> {
       attachment.session_id,
     );
 
-    const sync = await this.resyncSessionLeasesWithActiveChannels({
-      session_id: attachment.session_id,
-      user_id: attachment.user_id,
-      active_channels: await this.fetchActiveChannels(attachment.user_id),
-      allow_reopen_closed: true,
-    });
+    let sync: LeaseSyncResult;
+    try {
+      sync = await this.resyncSessionLeasesWithActiveChannels({
+        session_id: attachment.session_id,
+        user_id: attachment.user_id,
+        active_channels: await this.fetchActiveChannels(attachment.user_id),
+        allow_reopen_closed: true,
+      });
+    } catch (err) {
+      sendCommandError(
+        ws,
+        commandId,
+        responseError("CHAT_WORKER_UNAVAILABLE", err instanceof Error ? err.message : "heartbeat failed", true),
+      );
+      return;
+    }
 
     const ack: CommandAckFrame = {
       frame_type: "command_ack",

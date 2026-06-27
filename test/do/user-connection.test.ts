@@ -162,7 +162,7 @@ describe("UserConnection DO", () => {
       }),
     );
 
-    const errRaw = await nextMessage(ws);
+    const errRaw = await nextAck(ws);
     const err = JSON.parse(errRaw);
     expect(err.frame_type).toBe("command_error");
     expect(err.error.code).toBe("INVALID_MESSAGE");

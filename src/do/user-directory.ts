@@ -84,7 +84,21 @@ export class UserDirectory extends DurableObject<Env> {
     const url = new URL(request.url);
     if (url.pathname === "/ping") return Response.json({ ok: true });
 
+    if (url.pathname === "/internal/test-my-channels-failure") {
+      if (request.headers.get("X-Test-Only") !== "1") return new Response("forbidden", { status: 403 });
+      const body = await request.json().catch(() => ({})) as { enabled?: boolean };
+      if (body.enabled === false) {
+        await this.ctx.storage.delete("test:my-channels-failure");
+      } else {
+        await this.ctx.storage.put("test:my-channels-failure", true);
+      }
+      return Response.json({ ok: true });
+    }
+
     if (url.pathname === "/my-channels") {
+      if (await this.ctx.storage.get("test:my-channels-failure") === true) {
+        return new Response("test my-channels failure", { status: 503 });
+      }
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       const rows = this.ctx.storage.sql
         .exec("SELECT channel_id, kind, last_read_event_id, membership_version FROM my_channels WHERE user_id = ? AND status = 'active'", userId)

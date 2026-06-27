@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { getNamedDo } from "../helpers";
-import { liveStartAndAck, nextAck, upgradeUserConnection } from "../ws-helpers";
+import { liveStartAndAck, nextAck, nextMessage, sendHeartbeat, upgradeUserConnection } from "../ws-helpers";
+
+async function nextEventFrame(ws: WebSocket, eventId: string): Promise<Record<string, unknown>> {
+  for (let i = 0; i < 5; i++) {
+    const frame = JSON.parse(await nextMessage(ws)) as Record<string, unknown>;
+    if (frame.frame_type === "event" && frame.event_id === eventId) return frame;
+  }
+  throw new Error(`event ${eventId} not received`);
+}
 
 describe("UserConnection session.live_start", () => {
   it("registers fanout leases for active channels without replay", async () => {
@@ -95,6 +103,28 @@ describe("UserConnection session.live_start", () => {
       headers: { "X-Channel-Id": channelId },
     }))).json()) as { leases: Array<{ session_id: string; user_id: string }> };
     expect(dump.leases.some((l) => l.session_id === sessionId && l.user_id === memberId)).toBe(true);
+
+    const send = await channel.fetch(new Request("https://x/internal/message-send", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        command_id: "cmd-live-add-message",
+        dedupe_principal_key: `user:${ownerId}`,
+        type: "text",
+        text: "live add delivery",
+        reply_to: null,
+        mentions: [],
+        channel_id: channelId,
+      }),
+    }));
+    expect(send.status).toBe(200);
+    const sent = await send.json() as { event_id: string };
+    const delivered = nextEventFrame(ws, sent.event_id);
+    await runDurableObjectAlarm(channel);
+    await runDurableObjectAlarm(fanout);
+    const event = await delivered;
+    expect(event.channel_id).toBe(channelId);
+    expect(event.type).toBe("message.created");
 
     ws.close();
   });
@@ -231,6 +261,51 @@ describe("UserConnection session.live_start", () => {
     });
 
     ws.close();
+  });
+
+  it("does not close leases when my-channels reload fails during heartbeat", async () => {
+    const channelId = crypto.randomUUID();
+    const memberId = "u-live-dir-fail-member";
+    const { runInDurableObject } = await import("cloudflare:test") as {
+      runInDurableObject: (stub: DurableObjectStub, fn: (instance: unknown, state: any) => void | Promise<void>) => Promise<void>;
+    };
+
+    const dir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], memberId);
+    await dir.fetch(new Request("https://x/internal/upsert-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "join", channel_id: channelId, kind: "channel", membership_version: 1 }),
+    }));
+
+    const { ws, stub, sessionId } = await upgradeUserConnection(memberId);
+    await liveStartAndAck(ws, "cmd-live-dir-fail-start");
+
+    await dir.fetch(new Request("https://x/internal/test-my-channels-failure", {
+      method: "POST",
+      headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    }));
+
+    sendHeartbeat(ws, "cmd-live-dir-fail-heartbeat");
+    const raw = await nextAck(ws);
+    const frame = JSON.parse(raw) as { frame_type: string; error?: { code: string; retryable: boolean } };
+    expect(frame.frame_type).toBe("command_error");
+    expect(frame.error?.code).toBe("CHAT_WORKER_UNAVAILABLE");
+    expect(frame.error?.retryable).toBe(true);
+
+    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+      const row = state.storage.sql
+        .exec("SELECT status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
+        .toArray()[0] as { status: string } | undefined;
+      expect(row?.status).toBe("active");
+    });
+
+    ws.close();
+    await dir.fetch(new Request("https://x/internal/test-my-channels-failure", {
+      method: "POST",
+      headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: false }),
+    }));
   });
 
   it("closes affected member leases after channel dissolve", async () => {
