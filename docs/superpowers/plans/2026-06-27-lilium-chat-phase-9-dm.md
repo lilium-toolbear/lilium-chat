@@ -215,7 +215,7 @@ git commit -m "feat(do): DMDirectory skeleton + DM_DIRECTORY binding"
   2. If `status=creating` → return same `channel_id`, `created: false` (resume path).
   3. Else mint `channel_id = uuidv7()`, `INSERT dm_pairs (status=creating)`, return `{ channel_id, status: "creating", created: true }`.
   4. After successful `ChatChannel.createDm` (caller responsibility), caller invokes `POST /internal/complete-dm` body `{ pair_key, channel_id }` that sets `status=active` only when `channel_id` matches (idempotent). **Only call `complete-dm` when this open path actually created the pair row or the row is still `creating`** — if `get-or-create-dm` returned `status=active`, skip `complete-dm`.
-- Internal pair conflict (row exists with different `channel_id` than requested): log + return 500 (not exposed to Browser).
+- Internal invariant violation (e.g. `dm_pairs` row exists but cannot be read back consistently): log + return 500 (not exposed to Browser). Callers never supply `channel_id`; existing rows are always returned as-is.
 
 - [ ] **Step 1: Write failing tests** (`test/do/dm-directory.test.ts`):
   - First get-or-create inserts `creating` row and returns `channel_id`.
