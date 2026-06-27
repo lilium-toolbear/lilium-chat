@@ -15,9 +15,18 @@ import {
   channelDirectoryBaseline,
   channelDirectoryMigrations,
 } from "../../src/do/migrations/channel-directory";
+import {
+  DM_DIRECTORY_CURRENT_SCHEMA_VERSION,
+  dmDirectoryBaseline,
+  dmDirectoryMigrations,
+} from "../../src/do/migrations/dm-directory";
 
 function directoryStub(name: string) {
   return getNamedDo(env.CHANNEL_DIRECTORY as unknown as DurableObjectNamespace, name);
+}
+
+function dmDirectoryStub(name: string) {
+  return getNamedDo(env.DM_DIRECTORY as unknown as DurableObjectNamespace, name);
 }
 
 async function withDoState(stub: DurableObjectStub, fn: (ctx: DurableObjectState) => void | Promise<void>): Promise<void> {
@@ -172,6 +181,29 @@ describe("migrateSqlite", () => {
 
       const rows = ctx.storage.sql.exec("SELECT version FROM schema_migrations WHERE version=77").toArray();
       expect(rows).toHaveLength(1);
+    });
+  });
+});
+
+describe("DMDirectory migrateSqlite", () => {
+  it("empty DB runs baseline and stamps version 1", async () => {
+    const stub = dmDirectoryStub(`dm-migrate-empty-${crypto.randomUUID()}`);
+    const res = await stub.fetch(
+      new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as { current_version: number; applied: Array<{ version: number }> };
+    expect(body.current_version).toBe(DM_DIRECTORY_CURRENT_SCHEMA_VERSION);
+    expect(body.applied.map((row) => row.version)).toEqual([1]);
+  });
+
+  it("dm_pairs table exists after migration", async () => {
+    const stub = dmDirectoryStub(`dm-migrate-table-${crypto.randomUUID()}`);
+    await stub.fetch(new Request("https://x/ping"));
+
+    await withDoState(stub, (ctx) => {
+      migrateSqlite(ctx, "DMDirectory", dmDirectoryBaseline, dmDirectoryMigrations);
+      expect(tableExists(ctx, "dm_pairs")).toBe(true);
     });
   });
 });
