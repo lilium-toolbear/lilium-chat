@@ -15,7 +15,10 @@
 - **No cross-DO 2PC.** ChatChannel writes business rows + `projection_outbox` co-atomically; per-DO alarm flushes to target DOs; target writes are idempotent; exhausted retries → `dead_letter`. DM creation follows the same outbox pattern as `user_directory` join projections (see `create-channel` at chat-channel.ts ~2653–2668).
 - **`UserDirectory(current_user_id)` owns `dm.open` idempotency; `DMDirectory(pair_key)` owns pair uniqueness.** Do not merge these into one DO. A→B and B→A route to different `UserDirectory` instances; only `DMDirectory(pair_key)` converges to one `channel_id`. Same `Idempotency-Key` + different `recipient_user_id` → `409 IDEMPOTENCY_CONFLICT` (detected in `UserDirectory`, not `DMDirectory`).
 - **`pair_key` canonical form:** `user_low = min(current_user_id, recipient_user_id)` and `user_high = max(...)` by **dictionary-order UUID string comparison**; `pair_key = \`${user_low}:${user_high}\``. Route: `env.DM_DIRECTORY.getByName(pair_key)`.
-- **`POST /dms` response shape:** `channel` MUST be a **full** `ChannelSummary` (all list fields: `unread_count`, `last_read_event_id`, `last_message_preview`, `last_message_at`, `last_event_id`, plus `dm_peer` when `kind=dm`). Cached `idempotency_keys.response_json` stores this full inflated shape.
+- **`POST /dms` response shape:** `channel` MUST be a **full** `ChannelSummary` (all list fields: `unread_count`, `last_read_event_id`, `last_message_preview`, `last_message_at`, `last_event_id`, plus `dm_peer` when `kind=dm`). Cached `idempotency_keys.response_json` stores this full inflated shape. **`POST /dms` must not block on `my_channels` projection flush** — when the row is absent, use list-field defaults (`unread_count=0`, `last_read_event_id=null`, `last_message_*=null`).
+- **`/internal/open-dm` response protocol:** discriminated union `OpenDmInternalResponse`: `{ kind: 'cached', response: OpenDmResponse }` (return directly to Browser) or `{ kind: 'needs_inflate', channel_id, joined_at, role }` (Worker inflates → `open-dm-complete`). Completed idempotency replays must hit `cached` path for byte-identical responses.
+- **`joined_at` source of truth:** always from idempotent `ChatChannel./internal/create-dm` (`joined_at_by_user`), whether DMDirectory returned `active` or `creating`. Never read `joined_at` from `UserDirectory.my_channels` during `open-dm` (projection may lag).
+- **`DMDirectory` mints `channel_id`:** request body to `get-or-create-dm` has no `channel_id` field; only this DO calls `uuidv7()` for new DM channels.
 - **Viewer-specific projection at Worker layer only.** `channel_meta.title` / `avatar_url` stay empty for DM. Worker resolves `dm_peer` via `src/profile/resolve.ts` `resolveUserSummaries`. `ChatChannel/internal/summary` may return `dm_peer_user_id` (the other member's UUID) but must NOT call Hyperdrive.
 - **DM forbidden mutations → `409 UNSUPPORTED_CHANNEL_KIND`** (`retryable=false`). Not 422. Exception: `GET .../commands` on DM → `200 { "items": [] }`.
 - **`npm run cf-typegen`** after any `wrangler.jsonc` / `wrangler.test.jsonc` binding or migration tag change (regenerates gitignored `worker-configuration.d.ts`).
@@ -202,16 +205,16 @@ git commit -m "feat(do): DMDirectory skeleton + DM_DIRECTORY binding"
 {
   "user_a": "<uuid>",
   "user_b": "<uuid>",
-  "created_by": "<uuid>",
-  "channel_id": "<optional; required when inserting new row>"
+  "created_by": "<uuid>"
 }
 ```
+- **Do not** accept `channel_id` in the request body. `DMDirectory` is the sole minter of new DM `channel_id` values (`uuidv7()` inside this DO). UserDirectory and Worker must never mint `channel_id` for DM.
 - Returns `{ channel_id, status: "active" | "creating", created: boolean }`.
 - Logic (single `storage.transaction` per attempt):
-  1. If `dm_pairs` row exists with `status=active` → return existing `channel_id`.
-  2. If `status=creating` → return same `channel_id` (resume path).
-  3. Else mint/use provided `channel_id`, `INSERT dm_pairs (status=creating)`, return `{ channel_id, status: "creating", created: true }`.
-  4. After successful `ChatChannel.createDm` (caller responsibility), caller invokes `POST /internal/mark-dm-active` OR include `mark_active` in get-or-create follow-up — **prefer separate `POST /internal/complete-dm`** body `{ pair_key, channel_id }` that sets `status=active` only when `channel_id` matches (idempotent).
+  1. If `dm_pairs` row exists with `status=active` → return existing `channel_id`, `created: false`.
+  2. If `status=creating` → return same `channel_id`, `created: false` (resume path).
+  3. Else mint `channel_id = uuidv7()`, `INSERT dm_pairs (status=creating)`, return `{ channel_id, status: "creating", created: true }`.
+  4. After successful `ChatChannel.createDm` (caller responsibility), caller invokes `POST /internal/complete-dm` body `{ pair_key, channel_id }` that sets `status=active` only when `channel_id` matches (idempotent). **Only call `complete-dm` when this open path actually created the pair row or the row is still `creating`** — if `get-or-create-dm` returned `status=active`, skip `complete-dm`.
 - Internal pair conflict (row exists with different `channel_id` than requested): log + return 500 (not exposed to Browser).
 
 - [ ] **Step 1: Write failing tests** (`test/do/dm-directory.test.ts`):
@@ -295,18 +298,36 @@ git commit -m "feat(do): ChatChannel create-dm for kind=dm channels"
 - Validate UUID format → 422 `INVALID_DM_TARGET`.
 - Resolve recipient via `resolveUserSummaries([recipient_user_id], env, opts)` — absent → 404 `DM_TARGET_NOT_FOUND` + fail idempotency row.
 - `pair_key = canonicalDmPairKey(current, recipient).pair_key`.
-- Call `DMDirectory(pair_key)./internal/get-or-create-dm`; on `creating`, call `ChatChannel(channel_id)./internal/create-dm`; then `DMDirectory.complete-dm`.
-- **Do not** store inflated HTTP response until Worker supplies it — **preferred flow:** open-dm returns internal `{ channel_id, membership: { role, joined_at } }` raw; Worker inflates full `ChannelSummary` and calls `POST /internal/open-dm-complete` to persist `response_json`. **Simpler alternative (match channel-create-coordinate):** open-dm accepts optional `inflated_response_json` from a second internal call, OR returns raw and Worker passes inflated JSON back in `POST /internal/open-dm-finalize` with `{ idempotency_key, response_json }`. **Pick one:** use two-step like create-coordinate where coordinator calls create then stores create response — here Worker inflates then `UserDirectory` stores via finalize endpoint in same HTTP request thread:
-  1. `open-dm` orchestration returns `{ channel_id, joined_at, needs_inflate: true }` on success path inside DO.
-  2. Worker inflates → `POST /internal/open-dm-cache-response` `{ idempotency_key, response_json }` marks `completed`.
-  **OR** inline: `open-dm` body includes callback is impossible cross-DO — **authoritative:** Worker `openDmHandler` calls open-dm internal steps via multiple internal endpoints OR single open-dm that accepts `response_json` only on finalize sub-path. **Simplest mirror of channel-create-coordinate:** UserDirectory `open-dm` does all DO orchestration, then calls back into itself is wrong. **Final design for implementer:** split into:
-  - `POST /internal/open-dm` — idempotency + recipient validation + DMDirectory + ChatChannel.createDm orchestration; returns **internal** `{ channel_id, joined_at, role: "member" }`.
-  - Worker inflates full summary.
-  - `POST /internal/open-dm-complete` — `{ idempotency_key, response_json }` writes `status=completed` (same txn pattern as channel-create line 254–258).
+- Orchestration after idempotency reserve (always, whether DMDirectory returned `active` or `creating`):
+  1. `DMDirectory(pair_key)./internal/get-or-create-dm` → `{ channel_id, status, created }`.
+  2. **Always** call `ChatChannel(channel_id)./internal/create-dm` — idempotent: if `channel_meta` already exists, return existing meta + `joined_at_by_user` from DB (do not trust request body). This is the **source of truth for `joined_at`** when B opens an existing pair created by A; do not read `joined_at` from `UserDirectory.my_channels` projection (may not be flushed yet).
+  3. Call `DMDirectory.complete-dm` **only when** step 1 returned `status=creating` (new pair or crash-resume while still `creating`). Skip when step 1 returned `status=active`.
+- **Internal response protocol (discriminated union).** `POST /internal/open-dm` returns one of:
+```ts
+type OpenDmResponse = {
+  channel: ChannelSummary
+  membership: { role: 'member'; joined_at: string }
+}
+
+type OpenDmInternalResponse =
+  | { kind: 'cached'; response: OpenDmResponse }
+  | {
+      kind: 'needs_inflate'
+      channel_id: string
+      joined_at: string
+      role: 'member'
+    }
+```
+- Txn 1 idempotency: if `status=completed` and `response_json` present → return `{ kind: 'cached', response: JSON.parse(response_json) }` immediately (byte-identical replay path).
+- Success path before Worker inflation → return `{ kind: 'needs_inflate', channel_id, joined_at, role: 'member' }` where `joined_at` comes from `create-dm` response `joined_at_by_user[current_user_id]`.
+- `POST /internal/open-dm-complete` — body `{ idempotency_key, response_json }` writes `status=completed` + stores full inflated `OpenDmResponse` JSON (same txn pattern as channel-create line 254–258). Worker calls this only on `needs_inflate` path after inflation.
+- **Do not** store inflated HTTP response inside `open-dm` itself; Worker owns inflation + complete.
 
 - [ ] **Step 1: Write failing tests** (`test/do/user-directory-open-dm.test.ts`) — mirror `user-directory-create-coordinate.test.ts`:
-  - First open creates DM; returns internal channel_id.
-  - Same key + same recipient → cached `response_json` after complete step.
+  - First open creates DM; returns `{ kind: 'needs_inflate', channel_id, joined_at, role: 'member' }`.
+  - B opens A after A created pair → same `channel_id`, `joined_at` read from `ChatChannel.create-dm` idempotent path (not from projection).
+  - Same key + same recipient after `open-dm-complete` → `{ kind: 'cached', response: <full OpenDmResponse> }` directly from `response_json`.
+  - Same key + same recipient while row is `creating` and `response_json` absent → resumes orchestration, returns `needs_inflate`, then completes.
   - Same key + different recipient → `409 IDEMPOTENCY_CONFLICT`.
   - Self-DM → `422 INVALID_DM_TARGET`.
   - Unknown recipient (mock `resolveUserSummaries` via `clientFactory` returning empty map) → `404 DM_TARGET_NOT_FOUND`.
@@ -366,14 +387,17 @@ git commit -m "feat(routes): viewer-specific DM ChannelSummary inflation"
 5. `dirStub = env.USER_DIRECTORY.getByName(userId)`.
 6. `res = await dirStub.fetch("/internal/open-dm", { idempotency_key, recipient_user_id })`.
 7. Map errors: 404 → `DM_TARGET_NOT_FOUND`; 409 → `IDEMPOTENCY_CONFLICT`; 422 → `INVALID_DM_TARGET`.
-8. On 200 internal body `{ channel_id, joined_at }`: fetch summary + my_channels row; `inflateChannelSummaryForViewer`; build `{ channel, membership: { role: "member", joined_at } }`; call `/internal/open-dm-complete` with full JSON; return 200.
+8. Parse `OpenDmInternalResponse`:
+   - `kind === 'cached'` → return `response` directly (200). No inflation, no `open-dm-complete`.
+   - `kind === 'needs_inflate'` → fetch `ChatChannel(channel_id)/internal/summary`; optionally read `UserDirectory` `my_channels` row for `last_read_event_id` **best-effort only** — **do not block or poll** waiting for projection flush. If row absent, use defaults: `last_read_event_id = null`, `unread_count = 0`, `last_message_preview = null`, `last_message_at = null`, `last_event_id = null`. `inflateChannelSummaryForViewer` merges summary + defaults + profile resolution into full `ChannelSummary`. Build `{ channel, membership: { role, joined_at } }`; call `/internal/open-dm-complete` with full JSON; return 200.
 
 - [ ] **Step 1: Write failing tests** (`test/routes/dms.test.ts`):
-  - `POST /dms` happy path returns full `ChannelSummary` with all list fields + `dm_peer`.
-  - B opens A after A opened B → same `channel_id`.
+  - `POST /dms` happy path returns full `ChannelSummary` with all list fields + `dm_peer` even when `my_channels` projection not yet flushed (defaults for unread/last_message_*).
+  - B opens A after A opened B → same `channel_id`; B gets correct `joined_at` from ChatChannel source-of-truth.
   - Missing `Idempotency-Key` → 400.
   - Self-DM → 422 `INVALID_DM_TARGET`.
-  - Idempotency replay returns byte-identical `channel` object.
+  - Same Idempotency-Key + same recipient after completed → Worker returns cached full response directly (`kind=cached` path); byte-identical `channel` object.
+  - Same Idempotency-Key + same recipient while `creating`/no `response_json` → resumes, inflates, completes, then subsequent retry hits cached path.
 - [ ] **Step 2: Implement** `openDmHandler` + `app.post("/api/chat/dms", ...)`.
 - [ ] **Step 3:** Run `npx vitest run test/routes/dms.test.ts --no-file-parallelism --test-timeout=60000 --hook-timeout=60000`. Green.
 - [ ] **Step 4:** `npm run typecheck`. Clean.
@@ -432,7 +456,6 @@ private async requireChannelKindChannel(): Promise<{ ok: true; meta } | { ok: fa
   - `/internal/members-add`, `/internal/members-update-role`, `/internal/members-remove`
   - `/internal/owner-transfer` (if present)
   - `/internal/bot-install`, `/internal/bot-install-update`, command binding updates
-  - Any `/internal/bot-message-send` when Phase 7 adds it
 
 - [ ] **Step 1: Write failing tests** (`test/do/chat-channel-dm-gates.test.ts`):
   - Seed a `kind=dm` channel via `create-dm`.
@@ -601,9 +624,10 @@ git commit -m "test(dm): message lifecycle on kind=dm channels"
 - A3–A4: `DMDirectory` DO + `dm_pairs` schema + `DM_DIRECTORY` wrangler binding (prod `v3` migration tag) + `cf-typegen`.
 - B1: Pair get-or-create + `complete-dm` in `DMDirectory`; no idempotency keys in this DO.
 - B2: `create-dm` txn with idempotent guard, two members, dual `user_directory` outbox, no public directory.
-- B3: `UserDirectory` `dm.open` idempotency mirrors `channel-create-coordinate`; recipient validation via `resolveUserSummaries`; two-step complete for cached full HTTP response.
+- B1: `DMDirectory` mints `channel_id` internally; request body has no `channel_id`.
+- B3: `UserDirectory` `dm.open` idempotency mirrors `channel-create-coordinate`; always calls idempotent `create-dm` for `joined_at`; `OpenDmInternalResponse` discriminated union (`cached` vs `needs_inflate`); `open-dm-complete` stores full `response_json`.
 - B4: Worker-side `inflateChannelSummaryForViewer`; `internal/summary` exposes `dm_peer_user_id` only (no Hyperdrive in DO).
-- B5: `POST /api/chat/dms` returns full `ChannelSummary` + `membership`.
+- B5: `POST /api/chat/dms` returns full `ChannelSummary` + `membership`; does not wait for `my_channels` projection flush (defaults when row absent).
 - B6: Reuse existing outbox → live `my_channels_changed` path; poll-based tests.
 - C1–C2: All channel management HTTP mutations → 409 on DM; join gate upgraded from 403 to 409.
 - C3: `GET commands` → `{ items: [] }` for DM.
@@ -618,7 +642,7 @@ git commit -m "test(dm): message lifecycle on kind=dm channels"
 - Frontend DM UI (`dzmm_archive` Phase DM-3).
 - `source_channel_id`, privacy settings, blacklist, message request, DM rate limits (Phase DM-4).
 - Bot install/invoke on DM beyond rejection gates (v1 bots do not enter DM).
-- `POST /api/chat/bot/channels/{id}/messages` route (not registered in index.ts yet) — when Phase 7 adds it, must include DM gate.
+- `POST /api/chat/bot/channels/{id}/messages` route — **not registered in `index.ts` today**; Phase 9 does **not** add this route. When a future phase registers it, it must gate DM with `409 UNSUPPORTED_CHANNEL_KIND`. Acceptance checklist uses conditional wording (see below).
 - Merging addendum into main contract v2.13 (docs-only; can land separately).
 - Hyperdrive live integration tests (use `clientFactory` injection in unit tests).
 
@@ -643,7 +667,7 @@ git commit -m "test(dm): message lifecycle on kind=dm channels"
 [ ] PATCH/dissolve/join/invites/members on DM → 409 UNSUPPORTED_CHANNEL_KIND
 [ ] GET .../commands on DM -> { items: [] }
 [ ] WS command.invoke / interaction.submit on DM -> UNSUPPORTED_CHANNEL_KIND
-[ ] POST /bot/channels/{dm_id}/messages -> 409 UNSUPPORTED_CHANNEL_KIND
+[ ] POST /bot/channels/{dm_id}/messages — route not in Phase 9 scope; if registered in a future phase, must return 409 UNSUPPORTED_CHANNEL_KIND on DM
 [ ] DM 中不能 admin delete 对方消息
 [ ] POST /dms 响应含完整 ChannelSummary 列表字段
 [ ] ChannelSummary title/avatar/dm_peer 为 viewer-specific 投影
