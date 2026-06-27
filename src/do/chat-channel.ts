@@ -284,6 +284,30 @@ export class ChatChannel extends DurableObject<Env> {
     return row?.role ?? null;
   }
 
+  private dmChannelManagementError(): Response {
+    return Response.json(
+      { error: { code: "UNSUPPORTED_CHANNEL_KIND", message: "operation not supported for DM channels", retryable: false } },
+      { status: 409 },
+    );
+  }
+
+  private readChannelMeta(): { channel_id: string; kind: string; visibility: string; status: string; membership_version: number; member_count: number } | undefined {
+    return this.ctx.storage.sql
+      .exec("SELECT channel_id, kind, visibility, status, membership_version, member_count FROM channel_meta LIMIT 1")
+      .toArray()[0] as { channel_id: string; kind: string; visibility: string; status: string; membership_version: number; member_count: number } | undefined;
+  }
+
+  private requireChannelKindChannel(): { ok: true; meta: NonNullable<ReturnType<ChatChannel["readChannelMeta"]>> } | { ok: false; response: Response } {
+    const meta = this.readChannelMeta();
+    if (meta === undefined) {
+      return { ok: false, response: new Response("not found", { status: 404 }) };
+    }
+    if (meta.kind === "dm") {
+      return { ok: false, response: this.dmChannelManagementError() };
+    }
+    return { ok: true, meta };
+  }
+
   // Maps a cached `{channel|member|error}` JSON (encoded inside a txn that cannot write business rows)
   // to the right HTTP status. Shared by all write handlers' cached branches (Tasks 7/8/9/11).
   private cachedResponse(j: string): Response {
@@ -373,6 +397,9 @@ export class ChatChannel extends DurableObject<Env> {
 
       const callerRole = this.activeRole(input.channelId, input.userId);
       const isSender = row.sender_kind === "user" && row.sender_user_id === input.userId;
+      const channelKind = this.ctx.storage.sql
+        .exec("SELECT kind FROM channel_meta WHERE channel_id=?", input.channelId)
+        .toArray()[0] as { kind: string } | undefined;
       if (input.operation === "message.edit") {
         if (!isSender || row.type !== "text" || (row.status !== "normal" && row.status !== "edited")) {
           return { kind: "error", j: JSON.stringify({ error: { code: "MESSAGE_NOT_EDITABLE", message: "message is not editable", retryable: false } }) };
@@ -382,7 +409,11 @@ export class ChatChannel extends DurableObject<Env> {
           return { kind: "error", j: JSON.stringify({ error: { code: "MESSAGE_NOT_EDITABLE", message: "message is not recallable", retryable: false } }) };
         }
       } else if (input.operation === "message.delete") {
-        if (!isSender && callerRole !== "owner" && callerRole !== "admin") {
+        if (channelKind?.kind === "dm") {
+          if (!isSender) {
+            return { kind: "error", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "only sender may delete in DM", retryable: false } }) };
+          }
+        } else if (!isSender && callerRole !== "owner" && callerRole !== "admin") {
           return { kind: "error", j: JSON.stringify({ error: { code: "FORBIDDEN", message: "only sender or owner/admin may delete", retryable: false } }) };
         }
         if (row.status !== "normal" && row.status !== "edited" && row.status !== "recalled") {
@@ -721,11 +752,11 @@ export class ChatChannel extends DurableObject<Env> {
           { status: 409 },
         );
       }
-      // DM channels are not joinable (no DM creation is exposed yet, but defend now).
+      // DM channels are not joinable.
       if (meta.kind === "dm") {
         return Response.json(
-          { error: { code: "FORBIDDEN", message: "channel is not publicly joinable", retryable: false } },
-          { status: 403 },
+          { error: { code: "UNSUPPORTED_CHANNEL_KIND", message: "operation not supported for DM channels", retryable: false } },
+          { status: 409 },
         );
       }
 
@@ -936,6 +967,18 @@ export class ChatChannel extends DurableObject<Env> {
           }
         | undefined;
 
+      let dmPeerUserId: string | null = null;
+      if (meta.kind === "dm" && userId) {
+        const peer = this.ctx.storage.sql
+          .exec(
+            "SELECT user_id FROM members WHERE channel_id=? AND user_id != ? AND left_at IS NULL LIMIT 1",
+            meta.channel_id,
+            userId,
+          )
+          .toArray()[0] as { user_id: string } | undefined;
+        dmPeerUserId = peer?.user_id ?? null;
+      }
+
       return Response.json({
         channel_id: meta.channel_id,
         kind: meta.kind,
@@ -952,6 +995,7 @@ export class ChatChannel extends DurableObject<Env> {
         last_message_sender_id: lastMsg?.sender_user_id ?? lastMsg?.sender_bot_id ?? null,
         last_event_id: lastEvent?.event_id ?? null,
         my_role: member?.role ?? null,
+        dm_peer_user_id: dmPeerUserId,
       });
     }
 
@@ -1682,6 +1726,8 @@ export class ChatChannel extends DurableObject<Env> {
     if (url.pathname === "/internal/owner-transfer") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });
+      const kindGate = this.requireChannelKindChannel();
+      if (!kindGate.ok) return kindGate.response;
       const b = (await request.json()) as {
         operation_id: string;
         channel_id: string;
@@ -2285,6 +2331,8 @@ export class ChatChannel extends DurableObject<Env> {
     if (url.pathname === "/internal/dissolve") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });
+      const kindGate = this.requireChannelKindChannel();
+      if (!kindGate.ok) return kindGate.response;
       const b = (await request.json()) as { idempotency_key: string; channel_id: string };
       const channelId = b.channel_id;
       const now = this.nowIso();
@@ -2659,9 +2707,139 @@ export class ChatChannel extends DurableObject<Env> {
       });
     }
 
+    if (url.pathname === "/internal/create-dm") {
+      const createdBy = request.headers.get("X-Verified-User-Id") ?? "";
+      if (!createdBy) return new Response("missing verified user", { status: 401 });
+      const b = (await request.json()) as {
+        channel_id: string;
+        user_a: string;
+        user_b: string;
+        created_by: string;
+      };
+      const channelId = b.channel_id;
+      if (!channelId) {
+        return Response.json({ error: { code: "INVALID_MESSAGE", message: "channel_id required", retryable: false } }, { status: 422 });
+      }
+      const userA = b.user_a;
+      const userB = b.user_b;
+      if (!userA || !userB || userA === userB) {
+        return Response.json({ error: { code: "INVALID_DM_TARGET", message: "invalid dm participants", retryable: false } }, { status: 422 });
+      }
+
+      const now = this.nowIso();
+      const nowMs = Date.parse(now);
+      const membershipVersion = 1;
+
+      const result = await this.ctx.storage.transaction(async (): Promise<
+        | { kind: "cached"; channel: Record<string, unknown>; joinedAtByUser: Record<string, string> }
+        | { kind: "created"; channel: Record<string, unknown>; joinedAtByUser: Record<string, string> }
+      > => {
+        const existing = this.ctx.storage.sql
+          .exec("SELECT channel_id FROM channel_meta WHERE channel_id=?", channelId)
+          .toArray()[0] as { channel_id: string } | undefined;
+
+        const members = this.ctx.storage.sql
+          .exec("SELECT user_id, joined_at FROM members WHERE channel_id=? AND left_at IS NULL", channelId)
+          .toArray() as Array<{ user_id: string; joined_at: string }>;
+        const joinedAtByUser: Record<string, string> = {};
+        for (const m of members) joinedAtByUser[m.user_id] = m.joined_at;
+
+        if (existing !== undefined) {
+          const meta = this.ctx.storage.sql
+            .exec("SELECT channel_id, kind, visibility, title, topic, avatar_url, member_count, status, created_at, updated_at FROM channel_meta WHERE channel_id=?", channelId)
+            .toArray()[0] as {
+              channel_id: string; kind: string; visibility: string; title: string; topic: string | null;
+              avatar_url: string | null; member_count: number; status: string; created_at: string; updated_at: string;
+            };
+          return {
+            kind: "cached" as const,
+            channel: {
+              channel_id: meta.channel_id,
+              kind: meta.kind,
+              visibility: meta.visibility,
+              title: meta.title,
+              topic: meta.topic,
+              avatar_url: meta.avatar_url,
+              member_count: meta.member_count,
+              status: meta.status,
+              created_at: meta.created_at,
+              updated_at: meta.updated_at,
+            },
+            joinedAtByUser,
+          };
+        }
+
+        this.ctx.storage.sql.exec(
+          `INSERT INTO channel_meta (channel_id, kind, visibility, title, topic, avatar_url, status, created_by, created_at, updated_at, member_count, membership_version)
+           VALUES (?, 'dm', 'private', '', NULL, NULL, 'active', ?, ?, ?, 2, ?)`,
+          channelId, b.created_by, now, now, membershipVersion,
+        );
+        this.ctx.storage.sql.exec(
+          "INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, 'member', ?, NULL)",
+          channelId, userA, now,
+        );
+        this.ctx.storage.sql.exec(
+          "INSERT INTO members (channel_id, user_id, role, joined_at, left_at) VALUES (?, ?, 'member', ?, NULL)",
+          channelId, userB, now,
+        );
+        joinedAtByUser[userA] = now;
+        joinedAtByUser[userB] = now;
+
+        const auditId = `${channelId}:create-dm:${now}`;
+        this.ctx.storage.sql.exec(
+          "INSERT INTO audit_logs (audit_id, actor_kind, actor_id, action, target_type, target_id, before_json, after_json, reason, request_id, created_at) VALUES (?, 'user', ?, 'channel.create_dm', 'channel', ?, NULL, ?, NULL, ?, ?)",
+          auditId, b.created_by, channelId, JSON.stringify({ channel_id: channelId, kind: "dm", user_a: userA, user_b: userB }), channelId, now,
+        );
+
+        const channelCreatedId = this.nextEventId(nowMs);
+        this.ctx.storage.sql.exec(
+          "INSERT INTO events (event_id, event_type, channel_id, payload_json, occurred_at) VALUES (?, 'channel.created', ?, ?, ?)",
+          channelCreatedId, channelId, JSON.stringify(buildChannelCreatedPayload({
+            channel_id: channelId, kind: "dm", visibility: "private", title: "", actor_kind: "user", actor_id: b.created_by,
+          })), now,
+        );
+
+        for (const userId of [userA, userB]) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+            `user_directory:join:${channelId}:${userId}:${now}`,
+            userId,
+            JSON.stringify({ action: "join", channel_id: channelId, kind: "dm", membership_version: membershipVersion }),
+            now, now, now,
+          );
+        }
+
+        return {
+          kind: "created" as const,
+          channel: {
+            channel_id: channelId,
+            kind: "dm",
+            visibility: "private",
+            title: "",
+            topic: null,
+            avatar_url: null,
+            member_count: 2,
+            status: "active",
+            created_at: now,
+            updated_at: now,
+          },
+          joinedAtByUser,
+        };
+      });
+
+      if (result.kind === "created") await this.scheduleOutboxAlarm(now);
+
+      return Response.json({
+        ...result.channel,
+        joined_at_by_user: result.joinedAtByUser,
+      });
+    }
+
     if (url.pathname === "/internal/update-channel") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });
+      const kindGate = this.requireChannelKindChannel();
+      if (!kindGate.ok) return kindGate.response;
       const b = (await request.json()) as {
         idempotency_key: string; channel_id: string;
         title?: string; topic?: string | null; avatar_attachment_id?: string | null; visibility?: string;
@@ -2772,6 +2950,8 @@ export class ChatChannel extends DurableObject<Env> {
     if (url.pathname === "/internal/members-add") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });
+      const kindGate = this.requireChannelKindChannel();
+      if (!kindGate.ok) return kindGate.response;
       const b = (await request.json()) as { idempotency_key: string; channel_id: string; user_id: string; role: string };
       const channelId = b.channel_id;
       const now = this.nowIso();
@@ -2838,6 +3018,8 @@ export class ChatChannel extends DurableObject<Env> {
     if (url.pathname === "/internal/members-update-role") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });
+      const kindGate = this.requireChannelKindChannel();
+      if (!kindGate.ok) return kindGate.response;
       const b = (await request.json()) as { idempotency_key: string; channel_id: string; user_id: string; role: string };
       const channelId = b.channel_id;
       const now = this.nowIso();
@@ -2884,6 +3066,8 @@ export class ChatChannel extends DurableObject<Env> {
     if (url.pathname === "/internal/members-remove") {
       const userId = request.headers.get("X-Verified-User-Id") ?? "";
       if (!userId) return new Response("missing verified user", { status: 401 });
+      const kindGate = this.requireChannelKindChannel();
+      if (!kindGate.ok) return kindGate.response;
       const b = (await request.json()) as { idempotency_key: string; channel_id: string; user_id: string };
       const channelId = b.channel_id;
       const now = this.nowIso();
@@ -3141,6 +3325,8 @@ export class ChatChannel extends DurableObject<Env> {
   private async handleBotInstall(request: Request): Promise<Response> {
     const userId = request.headers.get("X-Verified-User-Id") ?? "";
     if (!userId) return this.botInstallError("UNAUTHORIZED", "missing verified user");
+    const kindGate = this.requireChannelKindChannel();
+    if (!kindGate.ok) return kindGate.response;
     const b = (await request.json().catch(() => null)) as {
       operation_id?: unknown;
       channel_id?: unknown;
@@ -3362,6 +3548,8 @@ export class ChatChannel extends DurableObject<Env> {
   private async handleBotInstallUpdate(request: Request): Promise<Response> {
     const userId = request.headers.get("X-Verified-User-Id") ?? "";
     if (!userId) return this.botInstallError("UNAUTHORIZED", "missing verified user");
+    const kindGate = this.requireChannelKindChannel();
+    if (!kindGate.ok) return kindGate.response;
     const b = (await request.json().catch(() => null)) as {
       operation_id?: unknown; channel_id?: unknown; bot_id?: unknown;
       status?: unknown; command_policy?: unknown;
@@ -3456,6 +3644,8 @@ export class ChatChannel extends DurableObject<Env> {
   private async handleCommandBindingUpdate(request: Request): Promise<Response> {
     const userId = request.headers.get("X-Verified-User-Id") ?? "";
     if (!userId) return this.botInstallError("UNAUTHORIZED", "missing verified user");
+    const kindGate = this.requireChannelKindChannel();
+    if (!kindGate.ok) return kindGate.response;
     const b = (await request.json().catch(() => null)) as {
       operation_id?: unknown; channel_id?: unknown; bot_command_id?: unknown;
       enabled?: unknown; permission_override?: unknown;
