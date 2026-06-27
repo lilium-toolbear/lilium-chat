@@ -129,7 +129,7 @@ describe("UserConnection DO", () => {
     });
 
     ws.send(cmd);
-    const ackRaw = await nextMessage(ws);
+    const ackRaw = await nextAck(ws);
     const ack = JSON.parse(ackRaw);
     expect(ack.frame_type).toBe("command_ack");
     expect(ack.status).toBe("committed");

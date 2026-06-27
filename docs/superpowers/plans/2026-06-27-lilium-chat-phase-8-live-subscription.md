@@ -109,6 +109,17 @@ HTTP bootstrap / GET .../events → gap recovery (authoritative)
 - [ ] Synchronous handling (no `waitUntil`)
 - [ ] Test: `test/do/user-connection-heartbeat-membership.test.ts` — removed member: heartbeat does not re-upsert fanout lease; local lease → `closed`; later event not delivered
 
+### Task P4-1b: Affected-user membership resync
+
+**Files:** `src/do/user-connection.ts`, `src/do/chat-channel.ts`, `src/ws/frames.ts`, `test/do/user-connection-live-start.test.ts`
+
+- [ ] Add internal `UserConnection /internal/live-memberships-changed`.
+- [ ] Resync leases by reloading authoritative `UserDirectory /my-channels`; `changed_channel_id` is only a hint.
+- [ ] Trigger resync after `user_directory` projection outbox succeeds, keyed by `affected_user_id`, not actor.
+- [ ] Covered mutations: channel create, member add/remove, invite accept/public join via user_directory join/leave outbox, and channel dissolve for all active members.
+- [ ] Closed lease rejoin creates a fresh `lease_id`.
+- [ ] Emit user-scoped `user_event my_channels_changed` as a non-authoritative hint; no Browser `channel.subscribe` / `channel.unsubscribe`.
+
 ### Task P4-2: Worker subprotocol v2
 
 **Files:** `src/routes/ws.ts`, `test/routes/ws.test.ts`
@@ -146,6 +157,8 @@ HTTP bootstrap / GET .../events → gap recovery (authoritative)
 - [ ] `session.live_start` retry: no duplicate leases
 - [ ] `session.heartbeat`: refresh only active memberships; no replay; no resurrect closed leases
 - [ ] Removed member: heartbeat closes local lease, no fanout upsert, no deliver
+- [ ] Member add/remove/dissolve: affected user's existing live sessions resync promptly after UserDirectory projection; actor UserConnection is not a substitute.
+- [ ] Leave then rejoin same channel: closed local lease reopens with a new `lease_id`.
 - [ ] `/deliver` membership_not_active closes local lease; fanout deletes lease
 - [ ] Close: SQL-based cleanup, not attachment
 - [ ] Deliver stale → lease deleted

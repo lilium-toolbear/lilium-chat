@@ -43,6 +43,262 @@ describe("UserConnection session.live_start", () => {
 
     ws.close();
   });
+
+  it("resyncs an existing live session after another user adds the member", async () => {
+    const channelId = crypto.randomUUID();
+    const ownerId = "u-live-add-owner";
+    const memberId = "u-live-add-member";
+    const channel = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    await channel.fetch(new Request("https://x/internal/create-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        channel_id: channelId,
+        creator_user_id: ownerId,
+        title: "Live add",
+        topic: null,
+        avatar_attachment_id: null,
+        visibility: "private",
+        initial_members: [],
+      }),
+    }));
+
+    const { ws, stub, sessionId } = await upgradeUserConnection(memberId);
+    await liveStartAndAck(ws, "cmd-live-before-add");
+
+    await channel.fetch(new Request("https://x/internal/members-add", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotency_key: "k-live-add-member",
+        channel_id: channelId,
+        user_id: memberId,
+        role: "member",
+      }),
+    }));
+
+    const { runDurableObjectAlarm, runInDurableObject } = await import("cloudflare:test") as {
+      runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void>;
+      runInDurableObject: (stub: DurableObjectStub, fn: (instance: unknown, state: any) => void | Promise<void>) => Promise<void>;
+    };
+    await runDurableObjectAlarm(channel);
+
+    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+      const row = state.storage.sql
+        .exec("SELECT status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
+        .toArray()[0] as { status: string } | undefined;
+      expect(row?.status).toBe("active");
+    });
+
+    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const dump = (await (await fanout.fetch(new Request("https://x/dump", {
+      headers: { "X-Channel-Id": channelId },
+    }))).json()) as { leases: Array<{ session_id: string; user_id: string }> };
+    expect(dump.leases.some((l) => l.session_id === sessionId && l.user_id === memberId)).toBe(true);
+
+    ws.close();
+  });
+
+  it("closes all live session leases after another user removes the member", async () => {
+    const channelId = crypto.randomUUID();
+    const ownerId = "u-live-rem-owner";
+    const memberId = "u-live-rem-member";
+    const channel = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    await channel.fetch(new Request("https://x/internal/create-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        channel_id: channelId,
+        creator_user_id: ownerId,
+        title: "Live remove",
+        topic: null,
+        avatar_attachment_id: null,
+        visibility: "private",
+        initial_members: [],
+      }),
+    }));
+
+    const { runDurableObjectAlarm, runInDurableObject } = await import("cloudflare:test") as {
+      runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void>;
+      runInDurableObject: (stub: DurableObjectStub, fn: (instance: unknown, state: any) => void | Promise<void>) => Promise<void>;
+    };
+    const first = await upgradeUserConnection(memberId);
+    const second = await upgradeUserConnection(memberId);
+    await liveStartAndAck(first.ws, "cmd-live-rem-1");
+    await liveStartAndAck(second.ws, "cmd-live-rem-2");
+
+    await channel.fetch(new Request("https://x/internal/members-add", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotency_key: "k-live-remove-add-member",
+        channel_id: channelId,
+        user_id: memberId,
+        role: "member",
+      }),
+    }));
+    await runDurableObjectAlarm(channel);
+
+    await channel.fetch(new Request("https://x/internal/members-remove", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotency_key: "k-live-remove-member",
+        channel_id: channelId,
+        user_id: memberId,
+      }),
+    }));
+    await runDurableObjectAlarm(channel);
+
+    await runInDurableObject(first.stub, async (_instance: unknown, state: any) => {
+      const rows = state.storage.sql
+        .exec("SELECT session_id, status FROM live_channel_leases WHERE channel_id=? ORDER BY session_id", channelId)
+        .toArray() as Array<{ session_id: string; status: string }>;
+      expect(rows).toEqual(expect.arrayContaining([
+        { session_id: first.sessionId, status: "closed" },
+        { session_id: second.sessionId, status: "closed" },
+      ]));
+    });
+
+    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const dump = (await (await fanout.fetch(new Request("https://x/dump", {
+      headers: { "X-Channel-Id": channelId },
+    }))).json()) as { leases: Array<{ session_id: string; user_id: string }> };
+    expect(dump.leases.filter((l) => l.user_id === memberId)).toHaveLength(0);
+
+    first.ws.close();
+    second.ws.close();
+  });
+
+  it("reopens a previously closed channel lease with a fresh lease id", async () => {
+    const channelId = crypto.randomUUID();
+    const memberId = "u-live-rejoin-member";
+    const { runInDurableObject } = await import("cloudflare:test") as {
+      runInDurableObject: (stub: DurableObjectStub, fn: (instance: unknown, state: any) => void | Promise<void>) => Promise<void>;
+    };
+
+    const { ws, stub, sessionId } = await upgradeUserConnection(memberId);
+    await liveStartAndAck(ws, "cmd-live-rejoin-1");
+    const dir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], memberId);
+
+    await dir.fetch(new Request("https://x/internal/upsert-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "join", channel_id: channelId, kind: "channel", membership_version: 1 }),
+    }));
+    await stub.fetch(new Request("https://x/internal/live-memberships-changed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ affected_user_id: memberId, reason: "member_added", changed_channel_id: channelId, membership_version: 1 }),
+    }));
+
+    let closedLeaseId = "";
+    await dir.fetch(new Request("https://x/internal/upsert-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "leave", channel_id: channelId, kind: "channel", membership_version: 2 }),
+    }));
+    await stub.fetch(new Request("https://x/internal/live-memberships-changed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ affected_user_id: memberId, reason: "member_removed", changed_channel_id: channelId, membership_version: 2 }),
+    }));
+    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+      const row = state.storage.sql
+        .exec("SELECT lease_id, status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
+        .toArray()[0] as { lease_id: string; status: string } | undefined;
+      expect(row?.status).toBe("closed");
+      closedLeaseId = row?.lease_id ?? "";
+    });
+
+    await dir.fetch(new Request("https://x/internal/upsert-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "join", channel_id: channelId, kind: "channel", membership_version: 3 }),
+    }));
+    await stub.fetch(new Request("https://x/internal/live-memberships-changed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ affected_user_id: memberId, reason: "member_added", changed_channel_id: channelId, membership_version: 3 }),
+    }));
+
+    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+      const row = state.storage.sql
+        .exec("SELECT lease_id, status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
+        .toArray()[0] as { lease_id: string; status: string } | undefined;
+      expect(row?.status).toBe("active");
+      expect(row?.lease_id).not.toBe(closedLeaseId);
+    });
+
+    ws.close();
+  });
+
+  it("closes affected member leases after channel dissolve", async () => {
+    const channelId = crypto.randomUUID();
+    const ownerId = "u-live-dis-owner";
+    const memberId = "u-live-dis-member";
+    const channel = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const { runDurableObjectAlarm, runInDurableObject } = await import("cloudflare:test") as {
+      runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void>;
+      runInDurableObject: (stub: DurableObjectStub, fn: (instance: unknown, state: any) => void | Promise<void>) => Promise<void>;
+    };
+
+    await channel.fetch(new Request("https://x/internal/create-channel", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        channel_id: channelId,
+        creator_user_id: ownerId,
+        title: "Live dissolve",
+        topic: null,
+        avatar_attachment_id: null,
+        visibility: "private",
+        initial_members: [],
+      }),
+    }));
+
+    const { ws, stub, sessionId } = await upgradeUserConnection(memberId);
+    await liveStartAndAck(ws, "cmd-live-dissolve");
+
+    await channel.fetch(new Request("https://x/internal/members-add", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-live-dissolve-add", channel_id: channelId, user_id: memberId, role: "member" }),
+    }));
+    await runDurableObjectAlarm(channel);
+
+    await channel.fetch(new Request("https://x/internal/dissolve", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: "k-live-dissolve", channel_id: channelId }),
+    }));
+    let status = "";
+    for (let i = 0; i < 5; i++) {
+      await runDurableObjectAlarm(channel);
+      await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+        const row = state.storage.sql
+          .exec("SELECT status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
+          .toArray()[0] as { status: string } | undefined;
+        status = row?.status ?? "";
+      });
+      if (status === "closed") break;
+    }
+    expect(status).toBe("closed");
+
+    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    let remainingLeaseCount = 0;
+    for (let i = 0; i < 5; i++) {
+      const dump = (await (await fanout.fetch(new Request("https://x/dump", {
+        headers: { "X-Channel-Id": channelId },
+      }))).json()) as { leases: Array<{ user_id: string }> };
+      remainingLeaseCount = dump.leases.filter((l) => l.user_id === memberId).length;
+      if (remainingLeaseCount === 0) break;
+      await runDurableObjectAlarm(fanout);
+    }
+    expect(remainingLeaseCount).toBe(0);
+
+    ws.close();
+  });
 });
 
 describe("UserConnection /deliver membership gate", () => {

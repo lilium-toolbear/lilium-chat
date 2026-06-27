@@ -219,6 +219,46 @@ CREATE INDEX IF NOT EXISTS idx_fanout_leases_expires
 
 旧 `/register-online`、`/unregister-online` → `410 Gone`，不得再写 live target。
 
+## 5.1 UserConnection membership resync
+
+`UserConnection DO(user_id)` 提供内部端点：
+
+```http
+POST /internal/live-memberships-changed
+Content-Type: application/json
+```
+
+请求体：
+
+```json
+{
+  "affected_user_id": "user-id",
+  "reason": "channel_joined|channel_left|member_added|member_removed|membership_updated|channel_dissolved|channel_created|system_resync",
+  "changed_channel_id": "channel-id",
+  "membership_version": 123
+}
+```
+
+规则：
+
+- `affected_user_id` 是 membership projection 变化的用户，不是发起操作的 actor。
+- 端点不使用 Browser JWT；只能由 server/DO 内部调用。
+- `changed_channel_id` 只是日志和优化 hint；实际 lease 集合必须重新读取 `UserDirectory /my-channels`。
+- 对该用户所有 `live_sessions.status='live'` session 执行同一套 lease resync：新增 active membership 建 lease，移除/解散 membership 关闭本地 lease 并 best-effort revoke `ChannelFanout` lease。
+- 关闭后又重新加入同一频道时必须生成新的 `lease_id`，不得复用旧 closed lease id。
+- 同步后可向该用户 socket 发送 user-scoped hint：
+
+```json
+{
+  "frame_type": "user_event",
+  "event": "my_channels_changed",
+  "reason": "member_added",
+  "changed_channel_id": "channel-id"
+}
+```
+
+该 frame 不是 channel timeline event，不写入 `events`，不经 `ChannelFanout`；前端只把它当作刷新 channel list/bootstrap 的 hint。
+
 ## 6. Deliver 与自愈
 
 投递前删除过期 lease。对每个未过期 lease 调 `UserConnection /deliver`：
@@ -276,8 +316,9 @@ CREATE INDEX IF NOT EXISTS idx_fanout_leases_expires
 
 成员 join/leave 后 UserDirectory 投影更新。在线 session：
 
-- **新加入频道**：下次 `session.heartbeat`（重载 my-channels）或客户端重发 `session.live_start` 创建 lease
-- **离开频道**：**不得**依赖 lease TTL 单独收敛——`session.heartbeat` 必须关闭非 active lease；`/deliver` membership 失败也必须关闭本地 lease，防止 heartbeat 复活
+- **新加入频道**：membership mutation commit 后，先让 `UserDirectory /my-channels` projection 可见，再通知 `UserConnection(affected_user_id)` 主动 resync 全部 live sessions 并创建 lease
+- **离开/移除/解散频道**：projection 可见后通知 `UserConnection(affected_user_id)` 主动关闭本地 lease 并 revoke fanout lease
+- **通知失败**：不回滚 membership mutation；记录结构化日志。`session.heartbeat` 与 `/deliver` membership re-check 仍是安全 fallback，但不是主收敛路径
 
 正确性不依赖即时 membership push；HTTP bootstrap 仍为权威。Live push 授权边界：**非 active 成员不得收到后续 live event**。
 
@@ -328,6 +369,7 @@ Event reducer：dedupe → 更新 sidebar；`channel_id === activeChannelId` 才
 10. 旧 live 路径（register-online、connect replay、WS cursor）已移除
 11. `/deliver` 在 version 落后时 **必须** re-check membership；非 active 必须关闭本地 lease 并拒绝投递
 12. `session.heartbeat` **不得** blind refresh 或复活 `closed`/membership 失败的 lease；必须对照当前 active memberships 过滤
+13. membership mutation 的 live resync 以 `affected_user_id` 为 key；admin add/remove、invite accept、public join、leave、channel create、channel dissolve 都不得只通知 actor
 
 ## 13. 观测
 

@@ -1,4 +1,4 @@
-export type Frame = CommandFrame | CommandAckFrame | CommandErrorFrame | EventFrame | ReadStateUpdatedFrame;
+export type Frame = CommandFrame | CommandAckFrame | CommandErrorFrame | EventFrame | ReadStateUpdatedFrame | UserEventFrame;
 
 export interface CommandFrame {
   frame_type: "command";
@@ -53,6 +53,13 @@ export interface ReadStateUpdatedFrame {
   channel_id: string;
   last_read_event_id: string;
   unread_count: number;
+}
+
+export interface UserEventFrame {
+  frame_type: "user_event";
+  event: "my_channels_changed";
+  reason: string;
+  changed_channel_id?: string;
 }
 
 export interface EventFrame {

@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateUserConnectionSchema } from "./migrations/user-connection";
-import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame } from "../ws/frames";
+import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame, type UserEventFrame } from "../ws/frames";
 import { channelRouteNameFor } from "../chat/system-channel";
 import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditCommand, parseMessageRecallCommand, parseMessageSendCommand } from "../chat/command";
 
@@ -40,6 +40,13 @@ interface LiveChannelLeaseRow {
 }
 
 const LEASE_TTL_MS = 10 * 60 * 1000;
+
+interface LeaseSyncResult {
+  active_count: number;
+  upserted_count: number;
+  closed_count: number;
+  lease_expires_at: string;
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -128,6 +135,18 @@ export class UserConnection extends DurableObject<Env> {
         membership_version_at_event?: number;
       };
       const result = await this.handleDeliver(body);
+      return Response.json(result);
+    }
+
+    if (url.pathname === "/internal/live-memberships-changed") {
+      if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+      const body = (await request.json()) as {
+        affected_user_id?: string;
+        reason?: string;
+        changed_channel_id?: string;
+        membership_version?: number;
+      };
+      const result = await this.handleLiveMembershipsChanged(body);
       return Response.json(result);
     }
 
@@ -472,11 +491,12 @@ export class UserConnection extends DurableObject<Env> {
     channelId: string,
     routeName: string,
     membershipVersion: number,
+    freshLeaseId = false,
   ): Promise<{ lease_id: string; expires_at: string }> {
     const ts = nowIso();
     const expiresAt = leaseExpiresAt();
     const existing = this.getLeaseRow(sessionId, channelId);
-    const leaseId = existing?.lease_id ?? crypto.randomUUID();
+    const leaseId = existing && !freshLeaseId ? existing.lease_id : crypto.randomUUID();
     this.ctx.storage.sql.exec(
       `INSERT INTO live_channel_leases (
         session_id, channel_id, route_name, lease_id, membership_version,
@@ -484,6 +504,7 @@ export class UserConnection extends DurableObject<Env> {
       ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
       ON CONFLICT(session_id, channel_id) DO UPDATE SET
         route_name=excluded.route_name,
+        lease_id=excluded.lease_id,
         membership_version=excluded.membership_version,
         status='active',
         expires_at=excluded.expires_at,
@@ -511,14 +532,18 @@ export class UserConnection extends DurableObject<Env> {
     await this.revokeFanoutLease(channelId, leaseId);
   }
 
-  private async syncLeasesForChannels(
-    sessionId: string,
-    userId: string,
-    channels: MyChannelRow[],
-  ): Promise<{ count: number; expires_at: string }> {
+  private async resyncSessionLeasesWithActiveChannels(input: {
+    session_id: string;
+    user_id: string;
+    active_channels: MyChannelRow[];
+    allow_reopen_closed: boolean;
+  }): Promise<LeaseSyncResult> {
+    const { session_id: sessionId, user_id: userId, active_channels: channels, allow_reopen_closed: allowReopenClosed } = input;
     const activeMap = new Map(channels.map((ch) => [ch.channel_id, ch.membership_version ?? 0]));
     const activeIds = new Set(activeMap.keys());
     let latestExpires = leaseExpiresAt();
+    let upsertedCount = 0;
+    let closedCount = 0;
 
     const localLeases = this.ctx.storage.sql
       .exec(
@@ -531,6 +556,7 @@ export class UserConnection extends DurableObject<Env> {
       if (lease.status === "closed") continue;
       if (!activeIds.has(lease.channel_id)) {
         await this.closeLocalLease(sessionId, lease.channel_id, lease.lease_id);
+        closedCount += 1;
       }
     }
 
@@ -539,7 +565,7 @@ export class UserConnection extends DurableObject<Env> {
       if (routeName === null) continue;
 
       const existing = this.getLeaseRow(sessionId, ch.channel_id);
-      if (existing?.status === "closed") continue;
+      if (existing?.status === "closed" && !allowReopenClosed) continue;
 
       const { lease_id: leaseId, expires_at: expiresAt } = await this.upsertLocalLease(
         sessionId,
@@ -547,6 +573,7 @@ export class UserConnection extends DurableObject<Env> {
         ch.channel_id,
         routeName,
         ch.membership_version ?? 0,
+        existing?.status === "closed",
       );
       if (expiresAt > latestExpires) latestExpires = expiresAt;
 
@@ -561,9 +588,10 @@ export class UserConnection extends DurableObject<Env> {
       if (!ok) {
         throw new Error("fanout lease upsert failed");
       }
+      upsertedCount += 1;
     }
 
-    return { count: channels.length, expires_at: latestExpires };
+    return { active_count: channels.length, upserted_count: upsertedCount, closed_count: closedCount, lease_expires_at: latestExpires };
   }
 
   private async handleSessionLiveStart(ws: WebSocket, attachment: ConnectionAttachment, commandId: string): Promise<void> {
@@ -575,11 +603,12 @@ export class UserConnection extends DurableObject<Env> {
 
     try {
       const channels = await this.fetchActiveChannels(attachment.user_id);
-      const { count, expires_at: leaseExpires } = await this.syncLeasesForChannels(
-        attachment.session_id,
-        attachment.user_id,
-        channels,
-      );
+      const sync = await this.resyncSessionLeasesWithActiveChannels({
+        session_id: attachment.session_id,
+        user_id: attachment.user_id,
+        active_channels: channels,
+        allow_reopen_closed: true,
+      });
       const ts = nowIso();
       this.ctx.storage.sql.exec(
         `UPDATE live_sessions SET status='live', live_started_at=COALESCE(live_started_at, ?), last_seen_at=? WHERE session_id=?`,
@@ -590,7 +619,7 @@ export class UserConnection extends DurableObject<Env> {
       console.log("live_start_committed", {
         session_id: attachment.session_id,
         user_id: attachment.user_id,
-        subscribed_channel_count: count,
+        subscribed_channel_count: sync.active_count,
       });
       const ack: CommandAckFrame = {
         frame_type: "command_ack",
@@ -599,8 +628,8 @@ export class UserConnection extends DurableObject<Env> {
         status: "committed",
         payload: {
           session_id: attachment.session_id,
-          subscribed_channel_count: count,
-          lease_expires_at: leaseExpires,
+          subscribed_channel_count: sync.active_count,
+          lease_expires_at: sync.lease_expires_at,
         },
       };
       ws.send(JSON.stringify(ack));
@@ -620,11 +649,7 @@ export class UserConnection extends DurableObject<Env> {
       return;
     }
 
-    const channels = await this.fetchActiveChannels(attachment.user_id);
-    const activeMap = new Map(channels.map((ch) => [ch.channel_id, ch.membership_version ?? 0]));
-    const activeIds = new Set(activeMap.keys());
     const ts = nowIso();
-    let latestExpires = leaseExpiresAt();
 
     this.ctx.storage.sql.exec(
       "UPDATE live_sessions SET last_seen_at=? WHERE session_id=?",
@@ -632,69 +657,12 @@ export class UserConnection extends DurableObject<Env> {
       attachment.session_id,
     );
 
-    const localLeases = this.ctx.storage.sql
-      .exec(
-        "SELECT session_id, channel_id, route_name, lease_id, membership_version, status, expires_at FROM live_channel_leases WHERE session_id=?",
-        attachment.session_id,
-      )
-      .toArray() as unknown as LiveChannelLeaseRow[];
-
-    for (const lease of localLeases) {
-      if (lease.status === "closed") continue;
-
-      if (!activeIds.has(lease.channel_id)) {
-        await this.closeLocalLease(attachment.session_id, lease.channel_id, lease.lease_id);
-        continue;
-      }
-
-      const currentVersion = activeMap.get(lease.channel_id) ?? lease.membership_version;
-      const expiresAt = leaseExpiresAt();
-      if (expiresAt > latestExpires) latestExpires = expiresAt;
-
-      this.ctx.storage.sql.exec(
-        `UPDATE live_channel_leases SET expires_at=?, membership_version=?, updated_at=?, status='active'
-         WHERE session_id=? AND channel_id=? AND status='active'`,
-        expiresAt,
-        currentVersion,
-        ts,
-        attachment.session_id,
-        lease.channel_id,
-      );
-
-      await this.upsertFanoutLease(
-        lease.channel_id,
-        lease.lease_id,
-        attachment.user_id,
-        attachment.session_id,
-        currentVersion,
-        expiresAt,
-      );
-    }
-
-    for (const ch of channels) {
-      const existing = this.getLeaseRow(attachment.session_id, ch.channel_id);
-      if (existing) continue;
-
-      const routeName = await channelRouteNameFor(this.env, attachment.user_id, ch.channel_id);
-      if (routeName === null) continue;
-
-      const { lease_id: leaseId, expires_at: expiresAt } = await this.upsertLocalLease(
-        attachment.session_id,
-        attachment.user_id,
-        ch.channel_id,
-        routeName,
-        ch.membership_version ?? 0,
-      );
-      if (expiresAt > latestExpires) latestExpires = expiresAt;
-      await this.upsertFanoutLease(
-        ch.channel_id,
-        leaseId,
-        attachment.user_id,
-        attachment.session_id,
-        ch.membership_version ?? 0,
-        expiresAt,
-      );
-    }
+    const sync = await this.resyncSessionLeasesWithActiveChannels({
+      session_id: attachment.session_id,
+      user_id: attachment.user_id,
+      active_channels: await this.fetchActiveChannels(attachment.user_id),
+      allow_reopen_closed: true,
+    });
 
     const ack: CommandAckFrame = {
       frame_type: "command_ack",
@@ -703,10 +671,70 @@ export class UserConnection extends DurableObject<Env> {
       status: "committed",
       payload: {
         session_id: attachment.session_id,
-        lease_expires_at: latestExpires,
+        lease_expires_at: sync.lease_expires_at,
       },
     };
     ws.send(JSON.stringify(ack));
+  }
+
+  private durableObjectName(): string | null {
+    const id = this.ctx.id as unknown as { name?: string };
+    return typeof id.name === "string" ? id.name : null;
+  }
+
+  private async handleLiveMembershipsChanged(body: {
+    affected_user_id?: string;
+    reason?: string;
+    changed_channel_id?: string;
+    membership_version?: number;
+  }): Promise<LeaseSyncResult & { ok: true; live_session_count: number }> {
+    const affectedUserId = body.affected_user_id ?? "";
+    if (!affectedUserId) throw new Error("affected_user_id required");
+    const name = this.durableObjectName();
+    if (name !== null && name !== affectedUserId) throw new Error("affected_user_id does not match UserConnection");
+
+    const activeChannels = await this.fetchActiveChannelsFromDirectory(affectedUserId);
+    const sessions = this.ctx.storage.sql
+      .exec("SELECT session_id FROM live_sessions WHERE user_id=? AND status='live'", affectedUserId)
+      .toArray() as Array<{ session_id: string }>;
+
+    let upserted = 0;
+    let closed = 0;
+    let leaseExpires = leaseExpiresAt();
+    for (const session of sessions) {
+      const result = await this.resyncSessionLeasesWithActiveChannels({
+        session_id: session.session_id,
+        user_id: affectedUserId,
+        active_channels: activeChannels,
+        allow_reopen_closed: true,
+      });
+      upserted += result.upserted_count;
+      closed += result.closed_count;
+      if (result.lease_expires_at > leaseExpires) leaseExpires = result.lease_expires_at;
+    }
+
+    const event: UserEventFrame = {
+      frame_type: "user_event",
+      event: "my_channels_changed",
+      reason: body.reason ?? "system_resync",
+      changed_channel_id: body.changed_channel_id,
+    };
+    for (const ws of this.ctx.getWebSockets(`user-conn:${affectedUserId}`)) {
+      try {
+        ws.send(JSON.stringify(event));
+      } catch {
+        // best-effort hint only
+      }
+    }
+
+    return {
+      ok: true,
+      live_session_count: sessions.length,
+      active_count: activeChannels.length,
+      upserted_count: upserted,
+      closed_count: closed,
+      lease_expires_at: leaseExpires,
+    };
   }
 
   private async handleDeliver(body: {

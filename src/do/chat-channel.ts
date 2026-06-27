@@ -97,6 +97,45 @@ export class ChatChannel extends DurableObject<Env> {
     );
   }
 
+  private liveMembershipReason(action: string | undefined): string {
+    return action === "leave" ? "channel_left" : "channel_joined";
+  }
+
+  private async notifyLiveMembershipChanged(
+    affectedUserId: string,
+    payload: { action?: string; channel_id?: string; membership_version?: number },
+  ): Promise<void> {
+    const reason = this.liveMembershipReason(payload.action);
+    try {
+      const res = await this.env.USER_CONNECTION.getByName(affectedUserId).fetch(new Request("https://x/internal/live-memberships-changed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          affected_user_id: affectedUserId,
+          reason,
+          changed_channel_id: payload.channel_id,
+          membership_version: payload.membership_version ?? 0,
+        }),
+      }));
+      if (!res.ok) {
+        console.log("live_membership_resync_failed", {
+          affected_user_id: affectedUserId,
+          reason,
+          changed_channel_id: payload.channel_id,
+          status: res.status,
+          error: await res.text(),
+        });
+      }
+    } catch (err) {
+      console.log("live_membership_resync_failed", {
+        affected_user_id: affectedUserId,
+        reason,
+        changed_channel_id: payload.channel_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   // SYNC core: co-atomic leave + fanout unregister outbox. Runs inside a caller transaction.
   // (P0-6: single leave implementation — /internal/test-leave and members-remove share this.)
   private markMemberLeftAndEnqueueFanoutUnregisterSync(channelId: string, userId: string, nowIso: string): void {
@@ -2310,9 +2349,12 @@ export class ChatChannel extends DurableObject<Env> {
           return { kind: "cached", responseJson: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner may dissolve", retryable: false } }) };
         }
 
-        const mvRow = this.ctx.storage.sql.exec("SELECT membership_version FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { membership_version: number } | undefined;
-        const mv = mvRow?.membership_version ?? 0;
-        this.ctx.storage.sql.exec("UPDATE channel_meta SET status='dissolved', updated_at=? WHERE channel_id=?", now, channelId);
+        const mvRow = this.ctx.storage.sql.exec("SELECT membership_version, kind FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { membership_version: number; kind: string } | undefined;
+        const mv = (mvRow?.membership_version ?? 0) + 1;
+        const activeMembers = this.ctx.storage.sql
+          .exec("SELECT user_id FROM members WHERE channel_id=? AND left_at IS NULL", channelId)
+          .toArray() as Array<{ user_id: string }>;
+        this.ctx.storage.sql.exec("UPDATE channel_meta SET status='dissolved', membership_version=?, updated_at=? WHERE channel_id=?", mv, now, channelId);
         const dissolvedId = this.nextEventId(nowMs);
         this.persistEventAndFanout(dissolvedId, "channel.dissolved", channelId, now,
           buildChannelDissolvedPayload({ channel_id: channelId, dissolved_at: now, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
@@ -2328,6 +2370,17 @@ export class ChatChannel extends DurableObject<Env> {
         // channel_directory projection: a dissolved channel must leave the public directory.
         if (meta.visibility === "public_listed") {
           this.insertOutboxRowForChannelDirectory(channelId, "delete", null, now);
+        }
+        for (const member of activeMembers) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
+            `user_directory:dissolve:${channelId}:${member.user_id}:${now}`,
+            member.user_id,
+            JSON.stringify({ action: "leave", channel_id: channelId, kind: mvRow?.kind ?? "channel", membership_version: mv }),
+            now,
+            now,
+            now,
+          );
         }
         return { kind: "dissolved", channel: { channel_id: channelId, status: "dissolved", updated_at: now } };
       });
@@ -2823,7 +2876,7 @@ export class ChatChannel extends DurableObject<Env> {
         const idem = this.ctx.storage.sql.exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='members.role' AND operation_id=?", userId, b.idempotency_key).toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
         if (idem) { if (idem.request_hash !== requestHash) return { kind: "conflict" }; return { kind: "cached", j: idem.response_json ?? "{}" }; }
 
-        const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, created_by FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; created_by: string } | undefined;
+        const meta = this.ctx.storage.sql.exec("SELECT status, membership_version, created_by, kind FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { status: string; membership_version: number; created_by: string; kind: string } | undefined;
         if (!meta) return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } }) };
         if (meta.status === "dissolved") return { kind: "cached", j: JSON.stringify({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }) };
         const callerRole = this.activeRole(channelId, userId);
@@ -2843,6 +2896,7 @@ export class ChatChannel extends DurableObject<Env> {
         this.persistEventAndFanout(updatedId, "member.role_updated", channelId, now, buildMemberRoleUpdatedPayload({ channel_id: channelId, user_id: b.user_id, before_role: beforeRole, after_role: b.role, membership_version: mv, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
         const noticeId = this.nextEventId(nowMs);
         this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.role_updated", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mv, now, actorMap);
+        this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:membership:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "join", channel_id: channelId, kind: meta.kind, membership_version: mv }), now, now, now);
 
         const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: b.role } });
         this.ctx.storage.sql.exec("INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'members.role', ?, ?, ?, 'completed', ?, ?)", userId, b.idempotency_key, requestHash, responseJson, now, idemExpiresAt);
@@ -3571,6 +3625,18 @@ export class ChatChannel extends DurableObject<Env> {
             nowIso,
             r.outbox_id,
           );
+          let payload: { action?: string; channel_id?: string; membership_version?: number } = {};
+          try {
+            const parsed = JSON.parse(r.payload_json) as { action?: unknown; channel_id?: unknown; membership_version?: unknown };
+            payload = {
+              action: typeof parsed.action === "string" ? parsed.action : undefined,
+              channel_id: typeof parsed.channel_id === "string" ? parsed.channel_id : undefined,
+              membership_version: typeof parsed.membership_version === "number" ? parsed.membership_version : undefined,
+            };
+          } catch {
+            payload = {};
+          }
+          await this.notifyLiveMembershipChanged(r.target_key, payload);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           await this.bumpOutboxRetry(r.outbox_id, nowIso, msg);
