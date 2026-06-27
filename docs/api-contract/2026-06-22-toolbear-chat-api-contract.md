@@ -698,7 +698,7 @@ Idempotency-Key: client-key-channel-create
 权限：
 
 - **创建者自动成为 `owner`**，并写入 `members` + UserDirectory.my_channels projection（同事务 outbox）。
-- 是否允许普通用户创建频道由 contract 写死：**Phase 3 允许任意已认证 Browser 用户创建 `kind="channel"` 频道**（DM 创建不暴露，见"关于 DM"）。`kind` 固定为 `channel`，请求不接受 `kind` 字段。
+- `POST /api/chat/channels` 仍只创建 `kind="channel"`，请求不接受 `kind` 字段。**Phase 3 允许任意已认证 Browser 用户创建 `kind="channel"` 频道**。DM 不通过本端点创建；DM 创建已在 v2.13 暴露为 `POST /api/chat/dms`，详见 `docs/api-contract/2026-06-27-dm-api-contract-addendum.md`。
 - endpoint 必须存在——后续 admin UI / 初始化工具 / 测试 fixture 都经此正式入口，不靠 `/internal/*` 旁路。
 
 路由与幂等（v2.5 delta）：创建频道的幂等由 `UserDirectory(creator_user_id)` 协调，不由 Worker 现场 mint 的 `ChatChannel` DO 承担。Worker 路由到 `UserDirectory(user_id)`，后者在其 `idempotency_keys` 事务内 mint `channel_id`（UUIDv7，即 `ChatChannel` DO name；系统频道例外，DO name=`system-general`），状态机 `creating`→`completed`，持久化 `channel_id`，再调用 `ChatChannel(channel_id).createChannel`（单事务原子写入，`channel_meta` 存在性即幂等 guard）。同一 `(user, operation=channel.create, key)` + 相同 `request_hash` 重试命中同一 `UserDirectory` DO → 同一 `channel_id` → 同一 `ChatChannel` DO → 缓存结果；不同 `request_hash` 返回 `409 IDEMPOTENCY_CONFLICT`。崩溃窗口：`status=creating` 时 retry 重新调用同一 `ChatChannel(channel_id).createChannel`（幂等返回已提交行）后标 `completed`，不重复建群。跨 DO 仍为 best-effort（无 2PC）。
