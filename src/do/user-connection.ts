@@ -291,6 +291,24 @@ export class UserConnection extends DurableObject<Env> {
       return;
     }
 
+    if (frame.command === "command.invoke" || frame.command === "interaction.submit") {
+      const channelId = frame.channel_id ?? "";
+      if (!channelId) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "missing channel_id")); return; }
+      const chStub = this.env.CHAT_CHANNEL.getByName(channelId);
+      const summaryRes = await chStub.fetch(new Request("https://x/internal/summary", {
+        headers: { "X-Verified-User-Id": attachment.user_id },
+      }));
+      if (summaryRes.ok) {
+        const summary = await summaryRes.json() as { kind?: string };
+        if (summary.kind === "dm") {
+          sendCommandError(ws, frame.command_id, responseError("UNSUPPORTED_CHANNEL_KIND", "operation not supported for DM channels", false));
+          return;
+        }
+      }
+      sendCommandError(ws, frame.command_id, responseError("INVALID_MESSAGE", "unsupported command"));
+      return;
+    }
+
     if (frame.command !== "message.send") {
       sendCommandError(ws, frame.command_id, responseError("INVALID_MESSAGE", "unsupported command"));
       return;
