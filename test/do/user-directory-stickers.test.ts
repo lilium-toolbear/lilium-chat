@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo, fakeS3PublicPath } from "../helpers";
+import { getNamedDo, fakeS3PublicPath, createTestChannel } from "../helpers";
 import { setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
 
@@ -325,17 +325,24 @@ describe("UserDirectory /internal/sticker-save + /internal/sticker-list + /inter
     expect(memberSaveBody.sticker.attachment.attachment_id).toBe(attachment_id);
   });
 
-  it("saves a channel-visible attachment from the system channel using client channel_id", async () => {
-    const { ensureSystemChannel, ensureSystemJoined, SYSTEM_CHANNEL_NAME } = await import("../../src/chat/system-channel");
+  it("saves a channel-visible attachment from a public channel using client channel_id", async () => {
     const ownerId = "u-sticker-system-owner";
     const memberId = "u-sticker-system-member";
-    const { channelId } = await ensureSystemChannel(env as unknown as Parameters<typeof ensureSystemChannel>[0]);
-    await ensureSystemJoined(env as unknown as Parameters<typeof ensureSystemJoined>[0], ownerId);
-    await ensureSystemJoined(env as unknown as Parameters<typeof ensureSystemJoined>[0], memberId);
+    const channelId = crypto.randomUUID();
+    const channelStub = await createTestChannel(env, {
+      channelId,
+      ownerId,
+      title: "Sticker Channel",
+      visibility: "public_listed",
+    });
+    await channelStub.fetch(new Request("https://x/internal/join", {
+      method: "POST",
+      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: memberId }),
+    }));
 
     const { attachment_id } = await presignAndFinalize(ownerId, fake);
-    const sysStub = chatStub(SYSTEM_CHANNEL_NAME);
-    const sendRes = await sysStub.fetch(
+    const sendRes = await channelStub.fetch(
       new Request("https://x/internal/message-send", {
         method: "POST",
         headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },

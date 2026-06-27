@@ -3,7 +3,6 @@ import type { Env } from "../env";
 import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateUserConnectionSchema } from "./migrations/user-connection";
 import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame, type UserEventFrame } from "../ws/frames";
-import { channelRouteNameFor } from "../chat/system-channel";
 import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditCommand, parseMessageRecallCommand, parseMessageSendCommand } from "../chat/command";
 
 export interface ConnectionAttachment {
@@ -251,12 +250,7 @@ export class UserConnection extends DurableObject<Env> {
       if (rsRes.status === 403) { sendCommandError(ws, frame.command_id, responseError("FORBIDDEN", "not an active member")); return; }
       if (!rsRes.ok) { sendCommandError(ws, frame.command_id, responseError("CHAT_WORKER_UNAVAILABLE", "read-state failed")); return; }
       const floor = (await rsRes.json()) as { last_read_event_id: string; advanced: boolean };
-      const routeName = await channelRouteNameFor(this.env, attachment.user_id, channelId);
-      if (routeName === null) {
-        sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found"));
-        return;
-      }
-      const chStub = this.env.CHAT_CHANNEL.getByName(routeName);
+      const chStub = this.env.CHAT_CHANNEL.getByName(channelId);
       const ucRes = await chStub.fetch(new Request(`https://x/internal/unread-count?after=${encodeURIComponent(floor.last_read_event_id)}`, { headers: { "X-Verified-User-Id": attachment.user_id } }));
       const unreadCount = ucRes.ok ? ((await ucRes.json()) as { unread_count: number }).unread_count : 0;
       ws.send(JSON.stringify({ frame_type: "command_ack", command: "channel.mark_read", command_id: frame.command_id, status: "committed", payload: { channel_id: channelId, last_read_event_id: floor.last_read_event_id, unread_count: unreadCount } }));
@@ -279,12 +273,10 @@ export class UserConnection extends DurableObject<Env> {
       else if (frame.command === "message.recall") parsed = parseMessageRecallCommand(frame);
       else parsed = parseMessageDeleteCommand(frame);
       if (!parsed.ok) { sendCommandError(ws, frame.command_id, parsed.error); return; }
-      const routeName = await channelRouteNameFor(this.env, attachment.user_id, channelId);
-      if (routeName === null) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found")); return; }
       const isMember = await this.ensureActiveMember(attachment.user_id, channelId);
       if (!isMember) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found or not a member")); return; }
       try {
-        const stub = this.env.CHAT_CHANNEL.getByName(routeName);
+        const stub = this.env.CHAT_CHANNEL.getByName(channelId);
         const endpoint = frame.command === "message.edit" ? "/internal/message-edit" : frame.command === "message.recall" ? "/internal/message-recall" : "/internal/message-delete";
         const body: Record<string, unknown> = { operation_id: frame.command_id, message_id: parsed.command.message_id, channel_id: channelId };
         if (frame.command === "message.edit") body.text = parsed.command.text;
@@ -315,12 +307,6 @@ export class UserConnection extends DurableObject<Env> {
       return;
     }
 
-    const routeName = await channelRouteNameFor(this.env, attachment.user_id, frame.channel_id);
-    if (routeName === null) {
-      sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found"));
-      return;
-    }
-
     const isMember = await this.ensureActiveMember(attachment.user_id, frame.channel_id);
     if (!isMember) {
       sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found or not a member"));
@@ -328,7 +314,7 @@ export class UserConnection extends DurableObject<Env> {
     }
 
     try {
-      const channel = this.env.CHAT_CHANNEL.getByName(routeName);
+      const channel = this.env.CHAT_CHANNEL.getByName(frame.channel_id);
       const res = await channel.fetch(new Request("https://x/internal/message-send", {
         method: "POST",
         headers: {
@@ -415,10 +401,7 @@ export class UserConnection extends DurableObject<Env> {
     userId: string,
     channelId: string,
   ): Promise<{ active: boolean; membership_version: number }> {
-    const routeName = await channelRouteNameFor(this.env, userId, channelId);
-    if (routeName === null) return { active: false, membership_version: 0 };
-
-    const channel = this.env.CHAT_CHANNEL.getByName(routeName);
+    const channel = this.env.CHAT_CHANNEL.getByName(channelId);
     const res = await channel.fetch(new Request("https://x/internal/summary", {
       headers: { "X-Verified-User-Id": userId },
     }));
@@ -498,7 +481,6 @@ export class UserConnection extends DurableObject<Env> {
     sessionId: string,
     userId: string,
     channelId: string,
-    routeName: string,
     membershipVersion: number,
     freshLeaseId = false,
   ): Promise<{ lease_id: string; expires_at: string }> {
@@ -520,7 +502,7 @@ export class UserConnection extends DurableObject<Env> {
         updated_at=excluded.updated_at`,
       sessionId,
       channelId,
-      routeName,
+      channelId,
       leaseId,
       membershipVersion,
       expiresAt,
@@ -570,9 +552,6 @@ export class UserConnection extends DurableObject<Env> {
     }
 
     for (const ch of channels) {
-      const routeName = await channelRouteNameFor(this.env, userId, ch.channel_id);
-      if (routeName === null) continue;
-
       const existing = this.getLeaseRow(sessionId, ch.channel_id);
       if (existing?.status === "closed" && !allowReopenClosed) continue;
 
@@ -580,7 +559,6 @@ export class UserConnection extends DurableObject<Env> {
         sessionId,
         userId,
         ch.channel_id,
-        routeName,
         ch.membership_version ?? 0,
         existing?.status === "closed",
       );

@@ -1,57 +1,29 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 
-import { getNamedDo } from "../helpers";
+import { makeJwt, setupOwnedChannelForUser, TEST_SECRET } from "../helpers";
+import { liveStartAndAck, upgradeUserConnection } from "../ws-helpers";
 
-function nextMessage(ws: WebSocket, timeoutMs = 3000): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => {
-      reject(new Error("timeout"));
-    }, timeoutMs);
-    ws.addEventListener(
-      "message",
-      (ev) => {
-        clearTimeout(t);
-        resolve(typeof ev.data === "string" ? ev.data : "");
-      },
-      { once: true },
-    );
-  });
-}
+const SELF = (await import("../../src/index")).default as {
+  fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
+};
 
-function encodeCursors(map: Record<string, string>): string {
-  return btoa(JSON.stringify(map)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-describe("hibernation wake: cursors restore + replay", () => {
-  it("reconnecting with a stale cursor replays events after it", async () => {
+describe("hibernation wake: attachment restore + HTTP catch-up", () => {
+  it("missed events before live_start are available via GET /events, not auto-replayed on connect", async () => {
     const userId = "u-hib-1";
-    const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
-    await sysStub.fetch(new Request("https://x/internal/maybe-create-system", { method: "POST", body: JSON.stringify({ title: "Lilium" }) }));
-    await sysStub.fetch(
-      new Request("https://x/internal/join", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userId }),
-      }),
-    );
-    const { runDurableObjectAlarm } = (await import("cloudflare:test")) as any;
-    await runDurableObjectAlarm(sysStub);
+    const token = await makeJwt({ sub: userId }, TEST_SECRET);
+    const { stub: channelStub, channelId } = await setupOwnedChannelForUser(env, userId, {
+      title: "Lilium",
+      visibility: "public_listed",
+    });
 
-    const summary = (await (await sysStub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }))).json()) as {
-      channel_id: string;
-      last_event_id: string | null;
-    };
-    const sysId = summary.channel_id;
-    const staleCursor = summary.last_event_id ?? "0";
-
-    const dirStub = env.USER_DIRECTORY.getByName(userId);
-    const dirRes = await dirStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
-    const dir = (await dirRes.json()) as { items: Array<{ channel_id: string }> };
-    expect(dir.items.find((m) => m.channel_id === sysId)).toBeDefined();
+    const beforeSend = (await (
+      await channelStub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }))
+    ).json()) as { last_event_id: string | null };
+    const staleCursor = beforeSend.last_event_id ?? "";
 
     const send = (await (
-      await sysStub.fetch(
+      await channelStub.fetch(
         new Request("https://x/internal/message-send", {
           method: "POST",
           headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -62,49 +34,48 @@ describe("hibernation wake: cursors restore + replay", () => {
             text: "before reconnect",
             reply_to: null,
             mentions: [],
-            channel_id: sysId,
+            channel_id: channelId,
           }),
         }),
       )
     ).json()) as { event_id: string };
 
-    const uc = getNamedDo(env.USER_CONNECTION as unknown as Parameters<typeof getNamedDo>[0], userId);
-    const res = await uc.fetch(new Request(`https://x/ws?cursors=${encodeCursors({ [sysId]: staleCursor })}`, {
-      headers: { Upgrade: "websocket", "X-Verified-User-Id": userId },
-    }));
-    expect(res.status).toBe(101);
-    const ws = res.webSocket as WebSocket;
-    ws.accept();
+    const { ws } = await upgradeUserConnection(userId);
+    await liveStartAndAck(ws, "cmd-hib-live");
 
-    const evRaw = await nextMessage(ws);
-    const ev = JSON.parse(evRaw) as { frame_type: string; event_id: string };
-    expect(ev.frame_type).toBe("event");
-    expect(ev.event_id).toBe(send.event_id);
+    const catchUpRes = await SELF.fetch(
+      new Request(
+        `https://chat.kuma.homes/api/chat/events?channel_id=${encodeURIComponent(channelId)}&after_event_id=${encodeURIComponent(staleCursor)}`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      ),
+      { ...env, JWT_SECRET: TEST_SECRET } as typeof env,
+    );
+    expect(catchUpRes.status).toBe(200);
+    const body = (await catchUpRes.json()) as { items: Array<{ event_id: string }> };
+    expect(body.items.some((item) => item.event_id === send.event_id)).toBe(true);
     ws.close();
   });
 
-  it("serializeAttachment round-trips per_channel_cursors (the eviction safety property)", async () => {
+  it("serializeAttachment round-trips user_id and session_id (the eviction safety property)", async () => {
     const userId = "u-hib-2";
-    const uc = getNamedDo(env.USER_CONNECTION as unknown as Parameters<typeof getNamedDo>[0], userId);
-    const cursors = encodeCursors({ "ch-x": "01JCURSOR" });
-    const res = await uc.fetch(new Request(`https://x/ws?cursors=${cursors}`, {
-      headers: { Upgrade: "websocket", "X-Verified-User-Id": userId },
-    }));
-    expect(res.status).toBe(101);
+    const { stub } = await upgradeUserConnection(userId);
 
-    const { runInDurableObject } = (await import("cloudflare:test")) as any;
+    const { runInDurableObject } = (await import("cloudflare:test")) as {
+      runInDurableObject: (
+        stub: DurableObjectStub,
+        cb: (instance: unknown, state: { getWebSockets: () => WebSocket[] }) => Promise<void>,
+      ) => Promise<void>;
+    };
     await runInDurableObject(
-      uc,
+      stub,
       async (_instance: unknown, state: { getWebSockets: () => WebSocket[] }) => {
         const socket = state.getWebSockets()[0];
         expect(socket).toBeDefined();
         if (!socket) return;
-        const att = socket.deserializeAttachment() as { per_channel_cursors: Record<string, string> } | null;
-        expect(att?.per_channel_cursors["ch-x"]).toBe("01JCURSOR");
+        const att = socket.deserializeAttachment() as { user_id: string; session_id: string } | null;
+        expect(att?.user_id).toBe(userId);
+        expect(att?.session_id).toBeTruthy();
       },
     );
-
-    (res.webSocket as WebSocket).accept();
-    (res.webSocket as WebSocket).close();
   });
 });

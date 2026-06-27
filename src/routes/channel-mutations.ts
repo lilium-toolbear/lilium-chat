@@ -2,7 +2,6 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
-import { channelRouteNameFor } from "../chat/system-channel";
 import { resolveUserSummaries } from "../profile/resolve";
 
 export async function getIdentity(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<{ userId: string; env: Env }> {
@@ -64,9 +63,7 @@ export async function updateChannelHandler(c: Context<{ Bindings: Env; Variables
   const body = (await c.req.json().catch(() => ({}))) as {
     title?: string; topic?: string | null; avatar_attachment_id?: string | null; visibility?: string;
   };
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
   const res = await stub.fetch(new Request("https://x/internal/update-channel", {
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -94,9 +91,7 @@ export async function dissolveChannelHandler(c: Context<{ Bindings: Env; Variabl
   if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
   const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
   if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
   const res = await stub.fetch(new Request("https://x/internal/dissolve", {
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -120,9 +115,7 @@ export async function addMemberHandler(c: Context<{ Bindings: Env; Variables: { 
   const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
   if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
   const body = (await c.req.json().catch(() => ({}))) as { user_id?: string; role?: string };
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
   const res = await stub.fetch(new Request("https://x/internal/members-add", {
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -144,9 +137,7 @@ export async function updateMemberRoleHandler(c: Context<{ Bindings: Env; Variab
   const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
   if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
   const body = (await c.req.json().catch(() => ({}))) as { role?: string };
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
   const res = await stub.fetch(new Request("https://x/internal/members-update-role", {
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -167,9 +158,7 @@ export async function removeMemberHandler(c: Context<{ Bindings: Env; Variables:
   if (!channelId || !memberUserId) throw new ApiError("CHANNEL_NOT_FOUND", "channel or user not found");
   const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
   if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
   const res = await stub.fetch(new Request("https://x/internal/members-remove", {
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -190,9 +179,7 @@ export async function listMembersHandler(c: Context<{ Bindings: Env; Variables: 
   const query = (url.searchParams.get("query") ?? "").toLowerCase();
   const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") ?? "50")));
   const cursor = url.searchParams.get("cursor") ?? "";
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
   // Push cursor + a limit+1 fetch into the DO so it can signal hasMore without a 2nd round-trip.
   const res = await stub.fetch(new Request(`https://x/internal/members-list?cursor=${encodeURIComponent(cursor)}`, { headers: { "X-Verified-User-Id": userId } }));
   if (res.status === 403) throw new ApiError("FORBIDDEN", "not a member");
@@ -223,9 +210,7 @@ export async function getMemberHandler(c: Context<{ Bindings: Env; Variables: { 
   const channelId = c.req.param("channel_id");
   const targetUserId = c.req.param("user_id");
   if (!channelId || !targetUserId) throw new ApiError("CHANNEL_NOT_FOUND", "channel or user not found");
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
   const res = await stub.fetch(new Request(`https://x/internal/members-get?user_id=${encodeURIComponent(targetUserId)}`, { headers: { "X-Verified-User-Id": userId } }));
   if (res.status === 403) throw new ApiError("FORBIDDEN", "not a member");
   if (res.status === 404) throw new ApiError("MEMBER_NOT_FOUND", "member not found");
@@ -243,9 +228,7 @@ export async function ownerTransferHandler(c: Context<{ Bindings: Env; Variables
   const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
   if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
   const body = (await c.req.json().catch(() => ({}))) as { target_user_id?: string; previous_owner_role?: string };
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
   const res = await stub.fetch(new Request("https://x/internal/owner-transfer", {
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -276,10 +259,7 @@ export async function createInviteHandler(c: Context<{ Bindings: Env; Variables:
   if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
 
   const body = (await c.req.json().catch(() => ({}))) as { expires_in_seconds?: number; max_uses?: number | null };
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
   const res = await stub.fetch(new Request("https://x/internal/invites-create", {
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -340,9 +320,7 @@ export async function previewInviteHandler(c: Context<{ Bindings: Env; Variables
     throw new ApiError("INVITE_NOT_FOUND", "invite expired or revoked");
   }
 
-  const routeName = await channelRouteNameFor(env, userId, row.channel_id);
-  if (routeName === null) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(row.channel_id);
   const inviteRes = await stub.fetch(new Request(
     `https://x/internal/invites-get?invite_code=${encodeURIComponent(row.invite_code)}&channel_id=${encodeURIComponent(row.channel_id)}`,
     { headers: { "X-Verified-User-Id": userId } },
@@ -394,9 +372,7 @@ export async function acceptInviteHandler(c: Context<{ Bindings: Env; Variables:
     throw new ApiError("INVITE_NOT_FOUND", "invite not found");
   }
 
-  const routeName = await channelRouteNameFor(env, userId, row.channel_id);
-  if (routeName === null) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(row.channel_id);
   const inviteRes = await stub.fetch(new Request("https://x/internal/invites-accept", {
     method: "POST",
     headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -515,9 +491,7 @@ export async function joinChannelHandler(c: Context<{ Bindings: Env; Variables: 
   const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
   if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
 
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
 
   const joinRes = await stub.fetch(new Request("https://x/internal/join", {
     method: "POST",

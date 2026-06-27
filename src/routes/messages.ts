@@ -6,7 +6,6 @@ import { projectMessagesForBrowser } from "../chat/sender";
 import type { MessageStickerSnapshot } from "../chat/message-projection";
 import type { MessageRow } from "../do/chat-channel";
 import type { AttachmentRow } from "../chat/attachment-projection";
-import { ensureSystemJoined, channelRouteNameFor } from "../chat/system-channel";
 
 export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const auth = c.req.header("Authorization") ?? "";
@@ -21,11 +20,7 @@ export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables:
   const before = url.searchParams.get("before");
   const limit = url.searchParams.get("limit") ?? "50";
 
-  await ensureSystemJoined(c.env, userId);
-  const routeName = await channelRouteNameFor(c.env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-
-  const stub = c.env.CHAT_CHANNEL.getByName(routeName);
+  const stub = c.env.CHAT_CHANNEL.getByName(channelId);
   const qs = new URLSearchParams();
   if (before) qs.set("before", before);
   qs.set("limit", limit);

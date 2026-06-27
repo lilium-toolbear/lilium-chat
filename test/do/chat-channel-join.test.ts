@@ -33,12 +33,9 @@ async function countMemberJoinedEvents(channelId: string, userId: string): Promi
   return n;
 }
 
-async function getIdemRows(userId: string, operationId: string): Promise<{ request_hash: string; response_json: string }[]> {
+async function getIdemRows(channelId: string, userId: string, operationId: string): Promise<{ request_hash: string; response_json: string }[]> {
   let out: { request_hash: string; response_json: string }[] = [];
-  // idempotency_keys is per-ChatChannel-DO; we read from any channel's DO that the user joined.
-  // We pass the channelId via a stub the caller already has. To keep this helper simple, we read
-  // from the system channel DO (system-general) which always exists in these tests.
-  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
+  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
   await runInDurableObject(stub, async (instance: unknown) => {
     out = (instance as {
       ctx: { storage: { sql: { exec: (q: string, ...p: unknown[]) => { toArray: () => Array<{ request_hash: string; response_json: string }> } } } };
@@ -95,19 +92,8 @@ describe("ChatChannel /internal/join", () => {
     const evCount = await countMemberJoinedEvents(channelId, "u-b1-joiner-1");
     expect(evCount).toBe(1);
     // idempotency row written (principal-scoped on the joiner)
-    const idem = await getIdemRows("u-b1-joiner-1", "op-join-1");
-    // Note: getIdemRows reads from system-general DO; the join happened on the channel DO, so this
-    // helper is not the right one for non-system channels. Verify via the channel DO instead.
-    let idemOnChannel: { request_hash: string; response_json: string }[] = [];
-    await runInDurableObject(stub, async (instance: unknown) => {
-      idemOnChannel = (instance as {
-        ctx: { storage: { sql: { exec: (q: string, ...p: unknown[]) => { toArray: () => Array<{ request_hash: string; response_json: string }> } } } };
-      }).ctx.storage.sql
-        .exec("SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.join' AND operation_id=?", "u-b1-joiner-1", "op-join-1")
-        .toArray();
-    });
-    expect(idemOnChannel.length).toBe(1);
-    void idem;
+    const idem = await getIdemRows(channelId, "u-b1-joiner-1", "op-join-1");
+    expect(idem.length).toBe(1);
   });
 
   it("duplicate same operation_id → cached response, no second member row, no second event", async () => {
@@ -355,69 +341,20 @@ describe("ChatChannel /internal/join", () => {
     expect(m!.role).toBe("member");
   });
 
-  it("ensureSystemJoined still succeeds (system channel is public_listed)", async () => {
-    const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
-    await sysStub.fetch(new Request("https://x/internal/maybe-create-system", {
-      method: "POST", body: JSON.stringify({ title: "Lilium" }),
-    }));
-    const res = await sysStub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-b1-sys-1", "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: "u-b1-sys-1" }),
-    }));
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { channel_id: string; role: string };
-    expect(body.channel_id).toBeTruthy();
-    expect(body.role).toBe("member");
-  });
-
-  it("browser join of the system channel (with operation_id) → 200, already-active-member no-op, returns existing role/joined_at, no member.joined event, idempotency row written (P1-1: system channel join is allowed, not 403)", async () => {
-    const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
-    await sysStub.fetch(new Request("https://x/internal/maybe-create-system", {
-      method: "POST", body: JSON.stringify({ title: "Lilium" }),
-    }));
-    // first login auto-join (no operation_id) — fresh join
-    const r1 = await sysStub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-b1-sys-2", "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: "u-b1-sys-2" }),
-    }));
+  it("browser join with operation_id on already-active member → 200 no-op, returns existing role/joined_at, no second member.joined event, idempotency row written", async () => {
+    const channelId = uniqId("b1sys02");
+    const { stub } = await createChannel({ channelId, ownerId: "u-b1-sys-owner-2", visibility: "public_listed", title: "PubJoinSys2" });
+    const r1 = await join(stub, "u-b1-sys-2");
     expect(r1.status).toBe(200);
     const b1 = (await r1.json()) as { joined_at: string };
-    // browser join with operation_id → already-active no-op
-    const r2 = await sysStub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-b1-sys-2", "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: "u-b1-sys-2", operation_id: "op-sys-browser-2" }),
-    }));
+    const r2 = await join(stub, "u-b1-sys-2", "op-sys-browser-2");
     expect(r2.status).toBe(200);
     const b2 = (await r2.json()) as { role: string; joined_at: string };
     expect(b2.joined_at).toBe(b1.joined_at);
     expect(b2.role).toBe("member");
-    // no new member.joined event for the no-op (only the first-join one)
-    let n = 0;
-    await runInDurableObject(sysStub, async (instance: unknown) => {
-      const sysChannelId = (instance as {
-        ctx: { storage: { sql: { exec: (q: string) => { toArray: () => Array<{ channel_id: string }> } } } };
-      }).ctx.storage.sql.exec("SELECT channel_id FROM channel_meta LIMIT 1").toArray()[0]?.channel_id;
-      if (sysChannelId) {
-        n = Number((instance as {
-          ctx: { storage: { sql: { exec: (q: string, ...p: unknown[]) => { toArray: () => Array<{ c: number | bigint }> } } } };
-        }).ctx.storage.sql
-          .exec("SELECT COUNT(*) AS c FROM events WHERE channel_id=? AND event_type='member.joined' AND payload_json LIKE ?", sysChannelId, `%"user_id":"u-b1-sys-2"%`)
-          .toArray()[0]?.c ?? 0);
-      }
-    });
-    expect(n).toBe(1);
-    // idempotency row written for the no-op
-    let idem: { response_json: string }[] = [];
-    await runInDurableObject(sysStub, async (instance: unknown) => {
-      idem = (instance as {
-        ctx: { storage: { sql: { exec: (q: string, ...p: unknown[]) => { toArray: () => Array<{ response_json: string }> } } } };
-      }).ctx.storage.sql
-        .exec("SELECT response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation='channel.join' AND operation_id=?", "u-b1-sys-2", "op-sys-browser-2")
-        .toArray();
-    });
+    const evCount = await countMemberJoinedEvents(channelId, "u-b1-sys-2");
+    expect(evCount).toBe(1);
+    const idem = await getIdemRows(channelId, "u-b1-sys-2", "op-sys-browser-2");
     expect(idem.length).toBe(1);
   });
 });

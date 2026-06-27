@@ -2,7 +2,6 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
-import { channelRouteNameFor, ensureSystemJoined } from "../chat/system-channel";
 import type { EventFrame } from "../ws/frames";
 
 interface ReplayResponse {
@@ -25,8 +24,6 @@ export async function eventsHandler(c: Context<{ Bindings: Env; Variables: { req
   if (!token) throw new ApiError("UNAUTHORIZED", "Not authenticated");
   const { user_id: userId } = await verifyBrowserJwt(token, c.env.JWT_SECRET);
 
-  await ensureSystemJoined(c.env, userId);
-
   const url = new URL(c.req.url);
   const channelId = url.searchParams.get("channel_id");
   const afterEventId = url.searchParams.get("after_event_id") ?? "";
@@ -45,10 +42,7 @@ export async function eventsHandler(c: Context<{ Bindings: Env; Variables: { req
 
   const replays = await Promise.all(
     targets.map(async (target): Promise<{ channel_id: string; items: EventFrame[]; last_event_id: string | null } | null> => {
-      const routeName = await channelRouteNameFor(c.env, userId, target.channel_id);
-      if (routeName === null) return null;
-
-      const stub = c.env.CHAT_CHANNEL.getByName(routeName);
+      const stub = c.env.CHAT_CHANNEL.getByName(target.channel_id);
       const replayRes = await stub.fetch(new Request(`https://x/internal/replay?after=${encodeURIComponent(target.after)}`, {
         headers: { "X-Verified-User-Id": userId },
       }));

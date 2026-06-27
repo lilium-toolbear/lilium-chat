@@ -2,16 +2,13 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { getIdentity } from "./channel-mutations";
-import { channelRouteNameFor } from "../chat/system-channel";
 
 // Browser API routes for per-channel bot installation + command binding.
 // These are channel admin (owner/admin) operations authenticated with the
 // ToolBear browser JWT. Runtime bot transport (Bot Gateway WS) is separate.
 
-async function chatChannelStub(env: Env, userId: string, channelId: string) {
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  return env.CHAT_CHANNEL.getByName(routeName);
+function chatChannelStub(env: Env, _userId: string, channelId: string) {
+  return env.CHAT_CHANNEL.getByName(channelId);
 }
 
 function mapError(res: Response, fallback: string): Promise<ApiError> {
@@ -140,9 +137,7 @@ export async function listChannelCommandsHandler(
   const channelId = c.req.param("channel_id");
   if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
   const prefix = c.req.query("prefix") ?? "";
-  const routeName = await channelRouteNameFor(env, userId, channelId);
-  if (routeName === null) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const stub = env.CHAT_CHANNEL.getByName(routeName);
+  const stub = env.CHAT_CHANNEL.getByName(channelId);
   const res = await stub.fetch(
     new Request(
       `https://x/internal/channel-commands?channel_id=${encodeURIComponent(channelId)}&user_id=${encodeURIComponent(userId)}&prefix=${encodeURIComponent(prefix)}`,

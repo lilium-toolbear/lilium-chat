@@ -90,7 +90,7 @@ Eight Durable Object classes (all SQLite-backed):
 
 | DO | Named by | Role |
 |---|---|---|
-| `ChatChannel` | `channel_id` (system channel: `system-general`) | Auth source-of-truth. Owns members, messages, event log, audit logs, attachments, outbox. |
+| `ChatChannel` | `channel_id` | Auth source-of-truth. Owns members, messages, event log, audit logs, attachments, outbox. |
 | `UserDirectory` | `user_id` | Repairable projection of memberships (`my_channels`), read-state floor, personal stickers, attachment ownership. |
 | `UserConnection` | `user_id` | WebSocket hibernation + per-channel cursors; routes WS commands to `ChatChannel`. |
 | `ChannelFanout` | `channel_id` | Holds online sessions per channel; delivers events to online connections. |

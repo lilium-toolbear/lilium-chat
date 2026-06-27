@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { makeJwt, TEST_SECRET, getNamedDo } from "../helpers";
+import { makeJwt, TEST_SECRET, setupOwnedChannelForUser } from "../helpers";
 
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
@@ -23,20 +23,9 @@ describe("GET /api/chat/events", () => {
     const userId = "u-ev-1";
     const token = await makeJwt({ sub: userId }, TEST_SECRET);
 
-    const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
-    await sysStub.fetch(new Request("https://x/internal/maybe-create-system", { method: "POST", body: JSON.stringify({ title: "Lilium" }) }));
-    await sysStub.fetch(
-      new Request("https://x/internal/join", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userId }),
-      }),
-    );
-    const sysId = (await (await sysStub.fetch(new Request("https://x/internal/summary", {
-      headers: { "X-Verified-User-Id": userId },
-    }))).json() as { channel_id: string }).channel_id;
+    const { stub: channelStub, channelId } = await setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
     const send = (await (
-      await sysStub.fetch(
+      await channelStub.fetch(
         new Request("https://x/internal/message-send", {
           method: "POST",
           headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -47,13 +36,13 @@ describe("GET /api/chat/events", () => {
             text: "hi",
             reply_to: null,
             mentions: [],
-            channel_id: sysId,
+            channel_id: channelId,
           }),
         }),
       )
     ).json()) as { event_id: string };
 
-    const res = await authedEventsReq(userId, token, `channel_id=${sysId}&after_event_id=`);
+    const res = await authedEventsReq(userId, token, `channel_id=${channelId}&after_event_id=`);
     expect(res.status).toBe(200);
     interface RoutedMessage {
       message_id: string;
@@ -76,25 +65,15 @@ describe("GET /api/chat/events", () => {
     expect(found?.payload.message).toHaveProperty("sender");
     expect(found?.payload.message.sender).toHaveProperty("user");
     expect(found?.payload.message.sender.user.user_id).toBe("u-ev-1");
-    expect(body.last_event_id_per_channel[sysId]).toBeTruthy();
+    expect(body.last_event_id_per_channel[channelId]).toBeTruthy();
   });
 
   it("replays all my channels via cursors (multi-channel merge)", async () => {
     const userId = "u-ev-2";
     const token = await makeJwt({ sub: userId }, TEST_SECRET);
 
-    const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
-    await sysStub.fetch(
-      new Request("https://x/internal/join", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userId }),
-      }),
-    );
-    const sysId = (await (await sysStub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }))).json() as {
-      channel_id: string;
-    }).channel_id;
-    await sysStub.fetch(
+    const { stub: channelStub, channelId } = await setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
+    await channelStub.fetch(
       new Request("https://x/internal/message-send", {
         method: "POST",
         headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
@@ -105,7 +84,7 @@ describe("GET /api/chat/events", () => {
           text: "yo",
           reply_to: null,
           mentions: [],
-          channel_id: sysId,
+          channel_id: channelId,
         }),
       }),
     );
@@ -118,6 +97,6 @@ describe("GET /api/chat/events", () => {
       last_event_id_per_channel: Record<string, string>;
     };
     expect(body.items.length).toBeGreaterThan(0);
-    expect(body.last_event_id_per_channel[sysId]).toBeTruthy();
+    expect(body.last_event_id_per_channel[channelId]).toBeTruthy();
   });
 });

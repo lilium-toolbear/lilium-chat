@@ -73,7 +73,7 @@ The Worker (`src/index.ts`) is a thin Hono router. It authenticates JWTs and pro
 DOs by name. WS upgrades (`src/routes/ws.ts`) verify the JWT, extract `user_id`, and forward
 it via the `X-Verified-User-Id` header to a `UserConnection` DO named by `user_id`.
 
-- **`ChatChannel`** (named by `channel_id`; system channel named `system-general`) — auth
+- **`ChatChannel`** (named by `channel_id`) — auth
   source-of-truth. Owns `channel_meta`, `members`, `messages`, `events` (per-channel event
   log), `audit_logs`, `attachments`, `projection_outbox`, `idempotency_keys`. All message
   mutations, member mutations, channel mutations, and the event log live here.
@@ -110,10 +110,7 @@ it via the `X-Verified-User-Id` header to a `UserConnection` DO named by `user_i
 - **WS commands routed by `UserConnection`, not the Worker.** Hibernation requires the
   message handler to live on the DO. HTTP mutations are routed by the Worker; WS commands by
   `UserConnection.webSocketMessage`.
-- **`channelRouteNameFor`** (`src/chat/system-channel.ts`) maps a client `channel_id` → DO
-  name. System channel → `system-general`; user-created channels → DO name = `channel_id`
-  (optimistic routing; `ChatChannel` self-validates with 404/409). Never accepts the literal
-  `system-general` as a user channel id.
+- **ChatChannel DO routing**：`ChatChannel` DO name 恒等于 client `channel_id`（UUIDv7）。所有路由直接用 `env.CHAT_CHANNEL.getByName(channel_id)`；用户通过 create/join/invite/member-add 获得 membership，无默认频道。
 - **Idempotency via `command_id`.** v4.0 collapsed `client_message_id`/`idempotency_key` into
   `command_id` = durable operation id = idempotency key. HTTP `Idempotency-Key` ≡ internal
   `operation_id`. Dedup is namespaced by `dedupe_principal_key` (`user:<uid>`/`bot:<id>`/

@@ -1,34 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 
-import { getNamedDo } from "../helpers";
+import { setupOwnedChannelForUser } from "../helpers";
 import { liveStartAndAck, nextAck, nextMessage, upgradeUserConnection } from "../ws-helpers";
 
-async function joinSystemChannel(userId: string): Promise<{ sysId: string; sysStub: DurableObjectStub }> {
-  const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
-  await sysStub.fetch(new Request("https://x/internal/maybe-create-system", {
-    method: "POST",
-    body: JSON.stringify({ title: "Lilium" }),
-  }));
-  await sysStub.fetch(
-    new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId }),
-    }),
-  );
-  const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
-  await runDurableObjectAlarm(sysStub);
-  const sysId = (await (await sysStub.fetch(new Request("https://x/internal/summary", {
-    headers: { "X-Verified-User-Id": userId },
-  }))).json() as { channel_id: string }).channel_id;
-  return { sysId, sysStub };
+async function joinTestChannel(userId: string): Promise<{ channelId: string }> {
+  const { channelId } = await setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
+  return { channelId };
 }
 
 describe("UserConnection DO", () => {
   it("/deliver sends an event frame on the live socket and stores a probe", async () => {
     const userId = "u-uc-deliver";
-    const { sysId } = await joinSystemChannel(userId);
+    const { channelId } = await joinTestChannel(userId);
     const { ws, stub, sessionId } = await upgradeUserConnection(userId);
     await liveStartAndAck(ws);
 
@@ -39,7 +23,7 @@ describe("UserConnection DO", () => {
         .exec(
           "SELECT lease_id FROM live_channel_leases WHERE session_id=? AND channel_id=?",
           sessionId,
-          sysId,
+          channelId,
         )
         .toArray()[0] as { lease_id: string } | undefined;
       leaseId = row?.lease_id ?? "";
@@ -51,17 +35,17 @@ describe("UserConnection DO", () => {
       api_version: "lilium.chat.v2",
       event_id: "e-d1",
       type: "message.created",
-      channel_id: sysId,
+      channel_id: channelId,
       occurred_at: "2026-06-23T00:00:00Z",
       payload: {},
     });
     const receivedPromise = nextMessage(ws);
     const deliverRes = await stub.fetch(new Request("https://x/deliver", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Channel-Id": sysId },
+      headers: { "Content-Type": "application/json", "X-Channel-Id": channelId },
       body: JSON.stringify({
         lease_id: leaseId,
-        channel_id: sysId,
+        channel_id: channelId,
         session_id: sessionId,
         event_id: "e-d1",
         event_json: eventJson,
@@ -80,20 +64,20 @@ describe("UserConnection DO", () => {
 
   it("/deliver with a non-existent session_id does NOT deliver to another socket of the same user (fail-closed)", async () => {
     const userId = "u-uc-failclosed";
-    const { sysId } = await joinSystemChannel(userId);
+    const { channelId } = await joinTestChannel(userId);
     const { ws, stub } = await upgradeUserConnection(userId);
     await liveStartAndAck(ws);
 
     const eventJson = JSON.stringify({
       frame_type: "event", api_version: "lilium.chat.v2", event_id: "e-stale", type: "message.created",
-      channel_id: sysId, occurred_at: "2026-06-23T00:00:00Z", payload: {},
+      channel_id: channelId, occurred_at: "2026-06-23T00:00:00Z", payload: {},
     });
     const deliverRes = await stub.fetch(new Request("https://x/deliver", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Channel-Id": sysId },
+      headers: { "Content-Type": "application/json", "X-Channel-Id": channelId },
       body: JSON.stringify({
         session_id: "session-that-does-not-exist",
-        channel_id: sysId,
+        channel_id: channelId,
         lease_id: "missing-lease",
         event_json: eventJson,
         membership_version_at_event: 0,
@@ -111,14 +95,14 @@ describe("UserConnection DO", () => {
 
   it("webSocketMessage routes message.send to ChatChannel and returns committed_ack", async () => {
     const userId = "u-uc-send";
-    const { sysId } = await joinSystemChannel(userId);
+    const { channelId } = await joinTestChannel(userId);
 
     const { ws } = await upgradeUserConnection(userId);
     const cmd = JSON.stringify({
       frame_type: "command",
       command: "message.send",
       command_id: "cmd-uc-1",
-      channel_id: sysId,
+      channel_id: channelId,
       payload: {
         type: "text",
         text: "hi from uc",
@@ -134,7 +118,7 @@ describe("UserConnection DO", () => {
     expect(ack.frame_type).toBe("command_ack");
     expect(ack.status).toBe("committed");
     expect(ack.command_id).toBe("cmd-uc-1");
-    expect(ack.payload.channel_id).toBe(sysId);
+    expect(ack.payload.channel_id).toBe(channelId);
     expect(ack.payload.message.message_id).toBeTruthy();
     expect(ack.payload.message.sender.user.user_id).toBe(userId);
     expect(ack.payload.event_id).toBeTruthy();
@@ -143,7 +127,7 @@ describe("UserConnection DO", () => {
 
   it("webSocketMessage returns command_error for invalid message (empty text)", async () => {
     const userId = "u-uc-err";
-    const { sysId } = await joinSystemChannel(userId);
+    const { channelId } = await joinTestChannel(userId);
 
     const { ws } = await upgradeUserConnection(userId);
     ws.send(
@@ -151,7 +135,7 @@ describe("UserConnection DO", () => {
         frame_type: "command",
         command: "message.send",
         command_id: "cmd-uc-2",
-        channel_id: sysId,
+        channel_id: channelId,
         payload: {
           type: "text",
           text: "   ",
@@ -171,13 +155,13 @@ describe("UserConnection DO", () => {
 
   it("idempotent: same command_id twice → same message_id in both acks", async () => {
     const userId = "u-uc-idem";
-    const { sysId } = await joinSystemChannel(userId);
+    const { channelId } = await joinTestChannel(userId);
 
     const { ws } = await upgradeUserConnection(userId);
     const base = {
       frame_type: "command",
       command: "message.send",
-      channel_id: sysId,
+      channel_id: channelId,
       payload: {
         type: "text",
         text: "dup",

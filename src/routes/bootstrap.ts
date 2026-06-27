@@ -7,8 +7,6 @@ import { projectMessagesForBrowser } from "../chat/sender";
 import type { MessageStickerSnapshot } from "../chat/message-projection";
 import type { MessageRow } from "../do/chat-channel";
 import type { AttachmentRow } from "../chat/attachment-projection";
-import { channelRouteNameFor, ensureSystemJoined } from "../chat/system-channel";
-
 interface MyChannel {
   channel_id: string;
   kind: string;
@@ -56,35 +54,21 @@ function fallbackMe(user_id: string): UserSummary {
   return { user_id, display_name: `user-${user_id.slice(0, 8)}`, avatar_url: null };
 }
 
-function ensureContainsSystemFallback(
-  myChannels: MyChannel[],
-  sysChannelId: string,
-): MyChannel[] {
-  if (myChannels.some((mc) => mc.channel_id === sysChannelId)) return myChannels;
-  return [{ channel_id: sysChannelId, kind: "channel", last_read_event_id: null, membership_version: 0 }, ...myChannels];
-}
-
 export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const auth = c.req.header("Authorization") ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (!token) throw new ApiError("UNAUTHORIZED", "Not authenticated");
   const { user_id } = await verifyBrowserJwt(token, c.env.JWT_SECRET);
 
-  const joined = await ensureSystemJoined(c.env, user_id);
-
   const dirStub = c.env.USER_DIRECTORY.getByName(user_id);
   const dirRes = await dirStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": user_id } }));
-  const rawMyChannels = dirRes.ok
+  const myChannels = dirRes.ok
     ? ((await dirRes.json()) as { items: MyChannel[] }).items
     : [];
-  const myChannels = ensureContainsSystemFallback(rawMyChannels, joined.channelId);
 
   const channelSummaries = await Promise.all(
     myChannels.map(async (mc) => {
-      const routeName = await channelRouteNameFor(c.env, user_id, mc.channel_id);
-      if (routeName === null) return null;
-
-      const stub = c.env.CHAT_CHANNEL.getByName(routeName);
+      const stub = c.env.CHAT_CHANNEL.getByName(mc.channel_id);
       const summaryRes = await stub.fetch(new Request("https://x/internal/summary", {
         headers: { "X-Verified-User-Id": user_id },
       }));
@@ -115,14 +99,12 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
   const channels = channelSummaries.filter((it): it is ChannelSummary => it !== null);
   const requestedChannelId = new URL(c.req.url).searchParams.get("channel_id");
   const activeChannel = requestedChannelId
-    ? channels.find((c) => c.channel_id === requestedChannelId)
+    ? channels.find((ch) => ch.channel_id === requestedChannelId)
     : channels[0];
 
   const messages = activeChannel
     ? await (async () => {
-      const stub = c.env.CHAT_CHANNEL.getByName(
-        (await channelRouteNameFor(c.env, user_id, activeChannel.channel_id)) ?? "",
-      );
+      const stub = c.env.CHAT_CHANNEL.getByName(activeChannel.channel_id);
       const mres = await stub.fetch(new Request("https://x/internal/messages?limit=50", {
         headers: { "X-Verified-User-Id": user_id },
       }));
@@ -137,9 +119,9 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
     : { items: [] as Array<unknown>, next_cursor: null };
 
   const per_channel: Record<string, string> = {};
-  for (const c of channels) {
-    if (c.last_event_id) {
-      per_channel[c.channel_id] = c.last_event_id;
+  for (const ch of channels) {
+    if (ch.last_event_id) {
+      per_channel[ch.channel_id] = ch.last_event_id;
     }
   }
 

@@ -1,6 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
-import { channelRouteNameFor } from "../chat/system-channel";
 import { uuidv7 } from "../ids/uuidv7";
 import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateUserDirectorySchema } from "./migrations/user-directory";
@@ -397,14 +396,7 @@ export class UserDirectory extends DurableObject<Env> {
       let projection = coord.projection;
       if (!projection) {
         // Channel-visible path: ask ChatChannel for the canonical projection.
-        const routeName = await channelRouteNameFor(this.env, userId, channelId);
-        if (!routeName) {
-          return Response.json(
-            { error: { code: "CHANNEL_NOT_FOUND", message: "channel not found", retryable: false } },
-            { status: 404 },
-          );
-        }
-        const chatStub = this.env.CHAT_CHANNEL.getByName(routeName);
+        const chatStub = this.env.CHAT_CHANNEL.getByName(channelId);
         const res = await chatStub.fetch(
           new Request(`https://x/internal/resolve-visible-attachment?attachment_id=${encodeURIComponent(attachmentId)}`, {
             headers: { "X-Verified-User-Id": userId },

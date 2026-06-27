@@ -13,7 +13,7 @@ async function bootstrap(token: string, channelId?: string): Promise<Response> {
 }
 
 describe("GET /api/chat/bootstrap (Phase 1)", () => {
-  it("auto-joins system channel and returns it in channels + active_channel + per_channel cursor", async () => {
+  it("returns empty channels for a new user with no memberships", async () => {
     const uid = "00000000-0000-7000-8000-000000000101";
     const token = await makeJwt({ sub: uid });
     const res = await bootstrap(token);
@@ -26,26 +26,21 @@ describe("GET /api/chat/bootstrap (Phase 1)", () => {
       event_state: { per_channel: Record<string, string> };
     };
     expect(body.me.user_id).toBe(uid);
-    expect(body.channels.length).toBeGreaterThan(0);
-    const sys = body.channels[0]!;
-    expect(sys.kind).toBe("channel");
-    expect(sys.last_event_id).not.toBeNull();
-    expect(body.active_channel).not.toBeNull();
-    expect(body.active_channel!.channel_id).toBe(sys.channel_id);
-    expect(body.event_state.per_channel[sys.channel_id]).toBe(sys.last_event_id);
+    expect(body.channels).toEqual([]);
+    expect(body.active_channel).toBeNull();
+    expect(body.event_state.per_channel).toEqual({});
     expect(body.messages.items).toEqual([]);
   });
 
-  it("is idempotent — second bootstrap returns same channel_id, no new join event", async () => {
+  it("is idempotent — second bootstrap still returns empty channels", async () => {
     const uid = "00000000-0000-7000-8000-000000000102";
     const token = await makeJwt({ sub: uid });
     const r1 = await bootstrap(token);
-    const b1 = await r1.json() as { channels: Array<{ channel_id: string }> };
+    const b1 = await r1.json() as { channels: unknown[] };
     const r2 = await bootstrap(token);
-    const b2 = await r2.json() as { channels: Array<{ channel_id: string }> };
-    expect(b1.channels.length).toBeGreaterThan(0);
-    expect(b2.channels.length).toBeGreaterThan(0);
-    expect(b1.channels[0]!.channel_id).toBe(b2.channels[0]!.channel_id);
+    const b2 = await r2.json() as { channels: unknown[] };
+    expect(b1.channels).toEqual([]);
+    expect(b2.channels).toEqual([]);
   });
 
   it("rejects machine token + managed session (carry from Phase 0)", async () => {

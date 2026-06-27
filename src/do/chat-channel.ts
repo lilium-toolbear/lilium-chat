@@ -696,32 +696,6 @@ export class ChatChannel extends DurableObject<Env> {
       return Response.json({ ids });
     }
 
-    if (url.pathname === "/internal/maybe-create-system") {
-      const b = (await request.json()) as { title: string };
-      const now = this.nowIso();
-
-      const existing = this.ctx.storage.sql
-        .exec("SELECT channel_id FROM channel_meta")
-        .toArray()[0] as { channel_id: string } | undefined;
-      if (existing !== undefined) {
-        return Response.json({ channel_id: existing.channel_id });
-      }
-
-      const channelId = uuidv7();
-      const title = b?.title?.trim() ?? "Lilium";
-      this.ctx.storage.sql.exec(
-        `INSERT INTO channel_meta (
-          channel_id, kind, visibility, title, topic, avatar_url, status,
-          created_by, created_at, updated_at, member_count, membership_version
-        ) VALUES (?, 'channel', 'public_listed', ?, NULL, NULL, 'active', 'system', ?, ?, 0, 0)`,
-        channelId,
-        title,
-        now,
-        now,
-      );
-      return Response.json({ channel_id: channelId });
-    }
-
     if (url.pathname === "/internal/join") {
       const b = (await request.json()) as { user_id: string; operation_id?: string };
       const userId = b.user_id;

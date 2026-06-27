@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { getNamedDo, setupOwnedChannelForUser } from "../helpers";
 import { liveStartAndAck, nextAck, nextMessage, sendHeartbeat, upgradeUserConnection } from "../ws-helpers";
+
+async function joinTestChannel(userId: string): Promise<{ channelStub: DurableObjectStub; channelId: string }> {
+  const { stub, channelId } = await setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
+  return { channelStub: stub, channelId };
+}
 
 async function nextEventFrame(ws: WebSocket, eventId: string): Promise<Record<string, unknown>> {
   for (let i = 0; i < 5; i++) {
@@ -14,37 +19,24 @@ async function nextEventFrame(ws: WebSocket, eventId: string): Promise<Record<st
 describe("UserConnection session.live_start", () => {
   it("registers fanout leases for active channels without replay", async () => {
     const userId = "u-live-start";
-    const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
-    await sysStub.fetch(new Request("https://x/internal/maybe-create-system", {
-      method: "POST", body: JSON.stringify({ title: "Lilium" }),
-    }));
-    await sysStub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId }),
-    }));
-    const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
-    await runDurableObjectAlarm(sysStub);
-    const sysId = ((await (await sysStub.fetch(new Request("https://x/internal/summary", {
-      headers: { "X-Verified-User-Id": userId },
-    }))).json()) as { channel_id: string }).channel_id;
+    const { channelStub, channelId } = await joinTestChannel(userId);
 
     const { ws, stub, sessionId } = await upgradeUserConnection(userId);
     const payload = await liveStartAndAck(ws, "cmd-ls-1");
     expect(payload.session_id).toBe(sessionId);
     expect(payload.subscribed_channel_count).toBeGreaterThanOrEqual(1);
 
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], sysId);
+    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
     const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Channel-Id": sysId },
+      headers: { "X-Channel-Id": channelId },
     }))).json()) as { leases: Array<{ session_id: string }> };
     expect(dump.leases.some((l) => l.session_id === sessionId)).toBe(true);
 
     await liveStartAndAck(ws, "cmd-ls-2");
-    const { runInDurableObject } = await import("cloudflare:test");
+    const { runInDurableObject, runDurableObjectAlarm } = await import("cloudflare:test");
     await runInDurableObject(stub, async (_instance: unknown, state: any) => {
       const rows = state.storage.sql
-        .exec("SELECT channel_id FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, sysId)
+        .exec("SELECT channel_id FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
         .toArray();
       expect(rows.length).toBe(1);
     });
@@ -379,61 +371,48 @@ describe("UserConnection session.live_start", () => {
 describe("UserConnection /deliver membership gate", () => {
   it("returns membership_not_active and closes local lease when user left", async () => {
     const userId = "u-deliver-member";
-    const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
-    await sysStub.fetch(new Request("https://x/internal/maybe-create-system", {
-      method: "POST", body: JSON.stringify({ title: "Lilium" }),
-    }));
-    await sysStub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId }),
-    }));
-    const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
-    await runDurableObjectAlarm(sysStub);
-    const sysId = ((await (await sysStub.fetch(new Request("https://x/internal/summary", {
-      headers: { "X-Verified-User-Id": userId },
-    }))).json()) as { channel_id: string }).channel_id;
+    const { channelStub, channelId } = await joinTestChannel(userId);
 
     const { ws, stub, sessionId } = await upgradeUserConnection(userId);
     await liveStartAndAck(ws);
 
     let leaseId = "";
     let membershipVersion = 0;
-    const { runInDurableObject } = await import("cloudflare:test");
+    const { runInDurableObject, runDurableObjectAlarm } = await import("cloudflare:test");
     await runInDurableObject(stub, async (_instance: unknown, state: any) => {
       const row = state.storage.sql
         .exec(
           "SELECT lease_id, membership_version FROM live_channel_leases WHERE session_id=? AND channel_id=?",
           sessionId,
-          sysId,
+          channelId,
         )
         .toArray()[0] as { lease_id: string; membership_version: number } | undefined;
       leaseId = row?.lease_id ?? "";
       membershipVersion = row?.membership_version ?? 0;
     });
 
-    await sysStub.fetch(new Request("https://x/internal/test-leave", {
+    await channelStub.fetch(new Request("https://x/internal/test-leave", {
       method: "POST",
       headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
       body: JSON.stringify({ user_id: userId }),
     }));
-    await runDurableObjectAlarm(sysStub);
+    await runDurableObjectAlarm(channelStub);
 
     const eventJson = JSON.stringify({
       frame_type: "event",
       api_version: "lilium.chat.v2",
       event_id: "e-member-gate",
       type: "message.created",
-      channel_id: sysId,
+      channel_id: channelId,
       occurred_at: "2026-06-27T00:00:00Z",
       payload: {},
     });
     const deliverRes = await stub.fetch(new Request("https://x/deliver", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Channel-Id": sysId },
+      headers: { "Content-Type": "application/json", "X-Channel-Id": channelId },
       body: JSON.stringify({
         lease_id: leaseId,
-        channel_id: sysId,
+        channel_id: channelId,
         session_id: sessionId,
         event_id: "e-member-gate",
         event_json: eventJson,
@@ -446,7 +425,7 @@ describe("UserConnection /deliver membership gate", () => {
 
     await runInDurableObject(stub, async (_instance: unknown, state: any) => {
       const row = state.storage.sql
-        .exec("SELECT status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, sysId)
+        .exec("SELECT status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
         .toArray()[0] as { status: string } | undefined;
       expect(row?.status).toBe("closed");
     });
@@ -457,33 +436,21 @@ describe("UserConnection /deliver membership gate", () => {
 describe("UserConnection session.heartbeat membership", () => {
   it("closes stale leases after member leave and does not deliver later events", async () => {
     const userId = "u-heartbeat-member";
-    const sysStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
-    await sysStub.fetch(new Request("https://x/internal/maybe-create-system", {
-      method: "POST", body: JSON.stringify({ title: "Lilium" }),
-    }));
-    await sysStub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId }),
-    }));
-    const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
-    await runDurableObjectAlarm(sysStub);
-    const sysId = ((await (await sysStub.fetch(new Request("https://x/internal/summary", {
-      headers: { "X-Verified-User-Id": userId },
-    }))).json()) as { channel_id: string }).channel_id;
+    const { channelStub, channelId } = await joinTestChannel(userId);
 
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], sysId);
+    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
     const { ws, stub, sessionId } = await upgradeUserConnection(userId);
     await liveStartAndAck(ws);
 
-    await sysStub.fetch(new Request("https://x/internal/test-leave", {
+    await channelStub.fetch(new Request("https://x/internal/test-leave", {
       method: "POST",
       headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
       body: JSON.stringify({ user_id: userId }),
     }));
 
+    const { runInDurableObject, runDurableObjectAlarm } = await import("cloudflare:test");
     for (let i = 0; i < 40; i++) {
-      await runDurableObjectAlarm(sysStub);
+      await runDurableObjectAlarm(channelStub);
       const dir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], userId);
       const dirRes = await dir.fetch(new Request("https://x/my-channels", {
         headers: { "X-Verified-User-Id": userId },
@@ -491,7 +458,7 @@ describe("UserConnection session.heartbeat membership", () => {
       const items = dirRes.ok
         ? ((await dirRes.json()) as { items: Array<{ channel_id: string }> }).items ?? []
         : [];
-      if (!items.some((it) => it.channel_id === sysId)) break;
+      if (!items.some((it) => it.channel_id === channelId)) break;
       await new Promise((r) => setTimeout(r, 50));
     }
 
@@ -501,15 +468,14 @@ describe("UserConnection session.heartbeat membership", () => {
     expect(JSON.parse(hbRaw).frame_type).toBe("command_ack");
 
     const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Channel-Id": sysId },
+      headers: { "X-Channel-Id": channelId },
     }))).json()) as { leases: Array<{ session_id: string }> };
     expect(dump.leases.some((l) => l.session_id === sessionId)).toBe(false);
 
     let leaseId = "";
-    const { runInDurableObject } = await import("cloudflare:test");
     await runInDurableObject(stub, async (_instance: unknown, state: any) => {
       const row = state.storage.sql
-        .exec("SELECT lease_id, status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, sysId)
+        .exec("SELECT lease_id, status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
         .toArray()[0] as { lease_id: string; status: string } | undefined;
       leaseId = row?.lease_id ?? "";
       expect(row?.status).toBe("closed");
@@ -520,16 +486,16 @@ describe("UserConnection session.heartbeat membership", () => {
       api_version: "lilium.chat.v2",
       event_id: "e-after-hb",
       type: "message.created",
-      channel_id: sysId,
+      channel_id: channelId,
       occurred_at: "2026-06-27T00:00:00Z",
       payload: {},
     });
     const deliverRes = await stub.fetch(new Request("https://x/deliver", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Channel-Id": sysId },
+      headers: { "Content-Type": "application/json", "X-Channel-Id": channelId },
       body: JSON.stringify({
         lease_id: leaseId,
-        channel_id: sysId,
+        channel_id: channelId,
         session_id: sessionId,
         event_json: eventJson,
         membership_version_at_event: 99,

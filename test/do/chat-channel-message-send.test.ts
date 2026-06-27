@@ -1,30 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 
-import { getNamedDo } from "../helpers";
+import { getNamedDo, setupOwnedChannelForUser } from "../helpers";
 
-async function setupSystemAndJoin(userId: string): Promise<{ stub: DurableObjectStub; channelId: string }> {
-  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], "system-general");
-  await stub.fetch(new Request("https://x/internal/maybe-create-system", {
-    method: "POST",
-    body: JSON.stringify({ title: "Lilium" }),
-  }));
-  await stub.fetch(
-    new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId }),
-    }),
-  );
-  const channelId = (await (await stub.fetch(new Request("https://x/internal/summary", {
-    headers: { "X-Verified-User-Id": userId },
-  }))).json() as { channel_id: string }).channel_id;
-  return { stub, channelId };
+async function setupChannelAndJoin(userId: string): Promise<{ stub: DurableObjectStub; channelId: string }> {
+  return setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
 }
 
 describe("ChatChannel /internal/message-send", () => {
   it("writes a message + event + outbox rows and returns full projection", async () => {
-    const { stub, channelId } = await setupSystemAndJoin("u-ms-1");
+    const { stub, channelId } = await setupChannelAndJoin("u-ms-1");
     const res = await stub.fetch(
       new Request("https://x/internal/message-send", {
         method: "POST",
@@ -51,7 +36,7 @@ describe("ChatChannel /internal/message-send", () => {
   });
 
   it("rejects a non-member with FORBIDDEN", async () => {
-    const { stub, channelId } = await setupSystemAndJoin("u-ms-2");
+    const { stub, channelId } = await setupChannelAndJoin("u-ms-2");
     const res = await stub.fetch(
       new Request("https://x/internal/message-send", {
         method: "POST",
@@ -71,7 +56,7 @@ describe("ChatChannel /internal/message-send", () => {
   });
 
   it("is idempotent on (dedupe_principal_key, command_id): same message_id + event_id", async () => {
-    const { stub, channelId } = await setupSystemAndJoin("u-ms-3");
+    const { stub, channelId } = await setupChannelAndJoin("u-ms-3");
     const body = {
       dedupe_principal_key: "user:u-ms-3",
       type: "text",
@@ -104,7 +89,7 @@ describe("ChatChannel /internal/message-send", () => {
   });
 
   it("returns IDEMPOTENCY_CONFLICT (409) when same command_id but different body", async () => {
-    const { stub, channelId } = await setupSystemAndJoin("u-ms-7");
+    const { stub, channelId } = await setupChannelAndJoin("u-ms-7");
     const base = {
       dedupe_principal_key: "user:u-ms-7",
       type: "text",
@@ -135,7 +120,7 @@ describe("ChatChannel /internal/message-send", () => {
   });
 
   it("different users, same command_id → different messages (namespacing)", async () => {
-    const { stub, channelId } = await setupSystemAndJoin("u-ms-4");
+    const { stub, channelId } = await setupChannelAndJoin("u-ms-4");
     await stub.fetch(
       new Request("https://x/internal/join", {
         method: "POST",
@@ -183,7 +168,7 @@ describe("ChatChannel /internal/message-send", () => {
   });
 
   it("/internal/replay returns the message.created event_json after creation, filtered by status", async () => {
-    const { stub, channelId } = await setupSystemAndJoin("u-ms-6");
+    const { stub, channelId } = await setupChannelAndJoin("u-ms-6");
     const send = (await (
       await stub.fetch(
         new Request("https://x/internal/message-send", {
@@ -216,7 +201,7 @@ describe("ChatChannel /internal/message-send", () => {
   // duplicate retry returns event_id:"" / message:null. We can't crash the DO mid-txn, but we assert
   // a duplicate retry returns the SAME complete ack (event_id + message present, not degraded).
   it("P0-2: duplicate retry returns the same complete ack (response_json is full, not {})", async () => {
-    const { stub, channelId } = await setupSystemAndJoin("u-ms-7");
+    const { stub, channelId } = await setupChannelAndJoin("u-ms-7");
     const body = {
       command_id: "cm-p02",
       dedupe_principal_key: "user:u-ms-7",
