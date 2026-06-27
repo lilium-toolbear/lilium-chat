@@ -18,9 +18,12 @@ import {
   buildMemberJoinedPayload,
   buildMemberRoleUpdatedPayload,
   buildMemberLeftPayload,
-  buildSystemNoticePayload,
+  buildBotInstalledPayload,
+  buildBotUpdatedPayload,
+  buildCommandBindingUpdatedPayload,
   resolveActorWithMap,
 } from "../chat/channel-events";
+import { personalInviteCode } from "../chat/invite-code";
 import { HTTP_STATUS_BY_CODE } from "../errors";
 import { resolveUserSummaries } from "../profile/resolve";
 import { botRegistryStub } from "../auth/bot";
@@ -530,27 +533,6 @@ export class ChatChannel extends DurableObject<Env> {
           input.operationId,
           now,
         );
-        const senderUserId = row.sender_kind === "user" ? row.sender_user_id : null;
-        if (senderUserId !== null && senderUserId !== input.userId) {
-          const noticeId = this.nextEventId(nowMs);
-          this.persistEventAndFanout(
-            noticeId,
-            "system.notice",
-            input.channelId,
-            now,
-            buildSystemNoticePayload({
-              notice_kind: "message.deleted",
-              actor_kind: "user",
-              actor_id: input.userId,
-              target_user_id: senderUserId,
-              message_id: input.messageId,
-              channel_changes: null,
-            }),
-            mv,
-            now,
-            actorMap,
-          );
-        }
       }
 
       const fullAckJson = JSON.stringify({
@@ -865,24 +847,7 @@ export class ChatChannel extends DurableObject<Env> {
             membership_version: membershipVersion,
             actor_kind: "user",
             actor_id: userId,
-          }),
-          membershipVersion,
-          now,
-          actorMap,
-        );
-        const noticeId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(
-          noticeId,
-          "system.notice",
-          channelId,
-          now,
-          buildSystemNoticePayload({
-            notice_kind: "member.joined",
-            actor_kind: "user",
-            actor_id: userId,
-            target_user_id: userId,
-            message_id: null,
-            channel_changes: null,
+            join_source: "public",
           }),
           membershipVersion,
           now,
@@ -1878,21 +1843,6 @@ export class ChatChannel extends DurableObject<Env> {
           actorMap,
         );
 
-        const noticeId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(noticeId, "system.notice", b.channel_id, now,
-          buildSystemNoticePayload({
-            notice_kind: "member.role_updated",
-            actor_kind: "user",
-            actor_id: userId,
-            target_user_id: b.target_user_id,
-            message_id: null,
-            channel_changes: null,
-          }),
-          secondMembershipVersion,
-          now,
-          actorMap,
-        );
-
         const response = {
           channel_id: b.channel_id,
           previous_owner: { user_id: userId, role: b.previous_owner_role },
@@ -1964,7 +1914,7 @@ export class ChatChannel extends DurableObject<Env> {
         .toArray()[0] as { response_json: string } | undefined;
       if (preCheck) return this.cachedResponse(preCheck.response_json);
 
-      const inviteCode = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+      const inviteCode = await personalInviteCode(channelId, userId);
       const outboxId = `invite_directory:${inviteCode}:${now}`;
       const outboxEventId = this.nextEventId(nowMs);
       const response = {
@@ -2001,18 +1951,34 @@ export class ChatChannel extends DurableObject<Env> {
         }
 
         const role = this.activeRole(channelId, userId);
-        if (role !== "owner" && role !== "admin") {
-          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "FORBIDDEN", message: "only owner or admin may create invite", retryable: false } }) };
+        if (!role) {
+          return { kind: "cached", responseJson: JSON.stringify({ error: { code: "FORBIDDEN", message: "only channel members may create invite", retryable: false } }) };
         }
 
-        this.ctx.storage.sql.exec(
-          "INSERT INTO invites (invite_code, created_by, expires_at, max_uses, used_count, revoked_at, created_at) VALUES (?, ?, ?, ?, 0, NULL, ?)",
-          inviteCode,
-          userId,
-          expiresAt,
-          maxUses,
-          now,
-        );
+        const existing = this.ctx.storage.sql
+          .exec("SELECT invite_code, created_by, revoked_at FROM invites WHERE invite_code=?", inviteCode)
+          .toArray()[0] as { invite_code: string; created_by: string; revoked_at: string | null } | undefined;
+
+        if (existing === undefined) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO invites (invite_code, created_by, expires_at, max_uses, used_count, revoked_at, created_at) VALUES (?, ?, ?, ?, 0, NULL, ?)",
+            inviteCode,
+            userId,
+            expiresAt,
+            maxUses,
+            now,
+          );
+        } else {
+          if (existing.created_by !== userId) {
+            return { kind: "cached", responseJson: JSON.stringify({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "invite code collision", retryable: true } }) };
+          }
+          this.ctx.storage.sql.exec(
+            "UPDATE invites SET expires_at=?, max_uses=?, revoked_at=NULL WHERE invite_code=?",
+            expiresAt,
+            maxUses,
+            inviteCode,
+          );
+        }
         this.ctx.storage.sql.exec(
           "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, 'channel.invite_create', ?, ?, ?, 'completed', ?, ?)",
           userId,
@@ -2185,8 +2151,11 @@ export class ChatChannel extends DurableObject<Env> {
         | { kind: "cached"; responseJson: string }
         | { kind: "ok"; responseJson: string };
 
-      // Resolve actor profile BEFORE the transaction (Hyperdrive is a network call).
-      const actorMap = await this.resolveActorMap([userId]);
+      const inviteHead = this.ctx.storage.sql
+        .exec("SELECT created_by FROM invites WHERE invite_code=?", inviteCode)
+        .toArray()[0] as { created_by: string } | undefined;
+      const inviterUserIdForResolve = inviteHead?.created_by ?? userId;
+      const actorMap = await this.resolveActorMap([userId, inviterUserIdForResolve]);
 
       const txResult = await this.ctx.storage.transaction(async (): Promise<TxResult> => {
         const idem = this.ctx.storage.sql
@@ -2308,20 +2277,13 @@ export class ChatChannel extends DurableObject<Env> {
             membership_version: mv,
             actor_kind: "user",
             actor_id: userId,
+            join_source: "invite",
+            inviter_user_id: invite.created_by,
           }),
           mv,
           now,
           actorMap,
         );
-        const noticeId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({
-          notice_kind: "member.joined",
-          actor_kind: "user",
-          actor_id: userId,
-          target_user_id: userId,
-          message_id: null,
-          channel_changes: null,
-        }), mv, now, actorMap);
         this.ctx.storage.sql.exec(
           "INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)",
           `user_directory:join:${channelId}:${userId}:${now}`,
@@ -2419,9 +2381,6 @@ export class ChatChannel extends DurableObject<Env> {
         const dissolvedId = this.nextEventId(nowMs);
         this.persistEventAndFanout(dissolvedId, "channel.dissolved", channelId, now,
           buildChannelDissolvedPayload({ channel_id: channelId, dissolved_at: now, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
-        const noticeId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(noticeId, "system.notice", channelId, now,
-          buildSystemNoticePayload({ notice_kind: "channel.dissolved", actor_kind: "user", actor_id: userId, target_user_id: null, message_id: null, channel_changes: null }), mv, now, actorMap);
 
         const responseJson = JSON.stringify({ channel: { channel_id: channelId, status: "dissolved", updated_at: now } });
         this.ctx.storage.sql.exec(
@@ -2496,7 +2455,9 @@ export class ChatChannel extends DurableObject<Env> {
         "member.joined",
         "member.left",
         "member.role_updated",
-        "system.notice",
+        "bot.installed",
+        "bot.updated",
+        "command.binding_updated",
       ]);
       const userIdsToResolve: string[] = [];
       for (const r of parsedRows) {
@@ -2523,9 +2484,13 @@ export class ChatChannel extends DurableObject<Env> {
               actor_kind?: string;
               actor_id?: string;
               target_user_id?: string | null;
+              user_id?: string;
+              inviter_user_id?: string;
             };
             if (p.actor_kind === "user" && typeof p.actor_id === "string" && p.actor_id) userIdsToResolve.push(p.actor_id);
             if (typeof p.target_user_id === "string" && p.target_user_id) userIdsToResolve.push(p.target_user_id);
+            if (typeof p.user_id === "string" && p.user_id) userIdsToResolve.push(p.user_id);
+            if (typeof p.inviter_user_id === "string" && p.inviter_user_id) userIdsToResolve.push(p.inviter_user_id);
           } catch {
             // ignore malformed payload
           }
@@ -2673,8 +2638,6 @@ export class ChatChannel extends DurableObject<Env> {
         const eid = this.nextEventId(nowMs);
         events.push({ id: eid, type: "member.joined", payload: buildMemberJoinedPayload({ channel_id: channelId, user_id: im.user_id, role: im.role, membership_version: mv, actor_kind: "system", actor_id: "system" }), mv });
       }
-      const noticeId = this.nextEventId(nowMs);
-      events.push({ id: noticeId, type: "system.notice", payload: buildSystemNoticePayload({ notice_kind: "channel.created", actor_kind: "user", actor_id: creatorUserId, target_user_id: null, message_id: null, channel_changes: null }), mv });
 
       const finalMv = mv;
       const memberCount = 1 + initialMembers.length;
@@ -3002,9 +2965,6 @@ export class ChatChannel extends DurableObject<Env> {
           const updatedId = this.nextEventId(nowMs);
           this.persistEventAndFanout(updatedId, "channel.updated", channelId, now,
             buildChannelUpdatedPayload({ channel_id: channelId, channel_changes: changes, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
-          const noticeId = this.nextEventId(nowMs);
-          this.persistEventAndFanout(noticeId, "system.notice", channelId, now,
-            buildSystemNoticePayload({ notice_kind: "channel.updated", actor_kind: "user", actor_id: userId, target_user_id: null, message_id: null, channel_changes: changes }), mv, now, actorMap);
         }
 
         const responseJson = JSON.stringify({ channel });
@@ -3090,9 +3050,7 @@ export class ChatChannel extends DurableObject<Env> {
         this.ctx.storage.sql.exec("UPDATE channel_meta SET membership_version=?, member_count=?, updated_at=? WHERE channel_id=?", mv, meta.member_count + 1, now, channelId);
 
         const joinedId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(joinedId, "member.joined", channelId, now, buildMemberJoinedPayload({ channel_id: channelId, user_id: b.user_id, role: b.role, membership_version: mv, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
-        const noticeId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.joined", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mv, now, actorMap);
+        this.persistEventAndFanout(joinedId, "member.joined", channelId, now, buildMemberJoinedPayload({ channel_id: channelId, user_id: b.user_id, role: b.role, membership_version: mv, actor_kind: "user", actor_id: userId, join_source: "admin_add" }), mv, now, actorMap);
         this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:join:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "join", channel_id: channelId, kind: meta.kind, membership_version: mv }), now, now, now);
         // channel_directory projection: bump the directory's member_count for public channels.
         if (meta.visibility === "public_listed") {
@@ -3143,8 +3101,6 @@ export class ChatChannel extends DurableObject<Env> {
 
         const updatedId = this.nextEventId(nowMs);
         this.persistEventAndFanout(updatedId, "member.role_updated", channelId, now, buildMemberRoleUpdatedPayload({ channel_id: channelId, user_id: b.user_id, before_role: beforeRole, after_role: b.role, membership_version: mv, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
-        const noticeId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.role_updated", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mv, now, actorMap);
         this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:membership:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "join", channel_id: channelId, kind: meta.kind, membership_version: mv }), now, now, now);
 
         const responseJson = JSON.stringify({ member: { channel_id: channelId, user_id: b.user_id, role: b.role } });
@@ -3197,10 +3153,16 @@ export class ChatChannel extends DurableObject<Env> {
         const mvAfter = (this.ctx.storage.sql.exec("SELECT membership_version FROM channel_meta WHERE channel_id=?", channelId).toArray()[0] as { membership_version: number }).membership_version;
 
         const leftId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(leftId, "member.left", channelId, now, buildMemberLeftPayload({ channel_id: channelId, user_id: b.user_id, role: target.role, membership_version: mvAfter, actor_kind: "user", actor_id: userId }), mvAfter, now, actorMap);
-        const noticeId = this.nextEventId(nowMs);
-        this.persistEventAndFanout(noticeId, "system.notice", channelId, now, buildSystemNoticePayload({ notice_kind: "member.left", actor_kind: "user", actor_id: userId, target_user_id: b.user_id, message_id: null, channel_changes: null }), mvAfter, now, actorMap);
-        // user_directory leave projection (so my_channels reflects status='left')
+        this.persistEventAndFanout(leftId, "member.left", channelId, now, buildMemberLeftPayload({
+          channel_id: channelId,
+          user_id: b.user_id,
+          role: target.role,
+          membership_version: mvAfter,
+          actor_kind: "user",
+          actor_id: userId,
+          leave_source: isSelf ? "self" : "removed",
+        }), mvAfter, now, actorMap);
+        // user_directory leave projection
         this.ctx.storage.sql.exec("INSERT INTO projection_outbox (outbox_id, target_kind, target_key, event_id, payload_json, status, next_attempt_at, created_at, updated_at, attempts, max_attempts) VALUES (?, 'user_directory', ?, '', ?, 'pending', ?, ?, ?, 0, 5)", `user_directory:leave:${channelId}:${b.user_id}:${now}`, b.user_id, JSON.stringify({ action: "leave", channel_id: channelId, kind: meta.kind, membership_version: mvAfter }), now, now, now);
         // channel_directory projection: decrement the directory's member_count for public channels.
         if (meta.visibility === "public_listed") {
@@ -3477,6 +3439,7 @@ export class ChatChannel extends DurableObject<Env> {
       event_capabilities: Array<{ event_type: string; filters: unknown; default_enabled_on_install: boolean }>;
     };
 
+    const actorMap = await this.resolveActorMap([userId]);
     const txResult = this.ctx.storage.transactionSync(() => {
       const idem = this.ctx.storage.sql
         .exec(
@@ -3615,15 +3578,11 @@ export class ChatChannel extends DurableObject<Env> {
       );
 
       const mv = meta.membership_version;
-      const noticeId = this.nextEventId(nowMs);
+      const installedId = this.nextEventId(nowMs);
       this.persistEventAndFanout(
-        noticeId, "system.notice", channelId, now,
-        buildSystemNoticePayload({
-          notice_kind: "bot.installed", actor_kind: "user", actor_id: userId,
-          target_user_id: null, message_id: null, channel_changes: null,
-          bot_id: botId, bot_command_id: null, binding_changes: null,
-        }),
-        mv, now, new Map(),
+        installedId, "bot.installed", channelId, now,
+        buildBotInstalledPayload({ channel_id: channelId, bot_id: botId, actor_kind: "user", actor_id: userId }),
+        mv, now, actorMap,
       );
 
       const responseBody = { bot_id: botId, status: "active", bindings, subscriptions };
@@ -3677,6 +3636,7 @@ export class ChatChannel extends DurableObject<Env> {
       .toArray()[0] as { response_json: string } | undefined;
     if (preCheck) return this.cachedResponse(preCheck.response_json);
 
+    const actorMap = await this.resolveActorMap([userId]);
     const txResult = this.ctx.storage.transactionSync(() => {
       const idem = this.ctx.storage.sql
         .exec(
@@ -3711,15 +3671,15 @@ export class ChatChannel extends DurableObject<Env> {
       this.ctx.storage.sql.exec("UPDATE bot_installations SET status='removed', updated_by=?, updated_at=? WHERE bot_id=?", userId, now, botId);
 
       const mv = meta.membership_version;
-      const noticeId = this.nextEventId(nowMs);
+      const updatedId = this.nextEventId(nowMs);
       this.persistEventAndFanout(
-        noticeId, "system.notice", channelId, now,
-        buildSystemNoticePayload({
-          notice_kind: "bot.updated", actor_kind: "user", actor_id: userId,
-          target_user_id: null, message_id: null, channel_changes: null,
-          bot_id: botId, bot_command_id: null, binding_changes: { status: { before: "active", after: newStatus } },
+        updatedId, "bot.updated", channelId, now,
+        buildBotUpdatedPayload({
+          channel_id: channelId, bot_id: botId, status: newStatus,
+          changes: { status: { before: "active", after: newStatus } },
+          actor_kind: "user", actor_id: userId,
         }),
-        mv, now, new Map(),
+        mv, now, actorMap,
       );
 
       const responseBody = { bot_id: botId, status: newStatus };
@@ -3771,6 +3731,7 @@ export class ChatChannel extends DurableObject<Env> {
       .toArray()[0] as { response_json: string } | undefined;
     if (preCheck) return this.cachedResponse(preCheck.response_json);
 
+    const actorMap = await this.resolveActorMap([userId]);
     const txResult = this.ctx.storage.transactionSync(() => {
       const idem = this.ctx.storage.sql
         .exec(
@@ -3795,8 +3756,8 @@ export class ChatChannel extends DurableObject<Env> {
       }
 
       const binding = this.ctx.storage.sql
-        .exec("SELECT binding_id, bot_id, name, aliases_json FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?", channelId, botCommandId)
-        .toArray()[0] as { binding_id: string; bot_id: string; name: string; aliases_json: string } | undefined;
+        .exec("SELECT binding_id, bot_id, name, aliases_json, status FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?", channelId, botCommandId)
+        .toArray()[0] as { binding_id: string; bot_id: string; name: string; aliases_json: string; status: string } | undefined;
       if (!binding) return { kind: "error" as const, j: JSON.stringify({ error: { code: "COMMAND_NOT_FOUND", message: "command binding not found" } }) };
 
       if (enabled) {
@@ -3827,16 +3788,17 @@ export class ChatChannel extends DurableObject<Env> {
       }
 
       const mv = meta.membership_version;
-      const noticeId = this.nextEventId(nowMs);
+      const beforeStatus = binding.status;
+      const afterStatus = enabled ? "enabled" : "disabled";
+      const bindingUpdatedId = this.nextEventId(nowMs);
       this.persistEventAndFanout(
-        noticeId, "system.notice", channelId, now,
-        buildSystemNoticePayload({
-          notice_kind: "command.binding_updated", actor_kind: "user", actor_id: userId,
-          target_user_id: null, message_id: null, channel_changes: null,
-          bot_id: binding.bot_id, bot_command_id: botCommandId,
-          binding_changes: { enabled: { before: enabled ? "disabled" : "enabled", after: enabled ? "enabled" : "disabled" } },
+        bindingUpdatedId, "command.binding_updated", channelId, now,
+        buildCommandBindingUpdatedPayload({
+          channel_id: channelId, bot_id: binding.bot_id, bot_command_id: botCommandId,
+          binding_changes: { enabled: { before: beforeStatus, after: afterStatus } },
+          actor_kind: "user", actor_id: userId,
         }),
-        mv, now, new Map(),
+        mv, now, actorMap,
       );
 
       const responseBody = { bot_command_id: botCommandId, enabled, permission_override: permissionOverride };

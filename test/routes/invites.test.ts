@@ -49,7 +49,47 @@ describe("POST /api/chat/channels/:id/invites", () => {
     expect(expiresAt).toBeLessThan(now + 2 * 3600 * 1000);
   });
 
-  it("is idempotent for the same Idempotency-Key", async () => {
+  it('returns the same invite_code for the same member across separate requests', async () => {
+    const create = await authedReq("u-invite-stable-1", "POST", "/api/chat/channels", {
+      title: "Stable invite room",
+      visibility: "private",
+      initial_members: [{ user_id: "u-invite-stable-member", role: "member" }],
+    }, "invite-stable-channel-1");
+    expect(create.status).toBe(201);
+    const createBody = (await create.json()) as { channel: { channel_id: string } };
+
+    const r1 = await authedReq("u-invite-stable-member", "POST", `/api/chat/channels/${createBody.channel.channel_id}/invites`, {
+      expires_in_seconds: 3600,
+      max_uses: null,
+    }, "invite-stable-key-1");
+    const b1 = (await r1.json()) as { invite_code: string };
+    expect(r1.status).toBe(200);
+
+    const r2 = await authedReq("u-invite-stable-member", "POST", `/api/chat/channels/${createBody.channel.channel_id}/invites`, {
+      expires_in_seconds: 7200,
+      max_uses: null,
+    }, "invite-stable-key-2");
+    const b2 = (await r2.json()) as { invite_code: string };
+    expect(r2.status).toBe(200);
+    expect(b2.invite_code).toBe(b1.invite_code);
+  });
+
+  it('allows any active member to create an invite', async () => {
+    const create = await authedReq("u-invite-member-owner", "POST", "/api/chat/channels", {
+      title: "Member invite room",
+      visibility: "private",
+      initial_members: [{ user_id: "u-invite-member-only", role: "member" }],
+    }, "invite-member-channel-1");
+    const createBody = (await create.json()) as { channel: { channel_id: string } };
+
+    const res = await authedReq("u-invite-member-only", "POST", `/api/chat/channels/${createBody.channel.channel_id}/invites`, {
+      expires_in_seconds: 3600,
+      max_uses: null,
+    }, "invite-member-key-1");
+    expect(res.status).toBe(200);
+  });
+
+  it('is idempotent for the same Idempotency-Key', async () => {
     const create = await authedReq("u-invite-create-2", "POST", "/api/chat/channels", {
       title: "Invite room",
       visibility: "private",

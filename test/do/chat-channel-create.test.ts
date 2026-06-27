@@ -32,7 +32,7 @@ describe("ChatChannel /internal/create-channel", () => {
     expect(body.channel.kind).toBe("channel");
     expect(body.channel.status).toBe("active");
     expect(body.membership.role).toBe("owner");
-    expect(body.event_ids.length).toBeGreaterThanOrEqual(3); // channel.created + member.joined(creator) + member.joined(init) + system.notice
+    expect(body.event_ids.length).toBeGreaterThanOrEqual(3); // channel.created + member.joined(creator) + member.joined(init)
   });
 
   it("is idempotent on re-call (same channel_id returns existing, no duplicate events)", async () => {

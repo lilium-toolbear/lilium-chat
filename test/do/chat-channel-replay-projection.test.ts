@@ -3,11 +3,10 @@ import { env } from "cloudflare:workers";
 import { getNamedDo } from "../helpers";
 
 describe("ChatChannel /internal/replay actor projection", () => {
-  it("replays system.notice with resolved actor + target_user (not bare ids)", async () => {
+  it("replays member.joined with resolved actor + user (not bare ids)", async () => {
     const cid = "0198aaaa-0000-7000-8000-000000000001";
     const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], cid);
-    // Create the channel (owner=u-replay-owner), which writes channel.created + member.joined
-    // + system.notice(notice_kind=channel.created, actor=owner). These payloads store actor_id=owner.
+    // Create the channel (owner=u-replay-owner), which writes channel.created + member.joined events.
     await stub.fetch(new Request("https://x/internal/create-channel", {
       method: "POST",
       headers: { "X-Verified-User-Id": "u-replay-owner", "Content-Type": "application/json" },
@@ -17,18 +16,19 @@ describe("ChatChannel /internal/replay actor projection", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { events: Array<{ event_json: string }> };
     const frames = body.events.map((e) => JSON.parse(e.event_json) as { type: string; payload: Record<string, unknown> });
-    // The create sequence writes: channel.created (actor=creator), member.joined(creator, actor=system),
-    // member.joined(initial member, actor=system), system.notice(notice_kind=channel.created, actor=creator, target_user_id=null).
-    // Assert the channel.created system.notice has its ACTOR resolved + ref stripped on the wire.
-    const notice = frames.find((f) => f.type === "system.notice" && (f.payload as { notice_kind?: string }).notice_kind === "channel.created");
-    expect(notice).toBeTruthy();
-    const p = notice!.payload as { actor?: unknown; target_user?: unknown; actor_id?: unknown; target_user_id?: unknown };
-    expect(p).toHaveProperty("actor");
-    expect(p.actor_id).toBeUndefined();      // ref stripped on the wire
-    expect(p.target_user_id).toBeUndefined(); // ref stripped on the wire
-    // channel.created notice has target_user_id=null → wire target_user is null (not a UserSummary), but the field IS present.
-    expect(p).toHaveProperty("target_user");
-    expect(p.target_user).toBe(null);
+    // member.joined(initial member, actor=system) — assert subject user is resolved on the wire.
+    const joined = frames.find((f) => {
+      if (f.type !== "member.joined") return false;
+      const payload = f.payload as { user?: { user_id?: string }; user_id?: string };
+      const subjectId = payload.user?.user_id ?? payload.user_id;
+      return subjectId === "u-replay-target";
+    });
+    expect(joined).toBeTruthy();
+    const p = joined!.payload as { actor?: unknown; user?: unknown; actor_id?: unknown; user_id?: unknown };
+    expect(p).toHaveProperty("user");
+    expect(p.actor_id).toBeUndefined();
+    expect(p.user_id).toBeUndefined();
+    expect((p.user as { user_id?: string })?.user_id).toBe("u-replay-target");
   });
 
   it("replays channel.created with resolved actor, not bare actor_id", async () => {

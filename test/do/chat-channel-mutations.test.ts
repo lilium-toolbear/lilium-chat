@@ -59,7 +59,7 @@ describe("ChatChannel /internal/update-channel", () => {
     setTestS3Client(fake);
   });
 
-  it("updates title + topic and writes channel.updated + system.notice", async () => {
+  it("updates title + topic and writes channel.updated", async () => {
     const stub = await makeChannel("0193aaaa-0000-7000-8000-000000000001");
     const res = await stub.fetch(new Request("https://x/internal/update-channel", {
       method: "POST",
@@ -177,7 +177,7 @@ describe("ChatChannel /internal/update-channel", () => {
 });
 
 describe("ChatChannel /internal/dissolve", () => {
-  it("owner dissolves → channel.dissolved + system.notice, status dissolved", async () => {
+  it("owner dissolves → channel.dissolved, status dissolved", async () => {
     const cid = "0194aaaa-0000-7000-8000-000000000001";
     const stub = await makeChannel(cid);
     const res = await stub.fetch(new Request("https://x/internal/dissolve", {
@@ -297,7 +297,7 @@ describe("ChatChannel /internal/dissolve", () => {
 });
 
 describe("ChatChannel members CRUD", () => {
-  it("admin adds a member → member.joined + system.notice", async () => {
+  it("admin adds a member → member.joined", async () => {
     const cid = "0195aaaa-0000-7000-8000-000000000001";
     const stub = await makeChannel(cid);
     const res = await stub.fetch(new Request("https://x/internal/members-add", {

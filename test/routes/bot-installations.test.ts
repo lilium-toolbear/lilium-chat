@@ -306,21 +306,19 @@ describe("POST /api/chat/channels/:id/bot-installations (7a-install)", () => {
     });
   });
 
-  it("emits a system.notice(notice_kind=bot.installed) with bot_id, no token", async () => {
+  it("emits bot.installed domain event with bot_id, no token", async () => {
     const ownerId = `owner-notice-${crypto.randomUUID()}`;
     const botId = `bot-notice-${crypto.randomUUID()}`;
     const channelId = await createChannel(ownerId, "Notice Channel");
     await seedBotWithCatalog({ botId });
     await browserReq(ownerId, "POST", `/api/chat/channels/${channelId}/bot-installations`, { bot_id: botId }, "key-notice-install");
     await withChannel(channelId, (ctx) => {
-      const notice = ctx.storage.sql
-        .exec("SELECT payload_json FROM events WHERE channel_id=? AND event_type='system.notice' AND payload_json LIKE '%bot.installed%'", channelId)
+      const row = ctx.storage.sql
+        .exec("SELECT payload_json FROM events WHERE channel_id=? AND event_type='bot.installed'", channelId)
         .toArray()[0] as { payload_json: string } | undefined;
-      expect(notice).toBeDefined();
-      const payload = JSON.parse(notice!.payload_json) as Record<string, unknown>;
-      expect(payload.notice_kind).toBe("bot.installed");
+      expect(row).toBeDefined();
+      const payload = JSON.parse(row!.payload_json) as Record<string, unknown>;
       expect(payload.bot_id).toBe(botId);
-      // no secret/token leak
       expect(JSON.stringify(payload)).not.toContain("token");
       expect(JSON.stringify(payload)).not.toContain("callback_secret");
     });

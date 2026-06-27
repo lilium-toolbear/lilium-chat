@@ -296,20 +296,6 @@ describe("ChatChannel message lifecycle", () => {
     const deletedPayload = JSON.parse(deletedFrame!.event_json) as { payload: { message?: { sender?: { user?: { user_id: string } } } } };
     expect(deletedPayload.payload.message?.sender).toBeDefined();
     expect(deletedPayload.payload.message?.sender?.user?.user_id).toBe(member);
-
-    const notice = replay.events.find((evt) => {
-      const parsed = JSON.parse(evt.event_json) as {
-        type: string;
-        payload: { notice_kind?: string; actor?: { user_id?: string }; target_user?: { user_id?: string } };
-      };
-      return parsed.type === "system.notice" && parsed.payload.notice_kind === "message.deleted";
-    });
-    expect(notice).toBeDefined();
-    const noticePayload = JSON.parse(notice!.event_json) as {
-      payload: { notice_kind?: string; actor?: { user_id?: string }; target_user?: { user_id?: string } };
-    };
-    expect(noticePayload.payload.actor?.user_id).toBe(owner);
-    expect(noticePayload.payload.target_user?.user_id).toBe(member);
   });
 
   // P0-2 regression: edit after send-with-mention must preserve mentions in the ack projection.

@@ -29,8 +29,19 @@ export function buildChannelDissolvedPayload(raw: {
 export function buildMemberJoinedPayload(raw: {
   channel_id: string; user_id: string; role: string; membership_version: number;
   actor_kind: string; actor_id: string;
+  join_source?: "invite" | "public" | "admin_add" | "initial" | null;
+  inviter_user_id?: string | null;
 }): Record<string, unknown> {
-  return { channel_id: raw.channel_id, user_id: raw.user_id, role: raw.role, membership_version: raw.membership_version, actor_kind: raw.actor_kind, actor_id: raw.actor_id };
+  return {
+    channel_id: raw.channel_id,
+    user_id: raw.user_id,
+    role: raw.role,
+    membership_version: raw.membership_version,
+    actor_kind: raw.actor_kind,
+    actor_id: raw.actor_id,
+    join_source: raw.join_source ?? null,
+    inviter_user_id: raw.inviter_user_id ?? null,
+  };
 }
 
 export function buildMemberRoleUpdatedPayload(raw: {
@@ -43,8 +54,17 @@ export function buildMemberRoleUpdatedPayload(raw: {
 export function buildMemberLeftPayload(raw: {
   channel_id: string; user_id: string; role: string; membership_version: number;
   actor_kind: string; actor_id: string;
+  leave_source?: "self" | "removed" | null;
 }): Record<string, unknown> {
-  return { channel_id: raw.channel_id, user_id: raw.user_id, role: raw.role, membership_version: raw.membership_version, actor_kind: raw.actor_kind, actor_id: raw.actor_id };
+  return {
+    channel_id: raw.channel_id,
+    user_id: raw.user_id,
+    role: raw.role,
+    membership_version: raw.membership_version,
+    actor_kind: raw.actor_kind,
+    actor_id: raw.actor_id,
+    leave_source: raw.leave_source ?? null,
+  };
 }
 
 export function buildReadStateUpdatedPayload(raw: {
@@ -53,26 +73,39 @@ export function buildReadStateUpdatedPayload(raw: {
   return { channel_id: raw.channel_id, user_id: raw.user_id, last_read_event_id: raw.last_read_event_id };
 }
 
-// Persisted ref shape per design §3.5a: only refs + structural fields, NO UserSummary.
-export function buildSystemNoticePayload(raw: {
-  notice_kind: string; actor_kind: string; actor_id: string;
-  target_user_id: string | null; message_id: string | null;
-  channel_changes: Record<string, { before: unknown; after: unknown }> | null;
-  /** Phase 7 bot setting notices (bot.installed / bot.updated / command.binding_updated / bot.subscription_updated). */
-  bot_id?: string | null;
-  bot_command_id?: string | null;
-  binding_changes?: Record<string, { before: unknown; after: unknown }> | null;
+export function buildBotInstalledPayload(raw: {
+  channel_id: string; bot_id: string; actor_kind: string; actor_id: string;
+}): Record<string, unknown> {
+  return { channel_id: raw.channel_id, bot_id: raw.bot_id, actor_kind: raw.actor_kind, actor_id: raw.actor_id };
+}
+
+export function buildBotUpdatedPayload(raw: {
+  channel_id: string; bot_id: string; status: string;
+  changes: Record<string, { before: unknown; after: unknown }> | null;
+  actor_kind: string; actor_id: string;
 }): Record<string, unknown> {
   return {
-    notice_kind: raw.notice_kind,
+    channel_id: raw.channel_id,
+    bot_id: raw.bot_id,
+    status: raw.status,
+    changes: raw.changes,
     actor_kind: raw.actor_kind,
     actor_id: raw.actor_id,
-    target_user_id: raw.target_user_id,
-    message_id: raw.message_id,
-    channel_changes: raw.channel_changes,
-    bot_id: raw.bot_id ?? null,
-    bot_command_id: raw.bot_command_id ?? null,
-    binding_changes: raw.binding_changes ?? null,
+  };
+}
+
+export function buildCommandBindingUpdatedPayload(raw: {
+  channel_id: string; bot_id: string; bot_command_id: string;
+  binding_changes: Record<string, { before: unknown; after: unknown }>;
+  actor_kind: string; actor_id: string;
+}): Record<string, unknown> {
+  return {
+    channel_id: raw.channel_id,
+    bot_id: raw.bot_id,
+    bot_command_id: raw.bot_command_id,
+    binding_changes: raw.binding_changes,
+    actor_kind: raw.actor_kind,
+    actor_id: raw.actor_id,
   };
 }
 
@@ -103,6 +136,19 @@ export function resolveActorWithMap(
     out.target_user = null;
   }
   delete out.target_user_id;
+
+  const subjectUserId = typeof out.user_id === "string" ? out.user_id : null;
+  if (subjectUserId) {
+    out.user = map.get(subjectUserId) ?? { user_id: subjectUserId, display_name: `user-${subjectUserId.slice(0, 8)}`, avatar_url: null };
+    delete out.user_id;
+  }
+
+  const inviterUserId = typeof out.inviter_user_id === "string" ? out.inviter_user_id : null;
+  if (inviterUserId) {
+    out.inviter = map.get(inviterUserId) ?? { user_id: inviterUserId, display_name: `user-${inviterUserId.slice(0, 8)}`, avatar_url: null };
+    delete out.inviter_user_id;
+  }
+
   return out;
 }
 
@@ -118,6 +164,10 @@ export async function resolveActorForLiveBroadcast(
   if (actorKind === "user" && actorId) ids.push(actorId);
   const targetUserId = typeof payload.target_user_id === "string" ? payload.target_user_id : null;
   if (targetUserId) ids.push(targetUserId);
+  const subjectUserId = typeof payload.user_id === "string" ? payload.user_id : null;
+  if (subjectUserId) ids.push(subjectUserId);
+  const inviterUserId = typeof payload.inviter_user_id === "string" ? payload.inviter_user_id : null;
+  if (inviterUserId) ids.push(inviterUserId);
   const map = ids.length > 0 ? await resolveUserSummaries(ids) : new Map<string, UserSummary>();
   return resolveActorWithMap(payload, map);
 }

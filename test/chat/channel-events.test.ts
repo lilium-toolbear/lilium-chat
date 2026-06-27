@@ -7,7 +7,9 @@ import {
   buildMemberRoleUpdatedPayload,
   buildMemberLeftPayload,
   buildReadStateUpdatedPayload,
-  buildSystemNoticePayload,
+  buildBotInstalledPayload,
+  buildBotUpdatedPayload,
+  buildCommandBindingUpdatedPayload,
   resolveActorForLiveBroadcast,
   resolveActorWithMap,
 } from "../../src/chat/channel-events";
@@ -40,9 +42,9 @@ describe("persisted payloads store actor refs, not UserSummary", () => {
     expect(p).toMatchObject({ before_role: "member", after_role: "admin", membership_version: 4 });
   });
 
-  it("member.left mirrors member.joined shape", () => {
-    const p = buildMemberLeftPayload({ channel_id: "c1", user_id: "u2", role: "member", membership_version: 4, actor_kind: "user", actor_id: "u1" });
-    expect(p).toMatchObject({ channel_id: "c1", user_id: "u2", role: "member", membership_version: 4, actor_kind: "user", actor_id: "u1" });
+  it("member.left carries leave_source", () => {
+    const p = buildMemberLeftPayload({ channel_id: "c1", user_id: "u2", role: "member", membership_version: 4, actor_kind: "user", actor_id: "u1", leave_source: "removed" });
+    expect(p).toMatchObject({ leave_source: "removed" });
   });
 
   it("read_state.updated", () => {
@@ -50,16 +52,34 @@ describe("persisted payloads store actor refs, not UserSummary", () => {
     expect(p).toEqual({ channel_id: "c1", user_id: "u1", last_read_event_id: "01J" });
   });
 
-  it("system.notice persisted ref shape", () => {
-    const p = buildSystemNoticePayload({ notice_kind: "channel.dissolved", actor_kind: "user", actor_id: "u1", target_user_id: null, message_id: null, channel_changes: null });
-    expect(p).toMatchObject({ notice_kind: "channel.dissolved", actor_kind: "user", actor_id: "u1", target_user_id: null, message_id: null, channel_changes: null });
+  it("bot.installed persisted ref shape", () => {
+    const p = buildBotInstalledPayload({ channel_id: "c1", bot_id: "b1", actor_kind: "user", actor_id: "u1" });
+    expect(p).toMatchObject({ channel_id: "c1", bot_id: "b1", actor_kind: "user", actor_id: "u1" });
     expect(JSON.stringify(p)).not.toContain("display_name");
+  });
+
+  it("bot.updated carries status changes", () => {
+    const p = buildBotUpdatedPayload({
+      channel_id: "c1", bot_id: "b1", status: "removed",
+      changes: { status: { before: "active", after: "removed" } },
+      actor_kind: "user", actor_id: "u1",
+    });
+    expect((p as any).changes).toEqual({ status: { before: "active", after: "removed" } });
+  });
+
+  it("command.binding_updated carries binding_changes", () => {
+    const p = buildCommandBindingUpdatedPayload({
+      channel_id: "c1", bot_id: "b1", bot_command_id: "cmd1",
+      binding_changes: { enabled: { before: "disabled", after: "enabled" } },
+      actor_kind: "user", actor_id: "u1",
+    });
+    expect((p as any).binding_changes).toEqual({ enabled: { before: "disabled", after: "enabled" } });
   });
 });
 
 describe("resolveActorForLiveBroadcast", () => {
-  it("replaces actor_id with a resolved actor UserSummary", async () => {
-    const persisted = buildSystemNoticePayload({ notice_kind: "member.joined", actor_kind: "user", actor_id: "u1", target_user_id: "u2", message_id: null, channel_changes: null });
+  it("replaces actor_id and user_id with resolved UserSummary fields", async () => {
+    const persisted = buildMemberJoinedPayload({ channel_id: "c1", user_id: "u2", role: "member", membership_version: 1, actor_kind: "user", actor_id: "u1" });
     const live = await resolveActorForLiveBroadcast(
       persisted,
       async () => new Map([[
@@ -71,17 +91,17 @@ describe("resolveActorForLiveBroadcast", () => {
       ]]),
     );
     expect((live as any).actor).toEqual({ user_id: "u1", display_name: "Alice", avatar_url: null });
-    expect((live as any).target_user).toEqual({ user_id: "u2", display_name: "Bob", avatar_url: "https://x/b.png" });
+    expect((live as any).user).toEqual({ user_id: "u2", display_name: "Bob", avatar_url: "https://x/b.png" });
     expect(live).not.toHaveProperty("actor_id");
-    expect(live).not.toHaveProperty("target_user_id");
+    expect(live).not.toHaveProperty("user_id");
   });
 
   it("system actor has actor=null and no resolution", async () => {
-    const persisted = buildSystemNoticePayload({ notice_kind: "member.joined", actor_kind: "system", actor_id: "system", target_user_id: null, message_id: null, channel_changes: null });
+    const persisted = buildMemberJoinedPayload({ channel_id: "c1", user_id: "u2", role: "member", membership_version: 1, actor_kind: "system", actor_id: "system" });
     const called: string[] = [];
     const live = await resolveActorForLiveBroadcast(persisted, async (ids) => { called.push(...ids); return new Map(); });
     expect((live as any).actor).toBe(null);
-    expect(called).toEqual([]); // system actor does not trigger resolution
+    expect(called).toEqual(["u2"]);
   });
 
   it("falls back to user-<shortid> when actor not in pg", async () => {
@@ -92,19 +112,21 @@ describe("resolveActorForLiveBroadcast", () => {
 });
 
 describe("resolveActorWithMap (sync, prod path)", () => {
-  it("resolves actor + target_user from a pre-resolved map", () => {
-    const persisted = buildSystemNoticePayload({ notice_kind: "member.role_updated", actor_kind: "user", actor_id: "u1", target_user_id: "u2", message_id: null, channel_changes: null });
+  it("resolves actor + user from a pre-resolved map", () => {
+    const persisted = buildMemberRoleUpdatedPayload({ channel_id: "c1", user_id: "u2", before_role: "member", after_role: "admin", membership_version: 1, actor_kind: "user", actor_id: "u1" });
     const map = new Map([["u1", { user_id: "u1", display_name: "Alice", avatar_url: null }], ["u2", { user_id: "u2", display_name: "Bob", avatar_url: null }]]);
     const live = resolveActorWithMap(persisted, map);
     expect((live as any).actor).toEqual({ user_id: "u1", display_name: "Alice", avatar_url: null });
-    expect((live as any).target_user).toEqual({ user_id: "u2", display_name: "Bob", avatar_url: null });
+    expect((live as any).user).toEqual({ user_id: "u2", display_name: "Bob", avatar_url: null });
     expect(live).not.toHaveProperty("actor_id");
+    expect(live).not.toHaveProperty("user_id");
   });
 
-  it("system actor → actor:null, no map lookup needed", () => {
+  it("system actor → actor:null, subject user still resolved", () => {
     const persisted = buildMemberJoinedPayload({ channel_id: "c1", user_id: "u2", role: "member", membership_version: 1, actor_kind: "system", actor_id: "system" });
-    const live = resolveActorWithMap(persisted, new Map());
+    const map = new Map([["u2", { user_id: "u2", display_name: "Bob", avatar_url: null }]]);
+    const live = resolveActorWithMap(persisted, map);
     expect((live as any).actor).toBe(null);
-    expect((live as any).target_user).toBe(null);
+    expect((live as any).user).toEqual({ user_id: "u2", display_name: "Bob", avatar_url: null });
   });
 });
