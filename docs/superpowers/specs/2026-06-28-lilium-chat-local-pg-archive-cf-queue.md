@@ -178,6 +178,24 @@ If an archive record exceeds 120 KiB, `appendArchiveRecordSync` must throw befor
 
 Do not split one business transaction into multiple archive records in the first implementation.
 
+### 2.6 Queue message retention (operational, Plan B)
+
+Cloudflare Queues message retention is an **operational constraint**, not a
+source-DO recovery mechanism. Maximum configurable retention is **14 days**;
+messages older than the configured window are deleted.
+
+Operator requirements:
+
+```text
+set lilium-chat-archive retention to the maximum acceptable local-daemon outage window (up to 14 days)
+document that planned daemon downtime must stay below configured retention
+do not implement source-DO requeue from status='queued' rows (see §4.7)
+```
+
+Recovery from daemon outage is: restore the daemon before retention expiry so it
+can pull pending Queue messages. There is no automatic backfill from
+`archive_outbox` rows already marked `queued`.
+
 ## 3. Source of truth and archive scope
 
 ### 3.1 Source DOs
@@ -459,7 +477,10 @@ BotRegistry:
 
 ### 4.6 Queue flush behavior
 
-`flushArchiveOutboxToQueue(ctx, env, options)`:
+`flushArchiveOutboxToQueue(ctx, queue, opts?)`:
+
+`queue` is `env.CHAT_ARCHIVE_QUEUE` at the DO call site; unit tests pass a fake
+`Queue<ArchiveRecord>` for the same signature.
 
 Query:
 
@@ -497,19 +518,45 @@ records.map((record) => ({ body: record, contentType: "json" }))
 
 Use Cloudflare Queue message body as the parsed ArchiveRecord object, not a string, if supported by current Worker Queue API. Otherwise send canonical JSON string. The local daemon must accept both object and JSON-string body formats.
 
-### 4.7 Source outbox retention
+### 4.7 Source outbox status semantics and Queue retention
 
-Do not delete source archive_outbox immediately.
-
-Recommended retention:
+Do not delete source `archive_outbox` rows automatically. Each row's `status`
+has a fixed meaning:
 
 ```text
-queued rows may be compacted after 7 days
-failed rows are never auto-deleted
-pending rows are never deleted
+pending  — not yet durably accepted by Cloudflare Queue; source DO alarm must retry flush
+queued   — Queue has durably accepted the message; row kept for audit / manual inspection only
+failed   — producer-side deterministic failure (e.g. ARCHIVE_RECORD_TOO_LARGE, max_attempts exhausted)
 ```
 
-Compaction is optional for this implementation. If implemented, it must only delete `status='queued'` rows older than retention.
+**`queued` does not bear recovery responsibility.** Once a row is `queued`, the
+source DO's job is done. Do **not** implement automatic requeue from `queued`
+rows back into the Queue. `payload_json` on `queued` rows is not a durable
+recovery source for daemon/Queue outages.
+
+**Queue retention is an operational constraint.** Cloudflare Queues message
+retention is configurable up to **14 days**; messages older than the configured
+retention are deleted. Operators must:
+
+```text
+configure lilium-chat-archive retention to the maximum acceptable daemon-downtime window (up to 14 days)
+ensure local daemon maximum planned outage < configured Queue retention
+monitor daemon health and Queue depth; recovery is bring daemon back before retention expiry
+```
+
+If daemon downtime exceeds Queue retention, messages are **lost** from the Queue
+even though source rows remain `status='queued'`. That gap is accepted under
+Plan B — prevention is operational (retention sizing + daemon uptime), not
+source-DO requeue. PG `chat_archive_records` is authoritative only for messages
+the daemon already pulled and committed.
+
+Retention policy for source rows:
+
+```text
+pending rows: never auto-deleted
+queued rows: never auto-deleted (audit); no auto-compact in first implementation
+failed rows: never auto-deleted
+```
 
 ## 5. Archive payload construction rules
 
@@ -624,10 +671,17 @@ Required paths include:
 /internal/bot-install
 /internal/bot-install-update
 /internal/command-binding-update
-/internal/command-invoke
-/internal/interaction-submit
+/internal/command-invoke          — required when route exists (not implemented today)
+/internal/interaction-submit      — required when route exists (not implemented today)
 bot effect application paths that create/update messages or interactions
 ```
+
+`/internal/command-invoke` and `/internal/interaction-submit` are **not**
+implemented as ChatChannel routes today (`UserConnection` returns unsupported).
+Archive instrumentation for these paths is required **when the routes land**;
+until then they are drift TODO/allowlist items and must not block Phase A/B
+archive delivery. Do not fail integration or acceptance gates on missing
+non-archive product features.
 
 For each mutation, append the archive record in the same SQLite transaction as the canonical business rows.
 
@@ -1089,7 +1143,7 @@ CF_QUEUE_ID=<queue id>
 CF_QUEUES_TOKEN=<api token with queues read/write>
 DATABASE_URL=postgres://...
 QUEUE_PULL_BATCH_SIZE=100
-QUEUE_VISIBILITY_TIMEOUT_MS=600000
+QUEUE_VISIBILITY_TIMEOUT_MS=600000   # maps to pull body field visibility_timeout (ms)
 POLL_INTERVAL_MS=1000
 MAX_DRAIN_RECORDS_PER_SOURCE=1000
 ```
@@ -1102,14 +1156,27 @@ The daemon must call:
 POST https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/queues/${CF_QUEUE_ID}/messages/pull
 ```
 
-Body:
+Body (field names per Cloudflare pull consumer API — use `visibility_timeout`, not
+`visibility_timeout_ms`):
 
 ```json
 {
-  "visibility_timeout_ms": 600000,
+  "visibility_timeout": 600000,
   "batch_size": 100
 }
 ```
+
+Daemon construction:
+
+```ts
+const body = {
+  visibility_timeout: Number(process.env.QUEUE_VISIBILITY_TIMEOUT_MS ?? 600000),
+  batch_size: Number(process.env.QUEUE_PULL_BATCH_SIZE ?? 100),
+};
+```
+
+`visibility_timeout` is the HTTP JSON field name. `QUEUE_VISIBILITY_TIMEOUT_MS`
+is the local env var name only.
 
 Headers:
 
@@ -1349,6 +1416,12 @@ chat business path unaffected
 source DO eventually marks archive_outbox queued once Queue accepted
 ```
 
+If downtime exceeds configured Cloudflare Queue message retention (max 14 days),
+Queue messages are **deleted** while source rows may remain `status='queued'`.
+There is no source-DO requeue recovery (§4.7 Plan B). Prevention: configure Queue
+retention to the max acceptable outage window and restore the daemon before
+retention expiry. Rows already in PG `chat_archive_records` are unaffected.
+
 ### 10.3 PG unavailable
 
 If PG is unavailable:
@@ -1488,12 +1561,17 @@ bot command sync
 bot install
 bot install update
 command binding update
-command invoke
-interaction submit
+command invoke                    — when /internal/command-invoke route exists
+interaction submit                — when /internal/interaction-submit route exists
 bot effect that updates/creates message
 ```
 
-After daemon drain/replay, assert normalized PG tables contain expected rows.
+Routes not yet implemented (command invoke, interaction submit) are excluded
+from the required integration matrix until the product routes land; archive
+drift tests use an explicit allowlist (see backend plan §6.1).
+
+After daemon drain/replay, assert normalized PG tables contain expected rows for
+each covered flow.
 
 ### 12.3 Resilience tests
 
@@ -1549,6 +1627,7 @@ Operator setup:
 
 ```bash
 npx wrangler queues create lilium-chat-archive
+# Configure message retention (dashboard or API) to max acceptable daemon-downtime window, up to 14 days
 npx wrangler queues consumer http add lilium-chat-archive
 wrangler deploy
 DATABASE_URL=... npm run archive:migrate
@@ -1576,6 +1655,7 @@ PG migration
 how ordered replay works
 how to inspect lag
 how to recover replay errors
+Queue retention operational constraint (§4.7): configure up to 14 days; no queued-row requeue
 what is intentionally not archived
 ```
 
@@ -1596,8 +1676,10 @@ Implementation is accepted only if all of the following are true:
 11. Queue out-of-order delivery is safe.
 12. PG replay failure is repairable from raw log.
 13. Runtime state is never archived.
-14. All listed business mutation paths are instrumented.
-15. Full integration flow drains into PG and normalized tables match expected business state.
+14. All listed business mutation paths that **exist in code** are instrumented;
+    `command-invoke` / `interaction-submit` are allowlisted TODOs until routes land.
+15. Full integration flow drains into PG and normalized tables match expected
+    business state for implemented mutation paths.
 16. Full test suite and typecheck pass.
 
 ## 16. Implementation checklist

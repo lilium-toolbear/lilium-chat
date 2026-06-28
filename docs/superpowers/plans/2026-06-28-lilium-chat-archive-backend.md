@@ -180,12 +180,9 @@ Transient Queue send failure after a valid-sized record is fine: row stays
 
 ### 0.9 Testability: flush helper takes the queue as a direct param
 
-`flushArchiveOutboxToQueue(ctx, queue, opts)` — the DO passes
-`this.env.CHAT_ARCHIVE_QUEUE`; unit tests pass a **fake queue** recording
-`sendBatch`/`send` calls. This avoids needing a miniflare queue consumer for
-unit tests and keeps the size/batch/backoff logic deterministic. (Slight,
-documented deviation from spec §4.6 signature `flushArchiveOutboxToQueue(ctx,
-env, options)` — `env` replaced by `queue` for testability; behavior identical.)
+`flushArchiveOutboxToQueue(ctx, queue, opts?)` — matches spec §4.6. The DO
+passes `this.env.CHAT_ARCHIVE_QUEUE`; unit tests pass a **fake queue** recording
+`sendBatch`/`send` calls.
 
 For the **integration** path (real miniflare queue), `wrangler.test.jsonc`
 declares the same producer binding; miniflare materializes a real `Queue`. We do
@@ -404,11 +401,15 @@ Per spec §2.4 / §13, document in the runbook:
 
 ```bash
 npx wrangler queues create lilium-chat-archive
+# Set message retention (dashboard/API) to max acceptable daemon-downtime window, up to 14 days (spec §2.6, Plan B)
 npx wrangler queues consumer http add lilium-chat-archive   # HTTP pull — operator step only
 ```
 
 Cloudflare no longer supports enabling HTTP pull consumers through Wrangler
 config files; the CLI/dashboard step is required.
+
+**Queue retention (Plan B):** operational constraint only. No source-DO requeue
+from `queued` rows. See spec §4.7 for `pending` / `queued` / `failed` semantics.
 
 ---
 
@@ -565,8 +566,14 @@ Commit:
 - A backend runbook section covering:
   - **Wrangler split:** `queues.producers` in `wrangler.jsonc`; HTTP pull consumer
     **not** in wrangler config (operator CLI/dashboard only).
-  - Queue setup (`wrangler queues create` + `queues consumer http add`).
+  - Queue setup (`wrangler queues create` + retention up to 14 days + HTTP pull).
+  - Daemon pull body uses `visibility_timeout` (not `_ms`); env
+    `QUEUE_VISIBILITY_TIMEOUT_MS` maps to that field (spec §8.3).
   - Producer binding, source-DO → archive_outbox → Queue flow.
+  - **Queue retention (Plan B):** operational constraint only — configure
+    `lilium-chat-archive` retention up to 14 days; no source-DO requeue from
+    `queued` rows (spec §4.7). `pending` = must flush; `queued` = audit only;
+    `failed` = producer deterministic failure.
   - Why source-local outbox is required (§1.3), why no ArchiveRelay DO (§1.4).
   - How to inspect source lag (`SELECT count(*) FROM archive_outbox WHERE status='pending'`).
   - Optional `/internal/archive-outbox-pending` probe (test-gated).
