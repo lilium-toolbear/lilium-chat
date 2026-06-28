@@ -1,14 +1,26 @@
-# Lilium Chat — Local PG Archive (Backend) Implementation Plan
+# Lilium Chat — Local PG Archive (Backend Sub-Plan)
 
-> Scope: **chat backend only**. Covers spec §1–6, §11, and the backend-relevant
-> subset of §12 (tests) and §14 (docs). **Excludes** the local archiver daemon,
-> local PG schema/migration, raw-record insert, watermark drain, and table replay
-> handlers (spec §7–9, §13 daemon scripts, §12.2 integration-to-PG, and the
-> PG-side of §12.1/§12.3). Those are tracked separately as the "local daemon"
-> deliverable and consume the queue this plan produces.
+> **This is Phase A (backend sub-plan), not the full archive acceptance gate.**
+> Full one-shot implementation acceptance requires Phase B (local daemon + PG
+> replay) from the same spec. This plan delivers the Worker/DO producer path only;
+> Phase B is specified in spec §7–9, §12.2, §12.3 (PG-side), and §13 and must
+> ship in the same branch/PR series as Phase B before the archive feature is
+> considered complete.
+>
+> **Phase A scope (this plan):** spec §1–6, §11, backend-relevant §12.1/§12.3/
+> §12.4, §14 (backend runbook). Covers transactional `archive_outbox`, Queue
+> producer flush, mutation instrumentation, and backend unit/resilience/drift tests.
+>
+> **Phase B scope (not this plan's tasks, required for full acceptance):** local
+> archiver daemon (`scripts/archive-local/`), local PG schema/migration, raw-record
+> insert, watermark drain, table replay handlers, `archive:replay`, PG integration
+> tests (spec §12.2), and end-to-end drain-to-PG validation (spec §15 items 7–12,
+> 15).
 
 Reference spec: `docs/superpowers/specs/2026-06-28-lilium-chat-local-pg-archive-cf-queue.md`
-(authoritative when code and spec disagree, code changes).
+(authoritative for cross-phase contracts; when code and spec disagree, change code
+**or** update the spec in the same commit before implementation proceeds).
+The spec file must be committed alongside this plan (T1).
 
 ---
 
@@ -30,8 +42,9 @@ The existing `projection_outbox` flush (`ChatChannel.flushProjectionOutboxRows`,
 different size/batch rules (§2.5), a different status lifecycle
 (`pending` → `queued`/`failed`), and `max_attempts=20`. To avoid coupling the
 two retry/size policies, `archive_outbox` is a **separate table** with its own
-`DueTable` and its own flush function `flushArchiveOutboxToQueue`. Both tables
-share the same per-DO alarm via `scheduleNextAlarm`/`runDueJobs` (§0.4).
+flush function `flushArchiveOutboxToQueue` and archive-specific
+`bumpArchiveRetry`. Both tables share `scheduleNextAlarm` for earliest-due
+scheduling; archive flush is **not** routed through `runDueJobs` (§0.4).
 
 ### 0.3 `appendArchiveRecordSync` works in both `transactionSync` and `transaction`
 
@@ -61,50 +74,111 @@ any other bare-`sql.exec` bot app/token path must be wrapped the same way.
 
 ### 0.4 Alarm wiring without breaking existing behavior
 
-Each source DO's `alarm()` must run **both** the projection/cleanup due tables
-and the archive due table, then re-arm across all of them.
+**Do not register `archive_outbox` in `runDueJobs`.** `runDueJobs` executes an
+unbounded `SELECT * … ORDER BY due ASC` with no `LIMIT` (`scheduler.ts:47–52`).
+Archive backlog can be much larger than `projection_outbox`; loading all due rows
+into memory would destabilize DO alarms.
 
-- `ChatChannel.alarm()` (`chat-channel.ts:1453`): today calls
-  `runDueJobs(ctx, now, this.outboxDueTables(handler))` then
-  `scheduleOutboxAlarm(now)`. Extend `outboxDueTables()` to return
-  `[projection_outbox_due_table, archive_outbox_due_table]` — each `DueTable`
-  carries its **own** `handler` (projection → `flushProjectionOutboxRows`;
-  archive → `flushArchiveOutboxToQueue`). `scheduleNextAlarm` already picks the
-  earliest `MIN(dueColumn)` across the whole array, so one alarm covers both.
-  Archive flush failure must be caught per-row so it never prevents projection
-  retry scheduling (spec §4.5).
-- `UserDirectory.alarm()` (`user-directory.ts:1155`): keep the
-  `pending_attachments` expiry `DueTable`; add `archive_outbox` `DueTable`.
-  `schedulePendingAlarm` → generalize to consider both tables.
-- `DMDirectory`: **no alarm today**. Add `alarm()` + `scheduleArchiveAlarm()`
-  over `archive_outbox`.
+Pattern for every source DO:
+
+1. `runDueJobs` — existing due tables only (`projection_outbox`,
+   `pending_attachments`, …).
+2. `flushArchiveOutboxToQueue(ctx, queue, { limit: 100, now })` — **direct call**
+   from `alarm()`, not via `runDueJobs`. The flush helper owns its own bounded
+   `LIMIT` query.
+3. `scheduleNextAlarm(ctx, dueTables)` — dueTables array **includes**
+   `archive_outbox` (for `MIN(next_attempt_at)` scheduling only; no handler). One
+   alarm timestamp covers projection + archive + any other due tables.
+
+Archive flush failure must be caught so it never prevents projection retry
+scheduling (spec §4.5).
+
+Per-DO wiring:
+
+- `ChatChannel.alarm()` (`chat-channel.ts:1453`): keep
+  `runDueJobs(ctx, now, this.outboxDueTables(handler))` for `projection_outbox`
+  only; then `await flushArchiveOutboxToQueue(...)`; then `scheduleOutboxAlarm`
+  passing due tables `[projection_outbox, archive_outbox]`.
+- `UserDirectory.alarm()` (`user-directory.ts:1155`): keep
+  `pending_attachments` in `runDueJobs`; then archive flush; then
+  `scheduleNextAlarm` over `[pending_attachments, archive_outbox]`.
+- `DMDirectory`: **no alarm today**. Add `alarm()` that calls archive flush +
+  `scheduleNextAlarm` over `[archive_outbox]`.
 - `BotRegistry`: **no-op alarm today** (`bot-registry.ts:110`). Replace with
-  `runDueJobs` over `archive_outbox` + `scheduleNextAlarm`.
+  archive flush + `scheduleNextAlarm` over `[archive_outbox]`.
 
 ### 0.5 `archive_id` is deterministic, not a UUID
 
-Per spec §4.4: `archive_id = "${source_kind}:${source_key}:${source_seq}"` where
-`source_seq` comes from a **per-source-DO** `archive_seq` counter (a new table,
-separate from `event_seq`). `source_key` is the DO name (`channel_id` / `user_id`
-/ `pair_key` / `"registry"`). This is distinct from `event_id`/`monotonicUuidV7`
-— do not reuse `event_seq` or `nextEventId`.
+Per spec §4.4: `archive_id` is built from a **per-source-DO** `archive_seq`
+counter (separate from `event_seq`). `source_key` is the raw DO name
+(`channel_id` / `user_id` / `pair_key` / `"registry"`). Because `pair_key` is
+`${user_low}:${user_high}` (contains `:`), **never** build or parse `archive_id`
+with naive `split(":")`.
 
-### 0.6 `row_version` rule (spec §5.3)
+Encoding:
 
-- ChatChannel records that correspond to exactly one channel event: use that
-  `event_id` as `row_version` for every `change` in the record.
-- Multi-event or non-event ChatChannel changes, and all
-  UserDirectory/DMDirectory/BotRegistry changes: `row_version =
-  "source_seq:" + source_seq`.
+```ts
+archive_id = `${source_kind}:${base64url(source_key)}:${source_seq}`
+```
 
-### 0.7 Queue binding type & message body
+`base64url` = standard base64url without padding. `validateArchiveRecord`
+reconstructs the expected `archive_id` from `(source_kind, source_key, source_seq)`
+and compares for equality — do not parse `archive_id` by splitting on `:`.
 
-`ArchiveQueueMessage = ArchiveRecord` (the parsed object). Env:
-`CHAT_ARCHIVE_QUEUE: Queue<ArchiveRecord>`. Flush sends the **object** via
-`sendBatch` (Workers Queue API accepts objects; they're JSON-serialized
-internally). The daemon (out of scope) must accept both object and JSON-string.
+### 0.6 `row_version` rule (spec §5.3) — per change, not per record
 
-### 0.8 Testability: flush helper takes the queue as a direct param
+`row_version` is set **per `ArchiveChange`**, not once for the whole record.
+
+Rules:
+
+- `chat_events` changes: always use that change row's `event_id`.
+- All other tables in a **single-event** mutation: use that mutation's
+  `event_id`.
+- All other tables in a **multi-event** mutation (e.g. `create-channel` emits
+  both `channel.created` and `member.joined`): use
+  `source_seq:<n>` where `n` is the record's `source_seq`.
+- UserDirectory / DMDirectory / BotRegistry (no channel events): always
+  `source_seq:<n>`.
+
+Example — `create-channel`: `chat_events` upserts use their respective
+`event_id`s; `chat_channels` and `chat_channel_members` upserts use
+`source_seq:<n>`.
+
+Because `source_seq` is assigned inside `appendArchiveRecordSync`, callers pass
+`buildChanges(sourceSeq)` (§2.2) so `row_version` can reference the assigned seq.
+
+### 0.7 Queue binding type & `sendBatch` shape
+
+`ArchiveQueueMessage = ArchiveRecord`. Env:
+`CHAT_ARCHIVE_QUEUE: Queue<ArchiveRecord>`.
+
+`sendBatch` requires `MessageSendRequest[]`, not bare record objects:
+
+```ts
+const batch: MessageSendRequest<ArchiveRecord>[] = records.map((record) => ({
+  body: record,
+  contentType: "json",
+}));
+await queue.sendBatch(batch);
+```
+
+The daemon (Phase B) must accept both object and JSON-string bodies on pull.
+
+### 0.8 Oversized payload fails before business commit
+
+Queue single-message hard limit is 128 KiB; `sendBatch` is capped at 100 messages
+or 256 KiB total. Policy: target ≤ 96 KiB, hard reject > 120 KiB.
+
+**`appendArchiveRecordSync` must measure canonical payload byte length after
+building the record and before INSERT.** If `> 120 KiB`, throw
+`ARCHIVE_RECORD_TOO_LARGE` so the open business transaction rolls back. Never
+mark an `archive_outbox` row `failed` for size at flush time — by then the
+business txn has already committed and the archive fact would be lost forever.
+
+Transient Queue send failure after a valid-sized record is fine: row stays
+`pending` with backoff. Deterministic oversize is a business-path error.
+
+### 0.9 Testability: flush helper takes the queue as a direct param
 
 `flushArchiveOutboxToQueue(ctx, queue, opts)` — the DO passes
 `this.env.CHAT_ARCHIVE_QUEUE`; unit tests pass a **fake queue** recording
@@ -118,7 +192,7 @@ declares the same producer binding; miniflare materializes a real `Queue`. We do
 **not** add a `queue()` push-consumer handler to `src/index.ts` (spec §2.4
 forbids a prod push consumer, and we don't need one to test the producer side).
 
-### 0.9 Validation helper lives in the backend
+### 0.10 Validation helper lives in the backend
 
 Spec §9 puts message validation in the daemon. We additionally expose a pure
 `validateArchiveRecord(record)` in `src/archive/payload.ts` so backend unit
@@ -135,7 +209,7 @@ input).
 src/archive/payload.ts          # ArchiveRecord / ArchiveChange / ArchiveSourceKind types + validateArchiveRecord + canonicalStringify
 src/archive/hash.ts             # canonicalStringify (deterministic key order) + sha256Hex(payload) for size/dedup/log
 src/archive/source-outbox.ts    # appendArchiveRecordSync(ctx, input) — archive_seq bump + archive_outbox insert
-src/archive/queue-flush.ts      # flushArchiveOutboxToQueue(ctx, queue, opts) — sendBatch, size/batch limits, status transitions, backoff
+src/archive/queue-flush.ts      # flushArchiveOutboxToQueue + bumpArchiveRetry (archive-specific retry; do not use bumpQueueRetry)
 src/archive/source-key.ts       # sourceKeyFor(doName) helpers + ARCHIVE_TABLE_WHITELIST + RUNTIME_TABLE_BLACKLIST (for drift tests)
 docs/superpowers/specs/2026-06-28-lilium-chat-local-pg-archive-cf-queue.md  # the spec itself (commit it)
 docs/superpowers/plans/2026-06-28-lilium-chat-archive-backend.md             # this plan
@@ -160,12 +234,15 @@ Types exactly per spec §4.3 (`ArchiveSourceKind`, `ArchiveChange` union of
 - `ArchiveQueueMessage = ArchiveRecord` (re-exported for the Env type).
 - `canonicalStringify(record): string` (delegates to `hash.ts`).
 - `ARCHIVE_FORMAT = "lilium.chat.archive.record.v1"`.
+- `encodeArchiveId(sourceKind, sourceKey, sourceSeq): string` — builds
+  `${source_kind}:${base64url(source_key)}:${source_seq}` (§0.5).
 - `validateArchiveRecord(record): { ok: true } | { ok: false; error: string }`
-  implementing spec §9 rules: format, `archive_id` matches
-  `${source_kind}:${source_key}:${source_seq}`, `source_kind` in allowed set,
-  non-empty `source_key`, positive-int `source_seq`, valid `occurred_at`,
-  non-empty `changes`, every `table` in `ARCHIVE_TABLE_WHITELIST`, every `op` in
-  `{upsert,delete,replace_scope}`, required `pk`/`scope` present.
+  implementing spec §9 rules: format; `archive_id` equals
+  `encodeArchiveId(record.source_kind, record.source_key, record.source_seq)`
+  (never `split(":")` on `archive_id`); `source_kind` in allowed set; non-empty
+  `source_key`; positive-int `source_seq`; valid `occurred_at`; non-empty
+  `changes`; every `table` in `ARCHIVE_TABLE_WHITELIST`; every `op` in
+  `{upsert,delete,replace_scope}`; required `pk`/`scope` present.
 - `ARCHIVE_TABLE_WHITELIST`: the normalized target table names from spec §7.5
   (`chat_channels`, `chat_channel_members`, … `chat_interactions`). This is the
   single source of truth for "tables that may appear in a payload".
@@ -181,7 +258,7 @@ appendArchiveRecordSync(ctx: DurableObjectState, input: {
   sourceKey: string;
   occurredAt: string;            // ISO; also used as next_attempt_at
   businessEventIds: string[];     // event_ids touched by this mutation (may be [])
-  changes: ArchiveChange[];
+  buildChanges: (sourceSeq: number) => ArchiveChange[];
 }): { archive_id: string; source_seq: number }
 ```
 
@@ -189,15 +266,19 @@ Behavior (spec §4.4), all sync `ctx.storage.sql.exec`:
 1. `SELECT last_seq FROM archive_seq WHERE id=1` (the row is seeded by migration).
 2. `last_seq + 1` → `source_seq`.
 3. `UPDATE archive_seq SET last_seq=? WHERE id=1`.
-4. `archive_id = "${sourceKind}:${sourceKey}:${sourceSeq}"`.
-5. Build `ArchiveRecord` (`format`, `archive_id`, `source_kind`, `source_key`,
+4. `changes = input.buildChanges(source_seq)` — callers set per-change `row_version`
+   using `source_seq` or event ids per §0.6.
+5. `archive_id = encodeArchiveId(sourceKind, sourceKey, sourceSeq)`.
+6. Build `ArchiveRecord` (`format`, `archive_id`, `source_kind`, `source_key`,
    `source_seq`, `business_event_ids`, `occurred_at`, `changes`).
-6. `payload_json = canonicalStringify(record)`.
-7. `INSERT INTO archive_outbox (archive_id, source_kind, source_key, source_seq,
+7. `payload_json = canonicalStringify(record)`.
+8. **Size gate (§0.8):** `byteLength = new TextEncoder().encode(payload_json).byteLength`.
+   If `> 120 * 1024`, throw `ApiError` / `ARCHIVE_RECORD_TOO_LARGE` (rolls back
+   the open business transaction). Do not INSERT.
+9. `INSERT INTO archive_outbox (archive_id, source_kind, source_key, source_seq,
    payload_json, status='pending', attempts=0, max_attempts=20, last_error=NULL,
    next_attempt_at=occurredAt, created_at=occurredAt, updated_at=occurredAt)`.
-8. Return `{archive_id, source_seq}` (callers use `source_seq` for `row_version`
-   when not using an event_id).
+10. Return `{archive_id, source_seq}`.
 
 `UNIQUE(source_kind, source_key, source_seq)` guarantees no duplicate per source
 even under re-issue.
@@ -216,25 +297,31 @@ Behavior (spec §4.6, §2.5, §10.1):
 1. `SELECT archive_id, source_kind, source_key, source_seq, payload_json FROM
    archive_outbox WHERE status='pending' AND next_attempt_at<=? ORDER BY
    source_seq ASC LIMIT ?` (default 100).
-2. Build batches: ≤100 msgs/batch, target ≤240 KiB total canonical payload per
-   batch. When adding a message would exceed 240 KiB, flush the current batch
-   and start a new one.
-3. Per message: `byteLength = Buffer.byteLength(canonicalStringify(parsed))`
-   (use `TextEncoder` — Workers has no `Buffer`). If `> 120 KiB`:
-   - `UPDATE archive_outbox SET status='failed', last_error='ARCHIVE_RECORD_TOO_LARGE',
-     updated_at=? WHERE archive_id=?`, structured-log, continue. (Never call
-     `queue.send` with it.)
-4. `await queue.sendBatch(messages)` (object bodies).
+2. Parse each `payload_json` to `ArchiveRecord`. Rows that fail
+   `validateArchiveRecord` are marked `failed` with `last_error` describing the
+   validation error (defensive — should not happen for rows we built).
+3. Build batches from valid rows: ≤100 msgs/batch, target ≤240 KiB total
+   canonical payload per batch. When adding a message would exceed 240 KiB, flush
+   the current batch and start a new one.
+4. **No flush-time oversize handling** — oversize records cannot exist in
+   `archive_outbox` because `appendArchiveRecordSync` rejects them before commit
+   (§0.8).
+5. `await queue.sendBatch(batch)` where each entry is
+   `{ body: record, contentType: "json" }`.
    - On success: `UPDATE archive_outbox SET status='queued', updated_at=? WHERE
      archive_id IN (...)`. (Rows kept for local inspection; spec §4.7.)
-   - On failure: for each affected row, `bumpQueueRetry`-style: `attempts+1`,
-     `next_attempt_at = now + computeRetryBackoffMs(attempts)`, keep
-     `status='pending'`; if `attempts >= max_attempts` → `status='failed'`,
-     `last_error=<error>`.
-5. After flush: if any `status='pending'` rows remain, the caller (alarm) re-arms
-   via `scheduleNextAlarm`. Return counts.
+   - On failure: for each affected row, call `bumpArchiveRetry` (§below); keep
+     `status='pending'` until max attempts, then `status='failed'`.
+6. After flush: if any `status='pending'` rows remain, the caller (alarm)
+   re-arms via `scheduleNextAlarm`. Return counts.
 
-Reuses `computeRetryBackoffMs` from `src/do/retry-backoff.ts` (do not duplicate).
+**`bumpArchiveRetry`** (in `queue-flush.ts`, not `bumpQueueRetry` from
+`retry-backoff.ts`): reuses `computeRetryBackoffMs` only. On retryable failure:
+`attempts+1`, `next_attempt_at = now + backoff`, `status='pending'`. When
+`attempts >= max_attempts`: `status='failed'`, `last_error=<error>`. Do **not**
+write `status='dead_letter'` or `failed_at` — `archive_outbox` has neither
+column (`projection_outbox` uses `bumpQueueRetry` + `dead_letter`; archive does
+not).
 
 ---
 
@@ -306,52 +393,66 @@ typecheck`. (`worker-configuration.d.ts` is gitignored; CI regenerates.)
 ### 4.5 Operator steps (documented, not automated)
 
 Per spec §2.4 / §13, document in the runbook:
+
+**Wrangler config split (do not conflate producer and HTTP pull consumer):**
+
+- `queues.producers` → **in** `wrangler.jsonc` / `wrangler.test.jsonc` (Worker
+  sends to Queue).
+- HTTP pull consumer → **not** in `wrangler.jsonc`. Do not add `queues.consumers`
+  or legacy `type: "http_pull"` to wrangler config. Enable only via operator CLI
+  or dashboard.
+
 ```bash
 npx wrangler queues create lilium-chat-archive
-npx wrangler queues consumer http add lilium-chat-archive   # HTTP pull — operator step, not wrangler.jsonc
+npx wrangler queues consumer http add lilium-chat-archive   # HTTP pull — operator step only
 ```
-These are out of code scope but must appear in docs (§7 of this plan).
+
+Cloudflare no longer supports enabling HTTP pull consumers through Wrangler
+config files; the CLI/dashboard step is required.
 
 ---
 
 ## 5. Alarm wiring per source DO
 
+> **Reminder:** `archive_outbox` is for `scheduleNextAlarm` MIN scheduling only.
+> Archive flush is a direct `flushArchiveOutboxToQueue` call — never a
+> `runDueJobs` handler (§0.4).
+
 ### 5.1 ChatChannel (`src/do/chat-channel.ts`)
 
-- Extend `outboxDueTables()` (line 627) to return two `DueTable`s:
-  - `isoDueTable("projection_outbox", "next_attempt_at", "status", "pending", projectionHandler)`
-    (unchanged behavior).
-  - `isoDueTable("archive_outbox", "next_attempt_at", "status", "pending", async (rows) => {
-      await this.flushArchiveOutboxRows(rows); })`.
-- `alarm()` (line 1453) stays `runDueJobs(ctx, now, this.outboxDueTables(...))`
-  then `scheduleOutboxAlarm(now)` — now covers both tables.
-- Add `flushArchiveOutboxRows(rows)`: wraps `flushArchiveOutboxToQueue(this.ctx,
-  this.env.CHAT_ARCHIVE_QUEUE, {now})`, catches per-row errors so archive
-  failure never blocks projection retry (spec §4.5). After flush, call
-  `scheduleOutboxAlarm(now)` to re-arm if pending rows remain (the existing
-  re-arm already queries both tables via the shared due-table array).
+- `outboxDueTables()` (line 627) stays **projection_outbox only** for
+  `runDueJobs`.
+- `alarm()` (line 1453):
+  1. `await runDueJobs(ctx, now, this.outboxDueTables(projectionHandler))`
+  2. `await flushArchiveOutboxToQueue(this.ctx, this.env.CHAT_ARCHIVE_QUEUE, { now })`
+     — catch/log errors so archive failure never blocks projection retries.
+  3. `scheduleOutboxAlarm(now)` — pass due tables
+     `[projection_outbox, archive_outbox]` to `scheduleNextAlarm` (archive table
+     included for MIN due only).
+- Add `archiveOutboxDueTable(): DueTable` — table metadata for scheduling; no
+  flush handler attached.
 
 ### 5.2 UserDirectory (`src/do/user-directory.ts`)
 
-- `alarm()` (line 1155): keep `pending_attachments` expiry `DueTable`; append
-  `archive_outbox` `DueTable` with archive-flush handler.
-- Generalize `schedulePendingAlarm` (line 1149) → `scheduleAlarm` that passes
-  `[pendingAttachmentsDueTable, archiveDueTable]` to `scheduleNextAlarm`.
+- `alarm()` (line 1155):
+  1. `runDueJobs` for `pending_attachments` only.
+  2. `flushArchiveOutboxToQueue`.
+  3. `scheduleNextAlarm` over `[pending_attachments, archive_outbox]`.
+- Generalize `schedulePendingAlarm` (line 1149) → `scheduleAlarm` with both tables.
 
 ### 5.3 DMDirectory (`src/do/dm-directory.ts`)
 
-- Add `alarm()`: `runDueJobs(ctx, now, [archiveDueTable])` then
-  `scheduleNextAlarm(ctx, [archiveDueTable])`.
-- Add `scheduleArchiveAlarm()`; call it at the end of each dm mutation that
-  appends an archive row (so the alarm fires promptly rather than waiting for
-  the next external trigger).
+- Add `alarm()`:
+  1. `flushArchiveOutboxToQueue`.
+  2. `scheduleNextAlarm(ctx, [archive_outbox])`.
+- Add `scheduleArchiveAlarm()`; call at end of dm mutations that append archive rows.
 
 ### 5.4 BotRegistry (`src/do/bot-registry.ts`)
 
-- Replace no-op `alarm()` (line 110) with `runDueJobs` over `archive_outbox` +
-  `scheduleNextAlarm`.
-- Add `scheduleArchiveAlarm()`; call after commands-sync / seed-official-bot /
-  token mutations.
+- Replace no-op `alarm()` (line 110):
+  1. `flushArchiveOutboxToQueue`.
+  2. `scheduleNextAlarm(ctx, [archive_outbox])`.
+- Add `scheduleArchiveAlarm()`; call after commands-sync / seed-official-bot / token mutations.
 
 > For all four DOs: after appending an archive row inside a mutation txn, call
 > the DO's `scheduleArchiveAlarm(now)` (with `respectExistingAlarm: true`) so
@@ -361,11 +462,13 @@ These are out of code scope but must appear in docs (§7 of this plan).
 
 ## 6. Mutation instrumentation
 
-For **every** mutation below: build the `changes[]` array from the rows the txn
-just wrote (read them back or reuse the in-txn values), then call
-`appendArchiveRecordSync(ctx, { sourceKind, sourceKey, occurredAt, businessEventIds, changes })`
-**inside the same transaction**, then `scheduleArchiveAlarm`. One archive record
-per business transaction (spec §2.5: never split one txn into multiple records).
+For **every** mutation below: build `changes` via `buildChanges(sourceSeq)` (§2.2),
+then call `appendArchiveRecordSync(ctx, { sourceKind, sourceKey, occurredAt,
+businessEventIds, buildChanges })` **inside the same transaction**, then
+`scheduleArchiveAlarm`. One archive record per business transaction (spec §2.5:
+never split one txn into multiple records).
+
+`row_version` per change follows §0.6.
 
 `sourceKind` mapping: ChatChannel→`chat_channel`, UserDirectory→`user_directory`,
 DMDirectory→`dm_directory`, BotRegistry→`bot_registry`.
@@ -386,12 +489,14 @@ Tables → normalized archive table names (spec §3.2 / §7.5):
 `command_invocations→chat_command_invocations`, `interactions→chat_interactions`,
 `channel_bot_event_subscriptions→chat_channel_bot_event_subscriptions`.
 
-Per-mutation changes (spec §6.1). `row_version` = the mutation's `event_id`
-(single-event) unless noted:
+Per-mutation changes (spec §6.1). **`row_version` is per change (§0.6):**
+`chat_events` upserts use each row's `event_id`; all other tables in a
+single-event mutation use that mutation's `event_id`; multi-event mutations
+(e.g. create-channel) use `source_seq:<n>` for non-event tables.
 
 | Route (file:line) | Changes (table: op) |
 |---|---|
-| create-channel `channel-routes.ts:430` | chat_channels:upsert; chat_channel_members:upsert (creator+initial); chat_events:upsert (channel.created, member.joined) |
+| create-channel `channel-routes.ts:430` | chat_channels:upsert; chat_channel_members:upsert (creator+initial); chat_events:upsert (channel.created, member.joined) — **multi-event row_version** |
 | create-dm `channel-routes.ts:495` | chat_channels:upsert(kind=dm); chat_channel_members:upsert (both); chat_audit_logs:upsert(create_dm); chat_events:upsert(channel.created) |
 | update-channel `channel-routes.ts:622` | chat_channels:upsert; chat_events:upsert(channel.updated); chat_audit_logs:upsert if written |
 | dissolve-channel `membership-routes.ts:365` | chat_channels:upsert(status=dissolved); chat_channel_members:upsert if mutated; chat_events:upsert(channel.dissolved); chat_audit_logs:upsert if written |
@@ -426,7 +531,7 @@ include normalized changes for all relevant tables — do **not** rely on
 
 | Route (file:line) | Changes |
 |---|---|
-| attachment-finalize `user-directory.ts:951` | chat_attachments:upsert — **only when finalized or already-finalized and a canonical finalized row is returned**. Columns: attachment_id, owner_user_id, kind, filename, mime_type, size_bytes, width, height, blurhash, storage_key, url, status, created_at (matches `AttachmentRow` in `src/chat/attachment-projection.ts:3`). `row_version=source_seq:<n>`. |
+| attachment-finalize `user-directory.ts:951` | chat_attachments:upsert — **only when finalized or already-finalized and a canonical finalized row is returned**. Columns: attachment_id, owner_user_id, kind, filename, mime_type, size_bytes, width, height, blurhash, storage_key, url, status, created_at (matches `AttachmentRow` in `src/chat/attachment-projection.ts:3`). |
 | sticker-save `user-directory.ts:484` | chat_personal_stickers:upsert. If restoring a soft-deleted sticker, `deleted_at=null` in `after`. |
 | sticker-delete `user-directory.ts:722` | chat_personal_stickers:upsert with `deleted_at` set (soft delete). |
 
@@ -456,17 +561,17 @@ inside it (§0.3).
 ## 7. Docs (spec §14)
 
 Commit:
-- `docs/superpowers/specs/2026-06-28-lilium-chat-local-pg-archive-cf-queue.md` (the spec itself).
-- A backend runbook section covering: queue setup (`wrangler queues create` +
-  `queues consumer http add` as operator steps), producer binding, the
-  source-DO → archive_outbox → Queue flow, why source-local outbox is required
-  (§1.3), why no ArchiveRelay DO (§1.4), how to inspect source lag
-  (`SELECT count(*) FROM archive_outbox WHERE status='pending'` per DO via the
-  existing `/internal/outbox-pending`-style probe — add an
-  `/internal/archive-outbox-pending` probe gated by
-  `ALLOW_INTERNAL_TEST_ROUTES` + `X-Test-Only` if a runtime inspection path is
-  wanted; otherwise document the SQL). Note explicitly what is **not** archived
-  (spec §3.6) and that the local daemon + PG schema are a separate deliverable.
+- `docs/superpowers/specs/2026-06-28-lilium-chat-local-pg-archive-cf-queue.md` (the spec itself — must exist in repo before implementation).
+- A backend runbook section covering:
+  - **Wrangler split:** `queues.producers` in `wrangler.jsonc`; HTTP pull consumer
+    **not** in wrangler config (operator CLI/dashboard only).
+  - Queue setup (`wrangler queues create` + `queues consumer http add`).
+  - Producer binding, source-DO → archive_outbox → Queue flow.
+  - Why source-local outbox is required (§1.3), why no ArchiveRelay DO (§1.4).
+  - How to inspect source lag (`SELECT count(*) FROM archive_outbox WHERE status='pending'`).
+  - Optional `/internal/archive-outbox-pending` probe (test-gated).
+  - What is **not** archived (spec §3.6).
+  - Phase B (local daemon + PG) is required for full feature acceptance.
 
 ---
 
@@ -484,17 +589,20 @@ New files under `test/archive/`:
   rejected. `canonicalStringify` is stable across key reordering.
 - `source-outbox.test.ts` — `appendArchiveRecordSync`:
   - `archive_seq` increments monotonically across calls in the same DO.
-  - `archive_id` is deterministic `${source_kind}:${source_key}:${source_seq}`.
+  - `archive_id` is deterministic via `encodeArchiveId` (base64url `source_key`).
+  - `buildChanges(sourceSeq)` receives the assigned seq before insert.
+  - Payload `> 120 KiB` throws before INSERT; business txn rolls back (no
+    `archive_outbox` row).
   - Appending inside `ctx.storage.transactionSync` is atomic with business rows
     (write business row + append in one txn, rollback on simulated failure → no
     archive row).
   - `UNIQUE(source_kind, source_key, source_seq)` holds.
 - `queue-flush.test.ts` — `flushArchiveOutboxToQueue` with a **fake queue**:
-  - pending rows → `sendBatch` called; rows marked `queued`.
+  - pending rows → `sendBatch` called with `{ body, contentType: "json" }[]`;
+    rows marked `queued`.
   - `sendBatch` throws → rows stay `pending`, `attempts+1`,
-    `next_attempt_at` backoff set; `attempts>=max_attempts` → `failed`.
-  - single message `>120 KiB` → row marked `failed` with
-    `ARCHIVE_RECORD_TOO_LARGE`, never sent; other rows still flush.
+    `next_attempt_at` backoff set via `bumpArchiveRetry`; `attempts>=max_attempts`
+    → `status='failed'` (not `dead_letter`).
   - `sendBatch` never exceeds 100 messages.
   - `sendBatch` total payload ≤ 240 KiB target (split into multiple batches).
   - default limit 100.
@@ -522,11 +630,15 @@ New files under `test/archive/`:
   invokes `appendArchiveRecordSync` (grep/static check), so an un-instrumented
   new route fails CI.
 
-### 8.4 Out of scope (tracked for the local-daemon deliverable)
+### 8.4 Phase B (local daemon + PG) — out of this plan, required for full acceptance
 
-PG raw insert idempotency, watermark init, ordered drain, out-of-order replay,
-upsert/replace_scope source_seq guards, duplicate-delivery-into-PG, the full
-drain-to-PG integration flow (spec §12.2), and `archive:replay` (spec §8.7).
+Tracked in spec §7–9, §12.2, §13, §15 (items 7–12, 15). Phase A must not block
+on Phase B, but **the archive feature is not shippable until Phase B lands** in
+the same implementation series:
+
+- PG raw insert idempotency, watermark init, ordered drain, out-of-order replay
+- upsert/replace_scope `source_seq` guards, duplicate-delivery-into-PG
+- drain-to-PG integration flow (spec §12.2), `archive:replay` (spec §8.7)
 
 ---
 
@@ -539,22 +651,22 @@ vitest command.
 [ ] T1  Commit the spec doc (docs/superpowers/specs/2026-06-28-...md) + this plan.
 [ ] T2  Add queues.producers CHAT_ARCHIVE_QUEUE to wrangler.jsonc + wrangler.test.jsonc.
 [ ] T3  npm run cf-typegen; augment src/env.ts to type CHAT_ARCHIVE_QUEUE: Queue<ArchiveRecord>.
-[ ] T4  src/archive/payload.ts (types, ARCHIVE_TABLE_WHITELIST, RUNTIME_TABLE_BLACKLIST, validateArchiveRecord, canonicalStringify) + src/archive/hash.ts.
-[ ] T5  src/archive/source-outbox.ts (appendArchiveRecordSync) + unit tests (T8.1 source-outbox).
-[ ] T6  src/archive/queue-flush.ts (flushArchiveOutboxToQueue) + unit tests (T8.1 queue-flush, fake queue).
+[ ] T4  src/archive/payload.ts (types, encodeArchiveId, ARCHIVE_TABLE_WHITELIST, RUNTIME_TABLE_BLACKLIST, validateArchiveRecord) + src/archive/hash.ts.
+[ ] T5  src/archive/source-outbox.ts (appendArchiveRecordSync with buildChanges + commit-time size gate) + unit tests.
+[ ] T6  src/archive/queue-flush.ts (flushArchiveOutboxToQueue, bumpArchiveRetry, sendBatch [{body,contentType}]) + unit tests.
 [ ] T7  Add archive_seq/archive_outbox migration to ChatChannel (ver 2026062803).
 [ ] T8  Add same migration to UserDirectory (2026062803), DMDirectory (2), BotRegistry (3).
-[ ] T9  ChatChannel: extend outboxDueTables + alarm with archive DueTable; add flushArchiveOutboxRows.
-[ ] T10 UserDirectory: extend alarm + scheduleAlarm with archive DueTable.
-[ ] T11 DMDirectory: add alarm + scheduleArchiveAlarm; call after dm mutations.
-[ ] T12 BotRegistry: replace no-op alarm; wrap seed-official-bot in transactionSync; call scheduleArchiveAlarm.
+[ ] T9  ChatChannel: alarm calls flushArchiveOutboxToQueue directly (not runDueJobs); scheduleNextAlarm includes archive_outbox for MIN due only.
+[ ] T10 UserDirectory: same pattern — runDueJobs for pending_attachments only; direct archive flush; schedule both tables.
+[ ] T11 DMDirectory: add alarm (direct archive flush + scheduleNextAlarm); scheduleArchiveAlarm after dm mutations.
+[ ] T12 BotRegistry: replace no-op alarm with direct archive flush + scheduleNextAlarm; wrap seed-official-bot in transactionSync.
 [ ] T13 Instrument ChatChannel mutations (§6.1 table) — message/channel/membership routes first, then bot routes.
 [ ] T14 Instrument UserDirectory attachment-finalize / sticker-save / sticker-delete (§6.2).
 [ ] T15 Instrument DMDirectory get-or-create-dm / complete-dm (§6.3).
 [ ] T16 Instrument BotRegistry commands-sync / seed-official-bot / token paths (§6.4).
 [ ] T17 Resilience tests (§8.2): queue-failure-isolates-business, duplicate append, runtime-tables-not-archived.
 [ ] T18 Drift/static tests (§8.3): whitelist/blacklist disjoint, per-DO table coverage, route-instrumentation grep.
-[ ] T19 Backend runbook doc (§7): queue setup, flow, lag inspection, exclusions, daemon-is-separate.
+[ ] T19 Backend runbook doc (§7): wrangler producer vs HTTP-pull split, queue setup, flow, lag inspection, Phase B note.
 [ ] T20 Final typecheck + full vitest run (load-adjusted); verify no ArchiveRelay DO exists; verify no queue push consumer configured.
 ```
 
@@ -564,31 +676,37 @@ T17/T18 last (they assert over instrumented code).
 
 ---
 
-## 10. Acceptance criteria (backend subset of spec §15)
+## 10. Acceptance criteria (Phase A — backend subset of spec §15)
 
-Backend is accepted only if all of:
+Phase A (this plan) is accepted when all of:
 
 1. No `ArchiveRelay` DO exists (grep confirms none).
 2. `CHAT_ARCHIVE_QUEUE` producer binding present in `wrangler.jsonc` +
-   `wrangler.test.jsonc`.
-3. HTTP pull consumer enablement is **documented** (operator step, §7).
-4. All 4 source DOs write `archive_outbox` in the same SQLite transaction as
-   business rows (verified by T5 atomicity test + per-mutation instrumentation).
-5. All 4 source DO alarms flush `archive_outbox` to the Queue.
-6. Business writes do not synchronously depend on the Queue (flush is
-   alarm-driven; `sendBatch` failure leaves rows `pending` and the mutation
-   already returned success).
-7. Flush respects 100-msg and 240 KiB batch limits and 120 KiB hard-fail.
-8. Runtime state (§3.6) never appears in a payload (drift + resilience tests).
-9. Every listed mutation path in §6.1–§6.4 is instrumented (route-instrumentation
-   static test) — `command-invoke` / `interaction-submit` flagged as
-   not-yet-implemented routes are documented TODOs, not blockers.
-10. `npm run typecheck` passes.
-11. Full vitest suite (load-adjusted) passes — no new false timeouts introduced
-    by the alarm wiring.
+   `wrangler.test.jsonc`. No `queues.consumers` or HTTP pull in wrangler config.
+3. HTTP pull consumer enablement documented as operator CLI step (§4.5, §7).
+4. Spec file committed at
+   `docs/superpowers/specs/2026-06-28-lilium-chat-local-pg-archive-cf-queue.md`.
+5. All 4 source DOs write `archive_outbox` in the same SQLite transaction as
+   business rows (T5 atomicity test + per-mutation instrumentation).
+6. All 4 source DO alarms call `flushArchiveOutboxToQueue` directly (not via
+   unbounded `runDueJobs` SELECT).
+7. Business writes do not synchronously depend on the Queue.
+8. Oversized records (`> 120 KiB`) fail in `appendArchiveRecordSync` before
+   commit — no flush-time `ARCHIVE_RECORD_TOO_LARGE` → `failed` path.
+9. `sendBatch` uses `{ body, contentType: "json" }[]`; respects 100-msg and
+   240 KiB batch limits.
+10. `bumpArchiveRetry` uses `status='failed'` at max attempts (not `dead_letter`).
+11. `archive_id` uses `base64url(source_key)` encoding; validator reconstructs,
+    does not `split(":")`.
+12. `buildChanges(sourceSeq)` API used for all instrumentation.
+13. Runtime state (§3.6) never appears in a payload (drift + resilience tests).
+14. Every listed mutation path in §6.1–§6.4 is instrumented.
+15. `npm run typecheck` passes.
+16. Full vitest suite (load-adjusted) passes.
 
-(Local-daemon acceptance criteria — Queue pull, raw insert before ack, ordered
-replay, out-of-order safety, replay repair — are out of scope for this plan.)
+**Full archive feature acceptance** additionally requires Phase B (spec §15 items
+7–12, 15): local daemon HTTP pull, PG raw insert before ack, ordered replay,
+out-of-order safety, replay repair, and integration drain-to-PG.
 
 ---
 
@@ -613,5 +731,10 @@ replay, out-of-order safety, replay repair — are out of scope for this plan.)
   land**; until then they are documented TODOs and excluded from the route-
   instrumentation static test via an explicit allowlist.
 - **Canonical JSON byte length**: Workers lacks `Buffer`; use
-  `new TextEncoder().encode(str).byteLength` for size checks. Ensure
-  `canonicalStringify` is the exact bytes both stored and measured.
+  `new TextEncoder().encode(str).byteLength` for size checks in
+  `appendArchiveRecordSync` (commit-time gate, §0.8). Ensure `canonicalStringify`
+  is the exact bytes both stored and measured.
+- **Archive alarm backlog**: `archive_outbox` must never enter `runDueJobs`
+  (unbounded SELECT). Alarm calls `flushArchiveOutboxToQueue({ limit: 100 })`
+  directly; only `scheduleNextAlarm` reads `MIN(next_attempt_at)` from
+  `archive_outbox`.
