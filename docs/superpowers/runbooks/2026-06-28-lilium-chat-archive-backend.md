@@ -67,5 +67,19 @@ Source DO business txn
 Source DO alarm
   → flushArchiveOutboxToQueue → CHAT_ARCHIVE_QUEUE
 Local daemon (Phase B)
-  → HTTP pull → local PG → ack
+  → HTTP pull → chat.events (raw JSONB) → ack
 ```
+
+## Minimal raw daemon (chat.events)
+
+Stores each pulled Queue message body as-is in `chat.events` (schema `chat`).
+
+```bash
+# once: create table
+DATABASE_URL=postgres://... npm run archive:migrate
+
+# run (requires CF queue HTTP pull consumer + env below)
+CF_ACCOUNT_ID=... CF_QUEUE_ID=... CF_QUEUES_TOKEN=... DATABASE_URL=... npm run archive:daemon
+```
+
+Script: `scripts/archive-local/daemon.mjs`. Migration: `scripts/archive-local/migrations/001_chat_events_raw.sql`.

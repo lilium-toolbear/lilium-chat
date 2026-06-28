@@ -11,7 +11,9 @@
     "test": "vitest",
     "test:once": "vitest run",
     "typecheck": "tsc --noEmit",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "archive:daemon": "node ./scripts/archive-local/daemon.mjs",
+    "archive:migrate": "node ./scripts/archive-local/migrate.mjs"
   },
   "dependencies": {
     "aws4fetch": "^1.0.20",
