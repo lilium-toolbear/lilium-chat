@@ -41,6 +41,10 @@ interface LiveChannelLeaseRow {
 }
 
 const LEASE_TTL_MS = 10 * 60 * 1000;
+/** Matches browser `session.heartbeat` interval (see toolbear_ui useChatSocket). */
+const HEARTBEAT_INTERVAL_MS = 4 * 60 * 1000;
+/** Refresh lease TTL when expiry is within one heartbeat + safety margin. */
+const LEASE_REFRESH_LEAD_MS = HEARTBEAT_INTERVAL_MS + 60_000;
 
 interface LeaseSyncResult {
   active_count: number;
@@ -55,6 +59,20 @@ function nowIso(): string {
 
 function leaseExpiresAt(): string {
   return new Date(Date.now() + LEASE_TTL_MS).toISOString();
+}
+
+function leaseNeedsRefresh(
+  existing: LiveChannelLeaseRow | null,
+  targetMembershipVersion: number,
+  reopenClosed: boolean,
+): boolean {
+  if (!existing) return true;
+  if (existing.status === "closed") return reopenClosed;
+  if (existing.status !== "active") return true;
+  if (existing.membership_version < targetMembershipVersion) return true;
+  const remainingMs = Date.parse(existing.expires_at) - Date.now();
+  if (!Number.isFinite(remainingMs) || remainingMs <= LEASE_REFRESH_LEAD_MS) return true;
+  return false;
 }
 
 function responseError(code: string, message: string, retryable = false): SendError {
@@ -581,11 +599,17 @@ export class UserConnection extends DurableObject<Env> {
       const existing = this.getLeaseRow(sessionId, ch.channel_id);
       if (existing?.status === "closed" && !allowReopenClosed) continue;
 
+      const targetMembershipVersion = ch.membership_version ?? 0;
+      if (!leaseNeedsRefresh(existing, targetMembershipVersion, allowReopenClosed)) {
+        if (existing && existing.expires_at > latestExpires) latestExpires = existing.expires_at;
+        continue;
+      }
+
       const { lease_id: leaseId, expires_at: expiresAt } = await this.upsertLocalLease(
         sessionId,
         userId,
         ch.channel_id,
-        ch.membership_version ?? 0,
+        targetMembershipVersion,
         existing?.status === "closed",
       );
       if (expiresAt > latestExpires) latestExpires = expiresAt;
@@ -595,7 +619,7 @@ export class UserConnection extends DurableObject<Env> {
         leaseId,
         userId,
         sessionId,
-        ch.membership_version ?? 0,
+        targetMembershipVersion,
         expiresAt,
       );
       if (!ok) {
@@ -823,9 +847,11 @@ export class UserConnection extends DurableObject<Env> {
 
     try {
       ws.send(eventJson);
-      const att = ws.deserializeAttachment() as ConnectionAttachment | null;
-      if (att) {
-        ws.serializeAttachment({ ...att, last_deliver: eventJson });
+      if (this.env.ALLOW_INTERNAL_TEST_ROUTES === "1") {
+        const att = ws.deserializeAttachment() as ConnectionAttachment | null;
+        if (att) {
+          ws.serializeAttachment({ ...att, last_deliver: eventJson });
+        }
       }
       return { delivered: true };
     } catch {

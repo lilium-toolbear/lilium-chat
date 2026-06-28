@@ -427,6 +427,31 @@ describe("UserConnection /deliver membership gate", () => {
 });
 
 describe("UserConnection session.heartbeat membership", () => {
+  it("does not refresh fanout leases when TTL is still fresh", async () => {
+    const userId = "u-heartbeat-skip-upsert";
+    const { channelId } = await joinTestChannel(userId);
+    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+
+    const { ws } = await upgradeUserConnection(userId);
+    await liveStartAndAck(ws, "cmd-hb-skip-live-start");
+
+    const beforeDump = (await (await fanout.fetch(new Request("https://x/dump", {
+      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
+    }))).json()) as { leases: Array<{ updated_at: string }> };
+    expect(beforeDump.leases.length).toBeGreaterThan(0);
+    const updatedAtBefore = beforeDump.leases[0]?.updated_at ?? "";
+
+    sendHeartbeat(ws, "cmd-hb-skip");
+    const hbRaw = await nextAck(ws);
+    expect(JSON.parse(hbRaw).frame_type).toBe("command_ack");
+
+    const afterDump = (await (await fanout.fetch(new Request("https://x/dump", {
+      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
+    }))).json()) as { leases: Array<{ updated_at: string }> };
+    expect(afterDump.leases[0]?.updated_at).toBe(updatedAtBefore);
+    ws.close();
+  });
+
   it("closes stale leases after member leave and does not deliver later events", async () => {
     const userId = "u-heartbeat-member";
     const { channelStub, channelId } = await joinTestChannel(userId);
