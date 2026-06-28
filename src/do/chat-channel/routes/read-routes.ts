@@ -1,6 +1,7 @@
 import type { ChatChannelHost } from "../host";
 import { requireTestOnly } from "../../do-errors";
 import { buildChannelMetaProjectionForMember } from "../../../chat/channel-meta-projection";
+import { MEMBER_ROLE_ORDER_CASE, decodeMemberListCursor } from "../../../chat/member-list-order";
 import { buildReplayEventsResponse } from "../../../chat/replay-projection";
 import { buildTimelineHistoryResponse } from "../../../chat/timeline-history";
 import { resolveUserSummaries } from "../../../profile/resolve";
@@ -174,14 +175,36 @@ export async function dispatchReadRoutes(host: ChatChannelHost, request: Request
     // Must be an ACTIVE member (even dissolved channels require it — no leaking member lists to ex-members).
     const activeMember = userId ? (host.ctx.storage.sql.exec("SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", realMeta.channel_id, userId).toArray()[0] as { x: number } | undefined) : undefined;
     if (!activeMember) return new Response("forbidden", { status: 403 });
-    // Cursor is the last user_id of the previous page; members-list pages by joined_at ASC (tiebreak user_id).
-    const cursorUserId = url.searchParams.get("cursor") ?? "";
-    const rows = host.ctx.storage.sql.exec(
-      "SELECT user_id, role, joined_at FROM members WHERE channel_id=? AND left_at IS NULL AND user_id > ? ORDER BY user_id ASC LIMIT 101",
-      realMeta.channel_id, cursorUserId,
-    ).toArray() as Array<{ user_id: string; role: string; joined_at: string }>;
+    // Cursor is role_rank|joined_at|user_id from the previous page's last row.
+    const cursor = url.searchParams.get("cursor") ?? "";
+    const decodedCursor = decodeMemberListCursor(cursor);
+    const rows = decodedCursor
+      ? host.ctx.storage.sql.exec(
+        `SELECT user_id, role, joined_at FROM members WHERE channel_id=? AND left_at IS NULL AND (
+          (${MEMBER_ROLE_ORDER_CASE}) > ?
+          OR ((${MEMBER_ROLE_ORDER_CASE}) = ? AND joined_at > ?)
+          OR ((${MEMBER_ROLE_ORDER_CASE}) = ? AND joined_at = ? AND user_id > ?)
+        ) ORDER BY ${MEMBER_ROLE_ORDER_CASE} ASC, joined_at ASC, user_id ASC LIMIT 101`,
+        realMeta.channel_id,
+        decodedCursor.roleRank,
+        decodedCursor.roleRank,
+        decodedCursor.joined_at,
+        decodedCursor.roleRank,
+        decodedCursor.joined_at,
+        decodedCursor.user_id,
+      ).toArray()
+      : host.ctx.storage.sql.exec(
+        `SELECT user_id, role, joined_at FROM members WHERE channel_id=? AND left_at IS NULL ORDER BY ${MEMBER_ROLE_ORDER_CASE} ASC, joined_at ASC, user_id ASC LIMIT 101`,
+        realMeta.channel_id,
+      ).toArray();
     // Return raw active members (the Worker resolves UserSummaries + applies the query filter).
-    return Response.json({ items: rows.map((r) => ({ user_id: r.user_id, role: r.role, joined_at: r.joined_at })) });
+    return Response.json({
+      items: (rows as Array<{ user_id: string; role: string; joined_at: string }>).map((r) => ({
+        user_id: r.user_id,
+        role: r.role,
+        joined_at: r.joined_at,
+      })),
+    });
   }
 
   if (url.pathname === "/internal/members-get") {

@@ -403,6 +403,18 @@ describe("ChatChannel members read", () => {
     expect(items.some((m) => m.user_id === "u-ml-a")).toBe(true);
   });
 
+  it("members-list orders owner before admin before member", async () => {
+    const cid = "0196aaab-0000-7000-8000-000000000001";
+    const stub = await makeChannel(cid);
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-ml-2", channel_id: cid, user_id: "u-ml-a", role: "member" }) }));
+    await stub.fetch(new Request("https://x/internal/members-update-role", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-ml-3", channel_id: cid, user_id: "u-ml-a", role: "admin" }) }));
+    await stub.fetch(new Request("https://x/internal/members-add", { method: "POST", headers: { "X-Verified-User-Id": "u-up-owner", "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: "k-ml-4", channel_id: cid, user_id: "u-ml-b", role: "member" }) }));
+    const res = await stub.fetch(new Request("https://x/internal/members-list", { headers: { "X-Verified-User-Id": "u-up-owner" } }));
+    expect(res.status).toBe(200);
+    const items = ((await res.json()) as { items: Array<{ user_id: string; role: string }> }).items;
+    expect(items.map((member) => member.role)).toEqual(["owner", "admin", "member"]);
+  });
+
   it("members-get returns status active for a member", async () => {
     const cid = "0196bbbb-0000-7000-8000-000000000001";
     const stub = await makeChannel(cid);

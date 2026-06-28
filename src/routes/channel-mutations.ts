@@ -7,6 +7,7 @@ import type {
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import type { ChannelSummaryFromDo } from "../chat/channel-summary";
+import { compareMemberListRows, encodeMemberListCursor } from "../chat/member-list-order";
 import { fallbackUserDisplayName } from "../contract/primitives";
 import { resolveUserSummaries } from "../profile/resolve";
 import { getIdentity, requireIdempotencyKey } from "./auth";
@@ -79,6 +80,10 @@ export async function updateChannelHandler(c: Context<{ Bindings: Env; Variables
   }
   if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to update channel");
   if (res.status === 404) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  if (res.status === 415) {
+    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
+    throw new ApiError(e.error?.code ?? "UNSUPPORTED_ATTACHMENT_TYPE", e.error?.message ?? "unsupported avatar attachment", { httpStatus: 415 });
+  }
   if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "channel update failed");
   const out = await res.json() as { channel: ChannelMetaProjection };
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
@@ -191,12 +196,25 @@ export async function listMembersHandler(c: Context<{ Bindings: Env; Variables: 
   if (query === "") {
     const hasMore = resolved.length > limit;
     const page = resolved.slice(0, limit);
-    const nextCursor = hasMore ? page[page.length - 1]?.user.user_id ?? null : null;
+    const last = page[page.length - 1];
+    const nextCursor = hasMore && last
+      ? encodeMemberListCursor({ user_id: last.user.user_id, role: last.role, joined_at: last.joined_at })
+      : null;
     return c.json({ items: page, next_cursor: nextCursor }, 200, { "X-Request-Id": c.get("requestId") });
   }
   // WITH a query filter: filter the page, no stable continuation cursor (Phase 3 member-list query
   // is a typeahead aid, not a paged search). Clients re-fetch with a refined query.
-  const filtered = resolved.filter((m) => (m.user.display_name ?? "").toLowerCase().startsWith(query) || m.user.user_id.toLowerCase().startsWith(query));
+  const filtered = resolved
+    .filter((m) => (m.user.display_name ?? "").toLowerCase().startsWith(query) || m.user.user_id.toLowerCase().startsWith(query))
+    .sort((left, right) => compareMemberListRows({
+      user_id: left.user.user_id,
+      role: left.role,
+      joined_at: left.joined_at,
+    }, {
+      user_id: right.user.user_id,
+      role: right.role,
+      joined_at: right.joined_at,
+    }));
   return c.json({ items: filtered.slice(0, limit), next_cursor: null }, 200, { "X-Request-Id": c.get("requestId") });
 }
 
