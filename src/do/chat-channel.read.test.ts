@@ -20,12 +20,14 @@ describe("ChatChannel read endpoints", () => {
     expect(body.last_event_id).not.toBeNull();
   });
 
-  it("messages pagination returns empty for fresh channel", async () => {
+  it("messages pagination returns domain setup events but no messages for fresh channel", async () => {
     const userId = "u-read-2";
     const { stub } = await setupChannel(userId);
     const res = await stub.fetch(new Request("https://x/internal/messages?limit=50", { headers: { "X-Verified-User-Id": userId } }));
-    const body = await res.json() as { items: unknown[]; next_cursor: string | null };
-    expect(body.items).toEqual([]);
+    const body = await res.json() as { items: Array<{ type: string }>; next_cursor: string | null };
+    expect(body.items.some((item) => item.type === "channel.created")).toBe(true);
+    expect(body.items.some((item) => item.type === "member.joined")).toBe(true);
+    expect(body.items.some((item) => item.type === "message.created")).toBe(false);
     expect(body.next_cursor).toBeNull();
   });
 

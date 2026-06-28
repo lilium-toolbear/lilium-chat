@@ -223,7 +223,6 @@ describe("UserDirectory attachment presign + finalize", () => {
     await runInDurableObject(stub, async (instance: unknown) => {
       const sql = (instance as { ctx: { storage: { sql: { exec: (query: string, ...params: unknown[]) => void } } } }).ctx.storage.sql;
       sql.exec("UPDATE pending_attachments SET expires_at=? WHERE attachment_id=?", "2000-01-01T00:00:00.000Z", presignBody.attachment_id);
-      await (instance as { schedulePendingAlarm: () => void }).schedulePendingAlarm();
     });
 
     await runDurableObjectAlarm(stub);

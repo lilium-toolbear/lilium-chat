@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
 
-import { getNamedDo, fakeS3PublicPath } from "../helpers";
+import { getNamedDo, fakeS3PublicPath, findTimelineMessageCreated, type TimelineHistoryItem } from "../helpers";
 import { setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
 
@@ -154,7 +154,7 @@ describe("ChatChannel message lifecycle", () => {
     expect(body.message.recalled_at).not.toBeNull();
   });
 
-  it("history includes recalled tombstones but excludes deleted messages", async () => {
+  it("history excludes recalled and deleted message.created events", async () => {
     const channelId = "01a40004b-0000-7000-8000-000000000001";
     const recalled = await setupAndSend("u-lc-4b", channelId, "recalled-msg", "cmd-send-4b");
     const deleted = await setupAndSend("u-lc-4b", channelId, "deleted-msg", "cmd-send-4c");
@@ -177,11 +177,9 @@ describe("ChatChannel message lifecycle", () => {
       new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": "u-lc-4b" } }),
     );
     expect(historyRes.status).toBe(200);
-    const historyBody = (await historyRes.json()) as { items: Array<{ message_id: string; status: string }> };
-    const recalledRow = historyBody.items.find((item) => item.message_id === recalled.messageId);
-    const deletedRow = historyBody.items.find((item) => item.message_id === deleted.messageId);
-    expect(recalledRow?.status).toBe("recalled");
-    expect(deletedRow).toBeUndefined();
+    const historyBody = (await historyRes.json()) as { items: TimelineHistoryItem[] };
+    expect(findTimelineMessageCreated(historyBody.items, recalled.messageId)).toBeUndefined();
+    expect(findTimelineMessageCreated(historyBody.items, deleted.messageId)).toBeUndefined();
   });
 
   it("lifecycle state matrix: non-text edit and hidden message edits are rejected", async () => {

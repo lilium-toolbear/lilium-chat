@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo, fakeS3PublicPath } from "../helpers";
+import { getNamedDo, fakeS3PublicPath, findTimelineMessageCreated, type TimelineHistoryItem } from "../helpers";
 import { setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
 
@@ -135,14 +135,11 @@ describe("ChatChannel message.send type=image", () => {
       new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": userId } }),
     );
     expect(historyRes.status).toBe(200);
-    const historyBody = (await historyRes.json()) as {
-      items: Array<{ message_id: string }>;
-      attachments: Record<string, Array<{ attachment_id: string }>>;
-    };
-    expect(historyBody.items).toHaveLength(1);
-    expect(historyBody.items[0]!.message_id).toBe(sendBody.message.message_id);
-    expect(historyBody.attachments[sendBody.message.message_id]).toHaveLength(1);
-    expect(historyBody.attachments[sendBody.message.message_id]![0]!.attachment_id).toBe(attachment_id);
+    const historyBody = (await historyRes.json()) as { items: TimelineHistoryItem[] };
+    const historyCreated = findTimelineMessageCreated(historyBody.items, sendBody.message.message_id);
+    expect(historyCreated).toBeDefined();
+    expect(historyCreated!.payload!.message!.attachments).toHaveLength(1);
+    expect(historyCreated!.payload!.message!.attachments![0]!.attachment_id).toBe(attachment_id);
 
     const replayRes = await stub.fetch(
       new Request("https://x/internal/replay?after=", { headers: { "X-Verified-User-Id": userId } }),

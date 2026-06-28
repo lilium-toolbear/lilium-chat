@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo, fakeS3PublicPath, createTestChannel } from "../helpers";
+import { getNamedDo, fakeS3PublicPath, createTestChannel, getTimelineMessageIdFromHistory, type TimelineHistoryItem } from "../helpers";
 import { setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
 
@@ -379,8 +379,8 @@ describe("UserDirectory /internal/sticker-save + /internal/sticker-list + /inter
       new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": ownerId } }),
     );
     expect(historyRes.status).toBe(200);
-    const historyBody = (await historyRes.json()) as { items: Array<{ message_id: string }> };
-    const messageId = historyBody.items[0]!.message_id;
+    const historyBody = (await historyRes.json()) as { items: TimelineHistoryItem[] };
+    const messageId = getTimelineMessageIdFromHistory(historyBody.items);
 
     const recallRes = await chatStub(channelId).fetch(
       new Request("https://x/internal/message-recall", {

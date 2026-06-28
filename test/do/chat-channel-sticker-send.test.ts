@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo, fakeS3PublicPath } from "../helpers";
+import { getNamedDo, fakeS3PublicPath, findTimelineMessageCreated, type TimelineHistoryItem } from "../helpers";
 import { setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
 
@@ -176,15 +176,12 @@ describe("ChatChannel message.send type=sticker", () => {
 
     const historyRes = await stub.fetch(new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": userId } }));
     expect(historyRes.status).toBe(200);
-    const historyBody = (await historyRes.json()) as {
-      items: Array<{ message_id: string; type: string }>;
-      stickers: Record<string, { sticker_id: string } | undefined>;
-    };
-    const live = historyBody.items.find((m) => m.message_id === sendBody.message.message_id);
+    const historyBody = (await historyRes.json()) as { items: TimelineHistoryItem[] };
+    const live = findTimelineMessageCreated(historyBody.items, sendBody.message.message_id);
     expect(live).toBeDefined();
-    expect(live!.type).toBe("sticker");
-    expect(historyBody.stickers[sendBody.message.message_id]).toBeDefined();
-    expect(historyBody.stickers[sendBody.message.message_id]!.sticker_id).toBe(sticker_id);
+    expect(live!.payload!.message!.type).toBe("sticker");
+    expect(live!.payload!.message!.sticker).not.toBeNull();
+    expect(live!.payload!.message!.sticker!.sticker_id).toBe(sticker_id);
   });
 
   it("replay returns sticker snapshot and hides it after recall", async () => {

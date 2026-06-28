@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo as _g, fakeS3AvatarPublicPath, fakeS3PublicPath } from "../helpers";
+import { getNamedDo as _g, fakeS3AvatarPublicPath, fakeS3PublicPath, type TimelineHistoryItem } from "../helpers";
 import { setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
 void _g;
@@ -258,8 +258,10 @@ describe("ChatChannel /internal/dissolve", () => {
 
     const messagesRes = await stub.fetch(new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": memberId } }));
     expect(messagesRes.status).toBe(200);
-    const messagesBody = await messagesRes.json() as { items: Array<{ text: string | null }> };
-    expect(messagesBody.items.some((item) => item.text === "before dissolve")).toBe(true);
+    const messagesBody = await messagesRes.json() as { items: TimelineHistoryItem[] };
+    expect(messagesBody.items.some(
+      (item) => item.type === "message.created" && item.payload?.message?.text === "before dissolve",
+    )).toBe(true);
   });
 
   it("dissolved channel allows self-leave and removes member from my_channels", async () => {

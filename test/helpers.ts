@@ -168,3 +168,35 @@ export async function makeJwt(claims: JwtClaims, secret: string = TEST_SECRET): 
   if (iat !== undefined) builder = builder.setIssuedAt(iat);
   return builder.sign(new TextEncoder().encode(secret));
 }
+
+/** Timeline history item shape from `GET /internal/messages` (unified event frames). */
+export type TimelineHistoryItem = {
+  type: string;
+  payload?: {
+    message?: {
+      message_id: string;
+      type?: string;
+      status?: string;
+      text?: string | null;
+      attachments?: Array<{ attachment_id: string; blurhash?: string | null }>;
+      sticker?: { sticker_id: string } | null;
+    };
+  };
+};
+
+export function findTimelineMessageCreated(
+  items: TimelineHistoryItem[],
+  messageId?: string,
+): TimelineHistoryItem | undefined {
+  return items.find(
+    (item) =>
+      item.type === "message.created" &&
+      (messageId === undefined || item.payload?.message?.message_id === messageId),
+  );
+}
+
+export function getTimelineMessageIdFromHistory(items: TimelineHistoryItem[]): string {
+  const messageId = findTimelineMessageCreated(items)?.payload?.message?.message_id;
+  if (!messageId) throw new Error("no message.created in timeline history");
+  return messageId;
+}

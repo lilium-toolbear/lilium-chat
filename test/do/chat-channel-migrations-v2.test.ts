@@ -130,7 +130,7 @@ describe("ChatChannel v2 migrations (Phase 7)", () => {
 
     let extraRuns = 0;
     const extra = {
-      version: 2026062699,
+      version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION + 1,
       name: "count runs",
       up() {
         extraRuns += 1;
