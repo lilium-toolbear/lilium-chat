@@ -400,16 +400,27 @@ Per spec §2.4 / §13, document in the runbook:
   or dashboard.
 
 ```bash
-npx wrangler queues create lilium-chat-archive
-# Set message retention (dashboard/API) to max acceptable daemon-downtime window, up to 14 days (spec §2.6, Plan B)
-npx wrangler queues consumer http add lilium-chat-archive   # HTTP pull — operator step only
+npx wrangler queues create lilium-chat-archive \
+  --message-retention-period-secs 1209600
+
+# If queue already exists:
+npx wrangler queues update lilium-chat-archive \
+  --message-retention-period-secs 1209600
+
+npx wrangler queues consumer http add lilium-chat-archive \
+  --batch-size 100 \
+  --message-retries 100 \
+  --visibility-timeout-secs 600
 ```
 
 Cloudflare no longer supports enabling HTTP pull consumers through Wrangler
 config files; the CLI/dashboard step is required.
 
-**Queue retention (Plan B):** operational constraint only. No source-DO requeue
-from `queued` rows. See spec §4.7 for `pending` / `queued` / `failed` semantics.
+**Queue retention (Plan B):** operational constraint for daemon **full stop**;
+also configure `--message-retries 100` so retry window is maximized. No
+source-DO requeue from `queued` rows. Daemon **must not pull** when PG is
+unhealthy — otherwise `max_retries` burns before retention (spec §8.5, §10.3).
+See spec §4.7 for `pending` / `queued` / `failed` semantics.
 
 ---
 
@@ -566,14 +577,14 @@ Commit:
 - A backend runbook section covering:
   - **Wrangler split:** `queues.producers` in `wrangler.jsonc`; HTTP pull consumer
     **not** in wrangler config (operator CLI/dashboard only).
-  - Queue setup (`wrangler queues create` + retention up to 14 days + HTTP pull).
+  - Queue setup: explicit wrangler create/update retention + consumer flags
+    (spec §2.4, §13).
   - Daemon pull body uses `visibility_timeout` (not `_ms`); env
     `QUEUE_VISIBILITY_TIMEOUT_MS` maps to that field (spec §8.3).
   - Producer binding, source-DO → archive_outbox → Queue flow.
-  - **Queue retention (Plan B):** operational constraint only — configure
-    `lilium-chat-archive` retention up to 14 days; no source-DO requeue from
-    `queued` rows (spec §4.7). `pending` = must flush; `queued` = audit only;
-    `failed` = producer deterministic failure.
+  - **Plan B retention:** retention for full-stop; `--message-retries 100`;
+    no requeue from `queued`. **PG health gate:** daemon must not pull when PG
+    down (spec §8.5, §10.3).
   - Why source-local outbox is required (§1.3), why no ArchiveRelay DO (§1.4).
   - How to inspect source lag (`SELECT count(*) FROM archive_outbox WHERE status='pending'`).
   - Optional `/internal/archive-outbox-pending` probe (test-gated).
@@ -645,7 +656,8 @@ the same implementation series:
 
 - PG raw insert idempotency, watermark init, ordered drain, out-of-order replay
 - upsert/replace_scope `source_seq` guards, duplicate-delivery-into-PG
-- drain-to-PG integration flow (spec §12.2), `archive:replay` (spec §8.7)
+- drain-to-PG integration flow (spec §12.2), `archive:replay` (spec §8.8)
+- daemon PG health gate before pull (spec §8.5); queue pull `visibility_timeout` smoke test
 
 ---
 

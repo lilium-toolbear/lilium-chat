@@ -140,11 +140,28 @@ interface Env {
 
 Enable HTTP pull for the queue out-of-band with Wrangler CLI or dashboard.
 
-Required command:
+Required commands (create queue with max retention, then add pull consumer with
+retry/visibility aligned to Plan B — see §2.6):
 
 ```bash
-npx wrangler queues consumer http add lilium-chat-archive
+npx wrangler queues create lilium-chat-archive \
+  --message-retention-period-secs 1209600
+
+# If queue already exists:
+npx wrangler queues update lilium-chat-archive \
+  --message-retention-period-secs 1209600
+
+npx wrangler queues consumer http add lilium-chat-archive \
+  --batch-size 100 \
+  --message-retries 100 \
+  --visibility-timeout-secs 600
 ```
+
+`1209600` seconds = 14 days (paid-plan maximum). `--message-retries 100` matches
+Cloudflare Queue limits maximum; combined with `--visibility-timeout-secs 600`
+this maximizes the retry window before messages are permanently deleted at
+`max_retries`. The local daemon must still avoid burning retries while PG is
+unhealthy (§8.5).
 
 Do not configure a Worker push consumer for this queue.
 
@@ -178,23 +195,42 @@ If an archive record exceeds 120 KiB, `appendArchiveRecordSync` must throw befor
 
 Do not split one business transaction into multiple archive records in the first implementation.
 
-### 2.6 Queue message retention (operational, Plan B)
+### 2.6 Queue message retention and retries (operational, Plan B)
 
 Cloudflare Queues message retention is an **operational constraint**, not a
-source-DO recovery mechanism. Maximum configurable retention is **14 days**;
-messages older than the configured window are deleted.
+source-DO recovery mechanism. Maximum configurable retention is **14 days**
+(`--message-retention-period-secs 1209600`); messages older than the configured
+window are deleted.
+
+**Retention is the recovery window only while messages are not being repeatedly
+consumed and failed.** Cloudflare also enforces per-message `max_retries` (up to
+100). When `attempts` reaches `max_retries`, the message is permanently deleted
+from the Queue — potentially **before** retention expires. Pull responses include
+an `attempts` field per leased message.
+
+Therefore Plan B requires **two** operational guarantees:
+
+```text
+1. Retention sizing: configure retention to max acceptable outage (up to 14 days);
+   daemon fully stopped must recover before retention expiry.
+2. No retry burn: daemon must NOT call /messages/pull while downstream PG is
+   unhealthy; tight pull → PG-fail → retry loops exhaust max_retries while source
+   archive_outbox rows are already status='queued' (no requeue) → archive loss.
+```
 
 Operator requirements:
 
 ```text
-set lilium-chat-archive retention to the maximum acceptable local-daemon outage window (up to 14 days)
-document that planned daemon downtime must stay below configured retention
+create/update queue with --message-retention-period-secs 1209600
+add HTTP pull consumer with --message-retries 100 --visibility-timeout-secs 600
+document planned daemon full-stop downtime < retention
 do not implement source-DO requeue from status='queued' rows (see §4.7)
+daemon implements PG health gate before pull (§8.5)
 ```
 
-Recovery from daemon outage is: restore the daemon before retention expiry so it
-can pull pending Queue messages. There is no automatic backfill from
-`archive_outbox` rows already marked `queued`.
+Recovery from daemon **full stop**: restore before retention expiry. Recovery from
+**PG outage while daemon runs**: stop pulling until PG healthy — do not rely on
+retention alone.
 
 ## 3. Source of truth and archive scope
 
@@ -534,21 +570,31 @@ source DO's job is done. Do **not** implement automatic requeue from `queued`
 rows back into the Queue. `payload_json` on `queued` rows is not a durable
 recovery source for daemon/Queue outages.
 
-**Queue retention is an operational constraint.** Cloudflare Queues message
-retention is configurable up to **14 days**; messages older than the configured
-retention are deleted. Operators must:
+**Queue retention is an operational constraint** (see §2.6). Retention protects
+against daemon **full stop**, not against **retry exhaustion** while the daemon
+keeps pulling with PG down.
+
+Operators must:
 
 ```text
-configure lilium-chat-archive retention to the maximum acceptable daemon-downtime window (up to 14 days)
-ensure local daemon maximum planned outage < configured Queue retention
-monitor daemon health and Queue depth; recovery is bring daemon back before retention expiry
+configure lilium-chat-archive retention to max acceptable full-stop window (up to 14 days)
+configure HTTP pull consumer --message-retries 100 --visibility-timeout-secs 600
+ensure daemon does not pull when PG unhealthy (§8.5)
+monitor daemon + PG health; full-stop recovery = restore daemon before retention expiry
 ```
 
-If daemon downtime exceeds Queue retention, messages are **lost** from the Queue
-even though source rows remain `status='queued'`. That gap is accepted under
+If daemon **full stop** exceeds Queue retention, messages are **lost** from the
+Queue while source rows may remain `status='queued'`. That gap is accepted under
 Plan B — prevention is operational (retention sizing + daemon uptime), not
-source-DO requeue. PG `chat_archive_records` is authoritative only for messages
-the daemon already pulled and committed.
+source-DO requeue.
+
+If daemon **runs** but PG is unavailable and the daemon keeps pulling, messages
+can hit `max_retries` and be deleted **before** retention expires while source
+rows are already `queued`. This is **not** acceptable — the daemon must gate
+pull on PG health (§8.5, §10.3).
+
+PG `chat_archive_records` is authoritative only for messages the daemon already
+pulled and committed.
 
 Retention policy for source rows:
 
@@ -1178,6 +1224,10 @@ const body = {
 `visibility_timeout` is the HTTP JSON field name. `QUEUE_VISIBILITY_TIMEOUT_MS`
 is the local env var name only.
 
+Cloudflare docs may show inconsistent examples (`visibility_timeout_ms` in some
+code blocks); use `visibility_timeout`. Phase B includes a live Queue pull smoke
+test to verify the API accepts the chosen field name (§12.1).
+
 Headers:
 
 ```http
@@ -1213,11 +1263,36 @@ Failed retryable messages:
 
 Only ack a Queue message after its raw record has been committed to PG.
 
-### 8.5 Daemon algorithm
+Pulled messages include `lease_id` and `attempts` (current delivery attempt count
+toward `max_retries`). Track `attempts` in structured logs; rising `attempts`
+while PG is unhealthy indicates retry-burn risk.
+
+### 8.5 PG health gate (required before pull)
+
+The daemon **must** verify PG connectivity before every `/messages/pull` call
+(e.g. lightweight `SELECT 1` or pool health check on `DATABASE_URL`).
+
+If PG is unavailable:
+
+```text
+do NOT call /messages/pull
+sleep with backoff (POLL_INTERVAL_MS or longer)
+do not consume Queue message attempts
+```
+
+This is load-bearing under Plan B: source rows may already be `status='queued'`
+with no requeue path; burning `max_retries` via pull-fail loops causes permanent
+archive loss before retention expiry.
+
+### 8.6 Daemon algorithm
 
 Loop:
 
 ```text
+if PG health check fails:
+  sleep/backoff
+  continue loop (no pull)
+
 pull messages from Cloudflare Queue
 if no messages:
   sleep POLL_INTERVAL_MS
@@ -1228,11 +1303,22 @@ else:
       INSERT INTO chat_archive_records ON CONFLICT DO NOTHING
   COMMIT
 
+  if PG batch failed (connection error, commit failed):
+    do NOT ack any message in the batch
+    do NOT pull additional messages in this iteration
+    for leased messages: either
+      (A) omit ack/retry and let visibility_timeout expire, then stop pulling until PG healthy, or
+      (B) call /messages/ack with retries:[{ lease_id, delay_seconds: long }] once, then stop pulling
+    do NOT run a tight pull-fail-retry loop
+    goto PG health gate (sleep until PG healthy)
+
   for each affected (source_kind, source_key):
     drain ready records in source_seq order into normalized tables
 
   ack messages whose raw record insert succeeded or already existed
-  retry messages that failed validation or PG insert
+  for validation failures on individual messages (poison / schema mismatch):
+    retry with delay only if PG is healthy and error may be transient deployment mismatch
+    do not tight-loop retries across the whole batch
 ```
 
 Important:
@@ -1244,7 +1330,7 @@ Important:
 * Replay of record 5 waits until source watermark reaches 4.
 * This avoids holding Queue messages hostage for missing earlier source_seq records.
 
-### 8.6 Ordered drain algorithm
+### 8.7 Ordered drain algorithm
 
 For each affected source:
 
@@ -1293,7 +1379,7 @@ Policy:
 * If replay fails due to code/schema bug, the raw record remains in PG with `apply_error`.
 * After fixing code/schema, rerun daemon or a replay command to drain unapplied records.
 
-### 8.7 Replay command
+### 8.8 Replay command
 
 Add a manual command:
 
@@ -1305,7 +1391,7 @@ It drains unapplied `chat_archive_records` from PG without pulling Queue message
 
 This is required for recovery after replay bugs.
 
-### 8.8 Replay implementation
+### 8.9 Replay implementation
 
 Implement a whitelist of table-specific replayers.
 
@@ -1389,9 +1475,11 @@ required pk/scope fields are present
 Invalid messages:
 
 * Insert no raw record.
-* Retry with delay if the error may be deployment mismatch.
-* If clearly unrecoverable, log and ack only if operator policy allows dropping poison messages.
-* Default implementation should retry poison messages and surface them via logs/metrics, not silently drop.
+* Only retry (via `/messages/ack` `retries`) when PG is healthy and the error may
+  be a transient deployment mismatch.
+* If PG is unhealthy, do not pull — do not burn retries on validation paths (§8.5).
+* If clearly unrecoverable poison, log and surface via metrics; do not ack-drop by
+  default unless operator policy explicitly allows.
 
 ## 10. Failure semantics
 
@@ -1427,10 +1515,23 @@ retention expiry. Rows already in PG `chat_archive_records` are unaffected.
 If PG is unavailable:
 
 ```text
-daemon cannot commit raw records
-Queue messages are not acked
-messages become visible again after visibility timeout or explicit retry
+daemon PG health check fails
+daemon does NOT call /messages/pull (no new leases, no attempt consumption)
+daemon sleeps/backoff until PG healthy
+already-leased messages from a prior partial batch:
+  do not ack
+  let visibility_timeout expire OR single long-delay retry via /messages/ack, then stop pulling
+  do NOT continue polling more messages
+  do NOT run tight pull-fail-retry loops
 ```
+
+**Failure mode to prevent:** daemon running + PG down + repeated pull → insert
+fail → retry/timeout → `attempts` reaches `max_retries` → message deleted while
+source `archive_outbox` is already `queued` with no requeue (Plan B). Retention
+does not protect against this; only the PG health gate does.
+
+Once PG recovers, normal pull/drain resumes. Messages not yet at `max_retries`
+become visible again after `visibility_timeout`.
 
 ### 10.4 Replay bug
 
@@ -1529,6 +1630,8 @@ PG out-of-order raw insert waits for missing seq
 PG upsert source_seq guard
 PG replace_scope source_seq guard
 duplicate Queue delivery does not duplicate normalized rows
+daemon skips /messages/pull when PG health check fails
+queue pull smoke test: API accepts visibility_timeout body field
 unknown table/op rejected
 runtime table names rejected
 ```
@@ -1579,7 +1682,8 @@ each covered flow.
 Queue send failure does not fail business mutation
 Queue duplicate delivery does not duplicate PG rows
 Queue delivers seq=2 before seq=1; raw stores both, replay waits, then applies 1 and 2
-PG unavailable causes messages to remain unacked/retried
+PG unavailable: daemon does not call /messages/pull; no tight retry-burn loop
+PG unavailable mid-batch: no ack; stop pulling until PG healthy
 Replay failure after raw insert can be repaired by archive:replay
 Local daemon stopped; business writes continue and Queue backlog grows
 Runtime tables never appear in archive payload
@@ -1626,9 +1730,18 @@ Add root package scripts if appropriate:
 Operator setup:
 
 ```bash
-npx wrangler queues create lilium-chat-archive
-# Configure message retention (dashboard or API) to max acceptable daemon-downtime window, up to 14 days
-npx wrangler queues consumer http add lilium-chat-archive
+npx wrangler queues create lilium-chat-archive \
+  --message-retention-period-secs 1209600
+
+# If queue already exists:
+npx wrangler queues update lilium-chat-archive \
+  --message-retention-period-secs 1209600
+
+npx wrangler queues consumer http add lilium-chat-archive \
+  --batch-size 100 \
+  --message-retries 100 \
+  --visibility-timeout-secs 600
+
 wrangler deploy
 DATABASE_URL=... npm run archive:migrate
 CF_ACCOUNT_ID=... CF_QUEUE_ID=... CF_QUEUES_TOKEN=... DATABASE_URL=... npm run archive:local
@@ -1655,7 +1768,7 @@ PG migration
 how ordered replay works
 how to inspect lag
 how to recover replay errors
-Queue retention operational constraint (§4.7): configure up to 14 days; no queued-row requeue
+Queue retention + consumer retry/visibility (§2.6, Plan B); PG health gate (§8.5)
 what is intentionally not archived
 ```
 
@@ -1665,22 +1778,23 @@ Implementation is accepted only if all of the following are true:
 
 1. No ArchiveRelay DO exists.
 2. Cloudflare Queue producer binding exists.
-3. HTTP pull consumer setup is documented.
+3. HTTP pull consumer setup documented with retention/retry/visibility flags (§2.4, §13).
 4. Source DOs write `archive_outbox` in the same transaction as business rows.
 5. Source DO alarms flush archive_outbox to Cloudflare Queue.
 6. Business writes do not synchronously depend on PG.
-7. Local daemon can pull Queue messages over HTTP.
-8. Local daemon commits raw `chat_archive_records` before Queue ack.
-9. Local daemon can replay normalized PG state in strict per-source `source_seq` order.
-10. Queue duplicate delivery is safe.
-11. Queue out-of-order delivery is safe.
-12. PG replay failure is repairable from raw log.
-13. Runtime state is never archived.
-14. All listed business mutation paths that **exist in code** are instrumented;
+7. Local daemon can pull Queue messages over HTTP (`visibility_timeout` body verified).
+8. Local daemon does **not** call `/messages/pull` when PG health check fails (§8.5).
+9. Local daemon commits raw `chat_archive_records` before Queue ack.
+10. Local daemon can replay normalized PG state in strict per-source `source_seq` order.
+11. Queue duplicate delivery is safe.
+12. Queue out-of-order delivery is safe.
+13. PG replay failure is repairable from raw log.
+14. Runtime state is never archived.
+15. All listed business mutation paths that **exist in code** are instrumented;
     `command-invoke` / `interaction-submit` are allowlisted TODOs until routes land.
-15. Full integration flow drains into PG and normalized tables match expected
+16. Full integration flow drains into PG and normalized tables match expected
     business state for implemented mutation paths.
-16. Full test suite and typecheck pass.
+17. Full test suite and typecheck pass.
 
 ## 16. Implementation checklist
 
@@ -1689,7 +1803,7 @@ Complete all items in one branch:
 ```text
 [ ] Add Cloudflare Queue producer binding `CHAT_ARCHIVE_QUEUE`.
 [ ] Add Queue Env type.
-[ ] Document `wrangler queues consumer http add lilium-chat-archive`.
+[ ] Document wrangler queue create/update + consumer http add with retention/retry flags (§2.4, §13).
 [ ] Add archive payload/hash/source-outbox/queue-flush helpers.
 [ ] Add archive_seq/archive_outbox migrations to ChatChannel.
 [ ] Add archive_seq/archive_outbox migrations to UserDirectory.
@@ -1703,7 +1817,8 @@ Complete all items in one branch:
 [ ] Instrument UserDirectory attachment/sticker mutations.
 [ ] Instrument DMDirectory mutations.
 [ ] Instrument BotRegistry command/token/app mutations.
-[ ] Add local archiver daemon.
+[ ] Add local archiver daemon (PG health gate before pull per §8.5).
+[ ] Add queue pull API smoke test: verify pull body accepts `visibility_timeout` (not `_ms`) against live/dev Queue.
 [ ] Add local PG migration.
 [ ] Add raw record insert.
 [ ] Add source watermark ordered drain.
