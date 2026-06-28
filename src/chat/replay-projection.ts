@@ -15,21 +15,22 @@ import type {
   MessagePersistedPayload,
   MessageRow,
 } from "../contract/persisted";
-import { fallbackUserDisplayName } from "../contract/primitives";
 import { resolveUserSummaries } from "../profile/resolve";
+import { buildLiveUserMaps } from "./replay-user-maps";
+import type { EventFrame } from "../contract/wire-frames";
 
-type SyncSql = {
+export type SyncSql = {
   exec: (query: string, ...params: unknown[]) => { toArray: () => unknown[] };
 };
 
-interface ReplayEventRow {
+export interface ReplayEventRow {
   event_id: string;
   event_type: string;
   payload_json: string;
   occurred_at: string;
 }
 
-interface ReplaySqlEventRow {
+export interface ReplaySqlEventRow {
   event_id: unknown;
   event_type: unknown;
   payload_json: unknown;
@@ -41,7 +42,7 @@ export interface ReplayEnvelope {
   event_json: string;
 }
 
-function parseReplayRows(rows: ReplaySqlEventRow[]): ReplayEventRow[] {
+export function parseReplayRows(rows: ReplaySqlEventRow[]): ReplayEventRow[] {
   return rows.map((row) => ({
     event_id: typeof row.event_id === "string" ? row.event_id : String(row.event_id ?? ""),
     event_type: typeof row.event_type === "string" ? row.event_type : String(row.event_type ?? ""),
@@ -60,30 +61,12 @@ function extractMessageSenderUserId(sql: SyncSql, messageId: string): string[] {
   return [];
 }
 
-function buildLiveUserMaps(rawMap: Map<string, { user_id: string; display_name: string | null; avatar_url: string | null }>): {
-  liveMap: Map<string, LiveUserSummary>;
-  liveSenderMap: Map<string, LiveUserSummary>;
-} {
-  const liveSenderMap = new Map<string, LiveUserSummary>();
-  const liveMap = new Map<string, LiveUserSummary>();
-  for (const [id, summary] of rawMap) {
-    const resolved = {
-      user_id: summary.user_id,
-      display_name: summary.display_name ?? fallbackUserDisplayName(id),
-      avatar_url: summary.avatar_url,
-    };
-    liveMap.set(id, resolved);
-    liveSenderMap.set(id, resolved);
-  }
-  return { liveMap, liveSenderMap };
-}
-
 function projectReplayMessagePayload(
   sql: SyncSql,
   eventType: string,
   persistedPayload: MessagePersistedPayload | ManagementPersistedPayload | unknown,
   liveSenderMap: Map<string, LiveUserSummary>,
-): ChatEventPayloadByType[ChatEventType] | unknown {
+): ChatEventPayloadByType[ChatEventType] | unknown | null {
   const messagePersisted = persistedPayload as MessagePersistedPayload;
   const p = messagePersisted.message;
   const messageId = typeof p?.message_id === "string" ? p.message_id : "";
@@ -137,41 +120,11 @@ function projectReplayMessagePayload(
   };
 }
 
-export async function buildReplayEventsResponse(opts: {
-  sql: SyncSql;
-  env: Env;
-  userId: string;
-  after: string;
-}): Promise<Response> {
-  const { sql, env, userId, after } = opts;
-  const meta = sql.exec("SELECT channel_id, visibility FROM channel_meta LIMIT 1").toArray()[0] as
-    | { channel_id: string; visibility: string }
-    | undefined;
-  if (meta === undefined) return Response.json({ events: [] });
-
-  const member = userId
-    ? (sql.exec(
-        "SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL",
-        meta.channel_id,
-        userId,
-      ).toArray()[0] as { x: number } | undefined)
-    : undefined;
-  if (!member && meta.visibility === "private") {
-    return new Response("forbidden", { status: 403 });
-  }
-
-  const rows = sql
-    .exec(
-      "SELECT event_id, event_type, payload_json, occurred_at FROM events WHERE channel_id=? AND event_id > ? ORDER BY event_id",
-      meta.channel_id,
-      after,
-    )
-    .toArray() as unknown as ReplaySqlEventRow[];
-  const parsedRows = parseReplayRows(rows);
+export function collectReplayUserIds(sql: SyncSql, parsedRows: ReplayEventRow[]): string[] {
   const messageReplayTypes = REPLAY_MESSAGE_EVENT_TYPES;
   const managementTypes = REPLAY_MANAGEMENT_EVENT_TYPES;
-
   const userIdsToResolve: string[] = [];
+
   for (const r of parsedRows) {
     if (messageReplayTypes.has(r.event_type)) {
       try {
@@ -204,11 +157,27 @@ export async function buildReplayEventsResponse(opts: {
     }
   }
 
-  const rawMap = await resolveUserSummaries(Array.from(new Set(userIdsToResolve)), env);
-  const { liveMap, liveSenderMap } = buildLiveUserMaps(rawMap);
-  const out: ReplayEnvelope[] = [];
+  return userIdsToResolve;
+}
+
+export function projectParsedEventRows(opts: {
+  sql: SyncSql;
+  channelId: string;
+  parsedRows: ReplayEventRow[];
+  liveMap: Map<string, LiveUserSummary>;
+  liveSenderMap: Map<string, LiveUserSummary>;
+  allowedEventTypes?: ReadonlySet<string>;
+}): EventFrame[] {
+  const { sql, channelId, parsedRows, liveMap, liveSenderMap, allowedEventTypes } = opts;
+  const messageReplayTypes = REPLAY_MESSAGE_EVENT_TYPES;
+  const managementTypes = REPLAY_MANAGEMENT_EVENT_TYPES;
+  const out: EventFrame[] = [];
 
   for (const r of parsedRows) {
+    if (allowedEventTypes && !allowedEventTypes.has(r.event_type)) {
+      continue;
+    }
+
     let persistedPayload: MessagePersistedPayload | ManagementPersistedPayload | unknown = {};
     try {
       persistedPayload = JSON.parse(r.payload_json) as MessagePersistedPayload | ManagementPersistedPayload;
@@ -226,37 +195,75 @@ export async function buildReplayEventsResponse(opts: {
         }
         wirePayload = projected;
       } catch {
-        // malformed payload or missing payload message_id
+        continue;
       }
     } else if (managementTypes.has(r.event_type) && r.event_type !== "read_state.updated") {
       wirePayload = resolveActorWithMap(persistedPayload as ManagementPersistedPayload, liveMap);
     }
 
-    const eventJson = isChatEventType(r.event_type)
-      ? JSON.stringify(
-          buildEventFrame({
-            event_id: r.event_id,
-            type: r.event_type,
-            channel_id: meta.channel_id,
-            occurred_at: r.occurred_at,
-            payload: wirePayload as ChatEventPayloadByType[typeof r.event_type],
-          }),
-        )
-      : JSON.stringify({
-          frame_type: "event",
-          api_version: "lilium.chat.v1",
-          event_id: r.event_id,
-          type: r.event_type,
-          channel_id: meta.channel_id,
-          occurred_at: r.occurred_at,
-          payload: wirePayload,
-        });
+    if (!isChatEventType(r.event_type)) {
+      continue;
+    }
 
-    out.push({
-      event_id: r.event_id,
-      event_json: eventJson,
-    });
+    out.push(
+      buildEventFrame({
+        event_id: r.event_id,
+        type: r.event_type,
+        channel_id: channelId,
+        occurred_at: r.occurred_at,
+        payload: wirePayload as ChatEventPayloadByType[typeof r.event_type],
+      }),
+    );
   }
+
+  return out;
+}
+
+export async function buildReplayEventsResponse(opts: {
+  sql: SyncSql;
+  env: Env;
+  userId: string;
+  after: string;
+}): Promise<Response> {
+  const { sql, env, userId, after } = opts;
+  const meta = sql.exec("SELECT channel_id, visibility FROM channel_meta LIMIT 1").toArray()[0] as
+    | { channel_id: string; visibility: string }
+    | undefined;
+  if (meta === undefined) return Response.json({ events: [] });
+
+  const member = userId
+    ? (sql.exec(
+        "SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL",
+        meta.channel_id,
+        userId,
+      ).toArray()[0] as { x: number } | undefined)
+    : undefined;
+  if (!member && meta.visibility === "private") {
+    return new Response("forbidden", { status: 403 });
+  }
+
+  const rows = sql
+    .exec(
+      "SELECT event_id, event_type, payload_json, occurred_at FROM events WHERE channel_id=? AND event_id > ? ORDER BY event_id",
+      meta.channel_id,
+      after,
+    )
+    .toArray() as unknown as ReplaySqlEventRow[];
+  const parsedRows = parseReplayRows(rows);
+  const rawMap = await resolveUserSummaries(Array.from(new Set(collectReplayUserIds(sql, parsedRows))), env);
+  const { liveMap, liveSenderMap } = buildLiveUserMaps(rawMap);
+  const frames = projectParsedEventRows({
+    sql,
+    channelId: meta.channel_id,
+    parsedRows,
+    liveMap,
+    liveSenderMap,
+  });
+
+  const out: ReplayEnvelope[] = frames.map((frame) => ({
+    event_id: frame.event_id,
+    event_json: JSON.stringify(frame),
+  }));
 
   return Response.json({ events: out });
 }

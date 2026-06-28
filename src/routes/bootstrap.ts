@@ -2,12 +2,9 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { resolveUserSummaries, type UserSummary } from "../profile/resolve";
-import { projectMessagesForBrowser } from "../chat/sender";
 import { inflateMyChannelSummaries } from "../chat/channel-list";
 import { fallbackUserDisplayName } from "../contract/primitives";
-import type { MessageStickerSnapshot } from "../chat/message-projection";
-import type { MessageRow } from "../contract/persisted";
-import type { AttachmentRow } from "../chat/attachment-projection";
+import type { EventFrame } from "../contract/wire-frames";
 import { getIdentity } from "./auth";
 interface MyChannel {
   channel_id: string;
@@ -81,15 +78,15 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
       const mres = await stub.fetch(new Request("https://x/internal/messages?limit=50", {
         headers: { "X-Verified-User-Id": user_id },
       }));
-      if (!mres.ok) return { items: [] as Array<unknown>, next_cursor: null };
+      if (!mres.ok) return { items: [] as EventFrame[], next_cursor: null };
 
-      const body = await mres.json() as { items: MessageRow[]; mentions: Record<string, Array<{ user_id: string; start: number; end: number }>>; attachments: Record<string, AttachmentRow[]>; stickers: Record<string, MessageStickerSnapshot>; next_cursor: string | null };
+      const body = await mres.json() as { items: EventFrame[]; next_cursor: string | null };
       return {
-        items: await projectMessagesForBrowser(body.items, body.mentions ?? {}, c.env, body.attachments ?? {}, body.stickers ?? {}),
+        items: body.items,
         next_cursor: body.next_cursor,
       };
     })()
-    : { items: [] as Array<unknown>, next_cursor: null };
+    : { items: [] as EventFrame[], next_cursor: null };
 
   const per_channel: Record<string, string> = {};
   for (const ch of channels) {

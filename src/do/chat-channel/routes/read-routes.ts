@@ -2,9 +2,7 @@ import type { ChatChannelHost } from "../host";
 import { requireTestOnly } from "../../do-errors";
 import { buildChannelMetaProjectionForMember } from "../../../chat/channel-meta-projection";
 import { buildReplayEventsResponse } from "../../../chat/replay-projection";
-import type { MessageRow } from "../../../contract/persisted";
-import type { AttachmentRow as ChatAttachmentRow } from "../../../chat/attachment-projection";
-import type { MessageStickerSnapshot } from "../../../chat/message-projection";
+import { buildTimelineHistoryResponse } from "../../../chat/timeline-history";
 import { resolveUserSummaries } from "../../../profile/resolve";
 
 export async function dispatchReadRoutes(host: ChatChannelHost, request: Request, url: URL): Promise<Response | null> {
@@ -55,83 +53,14 @@ export async function dispatchReadRoutes(host: ChatChannelHost, request: Request
     const rawLimit = Number(url.searchParams.get("limit") ?? "50");
     const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.floor(rawLimit))) : 50;
     const before = url.searchParams.get("before");
-
-    const meta = host.ctx.storage.sql.exec("SELECT channel_id, visibility FROM channel_meta LIMIT 1").toArray()[0] as
-      | { channel_id: string; visibility: string }
-      | undefined;
-    if (meta === undefined) {
-      return new Response("channel not created", { status: 409 });
-    }
-
-    const member = userId
-      ? (host.ctx.storage.sql
-          .exec("SELECT 1 AS x FROM members WHERE channel_id=? AND user_id=? AND left_at IS NULL", meta.channel_id, userId)
-          .toArray()[0] as { x: number } | undefined)
-      : undefined;
-    if (!member && meta.visibility === "private") {
-      return new Response("forbidden", { status: 403 });
-    }
-
-    const query = before === null
-      ?
-        "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE channel_id=? AND status != 'deleted' ORDER BY message_id DESC LIMIT ?"
-      : "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE channel_id=? AND status != 'deleted' AND message_id < ? ORDER BY message_id DESC LIMIT ?";
-
-    const rows = (before === null
-      ? host.ctx.storage.sql.exec(query, meta.channel_id, limit + 1)
-      : host.ctx.storage.sql.exec(query, meta.channel_id, before, limit + 1)
-    ).toArray() as unknown as MessageRow[];
-
-    const hasMore = rows.length > limit;
-    const page = hasMore ? rows.slice(0, limit) : rows;
-    const nextCursor = hasMore && page.length > 0 ? page[page.length - 1]!.message_id : null;
-
-    // v4.0: return raw MessageRows + the page's mentions (grouped by message_id). The Worker
-    // resolves sender UserSummaries and projects via the shared projectMessageForBrowser — one
-    // serializer across history / ack / event (addendum J). rowToMessage is no longer used here.
-    const messageIds = page.map((r) => r.message_id);
-    const mentionsByMessage: Record<string, Array<{ user_id: string; start: number; end: number }>> = {};
-    const attachmentsByMessage: Record<string, ChatAttachmentRow[]> = {};
-    const stickersByMessage: Record<string, MessageStickerSnapshot> = {};
-    if (messageIds.length > 0) {
-      const placeholders = messageIds.map(() => "?").join(",");
-      const mentionRows = host.ctx.storage.sql
-        .exec(`SELECT message_id, user_id, start, end_ AS end FROM mentions WHERE message_id IN (${placeholders})`, ...messageIds)
-        .toArray() as Array<{ message_id: string; user_id: string; start: number; end: number }>;
-      for (const mr of mentionRows) {
-        (mentionsByMessage[mr.message_id] ??= []).push({ user_id: mr.user_id, start: mr.start, end: mr.end });
-      }
-      const attachmentRows = host.ctx.storage.sql
-        .exec(
-          `SELECT ma.message_id, a.attachment_id, a.owner_user_id, a.kind, a.filename, a.mime_type, a.size_bytes, a.width, a.height, a.blurhash, a.storage_key, a.url, a.status, a.created_at
-           FROM message_attachments ma
-           JOIN attachments a ON a.attachment_id = ma.attachment_id
-           WHERE ma.message_id IN (${placeholders})`,
-          ...messageIds,
-        )
-        .toArray() as unknown as Array<ChatAttachmentRow & { message_id: string }>;
-      for (const ar of attachmentRows) {
-        const { message_id, ...row } = ar;
-        (attachmentsByMessage[message_id] ??= []).push(row);
-      }
-      const stickerRows = host.ctx.storage.sql
-        .exec(
-          `SELECT message_id, sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash FROM message_stickers WHERE message_id IN (${placeholders})`,
-          ...messageIds,
-        )
-        .toArray() as unknown as Array<MessageStickerSnapshot & { message_id: string }>;
-      for (const sr of stickerRows) {
-        const { message_id, ...snapshot } = sr;
-        stickersByMessage[message_id] = snapshot;
-      }
-    }
-
-    return Response.json({
-      items: page,
-      mentions: mentionsByMessage,
-      attachments: attachmentsByMessage,
-      stickers: stickersByMessage,
-      next_cursor: nextCursor,
+    const after = url.searchParams.get("after");
+    return buildTimelineHistoryResponse({
+      sql: host.ctx.storage.sql,
+      env: host.env,
+      userId,
+      before,
+      after,
+      limit,
     });
   }
 

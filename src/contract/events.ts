@@ -73,6 +73,12 @@ export const DOMAIN_TIMELINE_EVENT_TYPES = [
 
 export type DomainTimelineEventType = (typeof DOMAIN_TIMELINE_EVENT_TYPES)[number];
 
+/** Event types returned by channel timeline history HTTP (`GET .../messages`, bootstrap). */
+export const TIMELINE_HISTORY_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "message.created",
+  ...DOMAIN_TIMELINE_EVENT_TYPES,
+]);
+
 const DOMAIN_TIMELINE_EVENT_TYPE_SET = new Set<string>(DOMAIN_TIMELINE_EVENT_TYPES);
 const CHAT_EVENT_TYPE_SET = new Set<string>(CHAT_EVENT_TYPES);
 

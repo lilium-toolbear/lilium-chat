@@ -2,10 +2,7 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
-import { projectMessagesForBrowser } from "../chat/sender";
-import type { MessageStickerSnapshot } from "../chat/message-projection";
-import type { MessageRow } from "../contract/persisted";
-import type { AttachmentRow } from "../chat/attachment-projection";
+import type { EventFrame } from "../contract/wire-frames";
 
 export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const auth = c.req.header("Authorization") ?? "";
@@ -18,11 +15,13 @@ export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables:
 
   const url = new URL(c.req.url);
   const before = url.searchParams.get("before");
+  const after = url.searchParams.get("after");
   const limit = url.searchParams.get("limit") ?? "50";
 
   const stub = c.env.CHAT_CHANNEL.getByName(channelId);
   const qs = new URLSearchParams();
   if (before) qs.set("before", before);
+  if (after) qs.set("after", after);
   qs.set("limit", limit);
 
   const mres = await stub.fetch(new Request(`https://x/internal/messages?${qs}`, { headers: { "X-Verified-User-Id": userId } }));
@@ -31,14 +30,6 @@ export async function listMessagesHandler(c: Context<{ Bindings: Env; Variables:
     throw new ApiError("CHANNEL_NOT_FOUND", "channel not found", { httpStatus: 404 });
   }
   if (!mres.ok) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  const mb = await mres.json() as {
-    items: MessageRow[];
-    mentions: Record<string, Array<{ user_id: string; start: number; end: number }>>;
-    attachments: Record<string, AttachmentRow[]>;
-    stickers: Record<string, MessageStickerSnapshot>;
-    next_cursor: string | null;
-  };
-
-  const items = await projectMessagesForBrowser(mb.items, mb.mentions ?? {}, c.env, mb.attachments ?? {}, mb.stickers ?? {});
-  return c.json({ items, next_cursor: mb.next_cursor }, 200, { "X-Request-Id": c.get("requestId") });
+  const body = await mres.json() as { items: EventFrame[]; next_cursor: string | null };
+  return c.json({ items: body.items, next_cursor: body.next_cursor }, 200, { "X-Request-Id": c.get("requestId") });
 }
