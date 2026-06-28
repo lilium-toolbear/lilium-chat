@@ -12,6 +12,17 @@ import type { MessageImageAttachment } from "../../../contract/message";
 import { idempotencyExpiresAt } from "../../../contract/idempotency";
 import type { MessageMutationAckPayload, MessageMutationIdempotencyEnvelope } from "../../../contract/idempotency";
 import { resolveUserSummaries } from "../../../profile/resolve";
+import {
+  appendChatChannelArchive,
+  collectDefinedChanges,
+  replaceScopeMessageAttachmentsChange,
+  replaceScopeMessageStickersChange,
+  replaceScopeMentionsChange,
+  rvEvent,
+  upsertAttachmentsForMessageChanges,
+  upsertEventChange,
+  upsertMessageChange,
+} from "../../../archive/chat-channel-record";
 
 export async function dispatchMessageRoutes(host: ChatChannelHost, request: Request, url: URL): Promise<Response | null> {
   if (url.pathname === "/internal/message-send") {
@@ -381,6 +392,19 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
       if (statusRow?.visibility === "public_listed") {
         host.insertOutboxRowForChannelDirectory(channelId, "upsert", host.readChannelDirectorySnapshot(channelId, now), now);
       }
+
+      appendChatChannelArchive(host.ctx, channelId, now, [eventId], (sourceSeq) => {
+        const rv = rvEvent(eventId);
+        return collectDefinedChanges([
+          upsertMessageChange(host.ctx.storage.sql, messageId, channelId, rv),
+          replaceScopeMentionsChange(host.ctx.storage.sql, messageId, rv),
+          ...upsertAttachmentsForMessageChanges(host.ctx.storage.sql, messageId, rv),
+          replaceScopeMessageAttachmentsChange(host.ctx.storage.sql, messageId, rv),
+          replaceScopeMessageStickersChange(host.ctx.storage.sql, messageId, rv),
+          upsertEventChange(host.ctx.storage.sql, eventId),
+        ]);
+      });
+
       return { kind: "created", response_json: fullAckJson };
     });
 
@@ -400,7 +424,7 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
       return Response.json({ error: { code: "CHANNEL_DISSOLVED", message: "channel is dissolved", retryable: false } }, { status: 409 });
     }
     if (txResult.kind === "created") {
-      await host.scheduleOutboxAlarm(now);
+      await host.scheduleArchiveAlarm(now);
       // Return the same projection committed to idempotency_keys + the outbox — no post-txn recompute.
       const ackPayload = JSON.parse(txResult.response_json) as MessageMutationIdempotencyEnvelope;
       return Response.json(ackPayload.payload as MessageMutationAckPayload);

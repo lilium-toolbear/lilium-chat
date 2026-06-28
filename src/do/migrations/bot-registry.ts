@@ -6,8 +6,9 @@ import {
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
+import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
 
-export const BOT_REGISTRY_CURRENT_SCHEMA_VERSION = 2;
+export const BOT_REGISTRY_CURRENT_SCHEMA_VERSION = 3;
 
 export const BOT_REGISTRY_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS bot_apps (
@@ -111,6 +112,13 @@ export const botRegistryMigrations: SqlMigration[] = [
           "CREATE UNIQUE INDEX idx_bot_tokens_hash ON bot_tokens(token_hash)",
         );
       }
+    },
+  },
+  {
+    version: 3,
+    name: "archive_outbox + archive_seq for local PG archive",
+    up(ctx) {
+      applyArchiveOutboxMigration(ctx);
     },
   },
 ];

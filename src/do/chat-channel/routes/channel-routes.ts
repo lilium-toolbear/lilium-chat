@@ -12,6 +12,17 @@ import { idempotencyExpiresAt } from "../../../contract/idempotency";
 import type { ChannelMetaProjection, ChannelUpdatePresentFields } from "../../../contract/channel-api";
 import type { AttachmentRow as ChatAttachmentRow } from "../../../chat/attachment-projection";
 import { personalInviteCode } from "../../../chat/invite-code";
+import {
+  appendChatChannelArchive,
+  collectDefinedChanges,
+  rvEvent,
+  rvSeq,
+  upsertChannelChange,
+  upsertEventChange,
+  upsertInviteChange,
+  upsertMemberChange,
+  upsertAuditLogChange,
+} from "../../../archive/chat-channel-record";
 
 export async function dispatchChannelRoutes(host: ChatChannelHost, request: Request, url: URL): Promise<Response | null> {
   if (url.pathname === "/internal/invites-create") {
@@ -148,6 +159,11 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
         now,
       );
 
+      appendChatChannelArchive(host.ctx, channelId, now, [], (sourceSeq) => {
+        const rv = rvSeq(sourceSeq);
+        return collectDefinedChanges([upsertInviteChange(host.ctx.storage.sql, inviteCode, rv)]);
+      });
+
       return { kind: "ok", responseJson, outboxId };
     });
 
@@ -159,7 +175,7 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
     }
 
     await host.flushSingleInviteDirectoryOutbox(txResult.outboxId, now);
-    await host.scheduleOutboxAlarm(now);
+    await host.scheduleArchiveAlarm(now);
     return Response.json(JSON.parse(txResult.responseJson));
   }
 
@@ -356,6 +372,17 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
         now,
         idemExpiresAt,
       );
+
+      appendChatChannelArchive(host.ctx, channelId, now, [joinedId], (sourceSeq) => {
+        const rv = rvEvent(joinedId);
+        return collectDefinedChanges([
+          upsertChannelChange(host.ctx.storage.sql, channelId, rv),
+          upsertMemberChange(host.ctx.storage.sql, channelId, userId, rv),
+          upsertInviteChange(host.ctx.storage.sql, invite.invite_code, rv),
+          upsertEventChange(host.ctx.storage.sql, joinedId),
+        ]);
+      });
+
       return { kind: "ok", responseJson };
     });
 
@@ -363,7 +390,7 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
       return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: 409 });
     }
     if (txResult.kind === "ok") {
-      await host.scheduleOutboxAlarm(now);
+      await host.scheduleArchiveAlarm(now);
       return Response.json(JSON.parse(txResult.responseJson), { status: 200 });
     }
     return host.cachedResponse(txResult.responseJson);
@@ -480,10 +507,23 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
           title, avatar_url: null, member_count: memberCount, last_message_at: null, status: "active",
         }, now);
       }
+
+      const memberUserIds = [creatorUserId, ...initialMembers.map((im) => im.user_id)];
+      const businessEventIds = events.map((e) => e.id);
+      appendChatChannelArchive(host.ctx, channelId, now, businessEventIds, (sourceSeq) => {
+        const tableRv = rvSeq(sourceSeq);
+        const changes = [
+          upsertChannelChange(host.ctx.storage.sql, channelId, tableRv),
+          ...memberUserIds.map((uid) => upsertMemberChange(host.ctx.storage.sql, channelId, uid, tableRv)),
+          ...events.map((ev) => upsertEventChange(host.ctx.storage.sql, ev.id)),
+        ];
+        return collectDefinedChanges(changes);
+      });
+
       return { kind: "created" as const, channel: { channel_id: channelId, kind: "channel", visibility, title, topic: b.topic ?? null, avatar_url: null, member_count: memberCount, status: "active", created_at: now, updated_at: now }, joinedAt: now };
     });
 
-    if (result.kind === "created") await host.scheduleOutboxAlarm(now);
+    if (result.kind === "created") await host.scheduleArchiveAlarm(now);
 
     return Response.json({
       channel: result.channel,
@@ -593,6 +633,17 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
         );
       }
 
+      appendChatChannelArchive(host.ctx, channelId, now, [channelCreatedId], (sourceSeq) => {
+        const rv = rvEvent(channelCreatedId);
+        return collectDefinedChanges([
+          upsertChannelChange(host.ctx.storage.sql, channelId, rv),
+          upsertMemberChange(host.ctx.storage.sql, channelId, userA, rv),
+          upsertMemberChange(host.ctx.storage.sql, channelId, userB, rv),
+          upsertAuditLogChange(host.ctx.storage.sql, auditId, rv),
+          upsertEventChange(host.ctx.storage.sql, channelCreatedId),
+        ]);
+      });
+
       return {
         kind: "created" as const,
         channel: {
@@ -611,7 +662,7 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
       };
     });
 
-    if (result.kind === "created") await host.scheduleOutboxAlarm(now);
+    if (result.kind === "created") await host.scheduleArchiveAlarm(now);
 
     return Response.json({
       ...result.channel,
@@ -747,6 +798,14 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
         const updatedId = host.nextEventId(nowMs);
         host.persistEventAndFanout(updatedId, "channel.updated", channelId, now,
           buildChannelUpdatedPayload({ channel_id: channelId, channel_changes: changes, actor_kind: "user", actor_id: userId }), mv, now, actorMap);
+
+        appendChatChannelArchive(host.ctx, channelId, now, [updatedId], (sourceSeq) => {
+          const rv = rvEvent(updatedId);
+          return collectDefinedChanges([
+            upsertChannelChange(host.ctx.storage.sql, channelId, rv),
+            upsertEventChange(host.ctx.storage.sql, updatedId),
+          ]);
+        });
       }
 
       const responseJson = JSON.stringify({ channel });
@@ -775,7 +834,7 @@ export async function dispatchChannelRoutes(host: ChatChannelHost, request: Requ
       return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency_key reused with different body", retryable: false } }, { status: 409 });
     }
     if (txResult.kind === "ok") {
-      await host.scheduleOutboxAlarm(now);
+      await host.scheduleArchiveAlarm(now);
       return Response.json({ channel: txResult.channel }, { status: 200 });
     }
     // cached branch (success cached OR an error shape encoded inside the txn).

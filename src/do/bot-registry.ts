@@ -16,6 +16,12 @@ import {
   type ValidatedEventCapability,
 } from "../chat/command-options";
 import { hashBotToken } from "../auth/bot";
+import { archiveOutboxDueTable, flushArchiveOutboxToQueue } from "../archive/queue-flush";
+import { appendArchiveRecordSync } from "../archive/source-outbox";
+import { archiveReplaceScope, archiveUpsert, rowVersionFromSeq } from "../archive/changes";
+import { sourceKeyForBotRegistry } from "../archive/source-key";
+import type { ArchiveChange } from "../archive/payload";
+import { scheduleNextAlarm } from "./scheduler";
 
 // BotRegistry is a SINGLETON DO (getByName("registry")). token plaintext ->
 // hash cannot reverse-resolve bot_id, and the bot API entry point only has a
@@ -23,6 +29,174 @@ import { hashBotToken } from "../auth/bot";
 // SELECT ... WHERE token_hash=? (idx_bot_tokens_hash UNIQUE). It also owns the
 // GLOBAL bot command catalog (bot_commands + bot_command_aliases),
 // bot_event_capabilities, and bot profile (bot_apps).
+
+function appendBotRegistryArchive(
+  ctx: DurableObjectState,
+  occurredAt: string,
+  buildChanges: (sourceSeq: number) => ArchiveChange[],
+): void {
+  appendArchiveRecordSync(ctx, {
+    sourceKind: "bot_registry",
+    sourceKey: sourceKeyForBotRegistry(),
+    occurredAt,
+    businessEventIds: [],
+    buildChanges,
+  });
+}
+
+function readBotCommandArchiveRow(
+  ctx: DurableObjectState,
+  botCommandId: string,
+): Record<string, unknown> | undefined {
+  const row = ctx.storage.sql
+    .exec(
+      `SELECT bot_command_id, bot_id, name, description, options_json, default_member_permission,
+              default_enabled_on_install, schema_version, definition_hash, enabled, created_at, updated_at, deleted_at
+       FROM bot_commands WHERE bot_command_id=?`,
+      botCommandId,
+    )
+    .toArray()[0] as
+    | {
+        bot_command_id: string;
+        bot_id: string;
+        name: string;
+        description: string | null;
+        options_json: string;
+        default_member_permission: string;
+        default_enabled_on_install: number;
+        schema_version: number;
+        definition_hash: string;
+        enabled: number;
+        created_at: string;
+        updated_at: string;
+        deleted_at: string | null;
+      }
+    | undefined;
+  if (!row) return undefined;
+  return {
+    bot_command_id: row.bot_command_id,
+    bot_id: row.bot_id,
+    name: row.name,
+    description: row.description,
+    options_json: row.options_json,
+    default_member_permission: row.default_member_permission,
+    default_enabled_on_install: row.default_enabled_on_install,
+    schema_version: row.schema_version,
+    definition_hash: row.definition_hash,
+    enabled: row.enabled,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    deleted_at: row.deleted_at,
+  };
+}
+
+function readBotCommandAliasRows(ctx: DurableObjectState, botCommandId: string): Array<Record<string, unknown>> {
+  return (
+    ctx.storage.sql
+      .exec(
+        "SELECT bot_command_id, bot_id, alias, created_at FROM bot_command_aliases WHERE bot_command_id=? ORDER BY alias",
+        botCommandId,
+      )
+      .toArray() as Array<{ bot_command_id: string; bot_id: string; alias: string; created_at: string }>
+  ).map((row) => ({
+    bot_command_id: row.bot_command_id,
+    bot_id: row.bot_id,
+    alias: row.alias,
+    created_at: row.created_at,
+  }));
+}
+
+function readBotEventCapabilityRows(ctx: DurableObjectState, botId: string): Array<Record<string, unknown>> {
+  return (
+    ctx.storage.sql
+      .exec(
+        "SELECT bot_id, event_type, filters_json, default_enabled_on_install, created_at, updated_at FROM bot_event_capabilities WHERE bot_id=? ORDER BY event_type",
+        botId,
+      )
+      .toArray() as Array<{
+        bot_id: string;
+        event_type: string;
+        filters_json: string;
+        default_enabled_on_install: number;
+        created_at: string;
+        updated_at: string;
+      }>
+  ).map((row) => ({
+    bot_id: row.bot_id,
+    event_type: row.event_type,
+    filters_json: row.filters_json,
+    default_enabled_on_install: row.default_enabled_on_install,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  }));
+}
+
+function buildBotCommandsSyncArchiveChanges(
+  ctx: DurableObjectState,
+  botId: string,
+  botCommandIds: string[],
+  sourceSeq: number,
+): ArchiveChange[] {
+  const rowVersion = rowVersionFromSeq(sourceSeq);
+  const changes: ArchiveChange[] = [];
+  for (const botCommandId of botCommandIds) {
+    const commandAfter = readBotCommandArchiveRow(ctx, botCommandId);
+    if (commandAfter) {
+      changes.push(
+        archiveUpsert("chat_bot_commands", { bot_command_id: botCommandId }, rowVersion, commandAfter),
+      );
+    }
+    changes.push(
+      archiveReplaceScope(
+        "chat_bot_command_aliases",
+        { bot_command_id: botCommandId },
+        rowVersion,
+        readBotCommandAliasRows(ctx, botCommandId),
+      ),
+    );
+  }
+  changes.push(
+    archiveReplaceScope(
+      "chat_bot_event_capabilities",
+      { bot_id: botId },
+      rowVersion,
+      readBotEventCapabilityRows(ctx, botId),
+    ),
+  );
+  return changes;
+}
+
+function readBotAppArchiveRow(ctx: DurableObjectState, botId: string): Record<string, unknown> | undefined {
+  const row = ctx.storage.sql
+    .exec(
+      "SELECT bot_id, owner_user_id, display_name, avatar_url, callback_url, status, created_at, updated_at FROM bot_apps WHERE bot_id=?",
+      botId,
+    )
+    .toArray()[0] as
+    | {
+        bot_id: string;
+        owner_user_id: string;
+        display_name: string;
+        avatar_url: string | null;
+        callback_url: string;
+        status: string;
+        created_at: string;
+        updated_at: string;
+      }
+    | undefined;
+  if (!row) return undefined;
+  return {
+    bot_id: row.bot_id,
+    owner_user_id: row.owner_user_id,
+    display_name: row.display_name,
+    avatar_url: row.avatar_url,
+    callback_url: row.callback_url,
+    status: row.status,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
 export class BotRegistry extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -107,8 +281,18 @@ export class BotRegistry extends DurableObject<Env> {
     });
   }
 
+  async scheduleArchiveAlarm(): Promise<void> {
+    await scheduleNextAlarm(this.ctx, [archiveOutboxDueTable()], { respectExistingAlarm: true });
+  }
+
   async alarm(): Promise<void> {
-    // Phase 7a: no due jobs yet (delivery outbox lives in ChatChannel + BotConnection).
+    const now = new Date().toISOString();
+    try {
+      await flushArchiveOutboxToQueue(this.ctx, this.env.CHAT_ARCHIVE_QUEUE, { now });
+    } catch {
+      // Archive flush failure is retried via next alarm.
+    }
+    await scheduleNextAlarm(this.ctx, [archiveOutboxDueTable()], { respectExistingAlarm: true });
   }
 
   /**
@@ -364,9 +548,18 @@ export class BotRegistry extends DurableObject<Env> {
         nowIso,
         idemExpiresAt,
       );
+      appendBotRegistryArchive(this.ctx, nowIso, (sourceSeq) =>
+        buildBotCommandsSyncArchiveChanges(
+          this.ctx,
+          botId,
+          outCommands.map((command) => command.bot_command_id),
+          sourceSeq,
+        ),
+      );
       return responseBody;
     });
 
+    await this.scheduleArchiveAlarm();
     return Response.json(response);
   }
 
@@ -546,152 +739,197 @@ export class BotRegistry extends DurableObject<Env> {
       defHash: await sha256Hex(canonicalCommandDefinition(command as unknown as ValidatedCommand)),
     })));
 
-    let issuedToken: string | null = null;
-
-    this.ctx.storage.sql.exec(
-      `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, callback_url, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
-       ON CONFLICT(bot_id) DO UPDATE SET
-         display_name=excluded.display_name,
-         avatar_url=excluded.avatar_url,
-         status='active',
-         updated_at=excluded.updated_at`,
-      OFFICIAL_BOT_ID,
-      "system",
-      "Lilium Bot",
-      null,
-      "https://example.test/callback",
-      now,
-      now,
-    );
-
     const existingToken = this.ctx.storage.sql
       .exec("SELECT token_hash, revoked_at FROM bot_tokens WHERE bot_id=? AND revoked_at IS NULL LIMIT 1", OFFICIAL_BOT_ID)
       .toArray()[0] as { token_hash: string; revoked_at: string | null } | undefined;
 
+    let issuedToken: string | null = null;
+    let newTokenId: string | null = null;
+    let newTokenHash: string | null = null;
     if (!existingToken) {
       issuedToken = `lcbot_${crypto.randomUUID()}_${crypto.randomUUID()}`;
-      const tokenHash = await hashBotToken(issuedToken);
-      this.ctx.storage.sql.exec(
-        `INSERT INTO bot_tokens (token_id, bot_id, token_hash, scopes, created_at, revoked_at)
-         VALUES (?, ?, ?, ?, ?, NULL)`,
-        uuidv7(Date.now()),
-        OFFICIAL_BOT_ID,
-        tokenHash,
-        JSON.stringify(["chat:commands:manage", "chat:runtime:connect", "chat:messages:write"]),
-        now,
-      );
+      newTokenId = uuidv7(Date.now());
+      newTokenHash = await hashBotToken(issuedToken);
     }
 
-    const responseCommands: Array<{
-      bot_command_id: string;
-      name: string;
-      aliases: string[];
-      enabled: boolean;
-      default_enabled_on_install: boolean;
-      schema_version: number;
-      updated_at: string;
-    }> = [];
-
-    for (const plan of commandPlan) {
-      const command = plan.command;
-      const canonical = canonicalCommandDefinition(command as unknown as ValidatedCommand);
-      const existing = this.ctx.storage.sql
-        .exec(
-          "SELECT bot_command_id, schema_version, definition_hash FROM bot_commands WHERE bot_id=? AND name=?",
-          OFFICIAL_BOT_ID,
-          command.name,
-        )
-        .toArray()[0] as
-        | { bot_command_id: string; schema_version: number; definition_hash: string }
-        | undefined;
-
-      let botCommandId: string;
-      let schemaVersion: number;
-
-      if (existing) {
-        botCommandId = existing.bot_command_id;
-        schemaVersion = existing.definition_hash === plan.defHash ? existing.schema_version : existing.schema_version + 1;
-        this.ctx.storage.sql.exec(
-          `UPDATE bot_commands
-           SET description=?, options_json=?, default_member_permission=?, default_enabled_on_install=?,
-               schema_version=?, definition_hash=?, enabled=1, deleted_at=NULL, updated_at=?
-           WHERE bot_command_id=?`,
-          command.description,
-          JSON.stringify(command.options),
-          command.default_member_permission,
-          command.default_enabled_on_install ? 1 : 0,
-          schemaVersion,
-          plan.defHash,
-          now,
-          botCommandId,
-        );
-      } else {
-        botCommandId = uuidv7(Date.now());
-        schemaVersion = 1;
-        this.ctx.storage.sql.exec(
-          `INSERT INTO bot_commands (
-             bot_command_id, bot_id, name, description, options_json, default_member_permission,
-             default_enabled_on_install, schema_version, definition_hash, enabled, created_at, updated_at, deleted_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)`,
-          botCommandId,
-          OFFICIAL_BOT_ID,
-          command.name,
-          command.description,
-          JSON.stringify(command.options),
-          command.default_member_permission,
-          command.default_enabled_on_install ? 1 : 0,
-          schemaVersion,
-          plan.defHash,
-          now,
-          now,
-        );
-      }
-
-      this.ctx.storage.sql.exec("DELETE FROM bot_command_aliases WHERE bot_command_id=?", botCommandId);
-      for (const alias of command.aliases) {
-        this.ctx.storage.sql.exec(
-          "INSERT INTO bot_command_aliases (bot_command_id, bot_id, alias, created_at) VALUES (?, ?, ?, ?)",
-          botCommandId,
-          OFFICIAL_BOT_ID,
-          alias,
-          now,
-        );
-      }
-
-      responseCommands.push({
-        bot_command_id: botCommandId,
-        name: command.name,
-        aliases: command.aliases,
-        enabled: true,
-        default_enabled_on_install: command.default_enabled_on_install,
-        schema_version: schemaVersion,
-        updated_at: now,
-      });
-    }
-
-    const responseCaps = [] as Array<{ event_type: string; default_enabled_on_install: boolean; updated_at: string }>;
-    for (const cap of seedEventCapabilities) {
+    const seedResult = this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
-        `INSERT INTO bot_event_capabilities (bot_id, event_type, filters_json, default_enabled_on_install, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(bot_id, event_type) DO UPDATE SET
-           filters_json=excluded.filters_json,
-           default_enabled_on_install=excluded.default_enabled_on_install,
+        `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, callback_url, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+         ON CONFLICT(bot_id) DO UPDATE SET
+           display_name=excluded.display_name,
+           avatar_url=excluded.avatar_url,
+           status='active',
            updated_at=excluded.updated_at`,
         OFFICIAL_BOT_ID,
-        cap.event_type,
-        JSON.stringify(cap.default_filters),
-        cap.default_enabled_on_install ? 1 : 0,
+        "system",
+        "Lilium Bot",
+        null,
+        "https://example.test/callback",
         now,
         now,
       );
-      responseCaps.push({
-        event_type: cap.event_type,
-        default_enabled_on_install: cap.default_enabled_on_install,
-        updated_at: now,
+
+      if (newTokenId && newTokenHash) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO bot_tokens (token_id, bot_id, token_hash, scopes, created_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, NULL)`,
+          newTokenId,
+          OFFICIAL_BOT_ID,
+          newTokenHash,
+          JSON.stringify(["chat:commands:manage", "chat:runtime:connect", "chat:messages:write"]),
+          now,
+        );
+      }
+
+      const responseCommands: Array<{
+        bot_command_id: string;
+        name: string;
+        aliases: string[];
+        enabled: boolean;
+        default_enabled_on_install: boolean;
+        schema_version: number;
+        updated_at: string;
+      }> = [];
+
+      for (const plan of commandPlan) {
+        const command = plan.command;
+        const existing = this.ctx.storage.sql
+          .exec(
+            "SELECT bot_command_id, schema_version, definition_hash FROM bot_commands WHERE bot_id=? AND name=?",
+            OFFICIAL_BOT_ID,
+            command.name,
+          )
+          .toArray()[0] as
+          | { bot_command_id: string; schema_version: number; definition_hash: string }
+          | undefined;
+
+        let botCommandId: string;
+        let schemaVersion: number;
+
+        if (existing) {
+          botCommandId = existing.bot_command_id;
+          schemaVersion = existing.definition_hash === plan.defHash ? existing.schema_version : existing.schema_version + 1;
+          this.ctx.storage.sql.exec(
+            `UPDATE bot_commands
+             SET description=?, options_json=?, default_member_permission=?, default_enabled_on_install=?,
+                 schema_version=?, definition_hash=?, enabled=1, deleted_at=NULL, updated_at=?
+             WHERE bot_command_id=?`,
+            command.description,
+            JSON.stringify(command.options),
+            command.default_member_permission,
+            command.default_enabled_on_install ? 1 : 0,
+            schemaVersion,
+            plan.defHash,
+            now,
+            botCommandId,
+          );
+        } else {
+          botCommandId = uuidv7(Date.now());
+          schemaVersion = 1;
+          this.ctx.storage.sql.exec(
+            `INSERT INTO bot_commands (
+               bot_command_id, bot_id, name, description, options_json, default_member_permission,
+               default_enabled_on_install, schema_version, definition_hash, enabled, created_at, updated_at, deleted_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)`,
+            botCommandId,
+            OFFICIAL_BOT_ID,
+            command.name,
+            command.description,
+            JSON.stringify(command.options),
+            command.default_member_permission,
+            command.default_enabled_on_install ? 1 : 0,
+            schemaVersion,
+            plan.defHash,
+            now,
+            now,
+          );
+        }
+
+        this.ctx.storage.sql.exec("DELETE FROM bot_command_aliases WHERE bot_command_id=?", botCommandId);
+        for (const alias of command.aliases) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO bot_command_aliases (bot_command_id, bot_id, alias, created_at) VALUES (?, ?, ?, ?)",
+            botCommandId,
+            OFFICIAL_BOT_ID,
+            alias,
+            now,
+          );
+        }
+
+        responseCommands.push({
+          bot_command_id: botCommandId,
+          name: command.name,
+          aliases: command.aliases,
+          enabled: true,
+          default_enabled_on_install: command.default_enabled_on_install,
+          schema_version: schemaVersion,
+          updated_at: now,
+        });
+      }
+
+      const responseCaps = [] as Array<{ event_type: string; default_enabled_on_install: boolean; updated_at: string }>;
+      for (const cap of seedEventCapabilities) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO bot_event_capabilities (bot_id, event_type, filters_json, default_enabled_on_install, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(bot_id, event_type) DO UPDATE SET
+             filters_json=excluded.filters_json,
+             default_enabled_on_install=excluded.default_enabled_on_install,
+             updated_at=excluded.updated_at`,
+          OFFICIAL_BOT_ID,
+          cap.event_type,
+          JSON.stringify(cap.default_filters),
+          cap.default_enabled_on_install ? 1 : 0,
+          now,
+          now,
+        );
+        responseCaps.push({
+          event_type: cap.event_type,
+          default_enabled_on_install: cap.default_enabled_on_install,
+          updated_at: now,
+        });
+      }
+
+      appendBotRegistryArchive(this.ctx, now, (sourceSeq) => {
+        const rowVersion = rowVersionFromSeq(sourceSeq);
+        const changes: ArchiveChange[] = [];
+        const botApp = readBotAppArchiveRow(this.ctx, OFFICIAL_BOT_ID);
+        if (botApp) {
+          changes.push(archiveUpsert("chat_bot_apps", { bot_id: OFFICIAL_BOT_ID }, rowVersion, botApp));
+        }
+        if (newTokenId && newTokenHash) {
+          changes.push(
+            archiveUpsert(
+              "chat_bot_tokens",
+              { token_id: newTokenId },
+              rowVersion,
+              {
+                token_id: newTokenId,
+                bot_id: OFFICIAL_BOT_ID,
+                token_hash: newTokenHash,
+                scopes: JSON.stringify(["chat:commands:manage", "chat:runtime:connect", "chat:messages:write"]),
+                created_at: now,
+                revoked_at: null,
+              },
+            ),
+          );
+        }
+        changes.push(
+          ...buildBotCommandsSyncArchiveChanges(
+            this.ctx,
+            OFFICIAL_BOT_ID,
+            responseCommands.map((command) => command.bot_command_id),
+            sourceSeq,
+          ),
+        );
+        return changes;
       });
-    }
+
+      return { responseCommands, responseCaps };
+    });
+
+    await this.scheduleArchiveAlarm();
 
     return Response.json({
       bot: {
@@ -700,8 +938,8 @@ export class BotRegistry extends DurableObject<Env> {
         avatar_url: null,
       },
       token: issuedToken,
-      commands: responseCommands,
-      event_capabilities: responseCaps,
+      commands: seedResult.responseCommands,
+      event_capabilities: seedResult.responseCaps,
     });
   }
 }

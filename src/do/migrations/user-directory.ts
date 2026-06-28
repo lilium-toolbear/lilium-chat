@@ -5,8 +5,9 @@ import {
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
+import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
 
-export const USER_DIRECTORY_CURRENT_SCHEMA_VERSION = 2026062802;
+export const USER_DIRECTORY_CURRENT_SCHEMA_VERSION = 2026062803;
 
 export const USER_DIRECTORY_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS my_channels (
@@ -86,6 +87,13 @@ export const userDirectoryMigrations: SqlMigration[] = [
       if (!columnExists(ctx, "my_channels", "summary_json")) {
         ctx.storage.sql.exec("ALTER TABLE my_channels ADD COLUMN summary_json TEXT");
       }
+    },
+  },
+  {
+    version: 2026062803,
+    name: "archive_outbox + archive_seq for local PG archive",
+    up(ctx) {
+      applyArchiveOutboxMigration(ctx);
     },
   },
 ];

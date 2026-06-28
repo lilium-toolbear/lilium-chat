@@ -51,6 +51,23 @@ import {
 import { bumpQueueRetry } from "./retry-backoff";
 import { idempotencyConflictResponse, requireTestOnly } from "./do-errors";
 import { isoDueTable, runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "./scheduler";
+import { archiveOutboxDueTable, flushArchiveOutboxToQueue } from "../archive/queue-flush";
+import {
+  appendChatChannelArchive,
+  collectDefinedChanges,
+  replaceScopeMentionsChange,
+  replaceScopeCommandBindingsForBotChange,
+  replaceScopeCommandNamesForBindingChange,
+  replaceScopeCommandNamesForBotChange,
+  replaceScopeBotEventSubscriptionsForBotChange,
+  rvEvent,
+  upsertAuditLogChange,
+  upsertBotInstallationChange,
+  upsertCommandBindingChange,
+  upsertEventChange,
+  upsertMessageChange,
+  upsertMessageEditChange,
+} from "../archive/chat-channel-record";
 import type { UserDirectoryOutboxPayload } from "../contract/outbox";
 import type {
   CommandBindingProjection,
@@ -558,6 +575,28 @@ export class ChatChannel extends DurableObject<Env> {
         responseJson: fullAckJson,
         nowIso: now,
       });
+
+      const editId = input.operation === "message.edit" ? `${eventId}:edit` : null;
+      const auditId = input.operation === "message.recall" || input.operation === "message.delete"
+        ? `${eventId}:audit`
+        : null;
+      appendChatChannelArchive(this.ctx, input.channelId, now, [eventId], (_sourceSeq) => {
+        const rv = rvEvent(eventId);
+        const changes: Array<import("../archive/payload").ArchiveChange | null> = [
+          upsertMessageChange(this.ctx.storage.sql, input.messageId, input.channelId, rv),
+          upsertEventChange(this.ctx.storage.sql, eventId),
+        ];
+        if (input.operation === "message.edit") {
+          changes.push(
+            upsertMessageEditChange(this.ctx.storage.sql, editId!, rv),
+          );
+          changes.push(replaceScopeMentionsChange(this.ctx.storage.sql, input.messageId, rv));
+        } else if (auditId) {
+          changes.push(upsertAuditLogChange(this.ctx.storage.sql, auditId, rv));
+        }
+        return collectDefinedChanges(changes);
+      });
+
       return { kind: "ok", responseJson: fullAckJson };
     });
 
@@ -579,7 +618,7 @@ export class ChatChannel extends DurableObject<Env> {
       return this.cachedResponse(txResult.j);
     }
 
-    await this.scheduleOutboxAlarm(now);
+    await this.scheduleArchiveAlarm(now);
     const ack = JSON.parse(txResult.responseJson) as MessageMutationIdempotencyEnvelope;
     return Response.json({ channel_id: ack.payload?.channel_id ?? input.channelId, event_id: ack.payload?.event_id ?? "", message: ack.payload?.message ?? null });
   }
@@ -619,9 +658,15 @@ export class ChatChannel extends DurableObject<Env> {
 
   private async scheduleOutboxAlarm(_nowIso?: string): Promise<void> {
     void _nowIso;
-    await scheduleNextAlarm(this.ctx, this.outboxDueTables(async () => Promise.resolve()), {
-      respectExistingAlarm: true,
-    });
+    await scheduleNextAlarm(
+      this.ctx,
+      [...this.outboxDueTables(async () => Promise.resolve()), archiveOutboxDueTable()],
+      { respectExistingAlarm: true },
+    );
+  }
+
+  async scheduleArchiveAlarm(nowIso?: string): Promise<void> {
+    await this.scheduleOutboxAlarm(nowIso);
   }
 
   private outboxDueTables(handler: (rows: DueRow[]) => Promise<void>): DueTable[] {
@@ -1066,6 +1111,18 @@ export class ChatChannel extends DurableObject<Env> {
         "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, ?, ?, ?, ?, 'completed', ?, ?)",
         userId, operation, operationId, requestHash, fullResponse, now, idemExpiresAt,
       );
+
+      appendChatChannelArchive(this.ctx, channelId, now, [installedId], (sourceSeq) => {
+        const rv = rvEvent(installedId);
+        return collectDefinedChanges([
+          upsertBotInstallationChange(this.ctx.storage.sql, channelId, botId, rv),
+          replaceScopeCommandBindingsForBotChange(this.ctx.storage.sql, channelId, botId, rv),
+          replaceScopeCommandNamesForBotChange(this.ctx.storage.sql, channelId, botId, rv),
+          replaceScopeBotEventSubscriptionsForBotChange(this.ctx.storage.sql, channelId, botId, rv),
+          upsertEventChange(this.ctx.storage.sql, installedId),
+        ]);
+      });
+
       return { kind: "ok" as const, responseJson: fullResponse };
     });
 
@@ -1073,7 +1130,7 @@ export class ChatChannel extends DurableObject<Env> {
       return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: 409 });
     }
     if (txResult.kind === "error") return this.cachedResponse(txResult.j);
-    await this.scheduleOutboxAlarm(now);
+    await this.scheduleArchiveAlarm(now);
     return Response.json(JSON.parse(txResult.responseJson));
   }
 
@@ -1163,6 +1220,18 @@ export class ChatChannel extends DurableObject<Env> {
         "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, ?, ?, ?, ?, 'completed', ?, ?)",
         userId, operation, operationId, requestHash, fullResponse, now, idemExpiresAt,
       );
+
+      appendChatChannelArchive(this.ctx, channelId, now, [updatedId], (sourceSeq) => {
+        const rv = rvEvent(updatedId);
+        return collectDefinedChanges([
+          upsertBotInstallationChange(this.ctx.storage.sql, channelId, botId, rv),
+          replaceScopeCommandBindingsForBotChange(this.ctx.storage.sql, channelId, botId, rv),
+          replaceScopeCommandNamesForBotChange(this.ctx.storage.sql, channelId, botId, rv),
+          replaceScopeBotEventSubscriptionsForBotChange(this.ctx.storage.sql, channelId, botId, rv),
+          upsertEventChange(this.ctx.storage.sql, updatedId),
+        ]);
+      });
+
       return { kind: "ok" as const, responseJson: fullResponse };
     });
 
@@ -1170,7 +1239,7 @@ export class ChatChannel extends DurableObject<Env> {
       return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: 409 });
     }
     if (txResult.kind === "error") return this.cachedResponse(txResult.j);
-    await this.scheduleOutboxAlarm(now);
+    await this.scheduleArchiveAlarm(now);
     return Response.json(JSON.parse(txResult.responseJson));
   }
 
@@ -1282,6 +1351,16 @@ export class ChatChannel extends DurableObject<Env> {
         "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, ?, ?, ?, ?, 'completed', ?, ?)",
         userId, operation, operationId, requestHash, fullResponse, now, idemExpiresAt,
       );
+
+      appendChatChannelArchive(this.ctx, channelId, now, [bindingUpdatedId], (sourceSeq) => {
+        const rv = rvEvent(bindingUpdatedId);
+        return collectDefinedChanges([
+          upsertCommandBindingChange(this.ctx.storage.sql, binding.binding_id, rv),
+          replaceScopeCommandNamesForBindingChange(this.ctx.storage.sql, channelId, botCommandId, rv),
+          upsertEventChange(this.ctx.storage.sql, bindingUpdatedId),
+        ]);
+      });
+
       return { kind: "ok" as const, responseJson: fullResponse };
     });
 
@@ -1289,7 +1368,7 @@ export class ChatChannel extends DurableObject<Env> {
       return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } }, { status: 409 });
     }
     if (txResult.kind === "error") return this.cachedResponse(txResult.j);
-    await this.scheduleOutboxAlarm(now);
+    await this.scheduleArchiveAlarm(now);
     return Response.json(JSON.parse(txResult.responseJson));
   }
 
@@ -1455,6 +1534,11 @@ export class ChatChannel extends DurableObject<Env> {
     await runDueJobs(this.ctx, nowIso, this.outboxDueTables(async (rows) => {
       await this.flushProjectionOutboxRows(rows as unknown as OutboxRow[], nowIso);
     }));
+    try {
+      await flushArchiveOutboxToQueue(this.ctx, this.env.CHAT_ARCHIVE_QUEUE, { now: nowIso });
+    } catch {
+      // Archive flush failure must not block projection retry scheduling.
+    }
     await this.scheduleOutboxAlarm(nowIso);
   }
 }

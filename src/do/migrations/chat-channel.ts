@@ -7,8 +7,9 @@ import {
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
+import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
 
-export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026062602;
+export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026062803;
 
 export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS channel_meta (
@@ -352,6 +353,13 @@ export const chatChannelMigrations: SqlMigration[] = [
           );
         }
       }
+    },
+  },
+  {
+    version: 2026062803,
+    name: "archive_outbox + archive_seq for local PG archive",
+    up(ctx) {
+      applyArchiveOutboxMigration(ctx);
     },
   },
 ];

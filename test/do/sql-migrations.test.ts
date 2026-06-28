@@ -194,7 +194,7 @@ describe("DMDirectory migrateSqlite", () => {
     expect(res.status).toBe(200);
     const body = await res.json() as { current_version: number; applied: Array<{ version: number }> };
     expect(body.current_version).toBe(DM_DIRECTORY_CURRENT_SCHEMA_VERSION);
-    expect(body.applied.map((row) => row.version)).toEqual([1]);
+    expect(body.applied.map((row) => row.version)).toEqual([1, 2]);
   });
 
   it("dm_pairs table exists after migration", async () => {
@@ -204,6 +204,7 @@ describe("DMDirectory migrateSqlite", () => {
     await withDoState(stub, (ctx) => {
       migrateSqlite(ctx, "DMDirectory", dmDirectoryBaseline, dmDirectoryMigrations);
       expect(tableExists(ctx, "dm_pairs")).toBe(true);
+      expect(tableExists(ctx, "archive_outbox")).toBe(true);
     });
   });
 });

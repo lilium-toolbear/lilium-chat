@@ -4,8 +4,9 @@ import {
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
+import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
 
-export const DM_DIRECTORY_CURRENT_SCHEMA_VERSION = 1;
+export const DM_DIRECTORY_CURRENT_SCHEMA_VERSION = 2;
 
 export const DM_DIRECTORY_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS dm_pairs (
@@ -29,7 +30,15 @@ export const dmDirectoryBaseline: BaselineDetector = {
   },
 };
 
-export const dmDirectoryMigrations: SqlMigration[] = [];
+export const dmDirectoryMigrations: SqlMigration[] = [
+  {
+    version: 2,
+    name: "archive_outbox + archive_seq for local PG archive",
+    up(ctx) {
+      applyArchiveOutboxMigration(ctx);
+    },
+  },
+];
 
 export function migrateDmDirectorySchema(ctx: DurableObjectState): void {
   migrateSqlite(ctx, "DMDirectory", dmDirectoryBaseline, dmDirectoryMigrations);

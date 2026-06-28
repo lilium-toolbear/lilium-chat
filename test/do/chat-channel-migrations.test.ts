@@ -103,7 +103,7 @@ describe("ChatChannel migrations", () => {
 
     let migrationRuns = 0;
     const extraMigration = {
-      version: 2026062699,
+      version: 2026062899,
       name: "count runs",
       up() {
         migrationRuns += 1;

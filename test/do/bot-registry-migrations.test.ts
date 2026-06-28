@@ -55,6 +55,8 @@ describe("BotRegistry v2 migrations (Phase 7)", () => {
     await stub.fetch(new Request("https://x/ping"));
     await withDoState(stub, (ctx) => {
       expectPhase7Catalog(ctx);
+      expect(tableExists(ctx, "archive_outbox")).toBe(true);
+      expect(tableExists(ctx, "archive_seq")).toBe(true);
     });
     expect(await schemaVersion(stub)).toBe(BOT_REGISTRY_CURRENT_SCHEMA_VERSION);
   });

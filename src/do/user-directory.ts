@@ -11,6 +11,11 @@ import { canonicalDmPairKey, isUuidString } from "../chat/dm-pair";
 import { resolveUserSummaries } from "../profile/resolve";
 import { idempotencyExpiresAt } from "../contract/idempotency";
 import { isoDueTable, runDueJobs, scheduleNextAlarm, type DueTable } from "./scheduler";
+import { archiveOutboxDueTable, flushArchiveOutboxToQueue } from "../archive/queue-flush";
+import { appendArchiveRecordSync } from "../archive/source-outbox";
+import { archiveUpsert, rowVersionFromSeq } from "../archive/changes";
+import { sourceKeyForUserDirectory } from "../archive/source-key";
+import type { ArchiveChange } from "../archive/payload";
 
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const MAX_ATTACHMENT_SIZE_BYTES = 20 * 1024 * 1024; // 20 MiB
@@ -37,6 +42,78 @@ type StickerSourceAttachment = {
   size_bytes: number;
   blurhash: string | null;
 };
+
+type PersonalStickerRow = {
+  sticker_id: string;
+  user_id: string;
+  attachment_id: string;
+  url: string;
+  mime_type: string;
+  width: number | null;
+  height: number | null;
+  size_bytes: number;
+  blurhash: string | null;
+  created_at: string;
+  deleted_at: string | null;
+};
+
+function attachmentArchiveAfter(row: AttachmentRow): Record<string, unknown> {
+  return {
+    attachment_id: row.attachment_id,
+    owner_user_id: row.owner_user_id,
+    kind: row.kind,
+    filename: row.filename,
+    mime_type: row.mime_type,
+    size_bytes: row.size_bytes,
+    width: row.width,
+    height: row.height,
+    blurhash: row.blurhash,
+    storage_key: row.storage_key,
+    url: row.url,
+    status: row.status,
+    created_at: row.created_at,
+  };
+}
+
+function personalStickerArchiveAfter(row: PersonalStickerRow): Record<string, unknown> {
+  return {
+    sticker_id: row.sticker_id,
+    user_id: row.user_id,
+    attachment_id: row.attachment_id,
+    url: row.url,
+    mime_type: row.mime_type,
+    width: row.width,
+    height: row.height,
+    size_bytes: row.size_bytes,
+    blurhash: row.blurhash,
+    created_at: row.created_at,
+    deleted_at: row.deleted_at,
+  };
+}
+
+function readPersonalStickerRow(ctx: DurableObjectState, stickerId: string): PersonalStickerRow | undefined {
+  return ctx.storage.sql
+    .exec(
+      "SELECT sticker_id, user_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash, created_at, deleted_at FROM personal_stickers WHERE sticker_id=?",
+      stickerId,
+    )
+    .toArray()[0] as PersonalStickerRow | undefined;
+}
+
+function appendUserDirectoryArchive(
+  ctx: DurableObjectState,
+  userId: string,
+  occurredAt: string,
+  buildChanges: (sourceSeq: number) => ArchiveChange[],
+): void {
+  appendArchiveRecordSync(ctx, {
+    sourceKind: "user_directory",
+    sourceKey: sourceKeyForUserDirectory(userId),
+    occurredAt,
+    businessEventIds: [],
+    buildChanges,
+  });
+}
 
 function validatePresignBody(body: {
   filename?: string;
@@ -591,6 +668,7 @@ export class UserDirectory extends DurableObject<Env> {
           )
           .toArray()[0] as { sticker_id: string; deleted_at: string | null } | undefined;
         const stickerId = existing?.sticker_id ?? newStickerId;
+        let stickerMutated = false;
         if (existing) {
           if (existing.deleted_at !== null) {
             // Restoring a soft-deleted row: this does not grow the library, so no limit check.
@@ -600,6 +678,7 @@ export class UserDirectory extends DurableObject<Env> {
               now,
               stickerId,
             );
+            stickerMutated = true;
           }
         } else {
           // Library limit applies only to genuinely new items (contract §8.3).
@@ -624,6 +703,24 @@ export class UserDirectory extends DurableObject<Env> {
             projection.blurhash ?? null,
             now,
           );
+          stickerMutated = true;
+        }
+
+        if (stickerMutated) {
+          const stickerRow = readPersonalStickerRow(this.ctx, stickerId);
+          if (stickerRow) {
+            appendUserDirectoryArchive(this.ctx, userId, now, (sourceSeq) => {
+              const rowVersion = rowVersionFromSeq(sourceSeq);
+              return [
+                archiveUpsert(
+                  "chat_personal_stickers",
+                  { sticker_id: stickerRow.sticker_id },
+                  rowVersion,
+                  personalStickerArchiveAfter(stickerRow),
+                ),
+              ];
+            });
+          }
         }
 
         const json = JSON.stringify({
@@ -652,7 +749,7 @@ export class UserDirectory extends DurableObject<Env> {
           now,
           idemExpiresAt,
         );
-        return { kind: "done" as const, responseJson: json };
+        return { kind: "done" as const, responseJson: json, archived: stickerMutated };
       });
 
       if (saveResult.kind === "conflict") {
@@ -666,6 +763,9 @@ export class UserDirectory extends DurableObject<Env> {
           { error: { code: "STICKER_LIBRARY_LIMIT_EXCEEDED", message: "personal sticker library is full", retryable: false } },
           { status: 409 },
         );
+      }
+      if (saveResult.archived) {
+        await this.scheduleArchiveAlarm();
       }
       return new Response(saveResult.responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
     }
@@ -763,13 +863,30 @@ export class UserDirectory extends DurableObject<Env> {
         if (row && row.user_id !== userId) {
           return { kind: "forbidden" as const };
         }
+        const hadActiveRow = row !== undefined && row.deleted_at === null;
         // Idempotent soft-delete: no-op if already deleted or absent (contract §8.3).
-        this.ctx.storage.sql.exec(
-          "UPDATE personal_stickers SET deleted_at=? WHERE sticker_id=? AND user_id=? AND deleted_at IS NULL",
-          now,
-          stickerId,
-          userId,
-        );
+        if (hadActiveRow) {
+          this.ctx.storage.sql.exec(
+            "UPDATE personal_stickers SET deleted_at=? WHERE sticker_id=? AND user_id=? AND deleted_at IS NULL",
+            now,
+            stickerId,
+            userId,
+          );
+          const stickerRow = readPersonalStickerRow(this.ctx, stickerId);
+          if (stickerRow) {
+            appendUserDirectoryArchive(this.ctx, userId, now, (sourceSeq) => {
+              const rowVersion = rowVersionFromSeq(sourceSeq);
+              return [
+                archiveUpsert(
+                  "chat_personal_stickers",
+                  { sticker_id: stickerRow.sticker_id },
+                  rowVersion,
+                  personalStickerArchiveAfter(stickerRow),
+                ),
+              ];
+            });
+          }
+        }
         this.ctx.storage.sql.exec(
           "INSERT OR REPLACE INTO idempotency_keys (operation, operation_id, request_hash, status, channel_id, response_json, created_at, updated_at, expires_at) VALUES ('sticker.delete', ?, ?, 'completed', NULL, ?, ?, ?, ?)",
           operationId,
@@ -779,7 +896,7 @@ export class UserDirectory extends DurableObject<Env> {
           now,
           idemExpiresAt,
         );
-        return { kind: "done" as const, responseJson };
+        return { kind: "done" as const, responseJson, archived: hadActiveRow };
       });
 
       if (result.kind === "conflict") {
@@ -793,6 +910,9 @@ export class UserDirectory extends DurableObject<Env> {
           { error: { code: "FORBIDDEN", message: "sticker does not belong to user", retryable: false } },
           { status: 403 },
         );
+      }
+      if (result.archived) {
+        await this.scheduleArchiveAlarm();
       }
       return new Response(result.responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
     }
@@ -944,7 +1064,7 @@ export class UserDirectory extends DurableObject<Env> {
         );
       });
 
-      await this.schedulePendingAlarm();
+      await this.scheduleAlarm();
       return new Response(responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
@@ -1084,6 +1204,17 @@ export class UserDirectory extends DurableObject<Env> {
           .toArray()[0] as AttachmentRow | undefined;
         const projection = projectFinalizedAttachmentForBrowser(finalizedRow!);
         const json = JSON.stringify({ attachment: projection });
+        appendUserDirectoryArchive(this.ctx, userId, now, (sourceSeq) => {
+          const rowVersion = rowVersionFromSeq(sourceSeq);
+          return [
+            archiveUpsert(
+              "chat_attachments",
+              { attachment_id: finalizedRow!.attachment_id },
+              rowVersion,
+              attachmentArchiveAfter(finalizedRow!),
+            ),
+          ];
+        });
         this.ctx.storage.sql.exec(
           "INSERT OR REPLACE INTO idempotency_keys (operation, operation_id, request_hash, status, attachment_id, response_json, created_at, updated_at, expires_at) VALUES ('attachment.finalize', ?, ?, 'completed', ?, ?, COALESCE((SELECT created_at FROM idempotency_keys WHERE operation='attachment.finalize' AND operation_id=?), ?), ?, ?)",
           idempotencyKey,
@@ -1098,7 +1229,7 @@ export class UserDirectory extends DurableObject<Env> {
         return json;
       });
 
-      await this.schedulePendingAlarm();
+      await this.scheduleArchiveAlarm();
       return new Response(responseJson, { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
@@ -1146,10 +1277,16 @@ export class UserDirectory extends DurableObject<Env> {
     ];
   }
 
-  private async schedulePendingAlarm(): Promise<void> {
-    await scheduleNextAlarm(this.ctx, this.pendingAttachmentDueTables(async () => Promise.resolve()), {
-      respectExistingAlarm: true,
-    });
+  private async scheduleAlarm(): Promise<void> {
+    await scheduleNextAlarm(
+      this.ctx,
+      [...this.pendingAttachmentDueTables(async () => Promise.resolve()), archiveOutboxDueTable()],
+      { respectExistingAlarm: true },
+    );
+  }
+
+  async scheduleArchiveAlarm(): Promise<void> {
+    await this.scheduleAlarm();
   }
 
   async alarm(): Promise<void> {
@@ -1164,6 +1301,11 @@ export class UserDirectory extends DurableObject<Env> {
         this.ctx.storage.sql.exec("DELETE FROM pending_attachments WHERE attachment_id=?", row.attachment_id);
       }
     }));
-    await this.schedulePendingAlarm();
+    try {
+      await flushArchiveOutboxToQueue(this.ctx, this.env.CHAT_ARCHIVE_QUEUE, { now });
+    } catch {
+      // Archive flush failure must not block attachment cleanup scheduling.
+    }
+    await this.scheduleAlarm();
   }
 }

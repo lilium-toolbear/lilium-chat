@@ -40,6 +40,10 @@
     }
   ],
 
+  "queues": {
+    "producers": [{ "binding": "CHAT_ARCHIVE_QUEUE", "queue": "lilium-chat-archive" }]
+  },
+
   "migrations": [
     {
       "tag": "v1",

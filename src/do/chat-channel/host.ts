@@ -45,6 +45,7 @@ export interface ChatChannelHost {
   ): void;
   readChannelDirectorySnapshot(channelId: string, nowIso: string): ChannelDirectorySnapshotFields | null;
   scheduleOutboxAlarm(nowIso?: string): Promise<void>;
+  scheduleArchiveAlarm(nowIso?: string): Promise<void>;
   markMemberLeftAndEnqueueFanoutUnregister(channelId: string, userId: string, nowIso: string): Promise<void>;
   markMemberLeftAndEnqueueFanoutUnregisterSync(channelId: string, userId: string, nowIso: string): void;
   applyMessageMutation(input: {

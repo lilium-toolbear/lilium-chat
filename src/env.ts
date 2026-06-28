@@ -11,6 +11,7 @@ declare global {
     SENTRY_DSN: string;
     /** Set to "1" only in wrangler.test.jsonc; absent in production. */
     ALLOW_INTERNAL_TEST_ROUTES?: string;
+    CHAT_ARCHIVE_QUEUE: Queue<import("./archive/payload").ArchiveRecord>;
   }
 }
 
