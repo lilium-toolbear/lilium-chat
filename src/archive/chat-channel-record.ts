@@ -226,6 +226,95 @@ export function upsertCommandBindingChange(
   );
 }
 
+function readCommandInvocation(sql: SqlStorage, invocationId: string): Record<string, unknown> | null {
+  const row = sql
+    .exec(
+      `SELECT invocation_id, channel_id, command_id, invoker_user_id, bot_id, bot_command_id, command_name,
+              invoked_name, command_schema_version, command_definition_hash, options_json,
+              status, error_code, error_message, created_at, updated_at, completed_at
+       FROM command_invocations WHERE invocation_id=?`,
+      invocationId,
+    )
+    .toArray()[0] as Record<string, unknown> | undefined;
+  return row ?? null;
+}
+
+export function upsertCommandInvocationChange(
+  sql: SqlStorage,
+  invocationId: string,
+  rowVersion: string,
+): ArchiveChange | null {
+  const row = readCommandInvocation(sql, invocationId);
+  if (!row) return null;
+  return archiveUpsert(
+    chatChannelTable("command_invocations"),
+    { invocation_id: invocationId },
+    rowVersion,
+    row,
+  );
+}
+
+function readStatefulSession(sql: SqlStorage, sessionId: string): Record<string, unknown> | null {
+  const row = sql
+    .exec(
+      `SELECT session_id, channel_id, bot_id, bot_command_id, invocation_id, started_by_user_id,
+              status, listen_rules_json, input_next_seq, input_last_acked_seq, effect_last_acked_seq,
+              started_at, expires_at, closed_at, close_reason, summary_json
+       FROM stateful_command_sessions WHERE session_id=?`,
+      sessionId,
+    )
+    .toArray()[0] as Record<string, unknown> | undefined;
+  return row ?? null;
+}
+
+export function upsertStatefulSessionChange(
+  sql: SqlStorage,
+  sessionId: string,
+  rowVersion: string,
+): ArchiveChange | null {
+  const row = readStatefulSession(sql, sessionId);
+  if (!row) return null;
+  return archiveUpsert(
+    chatChannelTable("stateful_command_sessions"),
+    { session_id: sessionId },
+    rowVersion,
+    row,
+  );
+}
+
+function readStatefulSessionInput(
+  sql: SqlStorage,
+  sessionId: string,
+  seq: number,
+): Record<string, unknown> | null {
+  const row = sql
+    .exec(
+      `SELECT session_id, seq, channel_id, event_id, message_id, message_projection_json,
+              status, created_at, sent_at, acked_at
+       FROM stateful_session_inputs WHERE session_id=? AND seq=?`,
+      sessionId,
+      seq,
+    )
+    .toArray()[0] as Record<string, unknown> | undefined;
+  return row ?? null;
+}
+
+export function upsertStatefulSessionInputChange(
+  sql: SqlStorage,
+  sessionId: string,
+  seq: number,
+  rowVersion: string,
+): ArchiveChange | null {
+  const row = readStatefulSessionInput(sql, sessionId, seq);
+  if (!row) return null;
+  return archiveUpsert(
+    chatChannelTable("stateful_session_inputs"),
+    { session_id: sessionId, seq },
+    rowVersion,
+    row,
+  );
+}
+
 export function replaceScopeMentionsChange(
   sql: SqlStorage,
   messageId: string,
@@ -309,29 +398,6 @@ export function upsertAttachmentsForMessageChanges(
       rowVersion,
       row,
     ),
-  );
-}
-
-export function replaceScopeCommandBindingsForBotChange(
-  sql: SqlStorage,
-  channelId: string,
-  botId: string,
-  rowVersion: string,
-): ArchiveChange {
-  const rows = sql
-    .exec(
-      `SELECT channel_id, bot_command_id, bot_id, status, permission_override,
-              command_snapshot_json, stateful_max_ttl_seconds, updated_by_user_id, updated_at
-       FROM channel_command_bindings WHERE channel_id=? AND bot_id=?`,
-      channelId,
-      botId,
-    )
-    .toArray() as Array<Record<string, unknown>>;
-  return archiveReplaceScope(
-    chatChannelTable("channel_command_bindings"),
-    { channel_id: channelId, bot_id: botId },
-    rowVersion,
-    rows,
   );
 }
 

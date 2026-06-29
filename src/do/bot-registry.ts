@@ -106,6 +106,15 @@ function readBotCommandAliasRows(ctx: DurableObjectState, botCommandId: string):
   }));
 }
 
+function readBotCommandNameRows(ctx: DurableObjectState, botCommandId: string): Array<Record<string, unknown>> {
+  return ctx.storage.sql
+    .exec(
+      "SELECT slash_token, bot_command_id, bot_id, kind, created_at FROM bot_command_names WHERE bot_command_id=? ORDER BY slash_token",
+      botCommandId,
+    )
+    .toArray() as Array<Record<string, unknown>>;
+}
+
 function buildBotCommandsSyncArchiveChanges(
   ctx: DurableObjectState,
   botCommandIds: string[],
@@ -126,6 +135,14 @@ function buildBotCommandsSyncArchiveChanges(
         { bot_command_id: botCommandId },
         rowVersion,
         readBotCommandAliasRows(ctx, botCommandId),
+      ),
+    );
+    changes.push(
+      archiveReplaceScope(
+        "chat_bot_command_names",
+        { bot_command_id: botCommandId },
+        rowVersion,
+        readBotCommandNameRows(ctx, botCommandId),
       ),
     );
   }
@@ -1385,9 +1402,12 @@ export class BotRegistry extends DurableObject<Env> {
               {
                 token_id: newTokenId,
                 bot_id: OFFICIAL_BOT_ID,
+                name: "default",
                 token_hash: newTokenHash,
                 scopes: JSON.stringify(["chat:commands:manage", "chat:runtime:connect", "chat:messages:write"]),
                 created_at: now,
+                expires_at: null,
+                last_used_at: null,
                 revoked_at: null,
               },
             ),

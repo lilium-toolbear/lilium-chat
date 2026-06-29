@@ -20,6 +20,15 @@ import {
 import { uuidv7 } from "../../ids/uuidv7";
 import { SESSION_START_TIMEOUT_MS } from "../../chat/stateful-session";
 import { idempotencyExpiresAt } from "../../contract/idempotency";
+import {
+  appendChatChannelArchive,
+  collectDefinedChanges,
+  rvEvent,
+  upsertEventChange,
+  upsertStatefulSessionChange,
+  upsertStatefulSessionInputChange,
+} from "../../archive/chat-channel-record";
+import { rowVersionFromSeq } from "../../archive/changes";
 
 export interface StatefulSessionHost {
   readonly ctx: DurableObjectState;
@@ -38,6 +47,7 @@ export interface StatefulSessionHost {
     actorMap: Map<string, UserSummary>,
   ): void;
   scheduleOutboxAlarm(nowIso?: string): Promise<void>;
+  scheduleArchiveAlarm(nowIso?: string): Promise<void>;
   cachedResponse(j: string): Response;
   activeRole(channelId: string, userId: string): string | null;
 }
@@ -261,6 +271,16 @@ export async function handleStatefulCommandInvoke(
       nowIso: now,
     });
 
+    appendChatChannelArchive(host.ctx, input.channelId, now, [], (sourceSeq) =>
+      collectDefinedChanges([
+        upsertStatefulSessionChange(
+          host.ctx.storage.sql,
+          sessionId,
+          rowVersionFromSeq(sourceSeq),
+        ),
+      ]),
+    );
+
     return { kind: "ok" as const, responseJson: JSON.stringify(responseBody) };
   });
 
@@ -274,6 +294,7 @@ export async function handleStatefulCommandInvoke(
   if (txResult.kind === "busy") return busyResponse(host, txResult.busy);
 
   await host.scheduleOutboxAlarm(now);
+  await host.scheduleArchiveAlarm(now);
   return Response.json(JSON.parse(txResult.responseJson));
 }
 
@@ -361,9 +382,16 @@ export async function handleBotSessionStarted(host: StatefulSessionHost, body: {
       }),
       nowIso: now,
     });
+    appendChatChannelArchive(host.ctx, row.channel_id, now, [eventId], () =>
+      collectDefinedChanges([
+        upsertStatefulSessionChange(host.ctx.storage.sql, row.session_id, rvEvent(eventId)),
+        upsertEventChange(host.ctx.storage.sql, eventId),
+      ]),
+    );
   });
 
   await host.scheduleOutboxAlarm(now);
+  await host.scheduleArchiveAlarm(now);
   return Response.json({ ok: true });
 }
 
@@ -535,9 +563,16 @@ export async function closeStatefulSession(
       }),
       nowIso: now,
     });
+    appendChatChannelArchive(host.ctx, row.channel_id, now, [eventId], () =>
+      collectDefinedChanges([
+        upsertStatefulSessionChange(host.ctx.storage.sql, sessionId, rvEvent(eventId)),
+        upsertEventChange(host.ctx.storage.sql, eventId),
+      ]),
+    );
   });
 
   await host.scheduleOutboxAlarm(now);
+  await host.scheduleArchiveAlarm(now);
 }
 
 export async function maybeEnqueueStatefulSessionInput(
@@ -639,9 +674,17 @@ export async function maybeEnqueueStatefulSessionInput(
       requestJson: JSON.stringify({ seq, frame: inputFrame }),
       nowIso: now,
     });
+    appendChatChannelArchive(host.ctx, input.channelId, now, [], (sourceSeq) => {
+      const rowVersion = rowVersionFromSeq(sourceSeq);
+      return collectDefinedChanges([
+        upsertStatefulSessionInputChange(host.ctx.storage.sql, session.session_id, seq, rowVersion),
+        upsertStatefulSessionChange(host.ctx.storage.sql, session.session_id, rowVersion),
+      ]);
+    });
   });
 
   await host.scheduleOutboxAlarm(now);
+  await host.scheduleArchiveAlarm(now);
 }
 
 export async function handleBotSessionCloseFromBot(

@@ -57,6 +57,7 @@ import {
   rvEvent,
   upsertAuditLogChange,
   upsertCommandBindingChange,
+  upsertCommandInvocationChange,
   upsertEventChange,
   upsertMessageChange,
   upsertMessageEditChange,
@@ -1377,6 +1378,14 @@ export class ChatChannel extends DurableObject<Env> {
         now,
         idemExpiresAt,
       );
+
+      appendChatChannelArchive(this.ctx, channelId, now, [eventId], () =>
+        collectDefinedChanges([
+          upsertCommandInvocationChange(this.ctx.storage.sql, invocationId, rvEvent(eventId)),
+          upsertEventChange(this.ctx.storage.sql, eventId),
+        ]),
+      );
+
       return { kind: "ok" as const, responseJson: JSON.stringify(responseBody) };
     });
 
