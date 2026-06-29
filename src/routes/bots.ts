@@ -21,6 +21,7 @@ async function getOwnedBot(env: Env, userId: string, botId: string): Promise<Bot
   if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE", "bot lookup failed");
   const body = (await res.json()) as { bot: BotAppSummary };
   if (body.bot.owner_user_id !== userId) throw new ApiError("FORBIDDEN", "bot access denied");
+  if (body.bot.status === "deleted") throw new ApiError("BOT_NOT_FOUND", "bot not found");
   return body.bot;
 }
 
@@ -83,6 +84,55 @@ export async function getBotHandler(
   if (!botId) throw new ApiError("BOT_NOT_FOUND", "bot_id required");
   const bot = await getOwnedBot(env, userId, botId);
   return c.json({ bot }, 200, { "X-Request-Id": c.get("requestId") });
+}
+
+export async function updateBotHandler(
+  c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
+): Promise<Response> {
+  const { userId, env } = await getIdentity(c);
+  requireIdempotencyKey(c);
+  const botId = c.req.param("bot_id");
+  if (!botId) throw new ApiError("BOT_NOT_FOUND", "bot_id required");
+  await getOwnedBot(env, userId, botId);
+
+  const body = (await c.req.json().catch(() => null)) as {
+    display_name?: string;
+    avatar_url?: string | null;
+    description?: string | null;
+    visibility?: "private" | "unlisted" | "public" | "official";
+    status?: "active" | "disabled" | "deleted";
+  } | null;
+  if (
+    !body ||
+    (body.display_name === undefined &&
+      body.avatar_url === undefined &&
+      body.description === undefined &&
+      body.visibility === undefined &&
+      body.status === undefined)
+  ) {
+    throw new ApiError("INVALID_MESSAGE", "at least one field required");
+  }
+  if (body.display_name !== undefined && (typeof body.display_name !== "string" || body.display_name.trim().length === 0)) {
+    throw new ApiError("INVALID_MESSAGE", "display_name invalid");
+  }
+
+  const patchBody: Record<string, unknown> = { bot_id: botId };
+  if (body.display_name !== undefined) patchBody.display_name = body.display_name;
+  if (body.avatar_url !== undefined) patchBody.avatar_url = body.avatar_url;
+  if (body.description !== undefined) patchBody.description = body.description;
+  if (body.visibility !== undefined) patchBody.visibility = body.visibility;
+  if (body.status !== undefined) patchBody.status = body.status;
+
+  const res = await botRegistryStub(env).fetch(
+    new Request("https://x/internal/bots-patch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patchBody),
+    }),
+  );
+  if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE", "bot update failed");
+  const out = (await res.json()) as { bot: BotAppSummary };
+  return c.json({ bot: out.bot }, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function listBotTokensHandler(

@@ -130,6 +130,109 @@ describe("Browser Bot Developer API", () => {
     expect(forbiddenRes.status).toBe(403);
   });
 
+  it("PATCH /api/chat/bots/:id updates avatar_url for owner", async () => {
+    const userId = `bot-patch-owner-${crypto.randomUUID()}`;
+    const createRes = await browserReq(
+      userId,
+      "POST",
+      "/api/chat/bots",
+      { display_name: "Patch Bot", issue_initial_token: false },
+      `key-patch-create-${crypto.randomUUID()}`,
+    );
+    const created = (await createRes.json()) as { bot: { bot_id: string } };
+
+    const patchRes = await browserReq(
+      userId,
+      "PATCH",
+      `/api/chat/bots/${created.bot.bot_id}`,
+      { avatar_url: "https://s3.kuma.homes/avatars/bot.png" },
+      `key-patch-avatar-${crypto.randomUUID()}`,
+    );
+    expect(patchRes.status).toBe(200);
+    const patched = (await patchRes.json()) as { bot: { avatar_url: string | null } };
+    expect(patched.bot.avatar_url).toBe("https://s3.kuma.homes/avatars/bot.png");
+
+    const getRes = await browserReq(userId, "GET", `/api/chat/bots/${created.bot.bot_id}`);
+    const got = (await getRes.json()) as { bot: { avatar_url: string | null } };
+    expect(got.bot.avatar_url).toBe("https://s3.kuma.homes/avatars/bot.png");
+  });
+
+  it("PATCH /api/chat/bots/:id returns 403 for non-owner", async () => {
+    const ownerId = `bot-patch-owner-${crypto.randomUUID()}`;
+    const otherId = `bot-patch-other-${crypto.randomUUID()}`;
+    const createRes = await browserReq(
+      ownerId,
+      "POST",
+      "/api/chat/bots",
+      { display_name: "Owner Patch Bot", issue_initial_token: false },
+      `key-patch-forbidden-create-${crypto.randomUUID()}`,
+    );
+    const created = (await createRes.json()) as { bot: { bot_id: string } };
+
+    const forbiddenRes = await browserReq(
+      otherId,
+      "PATCH",
+      `/api/chat/bots/${created.bot.bot_id}`,
+      { avatar_url: "https://example.com/evil.png" },
+      `key-patch-forbidden-${crypto.randomUUID()}`,
+    );
+    expect(forbiddenRes.status).toBe(403);
+  });
+
+  it("PATCH /api/chat/bots/:id updates description and visibility", async () => {
+    const userId = `bot-patch-profile-${crypto.randomUUID()}`;
+    const createRes = await browserReq(
+      userId,
+      "POST",
+      "/api/chat/bots",
+      { display_name: "Profile Bot", issue_initial_token: false },
+      `key-profile-create-${crypto.randomUUID()}`,
+    );
+    const created = (await createRes.json()) as { bot: { bot_id: string } };
+
+    const patchRes = await browserReq(
+      userId,
+      "PATCH",
+      `/api/chat/bots/${created.bot.bot_id}`,
+      { description: "Updated description", visibility: "public" },
+      `key-profile-patch-${crypto.randomUUID()}`,
+    );
+    expect(patchRes.status).toBe(200);
+    const patched = (await patchRes.json()) as {
+      bot: { description: string | null; visibility: string };
+    };
+    expect(patched.bot.description).toBe("Updated description");
+    expect(patched.bot.visibility).toBe("public");
+  });
+
+  it("PATCH /api/chat/bots/:id with status deleted removes bot from list", async () => {
+    const userId = `bot-delete-owner-${crypto.randomUUID()}`;
+    const createRes = await browserReq(
+      userId,
+      "POST",
+      "/api/chat/bots",
+      { display_name: "Delete Me", issue_initial_token: false },
+      `key-delete-create-${crypto.randomUUID()}`,
+    );
+    const created = (await createRes.json()) as { bot: { bot_id: string } };
+
+    const deleteRes = await browserReq(
+      userId,
+      "PATCH",
+      `/api/chat/bots/${created.bot.bot_id}`,
+      { status: "deleted" },
+      `key-delete-bot-${crypto.randomUUID()}`,
+    );
+    expect(deleteRes.status).toBe(200);
+
+    const listRes = await browserReq(userId, "GET", "/api/chat/bots");
+    const listBody = (await listRes.json()) as { items: Array<{ bot_id: string }> };
+    expect(listBody.items.some((item) => item.bot_id === created.bot.bot_id)).toBe(false);
+
+    const getRes = await browserReq(userId, "GET", `/api/chat/bots/${created.bot.bot_id}`);
+    expect(getRes.status).toBe(404);
+  });
+
   it("GET /api/chat/bots/:id/tokens lists metadata only", async () => {
     const userId = `bot-token-list-owner-${crypto.randomUUID()}`;
     const createRes = await browserReq(

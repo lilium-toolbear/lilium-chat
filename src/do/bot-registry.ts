@@ -290,6 +290,9 @@ export class BotRegistry extends DurableObject<Env> {
     if (url.pathname === "/internal/bots-get") {
       return this.handleBotsGet(url);
     }
+    if (url.pathname === "/internal/bots-patch") {
+      return this.handleBotsPatch(request);
+    }
     if (url.pathname === "/internal/bots-tokens-list") {
       return this.handleBotsTokensList(url);
     }
@@ -504,7 +507,7 @@ export class BotRegistry extends DurableObject<Env> {
         `SELECT b.bot_id, b.owner_user_id, b.display_name, b.avatar_url, b.description, b.visibility, b.status, b.created_at, b.updated_at,
                 (SELECT COUNT(*) FROM bot_commands c WHERE c.bot_id=b.bot_id AND c.status='active' AND c.deleted_at IS NULL) AS command_count
          FROM bot_apps b
-         WHERE b.owner_user_id=?
+         WHERE b.owner_user_id=? AND b.status != 'deleted'
          ORDER BY b.updated_at DESC, b.bot_id DESC
          LIMIT ? OFFSET ?`,
         ownerUserId,
@@ -568,6 +571,135 @@ export class BotRegistry extends DurableObject<Env> {
       return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot not found" } }, { status: 404 });
     }
     return Response.json({ bot: row });
+  }
+
+  private async handleBotsPatch(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as {
+      bot_id?: unknown;
+      display_name?: unknown;
+      avatar_url?: unknown;
+      description?: unknown;
+      visibility?: unknown;
+      status?: unknown;
+    } | null;
+    if (!body || typeof body.bot_id !== "string" || body.bot_id.length === 0) {
+      return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot_id required" } }, { status: 404 });
+    }
+
+    const hasDisplayName = body.display_name !== undefined;
+    const hasAvatarUrl = body.avatar_url !== undefined;
+    const hasDescription = body.description !== undefined;
+    const hasVisibility = body.visibility !== undefined;
+    const hasStatus = body.status !== undefined;
+    if (!hasDisplayName && !hasAvatarUrl && !hasDescription && !hasVisibility && !hasStatus) {
+      return Response.json(
+        { error: { code: "INVALID_MESSAGE", message: "at least one field required" } },
+        { status: 422 },
+      );
+    }
+
+    if (hasDisplayName && (typeof body.display_name !== "string" || body.display_name.trim().length === 0)) {
+      return Response.json(
+        { error: { code: "INVALID_MESSAGE", message: "display_name invalid" } },
+        { status: 422 },
+      );
+    }
+    if (hasAvatarUrl && body.avatar_url !== null && typeof body.avatar_url !== "string") {
+      return Response.json(
+        { error: { code: "INVALID_MESSAGE", message: "avatar_url invalid" } },
+        { status: 422 },
+      );
+    }
+    if (hasDescription && body.description !== null && typeof body.description !== "string") {
+      return Response.json(
+        { error: { code: "INVALID_MESSAGE", message: "description invalid" } },
+        { status: 422 },
+      );
+    }
+    const visibility =
+      hasVisibility &&
+      (body.visibility === "private" ||
+        body.visibility === "unlisted" ||
+        body.visibility === "public" ||
+        body.visibility === "official")
+        ? body.visibility
+        : null;
+    if (hasVisibility && visibility === null) {
+      return Response.json(
+        { error: { code: "INVALID_MESSAGE", message: "visibility invalid" } },
+        { status: 422 },
+      );
+    }
+    const status =
+      hasStatus && (body.status === "active" || body.status === "disabled" || body.status === "deleted")
+        ? body.status
+        : null;
+    if (hasStatus && status === null) {
+      return Response.json(
+        { error: { code: "INVALID_MESSAGE", message: "status invalid" } },
+        { status: 422 },
+      );
+    }
+
+    const existing = this.ctx.storage.sql
+      .exec("SELECT status FROM bot_apps WHERE bot_id=?", body.bot_id)
+      .toArray()[0] as { status: string } | undefined;
+    if (!existing || existing.status === "deleted") {
+      return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot not found" } }, { status: 404 });
+    }
+
+    const now = new Date().toISOString();
+    const sets: string[] = ["updated_at = ?"];
+    const params: unknown[] = [now];
+    if (hasDisplayName) {
+      sets.push("display_name = ?");
+      params.push((body.display_name as string).trim());
+    }
+    if (hasAvatarUrl) {
+      sets.push("avatar_url = ?");
+      params.push(typeof body.avatar_url === "string" ? body.avatar_url : null);
+    }
+    if (hasDescription) {
+      sets.push("description = ?");
+      params.push(typeof body.description === "string" ? body.description : null);
+    }
+    if (visibility !== null) {
+      sets.push("visibility = ?");
+      params.push(visibility);
+    }
+    if (status !== null) {
+      sets.push("status = ?");
+      params.push(status);
+    }
+    params.push(body.bot_id);
+
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(`UPDATE bot_apps SET ${sets.join(", ")} WHERE bot_id = ?`, ...params);
+      appendBotRegistryArchive(this.ctx, now, (sourceSeq) =>
+        buildBotAppAndTokenArchiveChanges(this.ctx, body.bot_id as string, null, sourceSeq),
+      );
+    });
+
+    await this.scheduleArchiveAlarm();
+
+    const updated = this.ctx.storage.sql
+      .exec(
+        "SELECT bot_id, owner_user_id, display_name, avatar_url, description, visibility, status, created_at, updated_at FROM bot_apps WHERE bot_id=?",
+        body.bot_id,
+      )
+      .toArray()[0] as {
+      bot_id: string;
+      owner_user_id: string;
+      display_name: string;
+      avatar_url: string | null;
+      description: string | null;
+      visibility: "private" | "unlisted" | "public" | "official";
+      status: "active" | "disabled" | "deleted";
+      created_at: string;
+      updated_at: string;
+    };
+
+    return Response.json({ bot: updated });
   }
 
   private async handleBotsTokensList(url: URL): Promise<Response> {

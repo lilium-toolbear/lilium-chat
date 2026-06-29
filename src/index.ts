@@ -38,6 +38,7 @@ import {
   listBotsHandler,
   listBotTokensHandler,
   revokeBotTokenHandler,
+  updateBotHandler,
 } from "./routes/bots";
 import {
   updateCommandBindingHandler,
@@ -112,6 +113,7 @@ app.put("/api/chat/bot/commands", (c) => putBotCommandsHandler(c));
 app.post("/api/chat/bots", (c) => createBotHandler(c));
 app.get("/api/chat/bots", (c) => listBotsHandler(c));
 app.get("/api/chat/bots/:bot_id", (c) => getBotHandler(c));
+app.patch("/api/chat/bots/:bot_id", (c) => updateBotHandler(c));
 app.get("/api/chat/bots/:bot_id/tokens", (c) => listBotTokensHandler(c));
 app.post("/api/chat/bots/:bot_id/tokens", (c) => createBotTokenHandler(c));
 app.delete("/api/chat/bots/:bot_id/tokens/:token_id", (c) => revokeBotTokenHandler(c));
