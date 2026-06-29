@@ -134,6 +134,8 @@ columns/indexes via a new migration with an incremented
 - [`docs/api-contract.md`](docs/api-contract.md) — **authoritative** Browser/Bot API
   contract (single source of truth). When code and contract disagree, the contract
   wins. All API changes must update this file and add a revision-record entry.
+  **Do not** retroactively update historical docs (`docs/api-contract/*` addenda,
+  phase plans, gap trackers) when the API spec changes.
 - `docs/api-contract/` — dated patches, discussion drafts, and changelog stubs
   only; **not** authoritative. See [`docs/api-contract/README.md`](docs/api-contract/README.md).
 - `docs/superpowers/specs/` — backend design spec (with a layered revision

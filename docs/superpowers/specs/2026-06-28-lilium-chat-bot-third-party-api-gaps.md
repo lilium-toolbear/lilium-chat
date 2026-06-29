@@ -13,6 +13,8 @@
 > 旧 standalone addendum 文件 `docs/api-contract/2026-06-30-bot-internal-api-contract-addendum.md` 已合并入主 contract §16，仅保留 redirect stub。
 >
 > 第三方公开 API 文档只描述已上线、可调用、经过验证的能力；不得从本文直接摘取“预留 scope / 尚未实现 / 内部路由 / Browser/Admin API / ToolBear Web route”等内容。
+>
+> **Spec 变更流程：** API contract 有变更时，**只**更新 `docs/api-contract.md`（含修订记录）；**不要**回头修改本文或其它历史文档。
 
 本文保留用于追踪历史讨论项、实现缺口、以及公开文档刻意不写的设计方向。
 

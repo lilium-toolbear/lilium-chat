@@ -10,7 +10,7 @@
 - 前身 contract：`dzmm_archive/docs/plans/2026-06-21-toolbear-chat-api-contract.md`（v1）
 - 历史 patch / 讨论：`docs/api-contract/`（**非**权威；见该目录 `README.md`）
 
-本文件是 v1 contract 的**修订版**。所有与 v1 一致的部分保持原状；偏离处显式标注 `(v2 delta)`。前端与 bot 实现**以本文件为准**。任何 API 变更必须修改本文件并追加修订记录条目。
+本文件是 v1 contract 的**修订版**。所有与 v1 一致的部分保持原状；偏离处显式标注 `(v2 delta)`。前端与 bot 实现**以本文件为准**。任何 API 变更必须修改本文件并追加修订记录条目；**不要**为追平 spec 去改历史 addendum、phase plan、gap tracker 等归档文档。
 
 ## v1 → v2 差异摘要
 
