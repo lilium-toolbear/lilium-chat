@@ -1,5 +1,6 @@
 import type { ChannelFieldChanges } from "./events";
 import type { MemberJoinSource, MemberLeaveSource } from "./events";
+import type { CommandManifestDelta } from "./bot-api";
 
 /** Actor references stored in SQLite events.payload_json (design §3.5). */
 export interface ActorPersistedFields {
@@ -70,6 +71,30 @@ export interface CommandBindingUpdatedPersistedPayload extends ActorPersistedFie
   bot_id: string;
   bot_command_id: string;
   binding_changes: Record<string, { before: unknown; after: unknown }>;
+  command_manifest_delta: CommandManifestDelta;
+}
+
+export interface StatefulSessionRefSummary {
+  session_id: string;
+  bot_command_id: string;
+  command_name: string;
+  status: string;
+  started_by_user_id: string;
+  started_at: string;
+  expires_at: string;
+}
+
+export interface StatefulSessionStartedPersistedPayload extends ActorPersistedFields {
+  session: StatefulSessionRefSummary;
+}
+
+export interface StatefulSessionClosedPersistedPayload extends ActorPersistedFields {
+  session_id: string;
+  bot_command_id: string;
+  command_name: string;
+  status: string;
+  reason: string;
+  closed_at: string;
 }
 
 export interface PersistedMessageSenderRef {
@@ -138,7 +163,9 @@ export type ManagementPersistedEventType =
   | "member.left"
   | "bot.installed"
   | "bot.updated"
-  | "command.binding_updated";
+  | "command.binding_updated"
+  | "stateful_session.started"
+  | "stateful_session.closed";
 
 export interface ManagementPersistedPayloadByType {
   "channel.created": ChannelCreatedPersistedPayload;
@@ -150,6 +177,8 @@ export interface ManagementPersistedPayloadByType {
   "bot.installed": BotInstalledPersistedPayload;
   "bot.updated": BotUpdatedPersistedPayload;
   "command.binding_updated": CommandBindingUpdatedPersistedPayload;
+  "stateful_session.started": StatefulSessionStartedPersistedPayload;
+  "stateful_session.closed": StatefulSessionClosedPersistedPayload;
 }
 
 export type ManagementPersistedPayload = ManagementPersistedPayloadByType[ManagementPersistedEventType];
@@ -168,6 +197,8 @@ export interface ChatEventPersistedPayloadByType {
   "bot.installed": BotInstalledPersistedPayload;
   "bot.updated": BotUpdatedPersistedPayload;
   "command.binding_updated": CommandBindingUpdatedPersistedPayload;
+  "stateful_session.started": StatefulSessionStartedPersistedPayload;
+  "stateful_session.closed": StatefulSessionClosedPersistedPayload;
 }
 
 /** channel_changes after JSON round-trip may not satisfy ChannelFieldChanges strictly. */

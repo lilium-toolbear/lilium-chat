@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo, makeJwt, TEST_SECRET } from "../helpers";
+import { createTestDmChannel, getNamedDo, makeJwt, TEST_SECRET } from "../helpers";
 
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown) => Promise<Response> | Response;
@@ -33,79 +33,59 @@ async function withChannel(
   });
 }
 
-type SeedPermission = "member" | "admin" | "owner";
-
-type SeedCommand = {
-  name: string;
-  aliases: string[];
-  description: string;
-  options?: unknown[];
-  defaultMemberPermission: SeedPermission;
-  defaultEnabledOnInstall: boolean;
-};
-
 const seededBotIds = new Set<string>();
 
-async function seedBotWithCatalog(opts: {
+async function seedBotCommand(opts: {
   botId: string;
+  botCommandId: string;
   displayName: string;
-  avatarUrl?: string | null;
-  commands: SeedCommand[];
+  commandName: string;
+  aliases: string[];
 }): Promise<void> {
-  const now = "2026-06-26T00:00:00.000Z";
+  const now = "2026-06-29T00:00:00.000Z";
   await withRegistry((ctx) => {
     ctx.storage.sql.exec(
-      `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, callback_url, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`,
+      `INSERT INTO bot_apps (
+         bot_id, owner_user_id, display_name, avatar_url, description, visibility, status, created_at, updated_at
+       ) VALUES (?, ?, ?, NULL, NULL, 'private', 'active', ?, ?)`,
       opts.botId,
       "owner-1",
       opts.displayName,
-      opts.avatarUrl ?? null,
-      "https://example.test/callback",
       now,
       now,
     );
-
-    for (const c of opts.commands) {
-      const commandId = `cmd-${opts.botId}-${c.name}`;
+    ctx.storage.sql.exec(
+      `INSERT INTO bot_commands (
+         bot_command_id, bot_id, name, description, options_json, default_member_permission,
+         execution_mode, stateful_config_json, status, schema_version, definition_hash, created_at, updated_at, deleted_at
+       ) VALUES (?, ?, ?, ?, ?, 'member', 'stateless', NULL, 'active', 1, ?, ?, ?, NULL)`,
+      opts.botCommandId,
+      opts.botId,
+      opts.commandName,
+      `Run ${opts.commandName}`,
+      "[]",
+      `hash-${opts.botCommandId}`,
+      now,
+      now,
+    );
+    for (const alias of opts.aliases) {
       ctx.storage.sql.exec(
-        `INSERT INTO bot_commands (
-           bot_command_id, bot_id, name, description, options_json,
-           default_member_permission, default_enabled_on_install, schema_version,
-           definition_hash, enabled, created_at, updated_at, deleted_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?, NULL)`,
-        commandId,
+        "INSERT INTO bot_command_aliases (bot_command_id, bot_id, alias, created_at) VALUES (?, ?, ?, ?)",
+        opts.botCommandId,
         opts.botId,
-        c.name,
-        c.description,
-        JSON.stringify(c.options ?? []),
-        c.defaultMemberPermission,
-        c.defaultEnabledOnInstall ? 1 : 0,
-        `hash-${c.name}-1`,
-        now,
+        alias,
         now,
       );
-      for (const alias of c.aliases) {
-        ctx.storage.sql.exec(
-          "INSERT INTO bot_command_aliases (bot_command_id, bot_id, alias, created_at) VALUES (?, ?, ?, ?)",
-          commandId,
-          opts.botId,
-          alias,
-          now,
-        );
-      }
     }
   });
-
   seededBotIds.add(opts.botId);
 }
 
 async function cleanupBot(botId: string): Promise<void> {
   await withRegistry((ctx) => {
+    ctx.storage.sql.exec("DELETE FROM bot_command_names WHERE bot_id=?", botId);
     ctx.storage.sql.exec("DELETE FROM bot_command_aliases WHERE bot_id=?", botId);
     ctx.storage.sql.exec("DELETE FROM bot_commands WHERE bot_id=?", botId);
-    ctx.storage.sql.exec("DELETE FROM bot_event_capabilities WHERE bot_id=?", botId);
-    ctx.storage.sql.exec("DELETE FROM bot_idempotency_keys WHERE principal_id=?", botId);
     ctx.storage.sql.exec("DELETE FROM bot_tokens WHERE bot_id=?", botId);
     ctx.storage.sql.exec("DELETE FROM bot_apps WHERE bot_id=?", botId);
   });
@@ -150,282 +130,114 @@ async function createChannel(ownerId: string, title: string): Promise<string> {
   return body.channel.channel_id;
 }
 
-describe("GET /api/chat/channels/:channel_id/commands (7a-commands-query)", () => {
-  it("returns matched_kind=canonical when prefix hits command name", async () => {
-    const ownerId = `owner-canon-${crypto.randomUUID()}`;
-    const botId = `bot-canon-${crypto.randomUUID()}`;
-    const channelId = await createChannel(ownerId, "Canonical Command Match");
-    await seedBotWithCatalog({
+describe("channel command bindings", () => {
+  it("admin allow writes snapshot and emits command.binding_updated with manifest delta", async () => {
+    const ownerId = `owner-allow-${crypto.randomUUID()}`;
+    const botId = `bot-allow-${crypto.randomUUID()}`;
+    const botCommandId = `cmd-allow-${crypto.randomUUID()}`;
+    const channelId = await createChannel(ownerId, "Command Allow");
+    await seedBotCommand({
       botId,
-      displayName: "Snapshot Bot",
-      commands: [
-        {
-          name: "summarize",
-          aliases: ["sum"],
-          description: "Summarize text",
-          defaultMemberPermission: "member",
-          defaultEnabledOnInstall: true,
-        },
-      ],
+      botCommandId,
+      displayName: "Allow Bot",
+      commandName: "ask",
+      aliases: ["ai"],
     });
 
-    const installRes = await browserReq(
-      ownerId,
-      "POST",
-      `/api/chat/channels/${channelId}/bot-installations`,
-      { bot_id: botId },
-      `key-canon-${crypto.randomUUID()}`,
-    );
-    expect(installRes.status).toBe(201);
-
-    const res = await browserReq(ownerId, "GET", `/api/chat/channels/${channelId}/commands?prefix=su`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { items: Array<{ name: string; matched_name: string; matched_kind: string }> };
-    expect(body.items).toHaveLength(1);
-    expect(body.items[0]!.name).toBe("summarize");
-    expect(body.items[0]!.matched_name).toBe("summarize");
-    expect(body.items[0]!.matched_kind).toBe("canonical");
-  });
-
-  it("returns matched_kind=alias when prefix hits an alias", async () => {
-    const ownerId = `owner-alias-${crypto.randomUUID()}`;
-    const botId = `bot-alias-${crypto.randomUUID()}`;
-    const channelId = await createChannel(ownerId, "Alias Command Match");
-    await seedBotWithCatalog({
-      botId,
-      displayName: "Alias Bot",
-      commands: [
-        {
-          name: "greet",
-          aliases: ["asstart", "start"],
-          description: "Send greeting",
-          defaultMemberPermission: "member",
-          defaultEnabledOnInstall: true,
-        },
-      ],
-    });
-
-    const installRes = await browserReq(
-      ownerId,
-      "POST",
-      `/api/chat/channels/${channelId}/bot-installations`,
-      { bot_id: botId },
-      `key-alias-${crypto.randomUUID()}`,
-    );
-    expect(installRes.status).toBe(201);
-
-    const res = await browserReq(ownerId, "GET", `/api/chat/channels/${channelId}/commands?prefix=as`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { items: Array<{ matched_name: string; matched_kind: string }> };
-    expect(body.items).toHaveLength(1);
-    expect(body.items[0]!.matched_name).toBe("asstart");
-    expect(body.items[0]!.matched_kind).toBe("alias");
-  });
-
-  it("returns 403 when the caller is not a channel member", async () => {
-    const ownerId = `owner-nm-${crypto.randomUUID()}`;
-    const outsiderId = `outside-nm-${crypto.randomUUID()}`;
-    const botId = `bot-nm-${crypto.randomUUID()}`;
-    const channelId = await createChannel(ownerId, "Non-member Command Query");
-    await seedBotWithCatalog({
-      botId,
-      displayName: "Private Bot",
-      commands: [
-        {
-          name: "help",
-          aliases: ["h"],
-          description: "Help text",
-          defaultMemberPermission: "member",
-          defaultEnabledOnInstall: true,
-        },
-      ],
-    });
-
-    const installRes = await browserReq(ownerId, "POST", `/api/chat/channels/${channelId}/bot-installations`, { bot_id: botId }, `key-nm-${crypto.randomUUID()}`);
-    expect(installRes.status).toBe(201);
-
-    const res = await browserReq(outsiderId, "GET", `/api/chat/channels/${channelId}/commands?prefix=he`);
-    expect(res.status).toBe(403);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("FORBIDDEN");
-  });
-
-  it("filters out commands requiring higher permission than caller", async () => {
-    const ownerId = `owner-admin-${crypto.randomUUID()}`;
-    const memberId = `member-admin-${crypto.randomUUID()}`;
-    const botId = `bot-admin-${crypto.randomUUID()}`;
-    const channelId = await createChannel(ownerId, "Permission Filter");
-    await seedBotWithCatalog({
-      botId,
-      displayName: "Permission Bot",
-      commands: [
-        {
-          name: "membercmd",
-          aliases: ["mcmd"],
-          description: "Member command",
-          defaultMemberPermission: "member",
-          defaultEnabledOnInstall: true,
-        },
-        {
-          name: "admincmd",
-          aliases: ["acmd"],
-          description: "Admin command",
-          defaultMemberPermission: "admin",
-          defaultEnabledOnInstall: true,
-        },
-      ],
-    });
-
-    const installRes = await browserReq(
-      ownerId,
-      "POST",
-      `/api/chat/channels/${channelId}/bot-installations`,
-      { bot_id: botId },
-      `key-filter-${crypto.randomUUID()}`,
-    );
-    expect(installRes.status).toBe(201);
-    const addMemberRes = await browserReq(ownerId, "POST", `/api/chat/channels/${channelId}/members`, { user_id: memberId, role: "member" }, `key-add-${memberId}`);
-    expect(addMemberRes.status).toBe(200);
-
-    const res = await browserReq(memberId, "GET", `/api/chat/channels/${channelId}/commands?prefix=ad`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { items: Array<{ name: string }> };
-    expect(body.items).toHaveLength(0);
-  });
-
-  it("returns empty list when no enabled commands match the channel state", async () => {
-    const ownerId = `owner-empty-${crypto.randomUUID()}`;
-    const botId = `bot-empty-${crypto.randomUUID()}`;
-    const channelId = await createChannel(ownerId, "No Enabled Commands");
-    await seedBotWithCatalog({
-      botId,
-      displayName: "Off Bot",
-      commands: [
-        {
-          name: "disabledcmd",
-          aliases: ["dcmd"],
-          description: "Disabled command",
-          defaultMemberPermission: "member",
-          defaultEnabledOnInstall: false,
-        },
-      ],
-    });
-
-    const installRes = await browserReq(
-      ownerId,
-      "POST",
-      `/api/chat/channels/${channelId}/bot-installations`,
-      { bot_id: botId },
-      `key-empty-${crypto.randomUUID()}`,
-    );
-    expect(installRes.status).toBe(201);
-
-    const res = await browserReq(ownerId, "GET", `/api/chat/channels/${channelId}/commands?prefix=dis`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { items: Array<unknown> };
-    expect(body.items).toHaveLength(0);
-  });
-
-  it("keeps binding state unchanged when enabling would conflict with an existing slash token", async () => {
-    const ownerId = `owner-binding-conf-${crypto.randomUUID()}`;
-    const botIdA = `bot-binding-conf-a-${crypto.randomUUID()}`;
-    const botIdB = `bot-binding-conf-b-${crypto.randomUUID()}`;
-    const channelId = await createChannel(ownerId, "Binding Conflict");
-    await seedBotWithCatalog({
-      botId: botIdA,
-      displayName: "Enabled Bot",
-      commands: [
-        {
-          name: "ask",
-          aliases: ["ai"],
-          description: "Ask",
-          defaultMemberPermission: "member",
-          defaultEnabledOnInstall: true,
-        },
-      ],
-    });
-    await seedBotWithCatalog({
-      botId: botIdB,
-      displayName: "Disabled Bot",
-      commands: [
-        {
-          name: "ask",
-          aliases: ["assist"],
-          description: "Ask too",
-          defaultMemberPermission: "member",
-          defaultEnabledOnInstall: false,
-        },
-      ],
-    });
-
-    const installA = await browserReq(ownerId, "POST", `/api/chat/channels/${channelId}/bot-installations`, { bot_id: botIdA }, `key-bind-a-${crypto.randomUUID()}`);
-    expect(installA.status).toBe(201);
-    const installB = await browserReq(ownerId, "POST", `/api/chat/channels/${channelId}/bot-installations`, { bot_id: botIdB }, `key-bind-b-${crypto.randomUUID()}`);
-    expect(installB.status).toBe(201);
-
-    const botBCommandId = `cmd-${botIdB}-ask`;
-    const enableB = await browserReq(
+    const patchRes = await browserReq(
       ownerId,
       "PATCH",
-      `/api/chat/channels/${channelId}/commands/${botBCommandId}`,
-      { enabled: true },
-      `key-bind-enable-${crypto.randomUUID()}`,
+      `/api/chat/channels/${channelId}/commands/${botCommandId}`,
+      { status: "allowed", permission_override: "member" },
+      `key-allow-${crypto.randomUUID()}`,
     );
-    expect(enableB.status).toBe(409);
-    const body = (await enableB.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("COMMAND_NAME_CONFLICT");
+    expect(patchRes.status).toBe(200);
+    const patchBody = (await patchRes.json()) as {
+      bot_command_id: string;
+      status: string;
+      permission_override: string | null;
+    };
+    expect(patchBody.bot_command_id).toBe(botCommandId);
+    expect(patchBody.status).toBe("allowed");
+    expect(patchBody.permission_override).toBe("member");
+
+    const manifestRes = await browserReq(ownerId, "GET", `/api/chat/channels/${channelId}/commands?prefix=zz`);
+    expect(manifestRes.status).toBe(200);
+    const manifest = (await manifestRes.json()) as {
+      version: number;
+      items: Array<{ bot_command_id: string; name: string }>;
+    };
+    expect(manifest.version).toBe(1);
+    expect(manifest.items).toHaveLength(1);
+    expect(manifest.items[0]?.bot_command_id).toBe(botCommandId);
+    expect(manifest.items[0]?.name).toBe("ask");
 
     await withChannel(channelId, (ctx) => {
       const binding = ctx.storage.sql
-        .exec("SELECT status FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?", channelId, botBCommandId)
-        .toArray()[0] as { status: string } | undefined;
-      expect(binding?.status).toBe("disabled");
-      const botBNames = ctx.storage.sql
-        .exec("SELECT COUNT(*) AS c FROM channel_command_names WHERE channel_id=? AND bot_id=?", channelId, botIdB)
-        .toArray()[0] as { c: number | bigint };
-      expect(Number(botBNames.c)).toBe(0);
-      const askOwner = ctx.storage.sql
-        .exec("SELECT bot_id FROM channel_command_names WHERE channel_id=? AND slash_name=?", channelId, "ask")
-        .toArray()[0] as { bot_id: string } | undefined;
-      expect(askOwner?.bot_id).toBe(botIdA);
+        .exec(
+          "SELECT status, command_snapshot_json FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?",
+          channelId,
+          botCommandId,
+        )
+        .toArray()[0] as { status: string; command_snapshot_json: string } | undefined;
+      expect(binding?.status).toBe("allowed");
+      const snapshot = JSON.parse(binding?.command_snapshot_json ?? "{}") as { bot_command_id?: string };
+      expect(snapshot.bot_command_id).toBe(botCommandId);
+
+      const meta = ctx.storage.sql
+        .exec("SELECT command_manifest_version FROM channel_meta WHERE channel_id=?", channelId)
+        .toArray()[0] as { command_manifest_version: number } | undefined;
+      expect(meta?.command_manifest_version).toBe(1);
+
+      const event = ctx.storage.sql
+        .exec(
+          "SELECT payload_json FROM events WHERE channel_id=? AND event_type='command.binding_updated' ORDER BY event_id DESC LIMIT 1",
+          channelId,
+        )
+        .toArray()[0] as { payload_json: string } | undefined;
+      expect(event).toBeTruthy();
+      const payload = JSON.parse(event?.payload_json ?? "{}") as {
+        command_manifest_delta?: { op?: string; manifest_version?: number; item?: { bot_command_id?: string } };
+      };
+      expect(payload.command_manifest_delta?.op).toBe("upsert");
+      expect(payload.command_manifest_delta?.manifest_version).toBe(1);
+      expect(payload.command_manifest_delta?.item?.bot_command_id).toBe(botCommandId);
     });
   });
 
-  it("uses bot summary from installation snapshot (no BotRegistry read during query)", async () => {
-    const ownerId = `owner-snapshot-${crypto.randomUUID()}`;
-    const botId = `bot-snapshot-${crypto.randomUUID()}`;
-    const channelId = await createChannel(ownerId, "Snapshot Source Bot");
-    await seedBotWithCatalog({
-      botId,
-      displayName: "Install Snapshot Bot",
-      commands: [
-        {
-          name: "snapshot",
-          aliases: ["sn"],
-          description: "Snapshot test",
-          defaultMemberPermission: "member",
-          defaultEnabledOnInstall: true,
-        },
-      ],
-    });
-
-    const installRes = await browserReq(
-      ownerId,
-      "POST",
-      `/api/chat/channels/${channelId}/bot-installations`,
-      { bot_id: botId },
-      `key-snapshot-${crypto.randomUUID()}`,
-    );
-    expect(installRes.status).toBe(201);
-
-    await withRegistry((ctx) => {
-      ctx.storage.sql.exec("UPDATE bot_apps SET display_name=? WHERE bot_id=?", "Registry Mutated Bot", botId);
-    });
-
-    const res = await browserReq(ownerId, "GET", `/api/chat/channels/${channelId}/commands?prefix=sn`);
+  it("dm commands get returns empty manifest", async () => {
+    const userA = `dm-a-${crypto.randomUUID()}`;
+    const userB = `dm-b-${crypto.randomUUID()}`;
+    const { channelId } = await createTestDmChannel(env, userA, userB, userA);
+    const res = await browserReq(userA, "GET", `/api/chat/channels/${channelId}/commands`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { items: Array<{ bot: { display_name: string } }> };
-    expect(body.items).toHaveLength(1);
-    expect(body.items[0]!.bot.display_name).toBe("Install Snapshot Bot");
+    const body = (await res.json()) as { version: number; items: unknown[] };
+    expect(body).toEqual({ version: 0, items: [] });
+  });
+
+  it("dm command patch returns UNSUPPORTED_CHANNEL_KIND", async () => {
+    const userA = `dm-a-${crypto.randomUUID()}`;
+    const userB = `dm-b-${crypto.randomUUID()}`;
+    const { channelId } = await createTestDmChannel(env, userA, userB, userA);
+    const botId = `bot-dm-${crypto.randomUUID()}`;
+    const botCommandId = `cmd-dm-${crypto.randomUUID()}`;
+    await seedBotCommand({
+      botId,
+      botCommandId,
+      displayName: "DM Bot",
+      commandName: "askdm",
+      aliases: [],
+    });
+
+    const res = await browserReq(
+      userA,
+      "PATCH",
+      `/api/chat/channels/${channelId}/commands/${botCommandId}`,
+      { status: "allowed" },
+      `key-dm-allow-${crypto.randomUUID()}`,
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("UNSUPPORTED_CHANNEL_KIND");
   });
 });

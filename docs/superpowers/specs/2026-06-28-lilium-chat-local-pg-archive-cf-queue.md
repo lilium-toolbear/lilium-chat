@@ -10,6 +10,48 @@ No backfill is required. Assume existing production data is empty or disposable.
 
 This is a one-shot full implementation. Do not split into phases. Do not implement only message archive first.
 
+### 0.1 Revision — slash catalog bot tables + developer API archive (2026-06-29)
+
+Slash-command backend (`feat/bot-slash-command-backend`) realigns **bot-related normalized PG tables** and **BotRegistry producer paths**. Local PG applies `scripts/archive-local/migrations/006_slash_catalog_archive.sql` after `001`–`005`.
+
+**Removed from replay** (Phase-7 installation / passive-event model; drop in `006`):
+
+```text
+chat_bot_installations
+chat_bot_event_capabilities
+chat_channel_command_names          # channel-scoped slash index (replaced by global bot_command_names)
+chat_channel_bot_event_subscriptions
+```
+
+**Added / realigned:**
+
+```text
+chat_bot_command_names              # global slash namespace (BotRegistry)
+chat_stateful_command_sessions      # ChatChannel
+chat_stateful_session_inputs        # ChatChannel
+```
+
+**Column / PK changes (existing tables):**
+
+| Table | Change |
+| --- | --- |
+| `chat.bot_apps` | add `description`, `visibility`; drop `callback_url` |
+| `chat.bot_tokens` | add `name`, `expires_at`, `last_used_at`; archive payload field `scopes` (from DO `scopes_json`) |
+| `chat.bot_commands` | add `execution_mode`, `stateful_config_json`, `status`; drop `enabled`, `default_enabled_on_install` |
+| `chat.channel_command_bindings` | PK `(channel_id, bot_command_id)`; snapshot column `command_snapshot_json`; drop per-channel alias/options columns |
+
+**BotRegistry archive producers** (`sourceKind=bot_registry`, `sourceKey=registry`):
+
+| Internal route | Archive changes |
+| --- | --- |
+| `/internal/commands-sync` | `chat_bot_commands` upsert; `chat_bot_command_aliases` + `chat_bot_command_names` replace_scope per `bot_command_id` |
+| `/internal/seed-official-bot` | `chat_bot_apps` upsert; `chat_bot_tokens` upsert (**hash only**); catalog rows as commands-sync |
+| `/internal/bots-create` | `chat_bot_apps` upsert; optional `chat_bot_tokens` upsert when `issue_initial_token` |
+| `/internal/bots-token-create` | `chat_bot_tokens` upsert |
+| `/internal/bots-token-revoke` | `chat_bot_tokens` upsert with `revoked_at` (first revoke only; idempotent retry does not re-emit) |
+
+Never archive plaintext `lcbot_*` tokens. `REPLAY_TABLES` / `ARCHIVE_TABLE_WHITELIST` must match exactly (`test/archive/drift.test.ts`).
+
 ## 1. Required architecture
 
 ### 1.1 Data flow
@@ -261,13 +303,14 @@ message_stickers
 mentions
 invites
 events
-bot_installations
 channel_command_bindings
-channel_command_names
 command_invocations
 interactions
-channel_bot_event_subscriptions
+stateful_command_sessions
+stateful_session_inputs
 ```
+
+Removed from slash-catalog scope (see §0.1): `bot_installations`, `channel_command_names`, `channel_bot_event_subscriptions`.
 
 Do not archive:
 
@@ -320,10 +363,12 @@ bot_apps
 bot_tokens
 bot_commands
 bot_command_aliases
-bot_event_capabilities
+bot_command_names
 ```
 
-Only token hashes may be archived. Never archive plaintext bot tokens.
+Removed from slash-catalog scope (see §0.1): `bot_event_capabilities`.
+
+Only token hashes may be archived. Never archive plaintext bot tokens. Token rows include metadata columns `name`, `expires_at`, `last_used_at`; payload uses `scopes` (stringified JSON), not `scopes_json`.
 
 ### 3.6 Runtime state that must never appear in archive payloads
 
@@ -633,21 +678,13 @@ BotRegistry command aliases after command sync:
   table = chat_bot_command_aliases
   scope = { bot_command_id }
 
-BotRegistry event capabilities when full-replaced:
-  table = chat_bot_event_capabilities
-  scope = { bot_id }
+BotRegistry global slash names after command sync:
+  table = chat_bot_command_names
+  scope = { bot_command_id }
 
-ChatChannel bot reinstall:
+ChatChannel command binding allow/block (slash catalog):
   table = chat_channel_command_bindings
-  scope = { channel_id, bot_id }
-
-ChatChannel bot reinstall:
-  table = chat_channel_command_names
-  scope = { channel_id, bot_id }
-
-ChatChannel command binding disable/enable:
-  table = chat_channel_command_names
-  scope = { channel_id, bot_command_id }
+  scope = { channel_id, bot_command_id }   # upsert per binding; no channel_command_names child table
 
 Message child snapshots:
   table = chat_mentions
@@ -860,6 +897,8 @@ Do not delete archived attachments/stickers.
 
 #### bot install
 
+> **Obsolete (slash catalog):** installation model removed. Historical reference only.
+
 Archive:
 
 ```text
@@ -870,7 +909,11 @@ chat_channel_bot_event_subscriptions replace_scope { channel_id, bot_id }
 chat_events upsert bot.installed
 ```
 
+Current model: `PATCH .../commands/{bot_command_id}` allow/block emits `chat_channel_command_bindings` upsert only (see §0.1).
+
 #### bot install update
+
+> **Obsolete (slash catalog).**
 
 Archive:
 
@@ -1003,23 +1046,57 @@ Instrument:
 ```text
 /internal/commands-sync
 /internal/seed-official-bot
-any bot app/token create/update/revoke path present in current code
+/internal/bots-create
+/internal/bots-token-create
+/internal/bots-token-revoke
 ```
+
+(`/internal/token-verify` is read-only — no archive.)
 
 #### commands-sync
 
 Archive:
 
 ```text
-chat_bot_apps upsert if bot app changes
-chat_bot_commands upsert for all current commands in request
+chat_bot_commands upsert for each command in request
 chat_bot_command_aliases replace_scope { bot_command_id } for each command in request
-chat_bot_event_capabilities replace_scope { bot_id } or upsert each current capability
+chat_bot_command_names replace_scope { bot_command_id } for each command in request
 ```
 
-If commands are disabled/deleted by sync semantics, archive final row state with `enabled=false` or `deleted_at`.
+Disabled/deleted-by-sync semantics archive final row state via `status` / `deleted_at`.
 
-#### token paths
+#### seed-official-bot
+
+Archive (same transaction as SQLite writes):
+
+```text
+chat_bot_apps upsert
+chat_bot_tokens upsert when a new token row is inserted (token_hash only)
+catalog rows as commands-sync
+```
+
+#### Browser bot developer API (internal)
+
+`POST /internal/bots-create` — after insert:
+
+```text
+chat_bot_apps upsert
+chat_bot_tokens upsert when issue_initial_token=true (token_hash, name, scopes, expires_at; never plaintext)
+```
+
+`POST /internal/bots-token-create`:
+
+```text
+chat_bot_tokens upsert
+```
+
+`POST /internal/bots-token-revoke` — on first revoke only:
+
+```text
+chat_bot_tokens upsert with revoked_at set
+```
+
+#### token paths (all routes)
 
 Archive token hash rows only:
 
@@ -1113,14 +1190,15 @@ chat_bot_apps
 chat_bot_tokens
 chat_bot_commands
 chat_bot_command_aliases
-chat_bot_event_capabilities
-chat_bot_installations
+chat_bot_command_names
 chat_channel_command_bindings
-chat_channel_command_names
-chat_channel_bot_event_subscriptions
+chat_stateful_command_sessions
+chat_stateful_session_inputs
 chat_command_invocations
 chat_interactions
 ```
+
+Slash-catalog removals (see §0.1): `chat_bot_installations`, `chat_bot_event_capabilities`, `chat_channel_command_names`, `chat_channel_bot_event_subscriptions`.
 
 Use the column shapes from current source DO schemas, with timestamp columns stored as `TIMESTAMPTZ` and JSON columns stored as `JSONB`.
 
@@ -1145,11 +1223,10 @@ chat_bot_apps: bot_id
 chat_bot_tokens: token_id, plus UNIQUE(token_hash)
 chat_bot_commands: bot_command_id, plus UNIQUE(bot_id, name)
 chat_bot_command_aliases: (bot_command_id, alias)
-chat_bot_event_capabilities: (bot_id, event_type)
-chat_bot_installations: (channel_id, bot_id)
-chat_channel_command_bindings: binding_id, plus UNIQUE(channel_id, bot_command_id)
-chat_channel_command_names: (channel_id, slash_name)
-chat_channel_bot_event_subscriptions: subscription_id, plus UNIQUE(channel_id, bot_id, event_type)
+chat_bot_command_names: slash_token (PK)
+chat_channel_command_bindings: (channel_id, bot_command_id)
+chat_stateful_command_sessions: session_id
+chat_stateful_session_inputs: (session_id, seq)
 chat_command_invocations: invocation_id, plus UNIQUE(channel_id, invoker_user_id, command_id)
 chat_interactions: interaction_id
 ```

@@ -98,7 +98,7 @@ export const REPLAY_TABLES: Record<string, ReplayTableConfig> = {
   chat_bot_commands: {
     pgTable: "chat.bot_commands",
     pk: ["bot_command_id"],
-    jsonColumns: new Set(["options_json"]),
+    jsonColumns: new Set(["options_json", "stateful_config_json"]),
     softDeleteColumn: "deleted_at",
   },
   chat_bot_command_aliases: {
@@ -107,36 +107,26 @@ export const REPLAY_TABLES: Record<string, ReplayTableConfig> = {
     scopeReplace: true,
     softDeleteColumn: "deleted_at",
   },
-  chat_bot_event_capabilities: {
-    pgTable: "chat.bot_event_capabilities",
-    pk: ["bot_id", "event_type"],
-    jsonColumns: new Set(["filters_json"]),
+  chat_bot_command_names: {
+    pgTable: "chat.bot_command_names",
+    pk: ["slash_token"],
     scopeReplace: true,
     softDeleteColumn: "deleted_at",
-  },
-  chat_bot_installations: {
-    pgTable: "chat.bot_installations",
-    pk: ["channel_id", "bot_id"],
   },
   chat_channel_command_bindings: {
     pgTable: "chat.channel_command_bindings",
-    pk: ["binding_id"],
-    jsonColumns: new Set(["options_json", "aliases_json"]),
-    scopeReplace: true,
-    softDeleteColumn: "deleted_at",
+    pk: ["channel_id", "bot_command_id"],
+    jsonColumns: new Set(["command_snapshot_json"]),
   },
-  chat_channel_command_names: {
-    pgTable: "chat.channel_command_names",
-    pk: ["channel_id", "slash_name"],
-    scopeReplace: true,
-    softDeleteColumn: "deleted_at",
+  chat_stateful_command_sessions: {
+    pgTable: "chat.stateful_command_sessions",
+    pk: ["session_id"],
+    jsonColumns: new Set(["listen_rules_json", "summary_json"]),
   },
-  chat_channel_bot_event_subscriptions: {
-    pgTable: "chat.channel_bot_event_subscriptions",
-    pk: ["subscription_id"],
-    jsonColumns: new Set(["filters_json"]),
-    scopeReplace: true,
-    softDeleteColumn: "deleted_at",
+  chat_stateful_session_inputs: {
+    pgTable: "chat.stateful_session_inputs",
+    pk: ["session_id", "seq"],
+    jsonColumns: new Set(["message_projection_json"]),
   },
   chat_command_invocations: {
     pgTable: "chat.command_invocations",

@@ -10,6 +10,7 @@ export type CommandOptionType =
   | "role";
 
 import { isRecord } from "../contract/utils";
+import type { CommandStatefulConfig } from "../contract/bot-api";
 
 const OPTION_TYPES: ReadonlySet<string> = new Set<CommandOptionType>([
   "string",
@@ -33,10 +34,11 @@ export interface CommandOption {
 export interface ValidatedCommand {
   name: string;
   aliases: string[];
-  description: string | null;
+  description: string;
   options: CommandOption[];
   default_member_permission: "member" | "admin" | "owner";
-  default_enabled_on_install: boolean;
+  execution_mode: "stateless" | "stateful";
+  stateful_config: CommandStatefulConfig | null;
 }
 
 export interface CommandInput {
@@ -45,33 +47,10 @@ export interface CommandInput {
   description?: unknown;
   options?: unknown;
   default_member_permission?: unknown;
-  default_enabled_on_install?: unknown;
-}
-
-export interface EventCapabilityInput {
-  event_type?: unknown;
-  default_enabled_on_install?: unknown;
-  default_filters?: unknown;
-}
-
-export interface ValidatedEventCapability {
-  event_type: "message.created";
-  default_enabled_on_install: boolean;
-  default_filters: {
-    message_types: string[];
-    include_bot_messages: boolean;
-    include_own_messages: boolean;
-    only_when_mentioned: boolean;
-  };
+  execution?: unknown;
 }
 
 const PERMISSIONS = new Set(["member", "admin", "owner"]);
-const DEFAULT_FILTERS = {
-  message_types: ["text"],
-  include_bot_messages: false,
-  include_own_messages: false,
-  only_when_mentioned: false,
-};
 
 export interface ValidateResult<T> {
   ok: boolean;
@@ -128,24 +107,22 @@ export function validateCommand(input: CommandInput): ValidateResult<ValidatedCo
   if (typeof input.name !== "string" || input.name.length === 0) {
     return fail("command.name required");
   }
-  if (!/^[a-z0-9_]{1,32}$/.test(input.name)) {
-    return fail("command.name must be lowercase alnum/underscore, <=32 chars");
-  }
   const aliases: string[] = [];
   if (input.aliases !== undefined && input.aliases !== null) {
     if (!Array.isArray(input.aliases)) return fail("command.aliases must be array");
-    const seen = new Set<string>([input.name]);
+    const seen = new Set<string>([input.name.toLowerCase()]);
     for (const a of input.aliases) {
-      if (typeof a !== "string" || !/^[a-z0-9_]{1,32}$/.test(a)) {
-        return fail("alias must be lowercase alnum/underscore, <=32 chars");
+      if (typeof a !== "string" || a.length === 0) {
+        return fail("alias must be non-empty string");
       }
-      if (seen.has(a)) return fail(`duplicate alias: ${a}`);
-      seen.add(a);
+      const key = a.toLowerCase();
+      if (seen.has(key)) return fail(`duplicate alias: ${a}`);
+      seen.add(key);
       aliases.push(a);
     }
   }
-  if (input.description !== undefined && input.description !== null) {
-    if (typeof input.description !== "string") return fail("command.description must be string");
+  if (typeof input.description !== "string") {
+    return fail("command.description must be string");
   }
   const options: CommandOption[] = [];
   if (input.options !== undefined && input.options !== null) {
@@ -163,56 +140,81 @@ export function validateCommand(input: CommandInput): ValidateResult<ValidatedCo
   if (typeof perm !== "string" || !PERMISSIONS.has(perm)) {
     return fail("default_member_permission must be member|admin|owner");
   }
-  const defaultEnabled = input.default_enabled_on_install ?? true;
-  if (typeof defaultEnabled !== "boolean") return fail("default_enabled_on_install must be boolean");
+
+  if (!isRecord(input.execution)) {
+    return fail("command.execution must be object");
+  }
+  if (input.execution.mode !== "stateless" && input.execution.mode !== "stateful") {
+    return fail("command.execution.mode must be stateless|stateful");
+  }
+
+  let statefulConfig: CommandStatefulConfig | null = null;
+  if (input.execution.mode === "stateful") {
+    if (!isRecord(input.execution.stateful)) {
+      return fail("command.execution.stateful required when mode=stateful");
+    }
+    const statefulRaw = input.execution.stateful;
+    if (statefulRaw.mutex_scope !== "channel") {
+      return fail("execution.stateful.mutex_scope must be channel");
+    }
+    if (
+      typeof statefulRaw.default_ttl_seconds !== "number" ||
+      !Number.isFinite(statefulRaw.default_ttl_seconds) ||
+      statefulRaw.default_ttl_seconds <= 0
+    ) {
+      return fail("execution.stateful.default_ttl_seconds must be positive number");
+    }
+    if (
+      typeof statefulRaw.max_ttl_seconds !== "number" ||
+      !Number.isFinite(statefulRaw.max_ttl_seconds) ||
+      statefulRaw.max_ttl_seconds <= 0
+    ) {
+      return fail("execution.stateful.max_ttl_seconds must be positive number");
+    }
+    if (statefulRaw.default_ttl_seconds > statefulRaw.max_ttl_seconds) {
+      return fail("execution.stateful.default_ttl_seconds must be <= max_ttl_seconds");
+    }
+    if (!isRecord(statefulRaw.listen_capability)) {
+      return fail("execution.stateful.listen_capability must be object");
+    }
+    if (
+      !Array.isArray(statefulRaw.listen_capability.message_types) ||
+      !statefulRaw.listen_capability.message_types.every((v) => typeof v === "string")
+    ) {
+      return fail("execution.stateful.listen_capability.message_types must be string[]");
+    }
+    if (typeof statefulRaw.listen_capability.include_bot_messages !== "boolean") {
+      return fail("execution.stateful.listen_capability.include_bot_messages must be boolean");
+    }
+    if (typeof statefulRaw.listen_capability.include_own_messages !== "boolean") {
+      return fail("execution.stateful.listen_capability.include_own_messages must be boolean");
+    }
+    statefulConfig = {
+      mutex_scope: "channel",
+      default_ttl_seconds: statefulRaw.default_ttl_seconds,
+      max_ttl_seconds: statefulRaw.max_ttl_seconds,
+      listen_capability: {
+        message_types: [...statefulRaw.listen_capability.message_types],
+        include_bot_messages: statefulRaw.listen_capability.include_bot_messages,
+        include_own_messages: statefulRaw.listen_capability.include_own_messages,
+      },
+    };
+  }
   return ok({
     name: input.name,
     aliases,
-    description: typeof input.description === "string" ? input.description : null,
+    description: input.description,
     options,
     default_member_permission: perm as "member" | "admin" | "owner",
-    default_enabled_on_install: defaultEnabled,
+    execution_mode: input.execution.mode,
+    stateful_config: statefulConfig,
   });
-}
-
-/** Validate an event_capabilities entry (Phase 7: only message.created). */
-export function validateEventCapability(
-  input: EventCapabilityInput,
-): ValidateResult<ValidatedEventCapability> {
-  if (input.event_type !== "message.created") {
-    return fail("event_type must be message.created (Phase 7)");
-  }
-  const defaultEnabled = input.default_enabled_on_install ?? false;
-  if (typeof defaultEnabled !== "boolean") {
-    return fail("default_enabled_on_install must be boolean");
-  }
-  const filters = { ...DEFAULT_FILTERS };
-  if (input.default_filters !== undefined && input.default_filters !== null) {
-    if (!isRecord(input.default_filters)) {
-      return fail("default_filters must be object");
-    }
-    const f = input.default_filters;
-    if (f.message_types !== undefined) {
-      if (!Array.isArray(f.message_types) || !f.message_types.every((s) => typeof s === "string")) {
-        return fail("default_filters.message_types must be string[]");
-      }
-      filters.message_types = f.message_types as string[];
-    }
-    for (const key of ["include_bot_messages", "include_own_messages", "only_when_mentioned"] as const) {
-      if (f[key] !== undefined) {
-        if (typeof f[key] !== "boolean") return fail(`default_filters.${key} must be boolean`);
-        filters[key] = f[key];
-      }
-    }
-  }
-  return ok({ event_type: "message.created", default_enabled_on_install: defaultEnabled, default_filters: filters });
 }
 
 /**
  * Canonical form for definition_hash: stable JSON over
- * {options, description, default_member_permission}. Aliases and
- * default_enabled_on_install are excluded — they are install-time concerns,
- * not part of the command definition's wire shape.
+ * {options, description, default_member_permission, execution}. Aliases are
+ * excluded because they are slash-token binding concerns.
  */
 export function canonicalCommandDefinition(cmd: ValidatedCommand): string {
   const optionsCanonical = cmd.options
@@ -229,6 +231,8 @@ export function canonicalCommandDefinition(cmd: ValidatedCommand): string {
     options: optionsCanonical,
     description: cmd.description,
     default_member_permission: cmd.default_member_permission,
+    execution_mode: cmd.execution_mode,
+    stateful_config: cmd.stateful_config,
   });
 }
 
@@ -243,16 +247,12 @@ export async function sha256Hex(text: string): Promise<string> {
 /** Canonical request hash for PUT /bot/commands idempotency. */
 export async function commandsRequestHash(body: {
   commands: ValidatedCommand[];
-  event_capabilities: ValidatedEventCapability[];
 }): Promise<string> {
   return sha256Hex(
     JSON.stringify({
       commands: body.commands
         .map((c) => ({ ...c, options: c.options.map((o) => ({ ...o })) }))
         .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
-      event_capabilities: body.event_capabilities
-        .map((e) => ({ ...e }))
-        .sort((a, b) => (a.event_type < b.event_type ? -1 : 1)),
     }),
   );
 }

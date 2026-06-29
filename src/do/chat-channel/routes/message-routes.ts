@@ -23,6 +23,10 @@ import {
   upsertEventChange,
   upsertMessageChange,
 } from "../../../archive/chat-channel-record";
+import {
+  maybeEnqueueStatefulSessionInput,
+  type StatefulSessionHost,
+} from "../stateful-session-handlers";
 
 export async function dispatchMessageRoutes(host: ChatChannelHost, request: Request, url: URL): Promise<Response | null> {
   if (url.pathname === "/internal/message-send") {
@@ -425,8 +429,21 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
     }
     if (txResult.kind === "created") {
       await host.scheduleArchiveAlarm(now);
-      // Return the same projection committed to idempotency_keys + the outbox — no post-txn recompute.
       const ackPayload = JSON.parse(txResult.response_json) as MessageMutationIdempotencyEnvelope;
+      const ackMessage = ackPayload.payload as MessageMutationAckPayload;
+      if (ackMessage.message) {
+        await maybeEnqueueStatefulSessionInput(host as unknown as StatefulSessionHost, {
+          channelId,
+          messageId,
+          eventId,
+          occurredAt: now,
+          senderKind: "user",
+          senderUserId: userId,
+          senderBotId: null,
+          messageType: b.type,
+          messageProjection: ackMessage.message,
+        });
+      }
       return Response.json(ackPayload.payload as MessageMutationAckPayload);
     }
     // cached: return the stored full ack payload exactly (addendum K). It was written complete in

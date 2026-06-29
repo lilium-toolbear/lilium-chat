@@ -25,9 +25,9 @@ async function withRegistry(
 
 async function cleanupOfficialBot(): Promise<void> {
   await withRegistry((ctx) => {
+    ctx.storage.sql.exec("DELETE FROM bot_command_names WHERE bot_id=?", OFFICIAL_BOT_ID);
     ctx.storage.sql.exec("DELETE FROM bot_command_aliases WHERE bot_id=?", OFFICIAL_BOT_ID);
     ctx.storage.sql.exec("DELETE FROM bot_commands WHERE bot_id=?", OFFICIAL_BOT_ID);
-    ctx.storage.sql.exec("DELETE FROM bot_event_capabilities WHERE bot_id=?", OFFICIAL_BOT_ID);
     ctx.storage.sql.exec("DELETE FROM bot_idempotency_keys WHERE principal_id=?", OFFICIAL_BOT_ID);
     ctx.storage.sql.exec("DELETE FROM bot_tokens WHERE bot_id=?", OFFICIAL_BOT_ID);
     ctx.storage.sql.exec("DELETE FROM bot_apps WHERE bot_id=?", OFFICIAL_BOT_ID);
@@ -48,7 +48,6 @@ async function seedOfficial(): Promise<{
     token: string | null;
     bot: { bot_id: string };
     commands: Array<{ bot_command_id: string; name: string; aliases: string[]; schema_version: number }>;
-      event_capabilities: Array<{ event_type: string }>; 
   };
   expect(body.bot.bot_id).toBe(OFFICIAL_BOT_ID);
   return { token: body.token, commands: body.commands };
@@ -89,10 +88,10 @@ describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
       expect(commands).toHaveLength(2);
       expect(commands.map((c) => c.name)).toEqual(["ask", "summarize"]);
 
-      const capabilities = ctx.storage.sql
-        .exec("SELECT event_type, default_enabled_on_install FROM bot_event_capabilities WHERE bot_id=?", OFFICIAL_BOT_ID)
-        .toArray() as Array<{ event_type: string; default_enabled_on_install: number }>;
-      expect(capabilities.map((c) => c.event_type)).toContain("message.created");
+      const globalNames = ctx.storage.sql
+        .exec("SELECT slash_token FROM bot_command_names WHERE bot_id=? ORDER BY slash_token", OFFICIAL_BOT_ID)
+        .toArray() as Array<{ slash_token: string }>;
+      expect(globalNames.length).toBeGreaterThan(0);
 
       const tokens = ctx.storage.sql
         .exec("SELECT token_hash FROM bot_tokens WHERE bot_id=?", OFFICIAL_BOT_ID)
@@ -147,14 +146,7 @@ describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
           description: "ask updated",
           options: [{ name: "prompt", type: "string", required: true, description: "Prompt" }],
           default_member_permission: "member",
-          default_enabled_on_install: true,
-        },
-      ],
-      event_capabilities: [
-        {
-          event_type: "message.created",
-          default_enabled_on_install: true,
-          default_filters: { message_types: ["text"], include_bot_messages: true, include_own_messages: false, only_when_mentioned: false },
+          execution: { mode: "stateless" },
         },
       ],
     }, "seed-sync");
@@ -162,14 +154,13 @@ describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
 
     const body = (await syncRes.json()) as {
       commands: Array<{ bot_command_id: string; name: string; aliases: string[]; schema_version: number }>;
-      event_capabilities: Array<{ event_type: string; default_enabled_on_install: boolean }>;
     };
     expect(body.commands).toHaveLength(1);
 
     await withRegistry((ctx) => {
       const ask = ctx.storage.sql
         .exec(
-          "SELECT bot_command_id, description, options_json, default_enabled_on_install, schema_version FROM bot_commands WHERE bot_id=? AND name=?",
+          "SELECT bot_command_id, description, options_json, execution_mode, schema_version FROM bot_commands WHERE bot_id=? AND name=?",
           OFFICIAL_BOT_ID,
           "ask",
         )
@@ -178,7 +169,7 @@ describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
               bot_command_id: string;
               description: string;
               options_json: string;
-              default_enabled_on_install: number;
+              execution_mode: string;
               schema_version: number;
             }
           | undefined;
@@ -187,7 +178,7 @@ describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
       expect(JSON.parse(ask!.options_json)).toEqual([
         { name: "prompt", type: "string", required: true, description: "Prompt" },
       ]);
-      expect(ask!.default_enabled_on_install).toBe(1);
+      expect(ask!.execution_mode).toBe("stateless");
       const expectedId = seed.commands.find((c) => c.name === "ask")!.bot_command_id;
       expect(ask!.bot_command_id).toBe(expectedId);
 
@@ -195,12 +186,6 @@ describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
         .exec("SELECT alias FROM bot_command_aliases WHERE bot_command_id=? ORDER BY alias", ask!.bot_command_id)
         .toArray() as Array<{ alias: string }>;
       expect(aliases.map((r) => r.alias)).toEqual(["a", "askit"]);
-
-      const cap = ctx.storage.sql
-        .exec("SELECT default_enabled_on_install FROM bot_event_capabilities WHERE bot_id=? AND event_type='message.created'", OFFICIAL_BOT_ID)
-        .toArray()[0] as { default_enabled_on_install: number } | undefined;
-      expect(cap).toBeDefined();
-      expect(cap!.default_enabled_on_install).toBe(1);
     });
 
     let askSchemaVersion = 0;

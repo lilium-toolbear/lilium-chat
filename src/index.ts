@@ -32,12 +32,20 @@ import {
 } from "./routes/channel-mutations";
 import { putBotCommandsHandler } from "./routes/bot";
 import {
-  installBotHandler,
-  updateBotInstallHandler,
+  createBotHandler,
+  createBotTokenHandler,
+  getBotHandler,
+  listBotsHandler,
+  listBotTokensHandler,
+  revokeBotTokenHandler,
+} from "./routes/bots";
+import {
   updateCommandBindingHandler,
   listChannelCommandsHandler,
-} from "./routes/bot-installations";
+} from "./routes/channel-commands";
 import { openDmHandler } from "./routes/dms";
+import { commandDirectoryHandler } from "./routes/command-directory";
+import { getStatefulSessionHandler, stopStatefulSessionHandler } from "./routes/stateful-session";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -101,10 +109,17 @@ app.delete("/api/chat/stickers/:sticker_id", (c) => deleteStickerHandler(c));
 app.get("/api/chat/events", (c) => eventsHandler(c));
 app.get("/api/chat/bot/ws", (c) => botWsUpgradeHandler(c));
 app.put("/api/chat/bot/commands", (c) => putBotCommandsHandler(c));
-app.post("/api/chat/channels/:channel_id/bot-installations", (c) => installBotHandler(c));
-app.patch("/api/chat/channels/:channel_id/bot-installations/:bot_id", (c) => updateBotInstallHandler(c));
+app.post("/api/chat/bots", (c) => createBotHandler(c));
+app.get("/api/chat/bots", (c) => listBotsHandler(c));
+app.get("/api/chat/bots/:bot_id", (c) => getBotHandler(c));
+app.get("/api/chat/bots/:bot_id/tokens", (c) => listBotTokensHandler(c));
+app.post("/api/chat/bots/:bot_id/tokens", (c) => createBotTokenHandler(c));
+app.delete("/api/chat/bots/:bot_id/tokens/:token_id", (c) => revokeBotTokenHandler(c));
+app.get("/api/chat/commands/directory", (c) => commandDirectoryHandler(c));
 app.patch("/api/chat/channels/:channel_id/commands/:bot_command_id", (c) => updateCommandBindingHandler(c));
 app.get("/api/chat/channels/:channel_id/commands", (c) => listChannelCommandsHandler(c));
+app.get("/api/chat/channels/:channel_id/stateful-session", (c) => getStatefulSessionHandler(c));
+app.post("/api/chat/channels/:channel_id/stateful-session/stop", (c) => stopStatefulSessionHandler(c));
 app.all("/api/chat/*", (c) => {
   throw new ApiError("CHANNEL_NOT_FOUND", "route not found", { httpStatus: 404 });
 });

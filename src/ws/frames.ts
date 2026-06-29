@@ -40,7 +40,18 @@ export type CommandAckFrame =
 export interface CommandErrorFrame {
   frame_type: "command_error";
   command_id: string;
-  error: { code: string; message: string; retryable: boolean };
+  error: {
+    code: string;
+    message: string;
+    retryable: boolean;
+    active_session?: {
+      session_id: string;
+      command_name: string;
+      started_by: { user_id: string; display_name: string; avatar_url: string | null };
+      started_at: string;
+      expires_at: string;
+    };
+  };
 }
 
 export interface ReadStateUpdatedFrame {

@@ -13,4 +13,14 @@ describe("ApiError HTTP status mapping (Phase 3 codes)", () => {
   it("INVITE_NOT_FOUND → 404 (forward-compat for Phase 6)", () => {
     expect(new ApiError("INVITE_NOT_FOUND", "x").httpStatus).toBe(404);
   });
+  it("COMMAND_NOT_ALLOWED → 403", () => {
+    expect(new ApiError("COMMAND_NOT_ALLOWED", "x").httpStatus).toBe(403);
+  });
+  it("STATEFUL_SESSION_BUSY → 409", () => {
+    expect(new ApiError("STATEFUL_SESSION_BUSY", "x").httpStatus).toBe(409);
+  });
+  it("BOT_OFFLINE → 503 retryable", () => {
+    expect(new ApiError("BOT_OFFLINE", "x").httpStatus).toBe(503);
+    expect(new ApiError("BOT_OFFLINE", "x").retryable).toBe(true);
+  });
 });

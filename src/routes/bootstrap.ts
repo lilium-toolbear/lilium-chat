@@ -5,6 +5,7 @@ import { resolveUserSummaries, type UserSummary } from "../profile/resolve";
 import { inflateMyChannelSummaries } from "../chat/channel-list";
 import { fallbackUserDisplayName } from "../contract/primitives";
 import type { EventFrame } from "../contract/wire-frames";
+import type { CommandManifestResponse } from "../contract/bot-api";
 import { getIdentity } from "./auth";
 interface MyChannel {
   channel_id: string;
@@ -88,6 +89,25 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
     })()
     : { items: [] as EventFrame[], next_cursor: null };
 
+  const shouldAttachManifest = Boolean(
+    requestedChannelId
+      && activeChannel
+      && activeChannel.channel_id === requestedChannelId
+      && activeChannel.kind !== "dm",
+  );
+
+  let commandManifest: CommandManifestResponse | null = null;
+  if (shouldAttachManifest && activeChannel) {
+    const stub = c.env.CHAT_CHANNEL.getByName(activeChannel.channel_id);
+    const res = await stub.fetch(new Request(
+      `https://x/internal/command-manifest?channel_id=${encodeURIComponent(activeChannel.channel_id)}`,
+      { headers: { "X-Verified-User-Id": user_id } },
+    ));
+    if (res.ok) {
+      commandManifest = await res.json() as CommandManifestResponse;
+    }
+  }
+
   const per_channel: Record<string, string> = {};
   for (const ch of channels) {
     if (ch.last_event_id) {
@@ -104,6 +124,7 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
       channels,
       active_channel: activeChannel ?? null,
       messages,
+      ...(commandManifest ? { command_manifest: commandManifest } : {}),
       event_state: { per_channel },
     },
     200,

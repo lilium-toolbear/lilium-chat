@@ -9,12 +9,10 @@ import {
   commandsRequestHash,
   sha256Hex,
   validateCommand,
-  validateEventCapability,
   type CommandInput,
-  type EventCapabilityInput,
   type ValidatedCommand,
-  type ValidatedEventCapability,
 } from "../chat/command-options";
+import { collectSlashTokens } from "../chat/slash-token";
 import { hashBotToken } from "../auth/bot";
 import { archiveOutboxDueTable, flushArchiveOutboxToQueue } from "../archive/queue-flush";
 import { appendArchiveRecordSync } from "../archive/source-outbox";
@@ -27,8 +25,8 @@ import { scheduleNextAlarm } from "./scheduler";
 // hash cannot reverse-resolve bot_id, and the bot API entry point only has a
 // bearer token, so token verification must happen in one place doing
 // SELECT ... WHERE token_hash=? (idx_bot_tokens_hash UNIQUE). It also owns the
-// GLOBAL bot command catalog (bot_commands + bot_command_aliases),
-// bot_event_capabilities, and bot profile (bot_apps).
+// GLOBAL bot command catalog (bot_commands + bot_command_aliases + bot_command_names)
+// and bot profile (bot_apps).
 
 function appendBotRegistryArchive(
   ctx: DurableObjectState,
@@ -51,7 +49,7 @@ function readBotCommandArchiveRow(
   const row = ctx.storage.sql
     .exec(
       `SELECT bot_command_id, bot_id, name, description, options_json, default_member_permission,
-              default_enabled_on_install, schema_version, definition_hash, enabled, created_at, updated_at, deleted_at
+              execution_mode, stateful_config_json, status, schema_version, definition_hash, created_at, updated_at, deleted_at
        FROM bot_commands WHERE bot_command_id=?`,
       botCommandId,
     )
@@ -63,10 +61,11 @@ function readBotCommandArchiveRow(
         description: string | null;
         options_json: string;
         default_member_permission: string;
-        default_enabled_on_install: number;
+        execution_mode: string;
+        stateful_config_json: string | null;
+        status: string;
         schema_version: number;
         definition_hash: string;
-        enabled: number;
         created_at: string;
         updated_at: string;
         deleted_at: string | null;
@@ -80,10 +79,11 @@ function readBotCommandArchiveRow(
     description: row.description,
     options_json: row.options_json,
     default_member_permission: row.default_member_permission,
-    default_enabled_on_install: row.default_enabled_on_install,
+    execution_mode: row.execution_mode,
+    stateful_config_json: row.stateful_config_json,
+    status: row.status,
     schema_version: row.schema_version,
     definition_hash: row.definition_hash,
-    enabled: row.enabled,
     created_at: row.created_at,
     updated_at: row.updated_at,
     deleted_at: row.deleted_at,
@@ -106,34 +106,17 @@ function readBotCommandAliasRows(ctx: DurableObjectState, botCommandId: string):
   }));
 }
 
-function readBotEventCapabilityRows(ctx: DurableObjectState, botId: string): Array<Record<string, unknown>> {
-  return (
-    ctx.storage.sql
-      .exec(
-        "SELECT bot_id, event_type, filters_json, default_enabled_on_install, created_at, updated_at FROM bot_event_capabilities WHERE bot_id=? ORDER BY event_type",
-        botId,
-      )
-      .toArray() as Array<{
-        bot_id: string;
-        event_type: string;
-        filters_json: string;
-        default_enabled_on_install: number;
-        created_at: string;
-        updated_at: string;
-      }>
-  ).map((row) => ({
-    bot_id: row.bot_id,
-    event_type: row.event_type,
-    filters_json: row.filters_json,
-    default_enabled_on_install: row.default_enabled_on_install,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-  }));
+function readBotCommandNameRows(ctx: DurableObjectState, botCommandId: string): Array<Record<string, unknown>> {
+  return ctx.storage.sql
+    .exec(
+      "SELECT slash_token, bot_command_id, bot_id, kind, created_at FROM bot_command_names WHERE bot_command_id=? ORDER BY slash_token",
+      botCommandId,
+    )
+    .toArray() as Array<Record<string, unknown>>;
 }
 
 function buildBotCommandsSyncArchiveChanges(
   ctx: DurableObjectState,
-  botId: string,
   botCommandIds: string[],
   sourceSeq: number,
 ): ArchiveChange[] {
@@ -154,22 +137,22 @@ function buildBotCommandsSyncArchiveChanges(
         readBotCommandAliasRows(ctx, botCommandId),
       ),
     );
+    changes.push(
+      archiveReplaceScope(
+        "chat_bot_command_names",
+        { bot_command_id: botCommandId },
+        rowVersion,
+        readBotCommandNameRows(ctx, botCommandId),
+      ),
+    );
   }
-  changes.push(
-    archiveReplaceScope(
-      "chat_bot_event_capabilities",
-      { bot_id: botId },
-      rowVersion,
-      readBotEventCapabilityRows(ctx, botId),
-    ),
-  );
   return changes;
 }
 
 function readBotAppArchiveRow(ctx: DurableObjectState, botId: string): Record<string, unknown> | undefined {
   const row = ctx.storage.sql
     .exec(
-      "SELECT bot_id, owner_user_id, display_name, avatar_url, callback_url, status, created_at, updated_at FROM bot_apps WHERE bot_id=?",
+      "SELECT bot_id, owner_user_id, display_name, avatar_url, description, visibility, status, created_at, updated_at FROM bot_apps WHERE bot_id=?",
       botId,
     )
     .toArray()[0] as
@@ -178,7 +161,8 @@ function readBotAppArchiveRow(ctx: DurableObjectState, botId: string): Record<st
         owner_user_id: string;
         display_name: string;
         avatar_url: string | null;
-        callback_url: string;
+        description: string | null;
+        visibility: string;
         status: string;
         created_at: string;
         updated_at: string;
@@ -190,11 +174,92 @@ function readBotAppArchiveRow(ctx: DurableObjectState, botId: string): Record<st
     owner_user_id: row.owner_user_id,
     display_name: row.display_name,
     avatar_url: row.avatar_url,
-    callback_url: row.callback_url,
+    description: row.description,
+    visibility: row.visibility,
     status: row.status,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
+}
+
+function readBotTokenArchiveRow(ctx: DurableObjectState, tokenId: string): Record<string, unknown> | undefined {
+  const row = ctx.storage.sql
+    .exec(
+      "SELECT token_id, bot_id, name, token_hash, scopes_json, created_at, expires_at, last_used_at, revoked_at FROM bot_tokens WHERE token_id=?",
+      tokenId,
+    )
+    .toArray()[0] as
+    | {
+        token_id: string;
+        bot_id: string;
+        name: string;
+        token_hash: string;
+        scopes_json: string;
+        created_at: string;
+        expires_at: string | null;
+        last_used_at: string | null;
+        revoked_at: string | null;
+      }
+    | undefined;
+  if (!row) return undefined;
+  return {
+    token_id: row.token_id,
+    bot_id: row.bot_id,
+    name: row.name,
+    token_hash: row.token_hash,
+    scopes: row.scopes_json,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    last_used_at: row.last_used_at,
+    revoked_at: row.revoked_at,
+  };
+}
+
+function buildBotAppAndTokenArchiveChanges(
+  ctx: DurableObjectState,
+  botId: string,
+  tokenId: string | null,
+  sourceSeq: number,
+): ArchiveChange[] {
+  const rowVersion = rowVersionFromSeq(sourceSeq);
+  const changes: ArchiveChange[] = [];
+  const botApp = readBotAppArchiveRow(ctx, botId);
+  if (botApp) {
+    changes.push(archiveUpsert("chat_bot_apps", { bot_id: botId }, rowVersion, botApp));
+  }
+  if (tokenId) {
+    const tokenRow = readBotTokenArchiveRow(ctx, tokenId);
+    if (tokenRow) {
+      changes.push(archiveUpsert("chat_bot_tokens", { token_id: tokenId }, rowVersion, tokenRow));
+    }
+  }
+  return changes;
+}
+
+function encodeOffsetCursor(offset: number): string {
+  return btoa(String(offset)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function decodeOffsetCursor(cursor: string | null): number {
+  if (!cursor) return 0;
+  try {
+    const normalized = cursor.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+    const parsed = Number.parseInt(atob(padded), 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function randomBase64Url(byteLength: number): string {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 export class BotRegistry extends DurableObject<Env> {
@@ -216,6 +281,24 @@ export class BotRegistry extends DurableObject<Env> {
     if (url.pathname === "/internal/bot-get") {
       return this.handleBotGet(url);
     }
+    if (url.pathname === "/internal/bots-create") {
+      return this.handleBotsCreate(request);
+    }
+    if (url.pathname === "/internal/bots-list") {
+      return this.handleBotsList(url);
+    }
+    if (url.pathname === "/internal/bots-get") {
+      return this.handleBotsGet(url);
+    }
+    if (url.pathname === "/internal/bots-tokens-list") {
+      return this.handleBotsTokensList(url);
+    }
+    if (url.pathname === "/internal/bots-token-create") {
+      return this.handleBotsTokenCreate(request);
+    }
+    if (url.pathname === "/internal/bots-token-revoke") {
+      return this.handleBotsTokenRevoke(request);
+    }
     if (url.pathname === "/internal/commands-sync") {
       return this.handleCommandsSync(request);
     }
@@ -224,6 +307,9 @@ export class BotRegistry extends DurableObject<Env> {
     }
     if (url.pathname === "/internal/command-get") {
       return this.handleCommandGet(url);
+    }
+    if (url.pathname === "/internal/commands-directory") {
+      return this.handleCommandsDirectory(url);
     }
     if (url.pathname === "/internal/seed-official-bot") {
       return this.handleSeedOfficialBot(request);
@@ -240,18 +326,32 @@ export class BotRegistry extends DurableObject<Env> {
     }
     const row = this.ctx.storage.sql
       .exec(
-        `SELECT t.bot_id AS bot_id, t.scopes AS scopes, t.revoked_at AS revoked_at, a.status AS status
+        `SELECT t.bot_id AS bot_id, t.scopes_json AS scopes_json, t.revoked_at AS revoked_at,
+                t.expires_at AS expires_at, a.status AS status
          FROM bot_tokens t JOIN bot_apps a USING(bot_id)
          WHERE t.token_hash = ?`,
         body.token_hash,
       )
-      .toArray()[0] as { bot_id: string; scopes: string; revoked_at: string | null; status: string } | undefined;
-    if (!row || row.revoked_at !== null || row.status !== "active") {
+      .toArray()[0] as
+      | {
+          bot_id: string;
+          scopes_json: string;
+          revoked_at: string | null;
+          expires_at: string | null;
+          status: string;
+        }
+      | undefined;
+    if (
+      !row ||
+      row.revoked_at !== null ||
+      row.status !== "active" ||
+      (row.expires_at !== null && row.expires_at <= new Date().toISOString())
+    ) {
       return Response.json({ error: { code: "UNAUTHORIZED", message: "invalid bot token" } }, { status: 401 });
     }
     let scopes: string[];
     try {
-      const parsed = JSON.parse(row.scopes);
+      const parsed = JSON.parse(row.scopes_json);
       scopes = Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string") : [];
     } catch {
       scopes = [];
@@ -281,6 +381,339 @@ export class BotRegistry extends DurableObject<Env> {
     });
   }
 
+  private async handleBotsCreate(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as {
+      owner_user_id?: unknown;
+      display_name?: unknown;
+      avatar_url?: unknown;
+      description?: unknown;
+      visibility?: unknown;
+      issue_initial_token?: unknown;
+      initial_token_name?: unknown;
+      initial_token_scopes?: unknown;
+      initial_token_expires_at?: unknown;
+    } | null;
+    if (!body || typeof body.owner_user_id !== "string" || typeof body.display_name !== "string") {
+      return Response.json(
+        { error: { code: "INVALID_MESSAGE", message: "owner_user_id and display_name required" } },
+        { status: 422 },
+      );
+    }
+
+    const displayName = body.display_name.trim();
+    const visibility =
+      body.visibility === "private" ||
+      body.visibility === "unlisted" ||
+      body.visibility === "public" ||
+      body.visibility === "official"
+        ? body.visibility
+        : "private";
+    const avatarUrl = typeof body.avatar_url === "string" ? body.avatar_url : null;
+    const description = typeof body.description === "string" ? body.description : null;
+    const issueInitialToken = body.issue_initial_token !== false;
+    const initialTokenName = typeof body.initial_token_name === "string" && body.initial_token_name.trim()
+      ? body.initial_token_name.trim()
+      : "default";
+    const tokenScopes = Array.isArray(body.initial_token_scopes)
+      ? body.initial_token_scopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0)
+      : ["chat:runtime:connect", "chat:commands:manage"];
+    const tokenExpiresAt = typeof body.initial_token_expires_at === "string" ? body.initial_token_expires_at : null;
+
+    const now = new Date().toISOString();
+    const botId = uuidv7(Date.now());
+
+    let tokenPlaintext: string | null = null;
+    let tokenHash: string | null = null;
+    let tokenId: string | null = null;
+    if (issueInitialToken) {
+      tokenPlaintext = `lcbot_${randomBase64Url(32)}`;
+      tokenHash = await hashBotToken(tokenPlaintext);
+      tokenId = uuidv7(Date.now());
+    }
+
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, description, visibility, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+        botId,
+        body.owner_user_id,
+        displayName,
+        avatarUrl,
+        description,
+        visibility,
+        now,
+        now,
+      );
+      if (tokenId && tokenHash) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO bot_tokens (token_id, bot_id, name, token_hash, scopes_json, created_at, expires_at, last_used_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+          tokenId,
+          botId,
+          initialTokenName,
+          tokenHash,
+          JSON.stringify(tokenScopes),
+          now,
+          tokenExpiresAt,
+        );
+      }
+      appendBotRegistryArchive(this.ctx, now, (sourceSeq) =>
+        buildBotAppAndTokenArchiveChanges(this.ctx, botId, tokenId, sourceSeq),
+      );
+    });
+
+    await this.scheduleArchiveAlarm();
+
+    return Response.json({
+      bot: {
+        bot_id: botId,
+        owner_user_id: body.owner_user_id,
+        display_name: displayName,
+        avatar_url: avatarUrl,
+        description,
+        visibility,
+        status: "active",
+        created_at: now,
+        updated_at: now,
+      },
+      initial_token:
+        tokenId && tokenPlaintext
+          ? {
+              token_id: tokenId,
+              name: initialTokenName,
+              scopes: tokenScopes,
+              plaintext: tokenPlaintext,
+              created_at: now,
+              expires_at: tokenExpiresAt,
+            }
+          : undefined,
+    });
+  }
+
+  private async handleBotsList(url: URL): Promise<Response> {
+    const ownerUserId = url.searchParams.get("owner_user_id");
+    if (!ownerUserId) {
+      return Response.json({ error: { code: "INVALID_MESSAGE", message: "owner_user_id required" } }, { status: 422 });
+    }
+    const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 20;
+    const offset = decodeOffsetCursor(url.searchParams.get("cursor"));
+
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT b.bot_id, b.owner_user_id, b.display_name, b.avatar_url, b.description, b.visibility, b.status, b.created_at, b.updated_at,
+                (SELECT COUNT(*) FROM bot_commands c WHERE c.bot_id=b.bot_id AND c.status='active' AND c.deleted_at IS NULL) AS command_count
+         FROM bot_apps b
+         WHERE b.owner_user_id=?
+         ORDER BY b.updated_at DESC, b.bot_id DESC
+         LIMIT ? OFFSET ?`,
+        ownerUserId,
+        limit,
+        offset,
+      )
+      .toArray() as Array<{
+      bot_id: string;
+      owner_user_id: string;
+      display_name: string;
+      avatar_url: string | null;
+      description: string | null;
+      visibility: "private" | "unlisted" | "public" | "official";
+      status: "active" | "disabled" | "deleted";
+      created_at: string;
+      updated_at: string;
+      command_count: number | bigint;
+    }>;
+
+    return Response.json({
+      items: rows.map((row) => ({
+        bot_id: row.bot_id,
+        owner_user_id: row.owner_user_id,
+        display_name: row.display_name,
+        avatar_url: row.avatar_url,
+        description: row.description,
+        visibility: row.visibility,
+        status: row.status,
+        command_count: Number(row.command_count),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      })),
+      next_cursor: rows.length === limit ? encodeOffsetCursor(offset + rows.length) : null,
+    });
+  }
+
+  private async handleBotsGet(url: URL): Promise<Response> {
+    const botId = url.searchParams.get("bot_id");
+    if (!botId) {
+      return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot_id required" } }, { status: 404 });
+    }
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT bot_id, owner_user_id, display_name, avatar_url, description, visibility, status, created_at, updated_at FROM bot_apps WHERE bot_id=?",
+        botId,
+      )
+      .toArray()[0] as
+      | {
+          bot_id: string;
+          owner_user_id: string;
+          display_name: string;
+          avatar_url: string | null;
+          description: string | null;
+          visibility: "private" | "unlisted" | "public" | "official";
+          status: "active" | "disabled" | "deleted";
+          created_at: string;
+          updated_at: string;
+        }
+      | undefined;
+    if (!row) {
+      return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot not found" } }, { status: 404 });
+    }
+    return Response.json({ bot: row });
+  }
+
+  private async handleBotsTokensList(url: URL): Promise<Response> {
+    const botId = url.searchParams.get("bot_id");
+    if (!botId) {
+      return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot_id required" } }, { status: 404 });
+    }
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT token_id, name, scopes_json, created_at, expires_at, last_used_at, revoked_at FROM bot_tokens WHERE bot_id=? ORDER BY created_at DESC, token_id DESC",
+        botId,
+      )
+      .toArray() as Array<{
+      token_id: string;
+      name: string;
+      scopes_json: string;
+      created_at: string;
+      expires_at: string | null;
+      last_used_at: string | null;
+      revoked_at: string | null;
+    }>;
+    return Response.json({
+      items: rows.map((row) => ({
+        token_id: row.token_id,
+        name: row.name,
+        scopes: JSON.parse(row.scopes_json) as string[],
+        created_at: row.created_at,
+        expires_at: row.expires_at,
+        last_used_at: row.last_used_at,
+        revoked_at: row.revoked_at,
+      })),
+    });
+  }
+
+  private async handleBotsTokenCreate(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as {
+      bot_id?: unknown;
+      name?: unknown;
+      scopes?: unknown;
+      expires_at?: unknown;
+    } | null;
+    if (!body || typeof body.bot_id !== "string") {
+      return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot_id required" } }, { status: 404 });
+    }
+    if (typeof body.name !== "string" || body.name.trim().length === 0) {
+      return Response.json({ error: { code: "INVALID_MESSAGE", message: "token name required" } }, { status: 422 });
+    }
+
+    const botExists = this.ctx.storage.sql
+      .exec("SELECT bot_id FROM bot_apps WHERE bot_id=?", body.bot_id)
+      .toArray()[0] as { bot_id: string } | undefined;
+    if (!botExists) {
+      return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot not found" } }, { status: 404 });
+    }
+
+    const botId = body.bot_id;
+    const tokenName = body.name.trim();
+    const tokenScopes = Array.isArray(body.scopes)
+      ? body.scopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0)
+      : ["chat:runtime:connect", "chat:commands:manage"];
+    const tokenExpiresAt = typeof body.expires_at === "string" ? body.expires_at : null;
+    const tokenPlaintext = `lcbot_${randomBase64Url(32)}`;
+    const tokenHash = await hashBotToken(tokenPlaintext);
+    const tokenId = uuidv7(Date.now());
+    const now = new Date().toISOString();
+
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO bot_tokens (token_id, bot_id, name, token_hash, scopes_json, created_at, expires_at, last_used_at, revoked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+        tokenId,
+        botId,
+        tokenName,
+        tokenHash,
+        JSON.stringify(tokenScopes),
+        now,
+        tokenExpiresAt,
+      );
+      appendBotRegistryArchive(this.ctx, now, (sourceSeq) => {
+        const rowVersion = rowVersionFromSeq(sourceSeq);
+        const tokenRow = readBotTokenArchiveRow(this.ctx, tokenId);
+        return tokenRow
+          ? [archiveUpsert("chat_bot_tokens", { token_id: tokenId }, rowVersion, tokenRow)]
+          : [];
+      });
+    });
+
+    await this.scheduleArchiveAlarm();
+
+    return Response.json({
+      token: {
+        token_id: tokenId,
+        name: tokenName,
+        scopes: tokenScopes,
+        plaintext: tokenPlaintext,
+        created_at: now,
+        expires_at: tokenExpiresAt,
+      },
+    });
+  }
+
+  private async handleBotsTokenRevoke(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as { bot_id?: unknown; token_id?: unknown } | null;
+    if (!body || typeof body.bot_id !== "string" || typeof body.token_id !== "string") {
+      return Response.json(
+        { error: { code: "INVALID_MESSAGE", message: "bot_id and token_id required" } },
+        { status: 422 },
+      );
+    }
+    const botId = body.bot_id;
+    const tokenId = body.token_id;
+    const row = this.ctx.storage.sql
+      .exec("SELECT revoked_at FROM bot_tokens WHERE token_id=? AND bot_id=?", tokenId, botId)
+      .toArray()[0] as { revoked_at: string | null } | undefined;
+    if (!row) {
+      return Response.json({ error: { code: "BOT_TOKEN_INVALID", message: "token not found" } }, { status: 404 });
+    }
+    const revokedAt = row.revoked_at ?? new Date().toISOString();
+    const shouldArchive = row.revoked_at === null;
+    this.ctx.storage.transactionSync(() => {
+      if (shouldArchive) {
+        this.ctx.storage.sql.exec(
+          "UPDATE bot_tokens SET revoked_at=? WHERE token_id=? AND bot_id=?",
+          revokedAt,
+          tokenId,
+          botId,
+        );
+      }
+      if (shouldArchive) {
+        appendBotRegistryArchive(this.ctx, revokedAt, (sourceSeq) => {
+          const rowVersion = rowVersionFromSeq(sourceSeq);
+          const tokenRow = readBotTokenArchiveRow(this.ctx, tokenId);
+          return tokenRow
+            ? [archiveUpsert("chat_bot_tokens", { token_id: tokenId }, rowVersion, tokenRow)]
+            : [];
+        });
+      }
+    });
+
+    if (shouldArchive) {
+      await this.scheduleArchiveAlarm();
+    }
+
+    return Response.json({ token_id: tokenId, revoked_at: revokedAt });
+  }
+
   async scheduleArchiveAlarm(): Promise<void> {
     await scheduleNextAlarm(this.ctx, [archiveOutboxDueTable()], { respectExistingAlarm: true });
   }
@@ -298,18 +731,16 @@ export class BotRegistry extends DurableObject<Env> {
   /**
    * PUT /bot/commands catalog sync. Upserts bot_commands (reuses bot_command_id
    * for the same bot_id+name, else mints a UUIDv7), full-replaces per-command
-   * aliases, upserts bot_event_capabilities. definition_hash detects semantic
-   * drift; schema_version increments only when the hash changes. Idempotent via
-   * bot_idempotency_keys (operation=bot.commands.sync). This only writes the
-   * global catalog — it does NOT enable commands in any channel (that is the
-   * channel binding layer in ChatChannel).
+   * aliases and global slash namespace entries in bot_command_names.
+   * definition_hash detects semantic drift; schema_version increments only when
+   * the hash changes. Idempotent via bot_idempotency_keys
+   * (operation=bot.commands.sync).
    */
   private async handleCommandsSync(request: Request): Promise<Response> {
     const body = (await request.json().catch(() => null)) as {
       bot_id?: unknown;
       idempotency_key?: unknown;
       commands?: unknown;
-      event_capabilities?: unknown;
     };
     if (
       typeof body?.bot_id !== "string" ||
@@ -331,6 +762,12 @@ export class BotRegistry extends DurableObject<Env> {
 
     const validatedCommands: ValidatedCommand[] = [];
     const slashTokens = new Set<string>();
+    const slashPlans: Array<{
+      command: ValidatedCommand;
+      canonical: string;
+      aliases: string[];
+      all: string[];
+    }> = [];
     for (const c of body.commands) {
       const r = validateCommand(c as CommandInput);
       if (!r.ok || !r.value) {
@@ -339,7 +776,19 @@ export class BotRegistry extends DurableObject<Env> {
           { status: 422 },
         );
       }
-      for (const token of [r.value.name, ...r.value.aliases]) {
+      const collected = collectSlashTokens(r.value.name, r.value.aliases);
+      if (!collected.ok) {
+        return Response.json(
+          {
+            error: {
+              code: "INVALID_COMMAND_OPTIONS",
+              message: `invalid slash token: ${collected.error}`,
+            },
+          },
+          { status: 422 },
+        );
+      }
+      for (const token of collected.all) {
         if (slashTokens.has(token)) {
           return Response.json(
             { error: { code: "INVALID_COMMAND_OPTIONS", message: `duplicate slash token: ${token}` } },
@@ -348,39 +797,22 @@ export class BotRegistry extends DurableObject<Env> {
         }
         slashTokens.add(token);
       }
-      validatedCommands.push(r.value);
-    }
-
-    const capsRaw = body.event_capabilities ?? [];
-    if (!Array.isArray(capsRaw)) {
-      return Response.json(
-        { error: { code: "INVALID_COMMAND_OPTIONS", message: "event_capabilities must be an array" } },
-        { status: 422 },
-      );
-    }
-    const validatedCaps: ValidatedEventCapability[] = [];
-    const capTypes = new Set<string>();
-    for (const cap of capsRaw) {
-      const r = validateEventCapability(cap as EventCapabilityInput);
-      if (!r.ok || !r.value) {
-        return Response.json(
-          { error: { code: "INVALID_COMMAND_OPTIONS", message: r.error ?? "invalid event_capability" } },
-          { status: 422 },
-        );
-      }
-      if (capTypes.has(r.value.event_type)) {
-        return Response.json(
-          { error: { code: "INVALID_COMMAND_OPTIONS", message: `duplicate event_capability: ${r.value.event_type}` } },
-          { status: 422 },
-        );
-      }
-      capTypes.add(r.value.event_type);
-      validatedCaps.push(r.value);
+      const validated = {
+        ...r.value,
+        name: collected.canonical,
+        aliases: collected.aliases,
+      };
+      validatedCommands.push(validated);
+      slashPlans.push({
+        command: validated,
+        canonical: collected.canonical,
+        aliases: collected.aliases,
+        all: collected.all,
+      });
     }
 
     const requestHash = await commandsRequestHash({
       commands: validatedCommands,
-      event_capabilities: validatedCaps,
     });
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
@@ -417,9 +849,21 @@ export class BotRegistry extends DurableObject<Env> {
     }
 
     // Precompute definition hashes (crypto.subtle is async; cannot run in transactionSync).
-    const commandPlans: Array<{ cmd: ValidatedCommand; defHash: string }> = [];
-    for (const cmd of validatedCommands) {
-      commandPlans.push({ cmd, defHash: await sha256Hex(canonicalCommandDefinition(cmd)) });
+    const commandPlans: Array<{
+      cmd: ValidatedCommand;
+      canonical: string;
+      aliases: string[];
+      allTokens: string[];
+      defHash: string;
+    }> = [];
+    for (const plan of slashPlans) {
+      commandPlans.push({
+        cmd: plan.command,
+        canonical: plan.canonical,
+        aliases: plan.aliases,
+        allTokens: plan.all,
+        defHash: await sha256Hex(canonicalCommandDefinition(plan.command)),
+      });
     }
 
     const response = this.ctx.storage.transactionSync(() => {
@@ -427,17 +871,20 @@ export class BotRegistry extends DurableObject<Env> {
         bot_command_id: string;
         name: string;
         aliases: string[];
-        enabled: boolean;
-        default_enabled_on_install: boolean;
+        status: string;
+        execution_mode: "stateless" | "stateful";
+        stateful_config: unknown | null;
+        definition_hash: string;
+        schema_version: number;
         updated_at: string;
       }> = [];
 
-      for (const { cmd, defHash } of commandPlans) {
+      for (const { cmd, canonical, aliases, allTokens, defHash } of commandPlans) {
         const row = this.ctx.storage.sql
           .exec(
             "SELECT bot_command_id, schema_version, definition_hash FROM bot_commands WHERE bot_id=? AND name=?",
             botId,
-            cmd.name,
+            canonical,
           )
           .toArray()[0] as
           | { bot_command_id: string; schema_version: number; definition_hash: string }
@@ -450,13 +897,14 @@ export class BotRegistry extends DurableObject<Env> {
           this.ctx.storage.sql.exec(
             `UPDATE bot_commands
              SET description=?, options_json=?, default_member_permission=?,
-                 default_enabled_on_install=?, definition_hash=?, schema_version=?,
-                 enabled=1, deleted_at=NULL, updated_at=?
+                 execution_mode=?, stateful_config_json=?, definition_hash=?,
+                 schema_version=?, status='active', deleted_at=NULL, updated_at=?
              WHERE bot_command_id=?`,
             cmd.description,
             JSON.stringify(cmd.options),
             cmd.default_member_permission,
-            cmd.default_enabled_on_install ? 1 : 0,
+            cmd.execution_mode,
+            cmd.stateful_config ? JSON.stringify(cmd.stateful_config) : null,
             defHash,
             schemaVersion,
             nowIso,
@@ -468,16 +916,17 @@ export class BotRegistry extends DurableObject<Env> {
           this.ctx.storage.sql.exec(
             `INSERT INTO bot_commands (
                bot_command_id, bot_id, name, description, options_json,
-               default_member_permission, default_enabled_on_install, schema_version,
-               definition_hash, enabled, created_at, updated_at, deleted_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)`,
+               default_member_permission, execution_mode, stateful_config_json, schema_version,
+               definition_hash, status, created_at, updated_at, deleted_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL)`,
             botCommandId,
             botId,
-            cmd.name,
+            canonical,
             cmd.description,
             JSON.stringify(cmd.options),
             cmd.default_member_permission,
-            cmd.default_enabled_on_install ? 1 : 0,
+            cmd.execution_mode,
+            cmd.stateful_config ? JSON.stringify(cmd.stateful_config) : null,
             schemaVersion,
             defHash,
             nowIso,
@@ -485,12 +934,37 @@ export class BotRegistry extends DurableObject<Env> {
           );
         }
 
+        for (const slashToken of allTokens) {
+          const existingName = this.ctx.storage.sql
+            .exec(
+              "SELECT bot_command_id, bot_id FROM bot_command_names WHERE slash_token=?",
+              slashToken,
+            )
+            .toArray()[0] as { bot_command_id: string; bot_id: string } | undefined;
+          if (existingName && existingName.bot_command_id !== botCommandId) {
+            return {
+              kind: "error" as const,
+              code: "COMMAND_NAME_CONFLICT",
+              message: `slash token already in use: ${slashToken}`,
+              conflict: {
+                slash_token: slashToken,
+                bot_command_id: existingName.bot_command_id,
+                bot_id: existingName.bot_id,
+              },
+            };
+          }
+        }
+
         // full-replace aliases for this command
         this.ctx.storage.sql.exec(
           "DELETE FROM bot_command_aliases WHERE bot_command_id=?",
           botCommandId,
         );
-        for (const alias of cmd.aliases) {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM bot_command_names WHERE bot_command_id=?",
+          botCommandId,
+        );
+        for (const alias of aliases) {
           this.ctx.storage.sql.exec(
             "INSERT INTO bot_command_aliases (bot_command_id, bot_id, alias, created_at) VALUES (?, ?, ?, ?)",
             botCommandId,
@@ -498,46 +972,44 @@ export class BotRegistry extends DurableObject<Env> {
             alias,
             nowIso,
           );
+          this.ctx.storage.sql.exec(
+            "INSERT INTO bot_command_names (slash_token, bot_command_id, bot_id, kind, created_at) VALUES (?, ?, ?, 'alias', ?)",
+            alias,
+            botCommandId,
+            botId,
+            nowIso,
+          );
         }
+        this.ctx.storage.sql.exec(
+          "INSERT INTO bot_command_names (slash_token, bot_command_id, bot_id, kind, created_at) VALUES (?, ?, ?, 'canonical', ?)",
+          canonical,
+          botCommandId,
+          botId,
+          nowIso,
+        );
 
         outCommands.push({
           bot_command_id: botCommandId,
-          name: cmd.name,
-          aliases: cmd.aliases,
-          enabled: true,
-          default_enabled_on_install: cmd.default_enabled_on_install,
+          name: canonical,
+          aliases,
+          status: "active",
+          execution_mode: cmd.execution_mode,
+          stateful_config: cmd.stateful_config,
+          definition_hash: defHash,
+          schema_version: schemaVersion,
           updated_at: nowIso,
         });
       }
 
-      const outCaps: Array<{
-        event_type: string;
-        default_enabled_on_install: boolean;
-        updated_at: string;
-      }> = [];
-      for (const cap of validatedCaps) {
-        this.ctx.storage.sql.exec(
-          `INSERT INTO bot_event_capabilities (bot_id, event_type, filters_json, default_enabled_on_install, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(bot_id, event_type) DO UPDATE SET
-             filters_json=excluded.filters_json,
-             default_enabled_on_install=excluded.default_enabled_on_install,
-             updated_at=excluded.updated_at`,
-          botId,
-          cap.event_type,
-          JSON.stringify(cap.default_filters),
-          cap.default_enabled_on_install ? 1 : 0,
-          nowIso,
-          nowIso,
-        );
-        outCaps.push({
-          event_type: cap.event_type,
-          default_enabled_on_install: cap.default_enabled_on_install,
-          updated_at: nowIso,
-        });
+      const responseBody = { commands: outCommands };
+      if (outCommands.some((c) => c.status !== "active")) {
+        // unreachable sentinel to keep exhaustive return shape explicit.
+        return {
+          kind: "error" as const,
+          code: "INVALID_COMMAND_OPTIONS",
+          message: "invalid command status",
+        };
       }
-
-      const responseBody = { commands: outCommands, event_capabilities: outCaps };
       this.ctx.storage.sql.exec(
         "INSERT INTO bot_idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('bot', ?, ?, ?, ?, ?, 'completed', ?, ?)",
         botId,
@@ -551,23 +1023,27 @@ export class BotRegistry extends DurableObject<Env> {
       appendBotRegistryArchive(this.ctx, nowIso, (sourceSeq) =>
         buildBotCommandsSyncArchiveChanges(
           this.ctx,
-          botId,
           outCommands.map((command) => command.bot_command_id),
           sourceSeq,
         ),
       );
-      return responseBody;
+      return { kind: "ok" as const, body: responseBody };
     });
 
+    if (response.kind === "error") {
+      return Response.json(
+        { error: { code: response.code, message: response.message, conflict: response.conflict } },
+        { status: response.code === "COMMAND_NAME_CONFLICT" ? 409 : 422 },
+      );
+    }
+
     await this.scheduleArchiveAlarm();
-    return Response.json(response);
+    return Response.json(response.body);
   }
 
   /**
-   * Return the bot's full enabled command catalog + aliases + event
-   * capabilities + profile. Used by ChatChannel /internal/bot-install to
-   * build channel_command_bindings + channel_command_names +
-   * channel_bot_event_subscriptions snapshots.
+   * Return the bot's full enabled command catalog + aliases + profile.
+   * Used by ChatChannel when building channel_command_bindings snapshots.
    */
   private async handleBotCommands(url: URL): Promise<Response> {
     const botId = url.searchParams.get("bot_id");
@@ -582,7 +1058,7 @@ export class BotRegistry extends DurableObject<Env> {
     }
     const commandRows = this.ctx.storage.sql
       .exec(
-        "SELECT bot_command_id, name, description, options_json, default_member_permission, default_enabled_on_install, schema_version, definition_hash FROM bot_commands WHERE bot_id=? AND enabled=1 AND deleted_at IS NULL",
+        "SELECT bot_command_id, name, description, options_json, default_member_permission, execution_mode, stateful_config_json, schema_version, definition_hash, status FROM bot_commands WHERE bot_id=? AND status='active' AND deleted_at IS NULL",
         botId,
       )
       .toArray() as Array<{
@@ -591,9 +1067,11 @@ export class BotRegistry extends DurableObject<Env> {
         description: string | null;
         options_json: string;
         default_member_permission: string;
-        default_enabled_on_install: number;
+        execution_mode: "stateless" | "stateful";
+        stateful_config_json: string | null;
         schema_version: number;
         definition_hash: string;
+        status: string;
       }>;
     const aliasRows = this.ctx.storage.sql
       .exec("SELECT bot_command_id, alias FROM bot_command_aliases WHERE bot_id=?", botId)
@@ -604,10 +1082,6 @@ export class BotRegistry extends DurableObject<Env> {
       list.push(a.alias);
       aliasesByCommand.set(a.bot_command_id, list);
     }
-    const capRows = this.ctx.storage.sql
-      .exec("SELECT event_type, filters_json, default_enabled_on_install FROM bot_event_capabilities WHERE bot_id=?", botId)
-      .toArray() as Array<{ event_type: string; filters_json: string; default_enabled_on_install: number }>;
-
     return Response.json({
       bot: { bot_id: bot.bot_id, display_name: bot.display_name, avatar_url: bot.avatar_url, status: bot.status },
       commands: commandRows.map((c) => ({
@@ -616,16 +1090,18 @@ export class BotRegistry extends DurableObject<Env> {
         description: c.description,
         options: JSON.parse(c.options_json),
         default_member_permission: c.default_member_permission,
-        default_enabled_on_install: c.default_enabled_on_install === 1,
+        execution: {
+          mode: c.execution_mode,
+          ...(c.execution_mode === "stateful" && c.stateful_config_json
+            ? { stateful: JSON.parse(c.stateful_config_json) }
+            : {}),
+        },
+        status: c.status,
         schema_version: c.schema_version,
         definition_hash: c.definition_hash,
         aliases: aliasesByCommand.get(c.bot_command_id) ?? [],
       })),
-      event_capabilities: capRows.map((cap) => ({
-        event_type: cap.event_type,
-        filters: JSON.parse(cap.filters_json),
-        default_enabled_on_install: cap.default_enabled_on_install === 1,
-      })),
+      event_capabilities: [],
     });
   }
 
@@ -636,31 +1112,51 @@ export class BotRegistry extends DurableObject<Env> {
    * drift -> refresh binding snapshot.
    */
   private async handleCommandGet(url: URL): Promise<Response> {
-    const botId = url.searchParams.get("bot_id");
     const botCommandId = url.searchParams.get("bot_command_id");
-    if (!botId || !botCommandId) {
-      return Response.json({ error: { code: "BOT_COMMAND_DISABLED", message: "bot_id and bot_command_id required" } }, { status: 404 });
+    if (!botCommandId) {
+      return Response.json({ error: { code: "BOT_COMMAND_DISABLED", message: "bot_command_id required" } }, { status: 404 });
     }
     const row = this.ctx.storage.sql
       .exec(
-        "SELECT bot_command_id, name, description, options_json, default_member_permission, schema_version, definition_hash, enabled, deleted_at FROM bot_commands WHERE bot_id=? AND bot_command_id=?",
-        botId,
+        `SELECT
+           c.bot_command_id,
+           c.bot_id,
+           c.name,
+           c.description,
+           c.options_json,
+           c.default_member_permission,
+           c.execution_mode,
+           c.stateful_config_json,
+           c.schema_version,
+           c.definition_hash,
+           c.status,
+           c.deleted_at,
+           a.display_name AS bot_display_name,
+           a.avatar_url AS bot_avatar_url
+         FROM bot_commands c
+         JOIN bot_apps a ON a.bot_id = c.bot_id
+         WHERE c.bot_command_id=?`,
         botCommandId,
       )
       .toArray()[0] as
       | {
           bot_command_id: string;
+          bot_id: string;
           name: string;
           description: string | null;
           options_json: string;
           default_member_permission: string;
+          execution_mode: "stateless" | "stateful";
+          stateful_config_json: string | null;
           schema_version: number;
           definition_hash: string;
-          enabled: number;
+          status: string;
           deleted_at: string | null;
+          bot_display_name: string;
+          bot_avatar_url: string | null;
         }
       | undefined;
-    if (!row || row.deleted_at !== null || row.enabled !== 1) {
+    if (!row || row.deleted_at !== null || row.status !== "active") {
       return Response.json({ error: { code: "BOT_COMMAND_DISABLED", message: "command disabled or deleted" } }, { status: 404 });
     }
     const aliasRows = this.ctx.storage.sql
@@ -668,13 +1164,115 @@ export class BotRegistry extends DurableObject<Env> {
       .toArray() as Array<{ alias: string }>;
     return Response.json({
       bot_command_id: row.bot_command_id,
+      bot_id: row.bot_id,
       name: row.name,
       description: row.description,
+      bot: {
+        bot_id: row.bot_id,
+        display_name: row.bot_display_name,
+        avatar_url: row.bot_avatar_url,
+      },
       options: JSON.parse(row.options_json),
       default_member_permission: row.default_member_permission,
+      execution: {
+        mode: row.execution_mode,
+        ...(row.execution_mode === "stateful" && row.stateful_config_json
+          ? { stateful: JSON.parse(row.stateful_config_json) }
+          : {}),
+      },
       schema_version: row.schema_version,
       definition_hash: row.definition_hash,
       aliases: aliasRows.map((a) => a.alias),
+    });
+  }
+
+  private async handleCommandsDirectory(url: URL): Promise<Response> {
+    const queryRaw = (url.searchParams.get("query") ?? "").trim().normalize("NFKC").toLowerCase();
+    const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 20;
+    const offset = decodeOffsetCursor(url.searchParams.get("cursor"));
+    const likeQuery = `%${queryRaw}%`;
+
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT c.bot_command_id, c.name, c.description, c.options_json, c.default_member_permission,
+                c.execution_mode, c.stateful_config_json, a.bot_id, a.display_name, a.avatar_url
+         FROM bot_commands c
+         JOIN bot_apps a ON a.bot_id = c.bot_id
+         WHERE c.status='active'
+           AND c.deleted_at IS NULL
+           AND a.status='active'
+           AND (
+             ? = ''
+             OR lower(c.name) LIKE ?
+             OR EXISTS (
+               SELECT 1 FROM bot_command_aliases ca
+               WHERE ca.bot_command_id = c.bot_command_id
+                 AND lower(ca.alias) LIKE ?
+             )
+           )
+         ORDER BY c.updated_at DESC, c.bot_command_id DESC
+         LIMIT ? OFFSET ?`,
+        queryRaw,
+        likeQuery,
+        likeQuery,
+        limit,
+        offset,
+      )
+      .toArray() as Array<{
+      bot_command_id: string;
+      name: string;
+      description: string | null;
+      options_json: string;
+      default_member_permission: "member" | "admin" | "owner";
+      execution_mode: "stateless" | "stateful";
+      stateful_config_json: string | null;
+      bot_id: string;
+      display_name: string;
+      avatar_url: string | null;
+    }>;
+
+    const commandIds = rows.map((row) => row.bot_command_id);
+    const aliasesByCommand = new Map<string, string[]>();
+    if (commandIds.length > 0) {
+      const placeholders = commandIds.map(() => "?").join(", ");
+      const aliasRows = this.ctx.storage.sql
+        .exec(
+          `SELECT bot_command_id, alias
+           FROM bot_command_aliases
+           WHERE bot_command_id IN (${placeholders})
+           ORDER BY alias ASC`,
+          ...commandIds,
+        )
+        .toArray() as Array<{ bot_command_id: string; alias: string }>;
+      for (const aliasRow of aliasRows) {
+        const list = aliasesByCommand.get(aliasRow.bot_command_id) ?? [];
+        list.push(aliasRow.alias);
+        aliasesByCommand.set(aliasRow.bot_command_id, list);
+      }
+    }
+
+    return Response.json({
+      items: rows.map((row) => ({
+        bot_command_id: row.bot_command_id,
+        name: row.name,
+        aliases: aliasesByCommand.get(row.bot_command_id) ?? [],
+        description: row.description ?? "",
+        bot: {
+          bot_id: row.bot_id,
+          display_name: row.display_name,
+          avatar_url: row.avatar_url,
+        },
+        options: JSON.parse(row.options_json) as unknown[],
+        default_member_permission: row.default_member_permission,
+        execution: {
+          mode: row.execution_mode,
+          ...(row.execution_mode === "stateful" && row.stateful_config_json
+            ? { stateful: JSON.parse(row.stateful_config_json) }
+            : {}),
+        },
+      })),
+      next_cursor: rows.length === limit ? encodeOffsetCursor(offset + rows.length) : null,
     });
   }
 
@@ -697,7 +1295,7 @@ export class BotRegistry extends DurableObject<Env> {
       options: unknown;
       aliases: string[];
       default_member_permission: "member" | "admin" | "owner";
-      default_enabled_on_install: boolean;
+      execution: { mode: "stateless" };
     }> = [
       {
         name: "ask",
@@ -707,7 +1305,7 @@ export class BotRegistry extends DurableObject<Env> {
         ],
         aliases: ["ai"],
         default_member_permission: "member",
-        default_enabled_on_install: true,
+        execution: { mode: "stateless" },
       },
       {
         name: "summarize",
@@ -717,20 +1315,7 @@ export class BotRegistry extends DurableObject<Env> {
         ],
         aliases: ["sum", "tl_dr"],
         default_member_permission: "member",
-        default_enabled_on_install: true,
-      },
-    ];
-
-    const seedEventCapabilities: Array<{ event_type: string; default_filters: unknown; default_enabled_on_install: boolean }> = [
-      {
-        event_type: "message.created",
-        default_filters: {
-          message_types: ["text"],
-          include_bot_messages: false,
-          include_own_messages: false,
-          only_when_mentioned: false,
-        },
-        default_enabled_on_install: false,
+        execution: { mode: "stateless" },
       },
     ];
 
@@ -754,28 +1339,32 @@ export class BotRegistry extends DurableObject<Env> {
 
     const seedResult = this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
-        `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, callback_url, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+        `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, description, visibility, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
          ON CONFLICT(bot_id) DO UPDATE SET
            display_name=excluded.display_name,
            avatar_url=excluded.avatar_url,
+           description=excluded.description,
+           visibility=excluded.visibility,
            status='active',
            updated_at=excluded.updated_at`,
         OFFICIAL_BOT_ID,
         "system",
         "Lilium Bot",
         null,
-        "https://example.test/callback",
+        "Official Lilium bot",
+        "official",
         now,
         now,
       );
 
       if (newTokenId && newTokenHash) {
         this.ctx.storage.sql.exec(
-          `INSERT INTO bot_tokens (token_id, bot_id, token_hash, scopes, created_at, revoked_at)
-           VALUES (?, ?, ?, ?, ?, NULL)`,
+          `INSERT INTO bot_tokens (token_id, bot_id, name, token_hash, scopes_json, created_at, expires_at, last_used_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
           newTokenId,
           OFFICIAL_BOT_ID,
+          "default",
           newTokenHash,
           JSON.stringify(["chat:commands:manage", "chat:runtime:connect", "chat:messages:write"]),
           now,
@@ -786,8 +1375,10 @@ export class BotRegistry extends DurableObject<Env> {
         bot_command_id: string;
         name: string;
         aliases: string[];
-        enabled: boolean;
-        default_enabled_on_install: boolean;
+        status: string;
+        execution_mode: "stateless" | "stateful";
+        stateful_config: unknown | null;
+        definition_hash: string;
         schema_version: number;
         updated_at: string;
       }> = [];
@@ -812,13 +1403,14 @@ export class BotRegistry extends DurableObject<Env> {
           schemaVersion = existing.definition_hash === plan.defHash ? existing.schema_version : existing.schema_version + 1;
           this.ctx.storage.sql.exec(
             `UPDATE bot_commands
-             SET description=?, options_json=?, default_member_permission=?, default_enabled_on_install=?,
-                 schema_version=?, definition_hash=?, enabled=1, deleted_at=NULL, updated_at=?
+             SET description=?, options_json=?, default_member_permission=?, execution_mode=?, stateful_config_json=?,
+                 schema_version=?, definition_hash=?, status='active', deleted_at=NULL, updated_at=?
              WHERE bot_command_id=?`,
             command.description,
             JSON.stringify(command.options),
             command.default_member_permission,
-            command.default_enabled_on_install ? 1 : 0,
+            command.execution.mode,
+            null,
             schemaVersion,
             plan.defHash,
             now,
@@ -830,15 +1422,15 @@ export class BotRegistry extends DurableObject<Env> {
           this.ctx.storage.sql.exec(
             `INSERT INTO bot_commands (
                bot_command_id, bot_id, name, description, options_json, default_member_permission,
-               default_enabled_on_install, schema_version, definition_hash, enabled, created_at, updated_at, deleted_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)`,
+               execution_mode, stateful_config_json, schema_version, definition_hash, status, created_at, updated_at, deleted_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'active', ?, ?, NULL)`,
             botCommandId,
             OFFICIAL_BOT_ID,
             command.name,
             command.description,
             JSON.stringify(command.options),
             command.default_member_permission,
-            command.default_enabled_on_install ? 1 : 0,
+            command.execution.mode,
             schemaVersion,
             plan.defHash,
             now,
@@ -857,36 +1449,36 @@ export class BotRegistry extends DurableObject<Env> {
           );
         }
 
+        this.ctx.storage.sql.exec(
+          "DELETE FROM bot_command_names WHERE bot_command_id=?",
+          botCommandId,
+        );
+        for (const alias of command.aliases) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO bot_command_names (slash_token, bot_command_id, bot_id, kind, created_at) VALUES (?, ?, ?, 'alias', ?)",
+            alias,
+            botCommandId,
+            OFFICIAL_BOT_ID,
+            now,
+          );
+        }
+        this.ctx.storage.sql.exec(
+          "INSERT INTO bot_command_names (slash_token, bot_command_id, bot_id, kind, created_at) VALUES (?, ?, ?, 'canonical', ?)",
+          command.name,
+          botCommandId,
+          OFFICIAL_BOT_ID,
+          now,
+        );
+
         responseCommands.push({
           bot_command_id: botCommandId,
           name: command.name,
           aliases: command.aliases,
-          enabled: true,
-          default_enabled_on_install: command.default_enabled_on_install,
+          status: "active",
+          execution_mode: command.execution.mode,
+          stateful_config: null,
+          definition_hash: plan.defHash,
           schema_version: schemaVersion,
-          updated_at: now,
-        });
-      }
-
-      const responseCaps = [] as Array<{ event_type: string; default_enabled_on_install: boolean; updated_at: string }>;
-      for (const cap of seedEventCapabilities) {
-        this.ctx.storage.sql.exec(
-          `INSERT INTO bot_event_capabilities (bot_id, event_type, filters_json, default_enabled_on_install, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(bot_id, event_type) DO UPDATE SET
-             filters_json=excluded.filters_json,
-             default_enabled_on_install=excluded.default_enabled_on_install,
-             updated_at=excluded.updated_at`,
-          OFFICIAL_BOT_ID,
-          cap.event_type,
-          JSON.stringify(cap.default_filters),
-          cap.default_enabled_on_install ? 1 : 0,
-          now,
-          now,
-        );
-        responseCaps.push({
-          event_type: cap.event_type,
-          default_enabled_on_install: cap.default_enabled_on_install,
           updated_at: now,
         });
       }
@@ -907,9 +1499,12 @@ export class BotRegistry extends DurableObject<Env> {
               {
                 token_id: newTokenId,
                 bot_id: OFFICIAL_BOT_ID,
+                name: "default",
                 token_hash: newTokenHash,
                 scopes: JSON.stringify(["chat:commands:manage", "chat:runtime:connect", "chat:messages:write"]),
                 created_at: now,
+                expires_at: null,
+                last_used_at: null,
                 revoked_at: null,
               },
             ),
@@ -918,7 +1513,6 @@ export class BotRegistry extends DurableObject<Env> {
         changes.push(
           ...buildBotCommandsSyncArchiveChanges(
             this.ctx,
-            OFFICIAL_BOT_ID,
             responseCommands.map((command) => command.bot_command_id),
             sourceSeq,
           ),
@@ -926,7 +1520,7 @@ export class BotRegistry extends DurableObject<Env> {
         return changes;
       });
 
-      return { responseCommands, responseCaps };
+      return { responseCommands };
     });
 
     await this.scheduleArchiveAlarm();
@@ -939,7 +1533,6 @@ export class BotRegistry extends DurableObject<Env> {
       },
       token: issuedToken,
       commands: seedResult.responseCommands,
-      event_capabilities: seedResult.responseCaps,
     });
   }
 }

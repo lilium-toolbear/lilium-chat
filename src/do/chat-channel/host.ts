@@ -68,8 +68,8 @@ export interface ChatChannelHost {
   activeRole(channelId: string, userId: string): string | null;
   assertNotDissolved(status: string): { code: string; message: string } | null;
   flushSingleInviteDirectoryOutbox(outboxId: string, nowIso: string): Promise<boolean>;
-  handleBotInstall(request: Request): Promise<Response>;
-  handleBotInstallUpdate(request: Request): Promise<Response>;
   handleCommandBindingUpdate(request: Request): Promise<Response>;
   handleChannelCommands(request: Request): Promise<Response>;
+  handleCommandManifest(request: Request): Promise<Response>;
+  handleCommandInvoke(request: Request): Promise<Response>;
 }

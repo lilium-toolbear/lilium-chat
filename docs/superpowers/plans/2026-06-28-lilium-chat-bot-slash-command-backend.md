@@ -712,6 +712,14 @@ Add routes on BotRegistry DO:
 
 Token plaintext format: `lcbot_` + base64url random; store SHA-256 hash only.
 
+**Archive (spec §0.1 / archive plan §6.4):** each write path appends inside `transactionSync`:
+
+- `bots-create` → `chat_bot_apps` + optional `chat_bot_tokens` (hash/metadata only)
+- `bots-token-create` → `chat_bot_tokens` upsert
+- `bots-token-revoke` → `chat_bot_tokens` upsert with `revoked_at`
+
+Covered by `test/routes/bots.test.ts` archive_outbox assertion.
+
 - [ ] **Step 4: Implement `src/routes/bots.ts` + register in `src/index.ts`**
 
 ```ts
@@ -1224,7 +1232,7 @@ Docs handling (do **not** delete historical mentions):
 - `docs/bot-developer-guide.md` — rewrite for new model (required)
 - `docs/api-contract/2026-06-28-bot-slash-command-contract-addendum.md`, `docs/superpowers/specs/`, `docs/superpowers/plans/` — **allowed** to mention removed routes/tables as non-goals or migration notes; do not strip these references
 
-Archive projection (`src/archive/`): update or remove references to deleted ChatChannel tables if present.
+Archive projection (`src/archive/`): update or remove references to deleted ChatChannel tables if present. Slash-catalog PG migration: `scripts/archive-local/migrations/006_slash_catalog_archive.sql` (bot table realignment — see archive spec §0.1). BotRegistry developer API paths (`bots-create`, `bots-token-create`, `bots-token-revoke`) must emit `chat_bot_apps` / `chat_bot_tokens` archive rows (hash only).
 
 - [ ] **Step 2: Update bot developer guide**
 

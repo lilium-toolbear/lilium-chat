@@ -47,12 +47,11 @@ export const CHAT_CHANNEL_TABLE_MAP: Record<string, string> = {
   mentions: "chat_mentions",
   invites: "chat_invites",
   events: "chat_events",
-  bot_installations: "chat_bot_installations",
   channel_command_bindings: "chat_channel_command_bindings",
-  channel_command_names: "chat_channel_command_names",
   command_invocations: "chat_command_invocations",
   interactions: "chat_interactions",
-  channel_bot_event_subscriptions: "chat_channel_bot_event_subscriptions",
+  stateful_command_sessions: "chat_stateful_command_sessions",
+  stateful_session_inputs: "chat_stateful_session_inputs",
 };
 
 export function chatChannelTable(sqliteTable: string): string {

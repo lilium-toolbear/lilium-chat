@@ -10,7 +10,10 @@ import type {
   MemberLeftPersistedPayload,
   MemberRoleUpdatedPersistedPayload,
   ReadStateUpdatedPersistedPayload,
+  StatefulSessionRefSummary,
 } from "../contract/persisted";
+import type { CommandManifestDelta } from "../contract/bot-api";
+import type { StatefulSessionSummary } from "../contract/events";
 import type { ManagementWirePayload } from "../contract/wire-frames";
 import { fallbackUserDisplayName, type UserSummary } from "../contract/primitives";
 
@@ -164,6 +167,7 @@ export function buildCommandBindingUpdatedPayload(raw: {
   binding_changes: Record<string, { before: unknown; after: unknown }>;
   actor_kind: string;
   actor_id: string;
+  command_manifest_delta: CommandManifestDelta;
 }): CommandBindingUpdatedPersistedPayload {
   return {
     channel_id: raw.channel_id,
@@ -172,6 +176,7 @@ export function buildCommandBindingUpdatedPayload(raw: {
     binding_changes: raw.binding_changes,
     actor_kind: raw.actor_kind,
     actor_id: raw.actor_id,
+    command_manifest_delta: raw.command_manifest_delta,
   };
 }
 
@@ -220,6 +225,21 @@ export function resolveActorWithMap(
   if (inviterUserId) {
     (wire as { inviter?: UserSummary | null }).inviter =
       map.get(inviterUserId) ?? fallbackUserSummary(inviterUserId);
+  }
+
+  const sessionRef = (tail as { session?: StatefulSessionRefSummary }).session;
+  if (sessionRef?.started_by_user_id) {
+    const { started_by_user_id, ...sessionRest } = sessionRef;
+    const session: StatefulSessionSummary = {
+      session_id: sessionRest.session_id,
+      bot_command_id: sessionRest.bot_command_id,
+      command_name: sessionRest.command_name,
+      status: sessionRest.status,
+      started_at: sessionRest.started_at,
+      expires_at: sessionRest.expires_at,
+      started_by: map.get(started_by_user_id) ?? fallbackUserSummary(started_by_user_id),
+    };
+    (wire as { session?: StatefulSessionSummary }).session = session;
   }
 
   return wire;
