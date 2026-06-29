@@ -44,6 +44,7 @@ import {
   listChannelCommandsHandler,
 } from "./routes/channel-commands";
 import { openDmHandler } from "./routes/dms";
+import { commandDirectoryHandler } from "./routes/command-directory";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -113,6 +114,7 @@ app.get("/api/chat/bots/:bot_id", (c) => getBotHandler(c));
 app.get("/api/chat/bots/:bot_id/tokens", (c) => listBotTokensHandler(c));
 app.post("/api/chat/bots/:bot_id/tokens", (c) => createBotTokenHandler(c));
 app.delete("/api/chat/bots/:bot_id/tokens/:token_id", (c) => revokeBotTokenHandler(c));
+app.get("/api/chat/commands/directory", (c) => commandDirectoryHandler(c));
 app.patch("/api/chat/channels/:channel_id/commands/:bot_command_id", (c) => updateCommandBindingHandler(c));
 app.get("/api/chat/channels/:channel_id/commands", (c) => listChannelCommandsHandler(c));
 app.all("/api/chat/*", (c) => {

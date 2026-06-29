@@ -237,6 +237,9 @@ export class BotRegistry extends DurableObject<Env> {
     if (url.pathname === "/internal/command-get") {
       return this.handleCommandGet(url);
     }
+    if (url.pathname === "/internal/commands-directory") {
+      return this.handleCommandsDirectory(url);
+    }
     if (url.pathname === "/internal/seed-official-bot") {
       return this.handleSeedOfficialBot(request);
     }
@@ -1068,6 +1071,96 @@ export class BotRegistry extends DurableObject<Env> {
       schema_version: row.schema_version,
       definition_hash: row.definition_hash,
       aliases: aliasRows.map((a) => a.alias),
+    });
+  }
+
+  private async handleCommandsDirectory(url: URL): Promise<Response> {
+    const queryRaw = (url.searchParams.get("query") ?? "").trim().normalize("NFKC").toLowerCase();
+    const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 20;
+    const offset = decodeOffsetCursor(url.searchParams.get("cursor"));
+    const likeQuery = `%${queryRaw}%`;
+
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT c.bot_command_id, c.name, c.description, c.options_json, c.default_member_permission,
+                c.execution_mode, c.stateful_config_json, a.bot_id, a.display_name, a.avatar_url
+         FROM bot_commands c
+         JOIN bot_apps a ON a.bot_id = c.bot_id
+         WHERE c.status='active'
+           AND c.deleted_at IS NULL
+           AND a.status='active'
+           AND (
+             ? = ''
+             OR lower(c.name) LIKE ?
+             OR EXISTS (
+               SELECT 1 FROM bot_command_aliases ca
+               WHERE ca.bot_command_id = c.bot_command_id
+                 AND lower(ca.alias) LIKE ?
+             )
+           )
+         ORDER BY c.updated_at DESC, c.bot_command_id DESC
+         LIMIT ? OFFSET ?`,
+        queryRaw,
+        likeQuery,
+        likeQuery,
+        limit,
+        offset,
+      )
+      .toArray() as Array<{
+      bot_command_id: string;
+      name: string;
+      description: string | null;
+      options_json: string;
+      default_member_permission: "member" | "admin" | "owner";
+      execution_mode: "stateless" | "stateful";
+      stateful_config_json: string | null;
+      bot_id: string;
+      display_name: string;
+      avatar_url: string | null;
+    }>;
+
+    const commandIds = rows.map((row) => row.bot_command_id);
+    const aliasesByCommand = new Map<string, string[]>();
+    if (commandIds.length > 0) {
+      const placeholders = commandIds.map(() => "?").join(", ");
+      const aliasRows = this.ctx.storage.sql
+        .exec(
+          `SELECT bot_command_id, alias
+           FROM bot_command_aliases
+           WHERE bot_command_id IN (${placeholders})
+           ORDER BY alias ASC`,
+          ...commandIds,
+        )
+        .toArray() as Array<{ bot_command_id: string; alias: string }>;
+      for (const aliasRow of aliasRows) {
+        const list = aliasesByCommand.get(aliasRow.bot_command_id) ?? [];
+        list.push(aliasRow.alias);
+        aliasesByCommand.set(aliasRow.bot_command_id, list);
+      }
+    }
+
+    return Response.json({
+      items: rows.map((row) => ({
+        bot_command_id: row.bot_command_id,
+        name: row.name,
+        aliases: aliasesByCommand.get(row.bot_command_id) ?? [],
+        description: row.description ?? "",
+        bot: {
+          bot_id: row.bot_id,
+          display_name: row.display_name,
+          avatar_url: row.avatar_url,
+        },
+        options: JSON.parse(row.options_json) as unknown[],
+        default_member_permission: row.default_member_permission,
+        execution: {
+          mode: row.execution_mode,
+          ...(row.execution_mode === "stateful" && row.stateful_config_json
+            ? { stateful: JSON.parse(row.stateful_config_json) }
+            : {}),
+        },
+      })),
+      next_cursor: rows.length === limit ? encodeOffsetCursor(offset + rows.length) : null,
     });
   }
 
