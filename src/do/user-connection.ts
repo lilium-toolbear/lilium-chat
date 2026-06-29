@@ -4,6 +4,7 @@ import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateUserConnectionSchema } from "./migrations/user-connection";
 import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame, type UserEventFrame } from "../ws/frames";
 import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditCommand, parseMessageRecallCommand, parseMessageSendCommand } from "../chat/command";
+import { parseCommandInvokeCommand } from "../chat/command-invoke";
 import type { MessageMutationAckPayload, MessageMutationInternalRequest } from "../contract/idempotency";
 import { requireTestOnly } from "./do-errors";
 
@@ -317,7 +318,72 @@ export class UserConnection extends DurableObject<Env> {
       return;
     }
 
-    if (frame.command === "command.invoke" || frame.command === "interaction.submit") {
+    if (frame.command === "command.invoke") {
+      const channelId = frame.channel_id ?? "";
+      if (!channelId) {
+        sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "missing channel_id"));
+        return;
+      }
+      const chStub = this.env.CHAT_CHANNEL.getByName(channelId);
+      const summaryRes = await chStub.fetch(new Request("https://x/internal/summary", {
+        headers: { "X-Verified-User-Id": attachment.user_id },
+      }));
+      if (summaryRes.ok) {
+        const summary = await summaryRes.json() as { kind?: string };
+        if (summary.kind === "dm") {
+          sendCommandError(ws, frame.command_id, responseError("UNSUPPORTED_CHANNEL_KIND", "operation not supported for DM channels", false));
+          return;
+        }
+      }
+
+      const parsed = parseCommandInvokeCommand(frame);
+      if (!parsed.ok) {
+        sendCommandError(ws, frame.command_id, parsed.error);
+        return;
+      }
+
+      const isMember = await this.ensureActiveMember(attachment.user_id, parsed.command.channel_id);
+      if (!isMember) {
+        sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found or not a member"));
+        return;
+      }
+      const invokeRes = await chStub.fetch(new Request("https://x/internal/command-invoke", {
+        method: "POST",
+        headers: {
+          "X-Verified-User-Id": attachment.user_id,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          operation_id: parsed.command.command_id,
+          channel_id: parsed.command.channel_id,
+          bot_command_id: parsed.command.bot_command_id,
+          invoked_name: parsed.command.invoked_name,
+          command_manifest_version: parsed.command.command_manifest_version,
+          options: parsed.command.options,
+        }),
+      }));
+      if (!invokeRes.ok) {
+        const body = await invokeRes.json().catch(() => null);
+        sendCommandError(ws, frame.command_id, normalizeEventError(body));
+        return;
+      }
+      const out = await invokeRes.json() as {
+        channel_id: string;
+        invocation_id: string;
+        event_id: string;
+        session_id?: string;
+      };
+      ws.send(JSON.stringify({
+        frame_type: "command_ack",
+        command: "command.invoke",
+        command_id: frame.command_id,
+        status: "committed",
+        payload: out,
+      }));
+      return;
+    }
+
+    if (frame.command === "interaction.submit") {
       const channelId = frame.channel_id ?? "";
       if (!channelId) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "missing channel_id")); return; }
       const chStub = this.env.CHAT_CHANNEL.getByName(channelId);
