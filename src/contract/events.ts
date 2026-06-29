@@ -14,6 +14,7 @@ export type ChatEventType =
   | "message.stream_started"
   | "message.stream_delta"
   | "message.stream_finalized"
+  | "message.stream_abandoned"
   | "member.joined"
   | "member.left"
   | "member.removed"
@@ -43,6 +44,7 @@ export const CHAT_EVENT_TYPES = [
   "message.stream_started",
   "message.stream_delta",
   "message.stream_finalized",
+  "message.stream_abandoned",
   "member.joined",
   "member.left",
   "member.removed",
@@ -98,6 +100,8 @@ export const REPLAY_MESSAGE_EVENT_TYPES: ReadonlySet<string> = new Set([
   "message.updated",
   "message.recalled",
   "message.deleted",
+  "message.stream_finalized",
+  "message.stream_abandoned",
 ]);
 
 /** Management events replay resolves actor refs to live UserSummary. */
@@ -171,6 +175,19 @@ export interface MessageStreamFinalizedPayload {
   channel_id?: ChatId;
   message_id?: ChatId;
   message?: WireChatMessage;
+}
+
+/** Live-only; delivered via `frame_type=stream_event`, not HTTP history. */
+export interface MessageStreamAbandonCleanupPayload {
+  channel_id?: ChatId;
+  message_id: ChatId;
+}
+
+/** Canonical channel event for non-empty partial stream abandon. */
+export interface MessageStreamAbandonedPayload {
+  channel_id?: ChatId;
+  event_id?: ChatId;
+  message: WireChatMessage;
 }
 
 export interface ChannelCreatedEventPayload {
@@ -351,6 +368,7 @@ export interface ChatEventPayloadByType {
   "message.stream_started": MessageStreamStartedPayload;
   "message.stream_delta": MessageStreamDeltaPayload;
   "message.stream_finalized": MessageStreamFinalizedPayload;
+  "message.stream_abandoned": MessageStreamAbandonedPayload;
   "member.joined": MemberJoinedEventPayload;
   "member.left": MemberLeftEventPayload;
   "member.removed": MemberRemovedEventPayload;

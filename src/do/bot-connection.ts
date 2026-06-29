@@ -702,8 +702,10 @@ export class BotConnection extends DurableObject<Env> {
     ws.send(
       JSON.stringify(
         buildDeliveryAck(parsed.delivery_id, "failed", {
-          code: "BOT_EFFECT_INVALID",
-          message: "delivery_result not implemented yet",
+          error: {
+            code: "BOT_EFFECT_INVALID",
+            message: "delivery_result not implemented yet",
+          },
         }),
       ),
     );
