@@ -74,6 +74,12 @@ import { dispatchMessageRoutes } from "./chat-channel/routes/message-routes";
 import { dispatchMembershipRoutes } from "./chat-channel/routes/membership-routes";
 import { dispatchChannelRoutes } from "./chat-channel/routes/channel-routes";
 import { dispatchBotRoutes } from "./chat-channel/routes/bot-routes";
+import {
+  handleStatefulCommandInvoke,
+  flushStatefulSessionTimeouts,
+  maybeEnqueueStatefulSessionInput,
+  type StatefulSessionHost,
+} from "./chat-channel/stateful-session-handlers";
 import { buildManifestRemoveDelta, buildManifestUpsertDelta, projectCommandManifest } from "../chat/command-manifest";
 import type { CommandOption } from "../chat/command-options";
 
@@ -674,7 +680,11 @@ export class ChatChannel extends DurableObject<Env> {
     void _nowIso;
     await scheduleNextAlarm(
       this.ctx,
-      [...this.outboxDueTables(async () => Promise.resolve()), archiveOutboxDueTable()],
+      [
+        ...this.outboxDueTables(async () => Promise.resolve()),
+        ...this.statefulSessionDueTables(),
+        archiveOutboxDueTable(),
+      ],
       { respectExistingAlarm: true },
     );
   }
@@ -687,6 +697,17 @@ export class ChatChannel extends DurableObject<Env> {
     return [
       isoDueTable("projection_outbox", "next_attempt_at", "status", "pending", handler),
       isoDueTable("bot_delivery_outbox", "next_attempt_at", "status", "pending", handler),
+    ];
+  }
+
+  private statefulSessionDueTables(): DueTable[] {
+    const host = this as unknown as StatefulSessionHost;
+    const flush = async () => {
+      await flushStatefulSessionTimeouts(host, this.nowIso());
+    };
+    return [
+      isoDueTable("stateful_command_sessions", "expires_at", "status", "active", flush),
+      isoDueTable("stateful_command_sessions", "started_at", "status", "starting", flush),
     ];
   }
 
@@ -909,6 +930,9 @@ export class ChatChannel extends DurableObject<Env> {
         ...(typeof parsed.execution.definition_hash === "string"
           ? { definition_hash: parsed.execution.definition_hash }
           : {}),
+        ...(parsed.execution.mode === "stateful" && isRecord(parsed.execution.stateful)
+          ? { stateful: parsed.execution.stateful }
+          : {}),
       },
     };
   }
@@ -1121,7 +1145,7 @@ export class ChatChannel extends DurableObject<Env> {
 
     const binding = this.ctx.storage.sql
       .exec(
-        "SELECT bot_id, status, permission_override, command_snapshot_json FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?",
+        "SELECT bot_id, status, permission_override, command_snapshot_json, stateful_max_ttl_seconds FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?",
         channelId,
         botCommandId,
       )
@@ -1130,6 +1154,7 @@ export class ChatChannel extends DurableObject<Env> {
         status: string;
         permission_override: string | null;
         command_snapshot_json: string;
+        stateful_max_ttl_seconds: number | null;
       } | undefined;
     if (!binding || binding.status !== "allowed") {
       return Response.json(
@@ -1183,6 +1208,23 @@ export class ChatChannel extends DurableObject<Env> {
       display_name: fallbackUserDisplayName(userId),
       avatar_url: null,
     };
+
+    if (snapshot.execution.mode === "stateful") {
+      return handleStatefulCommandInvoke(this as unknown as StatefulSessionHost, {
+        userId,
+        channelId,
+        botCommandId,
+        operationId,
+        invokedName,
+        options,
+        snapshot: snapshot as import("./chat-channel/stateful-session-handlers").InvokeSnapshot,
+        bindingBotId: binding.bot_id,
+        bindingMaxTtl: binding.stateful_max_ttl_seconds,
+        requestHash,
+        idemExpiresAt,
+        actor,
+      });
+    }
 
     const txResult = this.ctx.storage.transactionSync(() => {
       const idem = this.ctx.storage.sql
@@ -1829,6 +1871,7 @@ export class ChatChannel extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     const nowIso = this.nowIso();
+    await flushStatefulSessionTimeouts(this as unknown as StatefulSessionHost, nowIso);
     await runDueJobs(this.ctx, nowIso, this.outboxDueTables(async (rows) => {
       const projectionRows: OutboxRow[] = [];
       const botRows: BotDeliveryOutboxRow[] = [];

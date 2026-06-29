@@ -45,6 +45,7 @@ import {
 } from "./routes/channel-commands";
 import { openDmHandler } from "./routes/dms";
 import { commandDirectoryHandler } from "./routes/command-directory";
+import { getStatefulSessionHandler, stopStatefulSessionHandler } from "./routes/stateful-session";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -117,6 +118,8 @@ app.delete("/api/chat/bots/:bot_id/tokens/:token_id", (c) => revokeBotTokenHandl
 app.get("/api/chat/commands/directory", (c) => commandDirectoryHandler(c));
 app.patch("/api/chat/channels/:channel_id/commands/:bot_command_id", (c) => updateCommandBindingHandler(c));
 app.get("/api/chat/channels/:channel_id/commands", (c) => listChannelCommandsHandler(c));
+app.get("/api/chat/channels/:channel_id/stateful-session", (c) => getStatefulSessionHandler(c));
+app.post("/api/chat/channels/:channel_id/stateful-session/stop", (c) => stopStatefulSessionHandler(c));
 app.all("/api/chat/*", (c) => {
   throw new ApiError("CHANNEL_NOT_FOUND", "route not found", { httpStatus: 404 });
 });

@@ -10,6 +10,7 @@ import type {
   MemberLeftPersistedPayload,
   MemberRoleUpdatedPersistedPayload,
   ReadStateUpdatedPersistedPayload,
+  StatefulSessionRefSummary,
 } from "../contract/persisted";
 import type { CommandManifestDelta } from "../contract/bot-api";
 import type { ManagementWirePayload } from "../contract/wire-frames";
@@ -223,6 +224,15 @@ export function resolveActorWithMap(
   if (inviterUserId) {
     (wire as { inviter?: UserSummary | null }).inviter =
       map.get(inviterUserId) ?? fallbackUserSummary(inviterUserId);
+  }
+
+  const sessionRef = (tail as { session?: StatefulSessionRefSummary }).session;
+  if (sessionRef?.started_by_user_id) {
+    const { started_by_user_id, ...sessionRest } = sessionRef;
+    (wire as { session?: Record<string, unknown> }).session = {
+      ...sessionRest,
+      started_by: map.get(started_by_user_id) ?? fallbackUserSummary(started_by_user_id),
+    };
   }
 
   return wire;

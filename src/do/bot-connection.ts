@@ -16,6 +16,18 @@ import { uuidv7 } from "../ids/uuidv7";
 import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateBotConnectionSchema } from "./migrations/bot-connection";
 import { runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "./scheduler";
+import {
+  deleteStatefulSessionRef,
+  forwardBotSessionFrameToChatChannel,
+  resumeStatefulSessions,
+  upsertStatefulSessionRef,
+} from "./bot-connection-stateful";
+import {
+  parseSessionClose,
+  parseSessionInputAck,
+  parseSessionStarted,
+  type SessionInputFrame,
+} from "../chat/bot-gateway-session";
 
 interface BotConnectionAttachment {
   bot_id: string;
@@ -197,6 +209,62 @@ export class BotConnection extends DurableObject<Env> {
         delivery_id: deliveryId,
         status: deliveryStatus,
       });
+    }
+
+    if (url.pathname === "/internal/stateful-session-ref-upsert" && request.method === "POST") {
+      const botId = request.headers.get("X-Verified-Bot-Id");
+      if (!botId) return new Response("missing verified bot id", { status: 401 });
+      const body = (await request.json().catch(() => null)) as {
+        session_id?: unknown;
+        channel_id?: unknown;
+        bot_id?: unknown;
+        status?: unknown;
+        updated_at?: unknown;
+      } | null;
+      if (
+        !body ||
+        typeof body.session_id !== "string" ||
+        typeof body.channel_id !== "string" ||
+        typeof body.bot_id !== "string" ||
+        typeof body.status !== "string" ||
+        typeof body.updated_at !== "string"
+      ) {
+        return new Response("invalid payload", { status: 400 });
+      }
+      upsertStatefulSessionRef(this.ctx, {
+        session_id: body.session_id,
+        channel_id: body.channel_id,
+        bot_id: body.bot_id,
+        status: body.status,
+        updated_at: body.updated_at,
+      });
+      return Response.json({ ok: true });
+    }
+
+    if (url.pathname === "/internal/stateful-session-ref-delete" && request.method === "POST") {
+      const botId = request.headers.get("X-Verified-Bot-Id");
+      if (!botId) return new Response("missing verified bot id", { status: 401 });
+      const body = (await request.json().catch(() => null)) as { session_id?: unknown } | null;
+      if (!body || typeof body.session_id !== "string") {
+        return new Response("invalid payload", { status: 400 });
+      }
+      deleteStatefulSessionRef(this.ctx, body.session_id);
+      return Response.json({ ok: true });
+    }
+
+    if (url.pathname === "/internal/push-session-frame" && request.method === "POST") {
+      const botId = request.headers.get("X-Verified-Bot-Id");
+      if (!botId) return new Response("missing verified bot id", { status: 401 });
+      const frame = await request.json().catch(() => null);
+      if (!frame) return new Response("invalid payload", { status: 400 });
+      const connection = this.healthyConnectedState(botId);
+      if (!connection) return Response.json({ ok: true, delivered: false });
+      try {
+        connection.socket.send(JSON.stringify(frame));
+        return Response.json({ ok: true, delivered: true });
+      } catch {
+        return Response.json({ ok: true, delivered: false });
+      }
     }
 
     const botId = request.headers.get("X-Verified-Bot-Id");
@@ -484,6 +552,16 @@ export class BotConnection extends DurableObject<Env> {
           session_id: sessionId,
         });
         ws.send(JSON.stringify(buildReady(attachment.bot_id, sessionId, now)));
+        await resumeStatefulSessions(this.ctx, this.env, attachment.bot_id, (frame: SessionInputFrame) => {
+          const connection = this.healthyConnectedState(attachment.bot_id);
+          if (!connection) return false;
+          try {
+            connection.socket.send(JSON.stringify(frame));
+            return true;
+          } catch {
+            return false;
+          }
+        });
         return;
       }
 
@@ -496,6 +574,67 @@ export class BotConnection extends DurableObject<Env> {
       if (frame.type === "delivery_result") {
         const parsed = parseDeliveryResult(message);
         await this.handleDeliveryResult(ws, parsed);
+        return;
+      }
+
+      if (frame.type === "session.started") {
+        const parsed = parseSessionStarted(message);
+        this.touchConnected(attachment.bot_id, attachment.session_id);
+        const ref = this.ctx.storage.sql
+          .exec(
+            "SELECT channel_id FROM active_stateful_session_refs WHERE session_id=?",
+            parsed.session_id,
+          )
+          .toArray()[0] as { channel_id: string } | undefined;
+        if (ref) {
+          await forwardBotSessionFrameToChatChannel(
+            this.env,
+            ref.channel_id,
+            "/internal/bot-session-started",
+            parsed,
+          );
+        }
+        return;
+      }
+
+      if (frame.type === "session.input_ack") {
+        const parsed = parseSessionInputAck(message);
+        this.touchConnected(attachment.bot_id, attachment.session_id);
+        const ref = this.ctx.storage.sql
+          .exec(
+            "SELECT channel_id FROM active_stateful_session_refs WHERE session_id=?",
+            parsed.session_id,
+          )
+          .toArray()[0] as { channel_id: string } | undefined;
+        if (ref) {
+          await forwardBotSessionFrameToChatChannel(
+            this.env,
+            ref.channel_id,
+            "/internal/bot-session-input-ack",
+            parsed,
+          );
+        }
+        return;
+      }
+
+      if (frame.type === "session.close") {
+        const parsed = parseSessionClose(message);
+        this.touchConnected(attachment.bot_id, attachment.session_id);
+        const ref = this.ctx.storage.sql
+          .exec(
+            "SELECT channel_id FROM active_stateful_session_refs WHERE session_id=?",
+            parsed.session_id,
+          )
+          .toArray()[0] as { channel_id: string } | undefined;
+        if (ref) {
+          await forwardBotSessionFrameToChatChannel(
+            this.env,
+            ref.channel_id,
+            "/internal/bot-session-close",
+            parsed,
+          );
+        }
+        return;
       }
     } catch {
       // Protocol parse failures are ignored at WS layer for this phase.
