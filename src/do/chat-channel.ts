@@ -81,9 +81,25 @@ import {
   maybeEnqueueStatefulSessionInput,
   type StatefulSessionHost,
 } from "./chat-channel/stateful-session-handlers";
-import { buildManifestRemoveDelta, buildManifestUpsertDelta, projectCommandManifest } from "../chat/command-manifest";
+import { buildManifestRemoveDelta, buildManifestUpsertDelta, appendPlatformHelpItem, projectCommandManifest } from "../chat/command-manifest";
 import { parseCommandBindingSnapshot } from "../chat/command-snapshot";
 import type { CommandOption } from "../chat/command-options";
+import {
+  mergeOfficialIntoBindingRows,
+  isOfficialCommandId,
+  officialCommandToSnapshot,
+  type ChannelBindingRow,
+  type OfficialCommandCatalogItem,
+} from "../chat/official-command-manifest";
+import {
+  PLATFORM_BOT_AVATAR_URL,
+  PLATFORM_BOT_DISPLAY_NAME,
+  PLATFORM_BOT_ID,
+  PLATFORM_HELP_BOT_COMMAND_ID,
+  PLATFORM_HELP_NAME,
+  buildPlatformHelpText,
+  isPlatformHelpCommand,
+} from "../chat/platform-commands";
 import {
   flushStatefulBotDeliveryRow,
   STATEFUL_BOT_DELIVERY_KINDS,
@@ -952,6 +968,36 @@ export class ChatChannel extends DurableObject<Env> {
     return { ok: true };
   }
 
+  private async fetchOfficialCatalog(): Promise<OfficialCommandCatalogItem[]> {
+    const res = await this.env.BOT_REGISTRY.getByName("registry").fetch(
+      new Request("https://x/internal/official-commands"),
+    );
+    if (!res.ok) return [];
+    const body = (await res.json()) as { items?: OfficialCommandCatalogItem[] };
+    return Array.isArray(body.items) ? body.items : [];
+  }
+
+  private readChannelBindingRows(channelId: string): ChannelBindingRow[] {
+    return this.ctx.storage.sql
+      .exec(
+        `SELECT bot_command_id, bot_id, status, command_snapshot_json, permission_override
+         FROM channel_command_bindings
+         WHERE channel_id=?`,
+        channelId,
+      )
+      .toArray() as unknown as ChannelBindingRow[];
+  }
+
+  private async buildMergedManifest(
+    channelId: string,
+    manifestVersion: number,
+  ): Promise<ReturnType<typeof appendPlatformHelpItem>> {
+    const bindingRows = this.readChannelBindingRows(channelId);
+    const officialCatalog = await this.fetchOfficialCatalog();
+    const merged = mergeOfficialIntoBindingRows(bindingRows, officialCatalog);
+    return appendPlatformHelpItem(projectCommandManifest(manifestVersion, merged));
+  }
+
   /** GET /internal/channel-commands?channel_id=...&user_id=... — read full command manifest. */
   private async handleChannelCommands(request: Request): Promise<Response> {
     const userId = request.headers.get("X-Verified-User-Id") ?? "";
@@ -970,20 +1016,7 @@ export class ChatChannel extends DurableObject<Env> {
     const callerRole = this.activeRole(channelId, userId);
     if (!callerRole) return this.botInstallError("FORBIDDEN", "not a channel member");
 
-    const rows = this.ctx.storage.sql
-      .exec(
-        `SELECT status, command_snapshot_json, permission_override
-         FROM channel_command_bindings
-         WHERE channel_id=?`,
-        channelId,
-      )
-      .toArray() as Array<{
-        status: string;
-        command_snapshot_json: string;
-        permission_override: string | null;
-      }>;
-
-    const fullManifest = projectCommandManifest(meta.command_manifest_version, rows);
+    const fullManifest = await this.buildMergedManifest(channelId, meta.command_manifest_version);
     return Response.json({
       version: fullManifest.version,
       items: fullManifest.items.filter((item) =>
@@ -1011,19 +1044,8 @@ export class ChatChannel extends DurableObject<Env> {
     const callerRole = this.activeRole(channelId, userId);
     if (!callerRole) return this.botInstallError("FORBIDDEN", "not a channel member");
 
-    const rows = this.ctx.storage.sql
-      .exec(
-        `SELECT status, command_snapshot_json, permission_override
-         FROM channel_command_bindings
-         WHERE channel_id=?`,
-        channelId,
-      )
-      .toArray() as Array<{
-        status: string;
-        command_snapshot_json: string;
-        permission_override: string | null;
-      }>;
-    return Response.json(projectCommandManifest(meta.command_manifest_version, rows));
+    const fullManifest = await this.buildMergedManifest(channelId, meta.command_manifest_version);
+    return Response.json(fullManifest);
   }
 
   /** POST /internal/command-invoke — validate invoke and enqueue bot delivery. */
@@ -1106,6 +1128,21 @@ export class ChatChannel extends DurableObject<Env> {
       );
     }
 
+    if (isPlatformHelpCommand(botCommandId)) {
+      return this.handlePlatformHelpInvoke({
+        userId,
+        channelId,
+        operationId,
+        commandManifestVersion,
+        options,
+        requestHash,
+        idemExpiresAt,
+        now,
+        nowMs,
+        membershipVersion: meta.membership_version,
+      });
+    }
+
     const binding = this.ctx.storage.sql
       .exec(
         "SELECT bot_id, status, permission_override, command_snapshot_json, stateful_max_ttl_seconds FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?",
@@ -1119,7 +1156,14 @@ export class ChatChannel extends DurableObject<Env> {
         command_snapshot_json: string;
         stateful_max_ttl_seconds: number | null;
       } | undefined;
-    if (!binding || binding.status !== "allowed") {
+
+    const officialCatalog = await this.fetchOfficialCatalog();
+    let bindingBotId: string;
+    let bindingPermissionOverride: string | null;
+    let bindingMaxTtl: number | null;
+    let snapshot = null as ReturnType<typeof this.parseInvokeSnapshot>;
+
+    if (binding?.status === "blocked") {
       return Response.json(
         {
           error: {
@@ -1133,11 +1177,36 @@ export class ChatChannel extends DurableObject<Env> {
       );
     }
 
-    const snapshot = this.parseInvokeSnapshot(binding.command_snapshot_json);
+    if (binding?.status === "allowed") {
+      snapshot = this.parseInvokeSnapshot(binding.command_snapshot_json);
+      bindingBotId = binding.bot_id;
+      bindingPermissionOverride = binding.permission_override;
+      bindingMaxTtl = binding.stateful_max_ttl_seconds;
+    } else {
+      const officialItem = officialCatalog.find((item) => item.bot_command_id === botCommandId);
+      if (!officialItem) {
+        return Response.json(
+          {
+            error: {
+              code: "COMMAND_NOT_ALLOWED",
+              message: "This slash command is not allowed in this channel.",
+              retryable: false,
+              current_command_manifest_version: meta.command_manifest_version,
+            },
+          },
+          { status: HTTP_STATUS_BY_CODE.COMMAND_NOT_ALLOWED ?? 403 },
+        );
+      }
+      snapshot = this.parseInvokeSnapshot(JSON.stringify(officialCommandToSnapshot(officialItem)));
+      bindingBotId = officialItem.bot.bot_id;
+      bindingPermissionOverride = null;
+      bindingMaxTtl = null;
+    }
+
     if (!snapshot) {
       return this.botInstallError("COMMAND_OPTIONS_INVALID", "invalid command snapshot");
     }
-    const requiredRole = binding.permission_override ?? snapshot.default_member_permission;
+    const requiredRole = bindingPermissionOverride ?? snapshot.default_member_permission;
     if (!this.hasRolePermission(callerRole, requiredRole)) {
       return this.botInstallError("COMMAND_PERMISSION_DENIED", "You do not have permission to use this command.");
     }
@@ -1152,7 +1221,7 @@ export class ChatChannel extends DurableObject<Env> {
       );
     }
 
-    const connectionRes = await this.env.BOT_CONNECTION.getByName(binding.bot_id).fetch(
+    const connectionRes = await this.env.BOT_CONNECTION.getByName(bindingBotId).fetch(
       new Request("https://x/internal/connection-state"),
     );
     const connectionState = connectionRes.ok
@@ -1187,8 +1256,8 @@ export class ChatChannel extends DurableObject<Env> {
         invokedName,
         options,
         snapshot,
-        bindingBotId: binding.bot_id,
-        bindingMaxTtl: binding.stateful_max_ttl_seconds,
+        bindingBotId,
+        bindingMaxTtl: bindingMaxTtl,
         requestHash,
         idemExpiresAt,
         actor,
@@ -1236,17 +1305,12 @@ export class ChatChannel extends DurableObject<Env> {
 
       const currentBinding = this.ctx.storage.sql
         .exec(
-          "SELECT bot_id, status, permission_override, command_snapshot_json FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?",
+          "SELECT status FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?",
           channelId,
           botCommandId,
         )
-        .toArray()[0] as {
-          bot_id: string;
-          status: string;
-          permission_override: string | null;
-          command_snapshot_json: string;
-        } | undefined;
-      if (!currentBinding || currentBinding.status !== "allowed") {
+        .toArray()[0] as { status: string } | undefined;
+      if (currentBinding?.status === "blocked") {
         return {
           kind: "error" as const,
           j: JSON.stringify({
@@ -1259,14 +1323,14 @@ export class ChatChannel extends DurableObject<Env> {
         };
       }
 
-      const currentSnapshot = this.parseInvokeSnapshot(currentBinding.command_snapshot_json);
+      const currentSnapshot = snapshot;
       if (!currentSnapshot) {
         return {
           kind: "error" as const,
           j: JSON.stringify({ error: { code: "COMMAND_OPTIONS_INVALID", message: "invalid command snapshot" } }),
         };
       }
-      const currentRequiredRole = currentBinding.permission_override ?? currentSnapshot.default_member_permission;
+      const currentRequiredRole = bindingPermissionOverride ?? currentSnapshot.default_member_permission;
       if (!this.hasRolePermission(callerRole, currentRequiredRole)) {
         return {
           kind: "error" as const,
@@ -1292,7 +1356,7 @@ export class ChatChannel extends DurableObject<Env> {
         channelId,
         operationId,
         userId,
-        currentBinding.bot_id,
+        bindingBotId,
         botCommandId,
         currentSnapshot.name,
         invokedName || currentSnapshot.name,
@@ -1342,7 +1406,7 @@ export class ChatChannel extends DurableObject<Env> {
          ) VALUES (?, ?, ?, 'command_invocation', ?, NULL, ?, ?, 'pending', 0, 5, NULL, NULL, ?, ?, ?)`,
         outboxId,
         channelId,
-        currentBinding.bot_id,
+        bindingBotId,
         invocationId,
         eventId,
         JSON.stringify({
@@ -1403,6 +1467,192 @@ export class ChatChannel extends DurableObject<Env> {
     return Response.json(JSON.parse(txResult.responseJson));
   }
 
+  private async handlePlatformHelpInvoke(input: {
+    userId: string;
+    channelId: string;
+    operationId: string;
+    commandManifestVersion: number;
+    options: Record<string, { type: string; value: unknown }>;
+    requestHash: string;
+    idemExpiresAt: string;
+    now: string;
+    nowMs: number;
+    membershipVersion: number;
+  }): Promise<Response> {
+    const operation = "command.invoke";
+    const manifest = await this.buildMergedManifest(input.channelId, input.commandManifestVersion);
+    const commandOptionRaw = input.options.command?.value;
+    const commandOption = typeof commandOptionRaw === "string" ? commandOptionRaw : undefined;
+    const helpText = buildPlatformHelpText(manifest.items, commandOption);
+
+    const txResult = this.ctx.storage.transactionSync(() => {
+      const idem = this.ctx.storage.sql
+        .exec(
+          "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation=? AND operation_id=?",
+          input.userId,
+          operation,
+          input.operationId,
+        )
+        .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+      if (idem) {
+        if (idem.request_hash !== input.requestHash) return { kind: "conflict" as const };
+        return { kind: "cached" as const, responseJson: idem.response_json ?? "{}" };
+      }
+
+      const messageId = uuidv7(input.nowMs);
+      const invocationId = uuidv7(input.nowMs + 1);
+      const eventId = this.nextEventId(input.nowMs + 2);
+
+      this.ctx.storage.sql.exec(
+        `INSERT INTO messages (
+           message_id, command_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
+           sender_bot_id, sender_bot_display_name, sender_bot_avatar_url, type, format, status, text,
+           reply_to, stream_state, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'bot', NULL, ?, ?, ?, 'text', 'plain', 'normal', ?, NULL, 'none', ?, ?)`,
+        messageId,
+        input.operationId,
+        `user:${input.userId}`,
+        input.channelId,
+        PLATFORM_BOT_ID,
+        PLATFORM_BOT_DISPLAY_NAME,
+        PLATFORM_BOT_AVATAR_URL,
+        helpText,
+        input.now,
+        input.now,
+      );
+
+      this.ctx.storage.sql.exec(
+        `INSERT INTO command_invocations (
+           invocation_id, channel_id, command_id, invoker_user_id, bot_id, bot_command_id, command_name,
+           invoked_name, command_schema_version, command_definition_hash, options_json,
+           status, error_code, error_message, created_at, updated_at, completed_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'completed', NULL, NULL, ?, ?, ?)`,
+        invocationId,
+        input.channelId,
+        input.operationId,
+        input.userId,
+        PLATFORM_BOT_ID,
+        PLATFORM_HELP_BOT_COMMAND_ID,
+        PLATFORM_HELP_NAME,
+        PLATFORM_HELP_NAME,
+        `platform:${PLATFORM_HELP_BOT_COMMAND_ID}`,
+        JSON.stringify(input.options),
+        input.now,
+        input.now,
+        input.now,
+      );
+
+      const messageRow: MessageRow = {
+        message_id: messageId,
+        command_id: input.operationId,
+        channel_id: input.channelId,
+        sender_kind: "bot",
+        sender_user_id: null,
+        sender_bot_id: PLATFORM_BOT_ID,
+        sender_bot_display_name: PLATFORM_BOT_DISPLAY_NAME,
+        sender_bot_avatar_url: PLATFORM_BOT_AVATAR_URL,
+        type: "text",
+        format: "plain",
+        status: "normal",
+        text: helpText,
+        reply_to: null,
+        reply_snapshot_json: null,
+        stream_state: "none",
+        created_at: input.now,
+        updated_at: input.now,
+        edited_at: null,
+        deleted_at: null,
+        deleted_by: null,
+        recalled_at: null,
+      };
+
+      const liveMessage = projectMessageForBrowser(messageRow, {});
+      const liveEventFrame = buildEventFrame({
+        event_id: eventId,
+        type: "message.created",
+        channel_id: input.channelId,
+        occurred_at: input.now,
+        payload: { message: liveMessage },
+      });
+      const persistedPayload = buildMessageLifecyclePayload({
+        message_id: messageRow.message_id,
+        command_id: messageRow.command_id,
+        channel_id: messageRow.channel_id,
+        sender_kind: messageRow.sender_kind,
+        sender_user_id: messageRow.sender_user_id,
+        sender_bot_id: messageRow.sender_bot_id,
+        status: messageRow.status,
+        created_at: messageRow.created_at,
+        updated_at: messageRow.updated_at,
+        edited_at: messageRow.edited_at,
+        deleted_at: messageRow.deleted_at,
+        deleted_by: messageRow.deleted_by,
+        recalled_at: messageRow.recalled_at,
+        stream_state: messageRow.stream_state,
+        reply_to: messageRow.reply_to,
+        reply_snapshot_json: messageRow.reply_snapshot_json,
+        type: messageRow.type,
+        format: messageRow.format,
+        text: messageRow.text,
+      });
+      this.ctx.storage.sql.exec(
+        "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, 'message.created', ?, 'user', ?, ?, ?, ?)",
+        eventId,
+        input.channelId,
+        input.userId,
+        JSON.stringify(persistedPayload),
+        input.membershipVersion,
+        input.now,
+      );
+      this.insertOutboxRowForFanout(
+        input.channelId,
+        eventId,
+        JSON.stringify(liveEventFrame),
+        input.membershipVersion,
+        input.now,
+      );
+
+      const responseBody = {
+        channel_id: input.channelId,
+        invocation_id: invocationId,
+        event_id: eventId,
+        message_id: messageId,
+      };
+      this.ctx.storage.sql.exec(
+        "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, ?, ?, ?, ?, 'completed', ?, ?)",
+        input.userId,
+        operation,
+        input.operationId,
+        input.requestHash,
+        JSON.stringify(responseBody),
+        input.now,
+        input.idemExpiresAt,
+      );
+
+      appendChatChannelArchive(this.ctx, input.channelId, input.now, [eventId], () =>
+        collectDefinedChanges([
+          upsertMessageChange(this.ctx.storage.sql, messageId, input.channelId, rvEvent(eventId)),
+          upsertCommandInvocationChange(this.ctx.storage.sql, invocationId, rvEvent(eventId)),
+          upsertEventChange(this.ctx.storage.sql, eventId),
+        ]),
+      );
+
+      return { kind: "ok" as const, responseJson: JSON.stringify(responseBody) };
+    });
+
+    if (txResult.kind === "conflict") {
+      return Response.json(
+        { error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } },
+        { status: 409 },
+      );
+    }
+    if (txResult.kind === "cached") {
+      return this.cachedResponse(txResult.responseJson);
+    }
+    await this.scheduleArchiveAlarm(input.now);
+    return Response.json(JSON.parse(txResult.responseJson));
+  }
+
   /** POST /internal/command-binding-update — allow/block a single command binding. */
   private async handleCommandBindingUpdate(request: Request): Promise<Response> {
     const userId = request.headers.get("X-Verified-User-Id") ?? "";
@@ -1441,6 +1691,21 @@ export class ChatChannel extends DurableObject<Env> {
     if (status === "allowed" && !commandSnapshot) {
       return this.botInstallError("INVALID_MESSAGE", "command_snapshot required for allowed status");
     }
+
+    const officialCatalog = await this.fetchOfficialCatalog();
+    if (status === "allowed" && isOfficialCommandId(botCommandId, officialCatalog)) {
+      return Response.json(
+        {
+          error: {
+            code: "OFFICIAL_COMMAND_AUTO_ALLOWED",
+            message: "official commands are auto-allowed in every channel",
+            retryable: false,
+          },
+        },
+        { status: HTTP_STATUS_BY_CODE.OFFICIAL_COMMAND_AUTO_ALLOWED ?? 409 },
+      );
+    }
+
     const operationId = b.operation_id;
     const operation = "bot.command_binding_update";
     const now = this.nowIso();
@@ -1557,21 +1822,41 @@ export class ChatChannel extends DurableObject<Env> {
         manifestDelta = buildManifestUpsertDelta(nextManifestVersion, item);
       } else {
         if (!binding) {
-          return {
-            kind: "error" as const,
-            j: JSON.stringify({ error: { code: "COMMAND_NOT_FOUND", message: "command binding not found" } }),
-          };
+          const officialItem = officialCatalog.find((item) => item.bot_command_id === botCommandId);
+          if (!officialItem) {
+            return {
+              kind: "error" as const,
+              j: JSON.stringify({ error: { code: "COMMAND_NOT_FOUND", message: "command binding not found" } }),
+            };
+          }
+          bindingBotId = officialItem.bot.bot_id;
+          snapshotJson = JSON.stringify(officialCommandToSnapshot(officialItem));
+          this.ctx.storage.sql.exec(
+            `INSERT INTO channel_command_bindings (
+               channel_id, bot_command_id, bot_id, status, permission_override,
+               command_snapshot_json, stateful_max_ttl_seconds, updated_by_user_id, updated_at
+             ) VALUES (?, ?, ?, 'blocked', ?, ?, ?, ?, ?)`,
+            channelId,
+            botCommandId,
+            bindingBotId,
+            permissionOverride,
+            snapshotJson,
+            statefulMaxTtlSeconds,
+            userId,
+            now,
+          );
+        } else {
+          this.ctx.storage.sql.exec(
+            `UPDATE channel_command_bindings
+             SET status='blocked', permission_override=?, updated_by_user_id=?, updated_at=?
+             WHERE channel_id=? AND bot_command_id=?`,
+            permissionOverride,
+            userId,
+            now,
+            channelId,
+            botCommandId,
+          );
         }
-        this.ctx.storage.sql.exec(
-          `UPDATE channel_command_bindings
-           SET status='blocked', permission_override=?, updated_by_user_id=?, updated_at=?
-           WHERE channel_id=? AND bot_command_id=?`,
-          permissionOverride,
-          userId,
-          now,
-          channelId,
-          botCommandId,
-        );
       }
 
       this.ctx.storage.sql.exec(

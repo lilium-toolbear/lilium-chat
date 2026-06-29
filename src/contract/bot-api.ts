@@ -49,6 +49,7 @@ export interface CommandBindingSnapshot {
   name: string;
   aliases: string[];
   description: string;
+  help_text?: string;
   bot: CommandManifestBotSummary;
   options: unknown[];
   default_member_permission: "member" | "admin" | "owner";
@@ -66,6 +67,7 @@ export interface CommandManifestItem {
   name: string;
   aliases: string[];
   description: string;
+  help_text: string;
   bot: CommandManifestBotSummary;
   options: unknown[];
   effective_member_permission: "member" | "admin" | "owner";
@@ -94,6 +96,7 @@ export interface CommandDirectoryItem {
   name: string;
   aliases: string[];
   description: string;
+  help_text: string;
   bot: CommandManifestBotSummary;
   options: unknown[];
   default_member_permission: "member" | "admin" | "owner";

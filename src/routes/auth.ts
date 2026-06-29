@@ -5,12 +5,18 @@ import { verifyBrowserJwt } from "../auth/jwt";
 
 export async function getIdentity(
   c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
-): Promise<{ userId: string; env: Env }> {
+): Promise<{ userId: string; isAdmin: boolean; env: Env }> {
   const auth = c.req.header("Authorization") ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (!token) throw new ApiError("UNAUTHORIZED", "Not authenticated");
-  const { user_id } = await verifyBrowserJwt(token, c.env.JWT_SECRET);
-  return { userId: user_id, env: c.env };
+  const { user_id, is_admin } = await verifyBrowserJwt(token, c.env.JWT_SECRET);
+  return { userId: user_id, isAdmin: is_admin, env: c.env };
+}
+
+export function requireAdmin(isAdmin: boolean): void {
+  if (!isAdmin) {
+    throw new ApiError("ADMIN_ACCESS_REQUIRED", "Admin access required");
+  }
 }
 
 export function requireIdempotencyKey(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): string {

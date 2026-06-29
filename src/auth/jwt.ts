@@ -3,6 +3,7 @@ import { ApiError } from "../errors";
 
 export interface BrowserIdentity {
   user_id: string;
+  is_admin: boolean;
 }
 
 interface JwtPayload {
@@ -40,5 +41,5 @@ export async function verifyBrowserJwt(token: string, secret: string): Promise<B
     throw new ApiError("SESSION_NOT_ALLOWED", "Chat requires a direct user session");
   }
 
-  return { user_id: sub };
+  return { user_id: sub, is_admin: payload.admin === true };
 }

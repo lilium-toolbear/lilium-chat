@@ -134,6 +134,8 @@ export interface MessageRow {
   sender_kind: string;
   sender_user_id: string | null;
   sender_bot_id: string | null;
+  sender_bot_display_name?: string | null;
+  sender_bot_avatar_url?: string | null;
   type: string;
   format: string;
   status: string;

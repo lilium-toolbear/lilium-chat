@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { PLATFORM_HELP_BOT_COMMAND_ID } from "../../src/chat/platform-commands";
 import { env } from "cloudflare:workers";
 import { setupOwnedChannelForUser, makeJwt, TEST_SECRET } from "../helpers";
 
@@ -82,8 +83,8 @@ describe("bootstrap command manifest", () => {
     expect(body.active_channel?.channel_id).toBe(channelId);
     expect(body.active_channel?.kind).toBe("channel");
     expect(body.command_manifest?.version).toBe(1);
-    expect(body.command_manifest?.items).toHaveLength(1);
-    expect(body.command_manifest?.items[0]?.bot_command_id).toBe(botCommandId);
-    expect(body.command_manifest?.items[0]?.name).toBe("ask");
+    expect(body.command_manifest?.items).toHaveLength(2);
+    expect(body.command_manifest?.items.some((item) => item.bot_command_id === botCommandId)).toBe(true);
+    expect(body.command_manifest?.items.some((item) => item.bot_command_id === PLATFORM_HELP_BOT_COMMAND_ID)).toBe(true);
   });
 });

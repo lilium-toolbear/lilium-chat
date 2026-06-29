@@ -4,6 +4,7 @@ import type {
   CommandManifestResponse,
 } from "../contract/bot-api";
 import { parseCommandBindingSnapshot } from "./command-snapshot";
+import { platformHelpManifestItem } from "./platform-commands";
 
 type PermissionLevel = CommandManifestItem["effective_member_permission"];
 
@@ -37,6 +38,7 @@ export function projectCommandManifest(
       name: snapshot.name,
       aliases: snapshot.aliases,
       description: snapshot.description,
+      help_text: snapshot.help_text ?? "",
       bot: snapshot.bot,
       options: snapshot.options,
       execution: snapshot.execution,
@@ -51,6 +53,19 @@ export function projectCommandManifest(
   });
 
   return { version, items };
+}
+
+export function appendPlatformHelpItem(manifest: CommandManifestResponse): CommandManifestResponse {
+  if (manifest.items.some((item) => item.bot_command_id === platformHelpManifestItem().bot_command_id)) {
+    return manifest;
+  }
+  const items = [...manifest.items, platformHelpManifestItem()];
+  items.sort((a, b) => {
+    const byName = a.name.localeCompare(b.name);
+    if (byName !== 0) return byName;
+    return a.bot_command_id.localeCompare(b.bot_command_id);
+  });
+  return { version: manifest.version, items };
 }
 
 export function buildManifestUpsertDelta(

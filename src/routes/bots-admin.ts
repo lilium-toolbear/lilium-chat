@@ -1,8 +1,8 @@
 import type { Context } from "hono";
-import type { BotAppSummary, BotTokenCreated } from "../contract/bot-api";
+import type { BotAppSummary } from "../contract/bot-api";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
-import { getIdentity, requireIdempotencyKey } from "./auth";
+import { getIdentity, requireAdmin, requireIdempotencyKey } from "./auth";
 
 function botRegistryStub(env: Env): DurableObjectStub {
   return env.BOT_REGISTRY.get(env.BOT_REGISTRY.idFromName("registry"));
@@ -13,90 +13,65 @@ async function mapError(res: Response, fallbackCode: string, fallbackMessage: st
   return new ApiError(body.error?.code ?? fallbackCode, body.error?.message ?? fallbackMessage);
 }
 
-async function getOwnedBot(env: Env, userId: string, botId: string): Promise<BotAppSummary> {
+async function getAdminBot(env: Env, botId: string): Promise<BotAppSummary> {
   const res = await botRegistryStub(env).fetch(
     new Request(`https://x/internal/bots-get?bot_id=${encodeURIComponent(botId)}`),
   );
   if (res.status === 404) throw new ApiError("BOT_NOT_FOUND", "bot not found");
   if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE", "bot lookup failed");
   const body = (await res.json()) as { bot: BotAppSummary };
-  if (body.bot.owner_user_id !== userId) throw new ApiError("FORBIDDEN", "bot access denied");
   if (body.bot.status === "deleted") throw new ApiError("BOT_NOT_FOUND", "bot not found");
   return body.bot;
 }
 
-export async function createBotHandler(
+export async function listAdminBotsHandler(
   c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
 ): Promise<Response> {
-  const { userId, isAdmin, env } = await getIdentity(c);
-  requireIdempotencyKey(c);
-  const body = (await c.req.json().catch(() => null)) as {
-    display_name?: string;
-    avatar_url?: string | null;
-    description?: string | null;
-    visibility?: "private" | "unlisted" | "public" | "official";
-    issue_initial_token?: boolean;
-    initial_token_name?: string;
-  } | null;
-  if (!body || typeof body.display_name !== "string" || body.display_name.trim().length === 0) {
-    throw new ApiError("INVALID_MESSAGE", "display_name required");
-  }
-  if (body.visibility === "official" && !isAdmin) {
-    throw new ApiError("ADMIN_ACCESS_REQUIRED", "Admin access required to set visibility to official");
-  }
-  const res = await botRegistryStub(env).fetch(
-    new Request("https://x/internal/bots-create", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        owner_user_id: userId,
-        display_name: body.display_name,
-        avatar_url: body.avatar_url ?? null,
-        description: body.description ?? null,
-        visibility: body.visibility ?? "private",
-        issue_initial_token: body.issue_initial_token ?? true,
-        initial_token_name: body.initial_token_name ?? "default",
-      }),
-    }),
-  );
-  if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE", "bot create failed");
-  const out = (await res.json()) as { bot: BotAppSummary; initial_token?: BotTokenCreated };
-  return c.json(out, 201, { "X-Request-Id": c.get("requestId") });
-}
+  const { isAdmin, env } = await getIdentity(c);
+  requireAdmin(isAdmin);
 
-export async function listBotsHandler(
-  c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
-): Promise<Response> {
-  const { userId, env } = await getIdentity(c);
+  const query = new URLSearchParams();
   const limit = c.req.query("limit");
   const cursor = c.req.query("cursor");
-  const query = new URLSearchParams({ owner_user_id: userId });
+  const q = c.req.query("q");
+  const ownerUserId = c.req.query("owner_user_id");
+  const status = c.req.query("status");
+  const visibility = c.req.query("visibility");
   if (limit) query.set("limit", limit);
   if (cursor) query.set("cursor", cursor);
-  const res = await botRegistryStub(env).fetch(new Request(`https://x/internal/bots-list?${query.toString()}`));
-  if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE", "bot list failed");
+  if (q) query.set("q", q);
+  if (ownerUserId) query.set("owner_user_id", ownerUserId);
+  if (status) query.set("status", status);
+  if (visibility) query.set("visibility", visibility);
+
+  const res = await botRegistryStub(env).fetch(
+    new Request(`https://x/internal/bots-admin-list?${query.toString()}`),
+  );
+  if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE", "admin bot list failed");
   const out = (await res.json()) as { items: BotAppSummary[]; next_cursor: string | null };
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
-export async function getBotHandler(
+export async function getAdminBotHandler(
   c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
 ): Promise<Response> {
-  const { userId, env } = await getIdentity(c);
+  const { isAdmin, env } = await getIdentity(c);
+  requireAdmin(isAdmin);
   const botId = c.req.param("bot_id");
   if (!botId) throw new ApiError("BOT_NOT_FOUND", "bot_id required");
-  const bot = await getOwnedBot(env, userId, botId);
+  const bot = await getAdminBot(env, botId);
   return c.json({ bot }, 200, { "X-Request-Id": c.get("requestId") });
 }
 
-export async function updateBotHandler(
+export async function updateAdminBotHandler(
   c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
 ): Promise<Response> {
-  const { userId, isAdmin, env } = await getIdentity(c);
+  const { isAdmin, env } = await getIdentity(c);
+  requireAdmin(isAdmin);
   requireIdempotencyKey(c);
   const botId = c.req.param("bot_id");
   if (!botId) throw new ApiError("BOT_NOT_FOUND", "bot_id required");
-  await getOwnedBot(env, userId, botId);
+  await getAdminBot(env, botId);
 
   const body = (await c.req.json().catch(() => null)) as {
     display_name?: string;
@@ -118,9 +93,6 @@ export async function updateBotHandler(
   if (body.display_name !== undefined && (typeof body.display_name !== "string" || body.display_name.trim().length === 0)) {
     throw new ApiError("INVALID_MESSAGE", "display_name invalid");
   }
-  if (body.visibility === "official" && !isAdmin) {
-    throw new ApiError("ADMIN_ACCESS_REQUIRED", "Admin access required to set visibility to official");
-  }
 
   const patchBody: Record<string, unknown> = { bot_id: botId };
   if (body.display_name !== undefined) patchBody.display_name = body.display_name;
@@ -130,24 +102,25 @@ export async function updateBotHandler(
   if (body.status !== undefined) patchBody.status = body.status;
 
   const res = await botRegistryStub(env).fetch(
-    new Request("https://x/internal/bots-patch", {
+    new Request("https://x/internal/bots-admin-patch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patchBody),
     }),
   );
-  if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE", "bot update failed");
+  if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE", "admin bot update failed");
   const out = (await res.json()) as { bot: BotAppSummary };
   return c.json({ bot: out.bot }, 200, { "X-Request-Id": c.get("requestId") });
 }
 
-export async function listBotTokensHandler(
+export async function listAdminBotTokensHandler(
   c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
 ): Promise<Response> {
-  const { userId, env } = await getIdentity(c);
+  const { isAdmin, env } = await getIdentity(c);
+  requireAdmin(isAdmin);
   const botId = c.req.param("bot_id");
   if (!botId) throw new ApiError("BOT_NOT_FOUND", "bot_id required");
-  await getOwnedBot(env, userId, botId);
+  await getAdminBot(env, botId);
   const res = await botRegistryStub(env).fetch(
     new Request(`https://x/internal/bots-tokens-list?bot_id=${encodeURIComponent(botId)}`),
   );
@@ -166,50 +139,17 @@ export async function listBotTokensHandler(
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
-export async function createBotTokenHandler(
+export async function revokeAdminBotTokenHandler(
   c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
 ): Promise<Response> {
-  const { userId, env } = await getIdentity(c);
-  requireIdempotencyKey(c);
-  const botId = c.req.param("bot_id");
-  if (!botId) throw new ApiError("BOT_NOT_FOUND", "bot_id required");
-  await getOwnedBot(env, userId, botId);
-
-  const body = (await c.req.json().catch(() => null)) as {
-    name?: string;
-    scopes?: string[];
-    expires_at?: string | null;
-  } | null;
-  if (!body || typeof body.name !== "string" || body.name.trim().length === 0) {
-    throw new ApiError("INVALID_MESSAGE", "token name required");
-  }
-  const res = await botRegistryStub(env).fetch(
-    new Request("https://x/internal/bots-token-create", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        bot_id: botId,
-        name: body.name,
-        scopes: body.scopes,
-        expires_at: body.expires_at ?? null,
-      }),
-    }),
-  );
-  if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE", "token create failed");
-  const out = (await res.json()) as { token: BotTokenCreated };
-  return c.json(out, 201, { "X-Request-Id": c.get("requestId") });
-}
-
-export async function revokeBotTokenHandler(
-  c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
-): Promise<Response> {
-  const { userId, env } = await getIdentity(c);
+  const { isAdmin, env } = await getIdentity(c);
+  requireAdmin(isAdmin);
   requireIdempotencyKey(c);
   const botId = c.req.param("bot_id");
   const tokenId = c.req.param("token_id");
   if (!botId) throw new ApiError("BOT_NOT_FOUND", "bot_id required");
   if (!tokenId) throw new ApiError("BOT_TOKEN_INVALID", "token_id required");
-  await getOwnedBot(env, userId, botId);
+  await getAdminBot(env, botId);
   const res = await botRegistryStub(env).fetch(
     new Request("https://x/internal/bots-token-revoke", {
       method: "POST",
