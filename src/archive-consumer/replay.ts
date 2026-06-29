@@ -1,50 +1,6 @@
 import type { ArchiveChange, ArchiveRecord } from "../archive/payload.js";
 import type { PgQueryable } from "./pg-writer.js";
-
-interface ReplayTableConfig {
-  pgTable: string;
-  pk: string[];
-  replaceScopeColumns?: string[];
-  jsonColumns?: ReadonlySet<string>;
-  transformRow?: (row: Record<string, unknown>) => Record<string, unknown>;
-}
-
-const REPLAY_TABLES: Record<string, ReplayTableConfig> = {
-  chat_messages: {
-    pgTable: "chat.messages",
-    pk: ["message_id"],
-    jsonColumns: new Set(["reply_snapshot_json"]),
-  },
-  chat_events: {
-    pgTable: "chat.events",
-    pk: ["event_id"],
-    jsonColumns: new Set(["payload"]),
-    transformRow: (row) => {
-      const next = { ...row };
-      if (next.payload_json !== undefined && next.payload === undefined) {
-        const raw = next.payload_json;
-        next.payload = typeof raw === "string" ? JSON.parse(raw) : raw;
-        delete next.payload_json;
-      }
-      return next;
-    },
-  },
-  chat_mentions: {
-    pgTable: "chat.mentions",
-    pk: ["message_id", "start_index", "end_index"],
-    replaceScopeColumns: ["message_id"],
-  },
-  chat_message_attachments: {
-    pgTable: "chat.message_attachments",
-    pk: ["message_id", "attachment_id"],
-    replaceScopeColumns: ["message_id"],
-  },
-  chat_message_stickers: {
-    pgTable: "chat.message_stickers",
-    pk: ["message_id"],
-    replaceScopeColumns: ["message_id"],
-  },
-};
+import { REPLAY_TABLES, type ReplayTableConfig } from "./replay-tables.js";
 
 const ARCHIVE_COLUMNS = [
   "archived_source_kind",
@@ -117,25 +73,103 @@ async function applyUpsert(
   await client.query(sql, params);
 }
 
+async function applySoftDeleteByPk(
+  client: PgQueryable,
+  record: ArchiveRecord,
+  config: ReplayTableConfig,
+  pk: Record<string, string | number>,
+): Promise<void> {
+  const softCol = config.softDeleteColumn;
+  if (!softCol) {
+    console.warn(`skip archive delete op: table ${config.pgTable} has no soft delete column`);
+    return;
+  }
+  const pkCols = config.pk;
+  const where = pkCols.map((col, i) => `${quoteIdent(col)} = $${i + 1}`).join(" AND ");
+  const pkParams = pkCols.map((col) => pk[col]);
+  const seqParam = pkCols.length + 1;
+  const softParam = pkCols.length + 2;
+  const kindParam = pkCols.length + 3;
+  const keyParam = pkCols.length + 4;
+  const atParam = pkCols.length + 5;
+  await client.query(
+    `UPDATE ${config.pgTable}
+     SET ${quoteIdent(softCol)} = $${softParam}::timestamptz,
+         archived_source_kind = $${kindParam},
+         archived_source_key = $${keyParam},
+         archived_source_seq = $${seqParam},
+         archived_at = $${atParam}::timestamptz
+     WHERE ${where}
+       AND (archived_source_seq IS NULL OR archived_source_seq <= $${seqParam})`,
+    [
+      ...pkParams,
+      record.source_seq,
+      record.occurred_at,
+      record.source_kind,
+      record.source_key,
+      record.occurred_at,
+    ],
+  );
+}
+
+async function applyDelete(
+  client: PgQueryable,
+  record: ArchiveRecord,
+  change: Extract<ArchiveChange, { op: "delete" }>,
+): Promise<void> {
+  const config = REPLAY_TABLES[change.table];
+  if (!config) return;
+  await applySoftDeleteByPk(client, record, config, change.pk);
+}
+
+async function softDeleteScope(
+  client: PgQueryable,
+  record: ArchiveRecord,
+  config: ReplayTableConfig,
+  scope: Record<string, string | number>,
+): Promise<void> {
+  const softCol = config.softDeleteColumn ?? "deleted_at";
+  const scopeCols = Object.keys(scope);
+  const where = scopeCols.map((col, i) => `${quoteIdent(col)} = $${i + 1}`).join(" AND ");
+  const scopeParams = scopeCols.map((col) => scope[col]);
+  const seqParam = scopeCols.length + 1;
+  const softParam = scopeCols.length + 2;
+  const kindParam = scopeCols.length + 3;
+  const keyParam = scopeCols.length + 4;
+  const atParam = scopeCols.length + 5;
+  await client.query(
+    `UPDATE ${config.pgTable}
+     SET ${quoteIdent(softCol)} = $${softParam}::timestamptz,
+         archived_source_kind = $${kindParam},
+         archived_source_key = $${keyParam},
+         archived_source_seq = $${seqParam},
+         archived_at = $${atParam}::timestamptz
+     WHERE ${where}
+       AND ${quoteIdent(softCol)} IS NULL
+       AND (archived_source_seq IS NULL OR archived_source_seq <= $${seqParam})`,
+    [
+      ...scopeParams,
+      record.source_seq,
+      record.occurred_at,
+      record.source_kind,
+      record.source_key,
+      record.occurred_at,
+    ],
+  );
+}
+
 async function applyReplaceScope(
   client: PgQueryable,
   record: ArchiveRecord,
   change: Extract<ArchiveChange, { op: "replace_scope" }>,
 ): Promise<void> {
   const config = REPLAY_TABLES[change.table];
-  if (!config?.replaceScopeColumns) return;
-  const scopeCols = config.replaceScopeColumns;
-  const where = scopeCols.map((col, i) => `${quoteIdent(col)} = $${i + 1}`).join(" AND ");
-  const scopeParams = scopeCols.map((col) => change.scope[col]);
-  await client.query(
-    `DELETE FROM ${config.pgTable}
-     WHERE ${where}
-       AND (archived_source_seq IS NULL OR archived_source_seq <= $${scopeCols.length + 1})`,
-    [...scopeParams, record.source_seq],
-  );
+  if (!config?.scopeReplace) return;
+  const softCol = config.softDeleteColumn ?? "deleted_at";
+  await softDeleteScope(client, record, config, change.scope);
   for (const raw of change.rows) {
     const base = config.transformRow ? config.transformRow(raw) : raw;
-    const row = withArchiveMeta(record, base);
+    const row = withArchiveMeta(record, { ...base, [softCol]: null });
     const { sql, params } = buildUpsertSql(config, row);
     await client.query(sql, params);
   }
@@ -147,6 +181,10 @@ export async function applyArchiveRecord(client: PgQueryable, record: ArchiveRec
     if (change.op === "upsert") {
       if (!REPLAY_TABLES[change.table]) continue;
       await applyUpsert(client, record, change);
+      applied += 1;
+    } else if (change.op === "delete") {
+      if (!REPLAY_TABLES[change.table]) continue;
+      await applyDelete(client, record, change);
       applied += 1;
     } else if (change.op === "replace_scope") {
       if (!REPLAY_TABLES[change.table]) continue;

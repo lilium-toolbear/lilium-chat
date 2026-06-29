@@ -72,60 +72,51 @@ function makePgClient() {
     queries,
     async query(sql: string, params?: unknown[]) {
       queries.push({ sql, params });
+      if (sql.includes("FROM chat_archive_source_watermarks") && sql.includes("FOR UPDATE")) {
+        return { rows: [{ last_applied_seq: 0 }] };
+      }
+      if (sql.includes("FROM chat_archive_records") && sql.includes("source_seq = $3")) {
+        const record = chatEventsRecord();
+        return { rows: [{ archive_id: record.archive_id, payload: record }] };
+      }
+      if (sql.includes("applied_at IS NULL") && sql.includes("DISTINCT source_kind")) {
+        return { rows: [] };
+      }
+      return { rows: [] };
     },
   };
   return client;
 }
 
 describe("processArchiveMessageBatch", () => {
-  it("replays message and event upserts then acks on commit", async () => {
+  it("persists raw log, drains replay, then acks on commit", async () => {
     const client = makePgClient();
     const msg = makeMessage(chatEventsRecord());
 
     const result = await processArchiveMessageBatch([msg], client);
 
-    expect(result).toEqual({ acked: 1, retried: 0, skipped: 0 });
+    expect(result.acked).toBe(1);
+    expect(result.retried).toBe(0);
     expect(msg.ack).toHaveBeenCalledTimes(1);
+    expect(client.queries.some((q) => q.sql.includes("INSERT INTO chat_archive_records"))).toBe(true);
     expect(client.queries.some((q) => q.sql.includes("INSERT INTO chat.messages"))).toBe(true);
     expect(client.queries.some((q) => q.sql.includes("INSERT INTO chat.events"))).toBe(true);
   });
 
-  it("acks unsupported-table-only records as skipped", async () => {
-    const client = makePgClient();
-    const msg = makeMessage(
-      chatEventsRecord({
-        changes: [
-          {
-            op: "upsert",
-            table: "chat_channels",
-            pk: { channel_id: "ch-1" },
-            row_version: "v1",
-            after: { channel_id: "ch-1" },
-          },
-        ],
-      }),
-    );
-
-    const result = await processArchiveMessageBatch([msg], client);
-
-    expect(result).toEqual({ acked: 1, retried: 0, skipped: 1 });
-    expect(msg.ack).toHaveBeenCalledTimes(1);
-  });
-
-  it("retries invalid messages without ack", async () => {
+  it("retries when archive body is invalid", async () => {
     const client = makePgClient();
     const msg = makeMessage({ bad: true });
 
     const result = await processArchiveMessageBatch([msg], client);
 
-    expect(result).toEqual({ acked: 0, retried: 1, skipped: 0 });
+    expect(result).toEqual({ acked: 0, retried: 1, skipped: 0, drained: 0 });
     expect(msg.ack).not.toHaveBeenCalled();
     expect(msg.retry).toHaveBeenCalledWith({ delaySeconds: 60 });
   });
 });
 
 describe("applyArchiveRecord", () => {
-  it("applies empty replace_scope by deleting scoped rows only", async () => {
+  it("soft-deletes scoped rows on empty replace_scope", async () => {
     const client = makePgClient();
     const record = chatEventsRecord({
       changes: [
@@ -143,7 +134,9 @@ describe("applyArchiveRecord", () => {
 
     expect(applied).toBe(1);
     expect(client.queries).toHaveLength(1);
-    expect(client.queries[0]!.sql).toContain("DELETE FROM chat.mentions");
+    expect(client.queries[0]!.sql).toContain("UPDATE chat.mentions");
+    expect(client.queries[0]!.sql).toContain("deleted_at");
+    expect(client.queries[0]!.sql).not.toContain("DELETE FROM");
   });
 
   it("upserts pk-only junction rows without empty UPDATE SET", async () => {
@@ -162,9 +155,34 @@ describe("applyArchiveRecord", () => {
 
     await applyArchiveRecord(client, record);
 
+    const softDelete = client.queries.find((q) => q.sql.includes("UPDATE chat.message_attachments"));
+    expect(softDelete).toBeDefined();
+    expect(softDelete!.sql).toContain("deleted_at");
+
     const insert = client.queries.find((q) => q.sql.includes("INSERT INTO chat.message_attachments"));
     expect(insert).toBeDefined();
     expect(insert!.sql).toMatch(/DO UPDATE SET[\s\S]+archived_source_seq/);
     expect(insert!.sql).not.toMatch(/DO UPDATE SET\s+WHERE/);
+  });
+
+  it("soft-deletes channel members via delete op", async () => {
+    const client = makePgClient();
+    const record = chatEventsRecord({
+      changes: [
+        {
+          op: "delete",
+          table: "chat_channel_members",
+          pk: { channel_id: "ch-1", user_id: "u1" },
+          row_version: "evt-2",
+        },
+      ],
+    });
+
+    await applyArchiveRecord(client, record);
+
+    expect(client.queries).toHaveLength(1);
+    expect(client.queries[0]!.sql).toContain("UPDATE chat.channel_members");
+    expect(client.queries[0]!.sql).toContain("left_at");
+    expect(client.queries[0]!.sql).not.toContain("DELETE FROM");
   });
 });

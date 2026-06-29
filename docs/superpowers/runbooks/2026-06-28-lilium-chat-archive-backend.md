@@ -106,12 +106,25 @@ DATABASE_URL=postgres://... npm run archive:backfill
 The script will:
 
 1. Rename `chat.events` → `chat.events_raw` when the raw schema is detected
-2. Apply structured migrations (`001` + `002`)
-3. Replay pending raw rows into normalized tables (`chat.messages`, `chat.events`, …)
-4. Track progress in `chat.archive_backfill_applied`
+2. Apply migrations `001`–`005` (normalized tables + `chat_archive_records` / watermarks)
+3. For each legacy raw row: `INSERT` into `chat_archive_records`, mark `chat.archive_backfill_applied`
+4. Drain per-source watermarks into normalized tables (same path as queue consumer)
+5. Final sweep loops until `chat_archive_records` has no pending rows
 
-Replay order is per `(source_kind, source_key, source_seq)` so child `replace_scope`
-rows apply after their parent upserts within the same archive record.
+Replay applies **every** `changes[]` entry in each ArchiveRecord (all whitelisted
+tables: channels, members, messages, events, bots, invites, …) — not only message tables.
+
+Re-run from scratch:
+
+```bash
+BACKFILL_RESET=full DATABASE_URL=postgres://... npm run archive:backfill
+```
+
+Replay-only (raw log already ingested):
+
+```bash
+BACKFILL_RESET=replay BACKFILL_SKIP_INGEST=1 DATABASE_URL=postgres://... npm run archive:backfill
+```
 
 Dry run:
 

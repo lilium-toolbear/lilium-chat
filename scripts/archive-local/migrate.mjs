@@ -15,7 +15,13 @@ if (!databaseUrl) {
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
-const migrations = ["001_chat_events.sql", "002_message_tables.sql"];
+const migrations = [
+  "001_chat_events.sql",
+  "002_message_tables.sql",
+  "003_channel_tables.sql",
+  "004_remaining_tables.sql",
+  "005_archive_infra.sql",
+];
 
 const client = new pg.Client({ connectionString: databaseUrl });
 await client.connect();

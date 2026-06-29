@@ -15,6 +15,8 @@
     "archive:daemon": "node ./scripts/archive-local/daemon.mjs",
     "archive:migrate": "node ./scripts/archive-local/migrate.mjs",
     "archive:backfill": "tsx scripts/archive-local/backfill-raw.ts",
+    "archive:replay": "tsx scripts/archive-local/replay-pending.ts",
+    "archive:derive-channels": "tsx scripts/archive-local/derive-channels.ts",
     "archive:deploy": "wrangler deploy -c wrangler.archive.jsonc",
     "cf-typegen:archive": "wrangler types -c wrangler.archive.jsonc"
   },

@@ -1,6 +1,7 @@
 import { parseArchiveBody } from "../archive/apply-events.js";
-import { applyArchiveRecord } from "./replay.js";
+import { drainAffectedSources } from "./drain.js";
 import type { PgQueryable } from "./pg-writer.js";
+import { insertArchiveRecordIfAbsent } from "./raw-log.js";
 
 export interface ArchiveQueueMessageLike {
   id: string;
@@ -14,38 +15,37 @@ export interface ProcessBatchResult {
   acked: number;
   retried: number;
   skipped: number;
+  drained: number;
 }
 
 const RETRY_DELAY_SECONDS = 60;
 
 /**
- * Replay archive queue messages into normalized PG tables inside one transaction.
- * Ack/retry individual messages only after COMMIT succeeds.
+ * Persist archive records to raw log, drain per-source watermarks, then ack/retry.
+ * Queue ack means raw log persisted (spec §8.6–8.7), not normalized replay completed.
  */
 export async function processArchiveMessageBatch(
   messages: readonly ArchiveQueueMessageLike[],
   client: PgQueryable,
 ): Promise<ProcessBatchResult> {
   if (messages.length === 0) {
-    return { acked: 0, retried: 0, skipped: 0 };
+    return { acked: 0, retried: 0, skipped: 0, drained: 0 };
   }
 
+  const parsedRecords = [];
   const toAck: ArchiveQueueMessageLike[] = [];
   const toRetry: ArchiveQueueMessageLike[] = [];
-  let skipped = 0;
 
   await client.query("BEGIN");
   try {
     for (const message of messages) {
       try {
         const record = parseArchiveBody(message.body);
-        const applied = await applyArchiveRecord(client, record);
-        if (applied === 0) {
-          skipped += 1;
-        }
+        await insertArchiveRecordIfAbsent(client, record);
+        parsedRecords.push(record);
         toAck.push(message);
       } catch (err) {
-        console.error("archive message replay failed", {
+        console.error("archive message persist failed", {
           message_id: message.id,
           attempts: message.attempts,
           err: String(err),
@@ -59,6 +59,16 @@ export async function processArchiveMessageBatch(
     throw err;
   }
 
+  let drained = 0;
+  try {
+    drained = await drainAffectedSources(client, parsedRecords);
+  } catch (err) {
+    console.error("archive drain failed after raw log persist", {
+      err: String(err),
+      record_count: parsedRecords.length,
+    });
+  }
+
   for (const message of toAck) {
     message.ack();
   }
@@ -66,5 +76,5 @@ export async function processArchiveMessageBatch(
     message.retry({ delaySeconds: RETRY_DELAY_SECONDS });
   }
 
-  return { acked: toAck.length, retried: toRetry.length, skipped };
+  return { acked: toAck.length, retried: toRetry.length, skipped: 0, drained };
 }
