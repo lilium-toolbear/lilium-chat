@@ -7,6 +7,12 @@ export async function dispatchBotRoutes(host: ChatChannelHost, request: Request,
   if (url.pathname === "/internal/channel-commands") {
     return host.handleChannelCommands(request);
   }
+  if (url.pathname === "/internal/command-manifest") {
+    return host.handleCommandManifest(request);
+  }
+  if (url.pathname === "/internal/command-invoke") {
+    return host.handleCommandInvoke(request);
+  }
 
   return null;
 }

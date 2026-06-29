@@ -70,4 +70,6 @@ export interface ChatChannelHost {
   flushSingleInviteDirectoryOutbox(outboxId: string, nowIso: string): Promise<boolean>;
   handleCommandBindingUpdate(request: Request): Promise<Response>;
   handleChannelCommands(request: Request): Promise<Response>;
+  handleCommandManifest(request: Request): Promise<Response>;
+  handleCommandInvoke(request: Request): Promise<Response>;
 }
