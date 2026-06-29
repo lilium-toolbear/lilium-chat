@@ -1,12 +1,6 @@
 import type { ChatChannelHost } from "../host";
 
 export async function dispatchBotRoutes(host: ChatChannelHost, request: Request, url: URL): Promise<Response | null> {
-  if (url.pathname === "/internal/bot-install") {
-    return host.handleBotInstall(request);
-  }
-  if (url.pathname === "/internal/bot-install-update") {
-    return host.handleBotInstallUpdate(request);
-  }
   if (url.pathname === "/internal/command-binding-update") {
     return host.handleCommandBindingUpdate(request);
   }

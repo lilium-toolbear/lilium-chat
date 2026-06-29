@@ -76,10 +76,7 @@ export const ARCHIVE_TABLE_WHITELIST: ReadonlySet<string> = new Set([
   "chat_bot_commands",
   "chat_bot_command_aliases",
   "chat_bot_event_capabilities",
-  "chat_bot_installations",
   "chat_channel_command_bindings",
-  "chat_channel_command_names",
-  "chat_channel_bot_event_subscriptions",
   "chat_command_invocations",
   "chat_interactions",
 ]);

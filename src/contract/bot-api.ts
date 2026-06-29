@@ -62,7 +62,6 @@ export interface BotCommandsSyncResponse {
 export interface CommandBindingUpdateResponse {
   bot_command_id: string;
   status: string;
-  enabled: boolean;
   permission_override: string | null;
 }
 

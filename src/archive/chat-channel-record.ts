@@ -109,24 +109,15 @@ function readMessageEdit(sql: SqlStorage, editId: string): Record<string, unknow
   return row ?? null;
 }
 
-function readBotInstallation(sql: SqlStorage, botId: string): Record<string, unknown> | null {
+function readCommandBinding(sql: SqlStorage, channelId: string, botCommandId: string): Record<string, unknown> | null {
   const row = sql
     .exec(
-      "SELECT bot_id, installed_by, scopes, installed_at, status, updated_by, updated_at, bot_display_name, bot_avatar_url FROM bot_installations WHERE bot_id=?",
-      botId,
-    )
-    .toArray()[0] as Record<string, unknown> | undefined;
-  return row ?? null;
-}
-
-function readCommandBinding(sql: SqlStorage, bindingId: string): Record<string, unknown> | null {
-  const row = sql
-    .exec(
-      `SELECT binding_id, channel_id, bot_id, bot_command_id, status, permission_override,
-              name, description, options_json, aliases_json, default_member_permission,
-              definition_hash, created_by, created_at, updated_by, updated_at
-       FROM channel_command_bindings WHERE binding_id=?`,
-      bindingId,
+      `SELECT channel_id, bot_command_id, bot_id, status, permission_override,
+              command_snapshot_json, stateful_max_ttl_seconds, updated_by_user_id, updated_at
+       FROM channel_command_bindings
+       WHERE channel_id=? AND bot_command_id=?`,
+      channelId,
+      botCommandId,
     )
     .toArray()[0] as Record<string, unknown> | undefined;
   return row ?? null;
@@ -138,24 +129,6 @@ function normalizeMentionRow(row: Record<string, unknown>): Record<string, unkno
     user_id: row.user_id,
     start_index: row.start,
     end_index: row.end_,
-  };
-}
-
-function normalizeBotInstallationRow(
-  channelId: string,
-  row: Record<string, unknown>,
-): Record<string, unknown> {
-  return {
-    channel_id: channelId,
-    bot_id: row.bot_id,
-    installed_by: row.installed_by,
-    scopes: row.scopes,
-    installed_at: row.installed_at,
-    status: row.status,
-    updated_by: row.updated_by,
-    updated_at: row.updated_at,
-    bot_display_name: row.bot_display_name,
-    bot_avatar_url: row.bot_avatar_url,
   };
 }
 
@@ -237,32 +210,17 @@ export function upsertMessageEditChange(
   return archiveUpsert(chatChannelTable("message_edits"), { edit_id: editId }, rowVersion, row);
 }
 
-export function upsertBotInstallationChange(
-  sql: SqlStorage,
-  channelId: string,
-  botId: string,
-  rowVersion: string,
-): ArchiveChange | null {
-  const row = readBotInstallation(sql, botId);
-  if (!row) return null;
-  return archiveUpsert(
-    chatChannelTable("bot_installations"),
-    { channel_id: channelId, bot_id: botId },
-    rowVersion,
-    normalizeBotInstallationRow(channelId, row),
-  );
-}
-
 export function upsertCommandBindingChange(
   sql: SqlStorage,
-  bindingId: string,
+  channelId: string,
+  botCommandId: string,
   rowVersion: string,
 ): ArchiveChange | null {
-  const row = readCommandBinding(sql, bindingId);
+  const row = readCommandBinding(sql, channelId, botCommandId);
   if (!row) return null;
   return archiveUpsert(
     chatChannelTable("channel_command_bindings"),
-    { binding_id: bindingId },
+    { channel_id: channelId, bot_command_id: botCommandId },
     rowVersion,
     row,
   );
@@ -362,9 +320,8 @@ export function replaceScopeCommandBindingsForBotChange(
 ): ArchiveChange {
   const rows = sql
     .exec(
-      `SELECT binding_id, channel_id, bot_id, bot_command_id, status, permission_override,
-              name, description, options_json, aliases_json, default_member_permission,
-              definition_hash, created_by, created_at, updated_by, updated_at
+      `SELECT channel_id, bot_command_id, bot_id, status, permission_override,
+              command_snapshot_json, stateful_max_ttl_seconds, updated_by_user_id, updated_at
        FROM channel_command_bindings WHERE channel_id=? AND bot_id=?`,
       channelId,
       botId,
@@ -372,71 +329,6 @@ export function replaceScopeCommandBindingsForBotChange(
     .toArray() as Array<Record<string, unknown>>;
   return archiveReplaceScope(
     chatChannelTable("channel_command_bindings"),
-    { channel_id: channelId, bot_id: botId },
-    rowVersion,
-    rows,
-  );
-}
-
-export function replaceScopeCommandNamesForBotChange(
-  sql: SqlStorage,
-  channelId: string,
-  botId: string,
-  rowVersion: string,
-): ArchiveChange {
-  const rows = sql
-    .exec(
-      "SELECT channel_id, slash_name, bot_command_id, bot_id, kind, created_at FROM channel_command_names WHERE channel_id=? AND bot_id=?",
-      channelId,
-      botId,
-    )
-    .toArray() as Array<Record<string, unknown>>;
-  return archiveReplaceScope(
-    chatChannelTable("channel_command_names"),
-    { channel_id: channelId, bot_id: botId },
-    rowVersion,
-    rows,
-  );
-}
-
-export function replaceScopeCommandNamesForBindingChange(
-  sql: SqlStorage,
-  channelId: string,
-  botCommandId: string,
-  rowVersion: string,
-): ArchiveChange {
-  const rows = sql
-    .exec(
-      "SELECT channel_id, slash_name, bot_command_id, bot_id, kind, created_at FROM channel_command_names WHERE channel_id=? AND bot_command_id=?",
-      channelId,
-      botCommandId,
-    )
-    .toArray() as Array<Record<string, unknown>>;
-  return archiveReplaceScope(
-    chatChannelTable("channel_command_names"),
-    { channel_id: channelId, bot_command_id: botCommandId },
-    rowVersion,
-    rows,
-  );
-}
-
-export function replaceScopeBotEventSubscriptionsForBotChange(
-  sql: SqlStorage,
-  channelId: string,
-  botId: string,
-  rowVersion: string,
-): ArchiveChange {
-  const rows = sql
-    .exec(
-      `SELECT subscription_id, channel_id, bot_id, event_type, status, filters_json,
-              created_by, created_at, updated_by, updated_at
-       FROM channel_bot_event_subscriptions WHERE channel_id=? AND bot_id=?`,
-      channelId,
-      botId,
-    )
-    .toArray() as Array<Record<string, unknown>>;
-  return archiveReplaceScope(
-    chatChannelTable("channel_bot_event_subscriptions"),
     { channel_id: channelId, bot_id: botId },
     rowVersion,
     rows,
