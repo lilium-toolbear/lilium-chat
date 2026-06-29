@@ -8,19 +8,73 @@ import {
 } from "../sql-migrations";
 import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
 
-export const BOT_REGISTRY_CURRENT_SCHEMA_VERSION = 3;
+export const BOT_REGISTRY_CURRENT_SCHEMA_VERSION = 4;
 
 export const BOT_REGISTRY_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS bot_apps (
-    bot_id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, display_name TEXT NOT NULL,
-    avatar_url TEXT, callback_url TEXT NOT NULL, status TEXT NOT NULL,
+    bot_id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    avatar_url TEXT,
+    description TEXT,
+    visibility TEXT NOT NULL,
+    status TEXT NOT NULL,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS bot_tokens (
-    token_id TEXT PRIMARY KEY, bot_id TEXT NOT NULL, token_hash TEXT NOT NULL,
-    scopes TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT
+    token_id TEXT PRIMARY KEY,
+    bot_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    scopes_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    last_used_at TEXT,
+    revoked_at TEXT
   )`,
   `CREATE INDEX IF NOT EXISTS idx_bot_tokens_bot ON bot_tokens(bot_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_tokens_hash ON bot_tokens(token_hash)`,
+  `CREATE TABLE IF NOT EXISTS bot_commands (
+    bot_command_id TEXT PRIMARY KEY,
+    bot_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    options_json TEXT NOT NULL,
+    default_member_permission TEXT NOT NULL,
+    execution_mode TEXT NOT NULL,
+    stateful_config_json TEXT,
+    status TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    definition_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    deleted_at TEXT,
+    UNIQUE (bot_id, name)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_bot_commands_bot ON bot_commands(bot_id, status, name)`,
+  `CREATE TABLE IF NOT EXISTS bot_command_aliases (
+    bot_command_id TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (bot_command_id, alias),
+    UNIQUE (bot_id, alias)
+  )`,
+  `CREATE TABLE IF NOT EXISTS bot_command_names (
+    slash_token TEXT PRIMARY KEY,
+    bot_command_id TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS bot_idempotency_keys (
+    principal_kind TEXT NOT NULL, principal_id TEXT NOT NULL,
+    operation TEXT NOT NULL, operation_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL, response_json TEXT,
+    status TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+    PRIMARY KEY (principal_kind, principal_id, operation, operation_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_bot_idem_expires ON bot_idempotency_keys(expires_at)`,
 ];
 
 export const botRegistryBaseline: BaselineDetector = {
@@ -33,91 +87,35 @@ export const botRegistryBaseline: BaselineDetector = {
 
 export const botRegistryMigrations: SqlMigration[] = [
   {
-    version: 2,
-    name: "Phase 7 bot command catalog + aliases + event capabilities + idempotency + token_hash unique index",
-    up(ctx) {
-      // Global bot command catalog (contract §9.3). bot_command_id is the
-      // stable command definition id; name is canonical; aliases are alternate
-      // slash triggers (same command). definition_hash detects semantic drift
-      // so command.invoke can refresh channel binding snapshots.
-      if (!tableExists(ctx, "bot_commands")) {
-        ctx.storage.sql.exec(`CREATE TABLE bot_commands (
-          bot_command_id            TEXT PRIMARY KEY,
-          bot_id                    TEXT NOT NULL,
-          name                      TEXT NOT NULL,
-          description               TEXT,
-          options_json              TEXT NOT NULL,
-          default_member_permission TEXT NOT NULL,
-          default_enabled_on_install INTEGER NOT NULL DEFAULT 1,
-          schema_version            INTEGER NOT NULL DEFAULT 1,
-          definition_hash           TEXT NOT NULL,
-          enabled                   INTEGER NOT NULL DEFAULT 1,
-          created_at                TEXT NOT NULL,
-          updated_at                TEXT NOT NULL,
-          deleted_at                TEXT,
-          UNIQUE (bot_id, name)
-        )`);
-      }
-      if (!indexExists(ctx, "idx_bot_commands_bot")) {
-        ctx.storage.sql.exec(
-          "CREATE INDEX idx_bot_commands_bot ON bot_commands(bot_id, enabled, name)",
-        );
-      }
-
-      // Alternate slash triggers for the same bot_command_id.
-      if (!tableExists(ctx, "bot_command_aliases")) {
-        ctx.storage.sql.exec(`CREATE TABLE bot_command_aliases (
-          bot_command_id TEXT NOT NULL,
-          bot_id         TEXT NOT NULL,
-          alias          TEXT NOT NULL,
-          created_at     TEXT NOT NULL,
-          PRIMARY KEY (bot_command_id, alias),
-          UNIQUE (bot_id, alias)
-        )`);
-      }
-
-      // Bot-declared passive event capabilities + default filters (§9.9).
-      // Phase 7 only event_type=message.created.
-      if (!tableExists(ctx, "bot_event_capabilities")) {
-        ctx.storage.sql.exec(`CREATE TABLE bot_event_capabilities (
-          bot_id       TEXT NOT NULL,
-          event_type   TEXT NOT NULL,
-          filters_json TEXT NOT NULL,
-          default_enabled_on_install INTEGER NOT NULL DEFAULT 0,
-          created_at   TEXT NOT NULL,
-          updated_at   TEXT NOT NULL,
-          PRIMARY KEY(bot_id, event_type)
-        )`);
-      }
-
-      // Idempotency for PUT /bot/commands (operation=bot.commands.sync).
-      // Same shape as ChatChannel.idempotency_keys but bot-namespaced.
-      if (!tableExists(ctx, "bot_idempotency_keys")) {
-        ctx.storage.sql.exec(`CREATE TABLE bot_idempotency_keys (
-          principal_kind TEXT NOT NULL, principal_id TEXT NOT NULL,
-          operation TEXT NOT NULL, operation_id TEXT NOT NULL,
-          request_hash TEXT NOT NULL, response_json TEXT,
-          status TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-          PRIMARY KEY (principal_kind, principal_id, operation, operation_id)
-        )`);
-        ctx.storage.sql.exec(
-          "CREATE INDEX idx_bot_idem_expires ON bot_idempotency_keys(expires_at)",
-        );
-      }
-
-      // token plaintext -> hash cannot reverse-resolve bot_id; singleton
-      // registry SELECT ... WHERE token_hash=? requires the hash to be unique.
-      if (!indexExists(ctx, "idx_bot_tokens_hash")) {
-        ctx.storage.sql.exec(
-          "CREATE UNIQUE INDEX idx_bot_tokens_hash ON bot_tokens(token_hash)",
-        );
-      }
-    },
-  },
-  {
     version: 3,
     name: "archive_outbox + archive_seq for local PG archive",
     up(ctx) {
+      applyArchiveOutboxMigration(ctx);
+    },
+  },
+  {
+    version: 4,
+    name: "defensive reset for slash command baseline schema",
+    up(ctx) {
+      for (const tableName of [
+        "bot_command_names",
+        "bot_event_capabilities",
+        "bot_command_aliases",
+        "bot_commands",
+        "bot_idempotency_keys",
+        "bot_tokens",
+        "bot_apps",
+      ]) {
+        if (tableExists(ctx, tableName)) {
+          ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${tableName}`);
+        }
+      }
+      for (const indexName of ["idx_bot_commands_bot", "idx_bot_tokens_bot", "idx_bot_tokens_hash", "idx_bot_idem_expires"]) {
+        if (indexExists(ctx, indexName)) {
+          ctx.storage.sql.exec(`DROP INDEX IF EXISTS ${indexName}`);
+        }
+      }
+      applyBaselineSchema(ctx, BOT_REGISTRY_BASELINE_SCHEMA);
       applyArchiveOutboxMigration(ctx);
     },
   },
