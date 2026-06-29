@@ -82,6 +82,7 @@ import {
 } from "./chat-channel/stateful-session-handlers";
 import { buildManifestRemoveDelta, buildManifestUpsertDelta, projectCommandManifest } from "../chat/command-manifest";
 import type { CommandOption } from "../chat/command-options";
+import { parseStatefulConfigFromSnapshot } from "../chat/stateful-session";
 
 interface OutboxRow {
   outbox_id: string;
@@ -910,6 +911,25 @@ export class ChatChannel extends DurableObject<Env> {
     ) {
       return null;
     }
+
+    const statefulConfig = parsed.execution.mode === "stateful"
+      ? parseStatefulConfigFromSnapshot(parsed.execution as Record<string, unknown>)
+      : null;
+    if (parsed.execution.mode === "stateful" && !statefulConfig) {
+      return null;
+    }
+
+    const execution: CommandSnapshotForInvoke["execution"] = {
+      mode: parsed.execution.mode,
+      ...(statefulConfig ? { stateful: statefulConfig } : {}),
+      ...(typeof parsed.execution.schema_version === "number"
+        ? { schema_version: parsed.execution.schema_version }
+        : {}),
+      ...(typeof parsed.execution.definition_hash === "string"
+        ? { definition_hash: parsed.execution.definition_hash }
+        : {}),
+    };
+
     return {
       bot_command_id: parsed.bot_command_id,
       name: parsed.name,
@@ -922,18 +942,7 @@ export class ChatChannel extends DurableObject<Env> {
       },
       options: normalizedOptions,
       default_member_permission: parsed.default_member_permission,
-      execution: {
-        mode: parsed.execution.mode,
-        ...(typeof parsed.execution.schema_version === "number"
-          ? { schema_version: parsed.execution.schema_version }
-          : {}),
-        ...(typeof parsed.execution.definition_hash === "string"
-          ? { definition_hash: parsed.execution.definition_hash }
-          : {}),
-        ...(parsed.execution.mode === "stateful" && isRecord(parsed.execution.stateful)
-          ? { stateful: parsed.execution.stateful }
-          : {}),
-      },
+      execution,
     };
   }
 
