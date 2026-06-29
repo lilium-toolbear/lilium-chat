@@ -30,25 +30,29 @@ async function seedBot(opts: {
   const tokenHash = await hashBotToken(opts.token);
   await withRegistry((ctx) => {
     ctx.storage.sql.exec(
-      `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, callback_url, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, description, visibility, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       opts.botId,
       "owner-1",
       "Test Bot",
       null,
-      "https://example.test/callback",
+      null,
+      "private",
       opts.status ?? "active",
       "2026-06-26T00:00:00.000Z",
       "2026-06-26T00:00:00.000Z",
     );
     ctx.storage.sql.exec(
-      `INSERT INTO bot_tokens (token_id, bot_id, token_hash, scopes, created_at, revoked_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO bot_tokens (token_id, bot_id, name, token_hash, scopes_json, created_at, expires_at, last_used_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       `tok-${opts.botId}`,
       opts.botId,
+      "default",
       tokenHash,
       JSON.stringify(opts.scopes ?? ["chat:runtime:connect"]),
       "2026-06-26T00:00:00.000Z",
+      null,
+      null,
       opts.revoked ? "2026-06-26T00:00:00.000Z" : null,
     );
   });

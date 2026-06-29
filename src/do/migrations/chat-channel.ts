@@ -283,7 +283,7 @@ export const CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA: string[] = [
 ];
 
 export const chatChannelBaseline: BaselineDetector = {
-  version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+  version: 1,
   name: "baseline reset for slash bindings + stateful sessions",
   applyFresh(ctx) {
     applyBaselineSchema(ctx, CHAT_CHANNEL_BASELINE_SCHEMA);

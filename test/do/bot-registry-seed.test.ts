@@ -89,8 +89,8 @@ describe("BotRegistry /internal/seed-official-bot (7a-seed)", () => {
       expect(commands.map((c) => c.name)).toEqual(["ask", "summarize"]);
 
       const globalNames = ctx.storage.sql
-        .exec("SELECT command_name FROM bot_command_names WHERE bot_id=? ORDER BY command_name", OFFICIAL_BOT_ID)
-        .toArray() as Array<{ command_name: string }>;
+        .exec("SELECT slash_token FROM bot_command_names WHERE bot_id=? ORDER BY slash_token", OFFICIAL_BOT_ID)
+        .toArray() as Array<{ slash_token: string }>;
       expect(globalNames.length).toBeGreaterThan(0);
 
       const tokens = ctx.storage.sql

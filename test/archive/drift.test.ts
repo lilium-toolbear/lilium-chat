@@ -22,7 +22,7 @@ describe("archive drift/static", () => {
       "chat_messages",
       "chat_events",
       "chat_invites",
-      "chat_bot_installations",
+      "chat_channel_command_bindings",
     ];
     for (const table of required) {
       expect(ARCHIVE_TABLE_WHITELIST.has(table)).toBe(true);

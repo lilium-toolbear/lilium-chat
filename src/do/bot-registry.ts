@@ -1335,6 +1335,27 @@ export class BotRegistry extends DurableObject<Env> {
           );
         }
 
+        this.ctx.storage.sql.exec(
+          "DELETE FROM bot_command_names WHERE bot_command_id=?",
+          botCommandId,
+        );
+        for (const alias of command.aliases) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO bot_command_names (slash_token, bot_command_id, bot_id, kind, created_at) VALUES (?, ?, ?, 'alias', ?)",
+            alias,
+            botCommandId,
+            OFFICIAL_BOT_ID,
+            now,
+          );
+        }
+        this.ctx.storage.sql.exec(
+          "INSERT INTO bot_command_names (slash_token, bot_command_id, bot_id, kind, created_at) VALUES (?, ?, ?, 'canonical', ?)",
+          command.name,
+          botCommandId,
+          OFFICIAL_BOT_ID,
+          now,
+        );
+
         responseCommands.push({
           bot_command_id: botCommandId,
           name: command.name,
