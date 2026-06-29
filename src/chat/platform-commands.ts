@@ -3,7 +3,7 @@ import type { CommandManifestBotSummary, CommandManifestItem } from "../contract
 export const PLATFORM_BOT_ID = "00000000-0000-7000-8000-000000000600";
 export const PLATFORM_HELP_BOT_COMMAND_ID = "00000000-0000-7000-8000-000000000700";
 export const PLATFORM_HELP_NAME = "help";
-export const PLATFORM_HELP_DESCRIPTION = "查看可用斜杠命令";
+export const PLATFORM_HELP_DESCRIPTION = "查看可用命令";
 
 export const PLATFORM_BOT_DISPLAY_NAME = "system";
 export const PLATFORM_BOT_AVATAR_URL =
