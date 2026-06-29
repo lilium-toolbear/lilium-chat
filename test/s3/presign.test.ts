@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { presignPutUrl, headObjectKey, setTestS3Client } from "../../src/s3/presign";
+import { presignPutUrl, headObjectKey, PUBLIC_OBJECT_CACHE_CONTROL, setTestS3Client } from "../../src/s3/presign";
 import { s3WeedPathname } from "../../src/s3/url";
 import type { Env } from "../../src/env";
 import { FakeS3 } from "../fake-s3";
@@ -35,6 +35,10 @@ describe("S3 presign helpers", () => {
     expect(u.searchParams.get("X-Amz-Expires")).toBe("300");
     expect(u.searchParams.get("X-Amz-Fake")).toBe("signed");
     expect(r.expires_at).toBeTruthy();
+    expect(r.upload_headers).toEqual({
+      "Content-Type": "image/png",
+      "Cache-Control": PUBLIC_OBJECT_CACHE_CONTROL,
+    });
   });
 
   it("headObjectKey returns ok when object matches via clean HEAD URL", async () => {

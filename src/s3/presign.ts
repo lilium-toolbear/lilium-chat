@@ -11,23 +11,31 @@ export interface S3EnvLike {
 
 export const PRESIGN_TTL_SECONDS = 5 * 60; // 5 minutes
 
+/** Immutable public objects keyed by UUID; safe to cache at browser + CDN for 1 year. */
+export const PUBLIC_OBJECT_CACHE_CONTROL = "public, max-age=31536000, immutable";
+
 export async function presignPutUrl(
   env: S3EnvLike,
   key: string,
   contentType: string,
   _sizeBytes?: number,
-): Promise<{ upload_url: string; expires_at: string }> {
+): Promise<{ upload_url: string; expires_at: string; upload_headers: Record<string, string> }> {
   const client = getS3Client(env as Env);
   const url = s3ObjectUrl(env.S3_ENDPOINT, env.S3_BUCKET, key);
   url.searchParams.set("X-Amz-Expires", String(PRESIGN_TTL_SECONDS));
+  const uploadHeaders = {
+    "Content-Type": contentType,
+    "Cache-Control": PUBLIC_OBJECT_CACHE_CONTROL,
+  };
   const signedReq = await client.sign(url, {
     method: "PUT",
-    headers: { "Content-Type": contentType },
+    headers: uploadHeaders,
     aws: { signQuery: true, allHeaders: true },
   });
   return {
     upload_url: s3BrowserUploadUrl(signedReq.url, key),
     expires_at: new Date(Date.now() + PRESIGN_TTL_SECONDS * 1000).toISOString(),
+    upload_headers: uploadHeaders,
   };
 }
 

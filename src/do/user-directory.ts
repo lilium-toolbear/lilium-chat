@@ -1051,7 +1051,7 @@ export class UserDirectory extends DurableObject<Env> {
         attachment_id: attachmentId,
         upload_url: presign.upload_url,
         upload_method: "PUT",
-        upload_headers: { "Content-Type": contentType },
+        upload_headers: presign.upload_headers,
         expires_at: presign.expires_at,
       });
 

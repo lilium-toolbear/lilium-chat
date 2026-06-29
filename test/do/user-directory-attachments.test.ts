@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
 import { getNamedDo, fakeS3PublicPath } from "../helpers";
-import { setTestS3Client } from "../../src/s3/presign";
+import { PUBLIC_OBJECT_CACHE_CONTROL, setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
 
 function udStub(userId: string) {
@@ -46,7 +46,7 @@ describe("UserDirectory attachment presign + finalize", () => {
       attachment_id: string;
       upload_url: string;
       upload_method: string;
-      upload_headers: { "Content-Type": string };
+      upload_headers: { "Content-Type": string; "Cache-Control": string };
       expires_at: string;
     };
     expect(body.attachment_id).toBeTruthy();
@@ -54,6 +54,7 @@ describe("UserDirectory attachment presign + finalize", () => {
     expect(body.upload_url).toContain("s3.kuma.homes");
     expect(body.upload_url).toContain(`chat/attachments/${body.attachment_id}.png`);
     expect(body.upload_headers["Content-Type"]).toBe("image/png");
+    expect(body.upload_headers["Cache-Control"]).toBe(PUBLIC_OBJECT_CACHE_CONTROL);
     expect(body.expires_at).toBeTruthy();
   });
 
