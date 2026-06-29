@@ -4,7 +4,7 @@
 
 **Goal:** Replace the Phase 7 bot-installation product model with the Slash Command model from `docs/superpowers/specs/2026-06-28-lilium-chat-bot-spec-revised.md`: global slash namespace, per-channel allow/block bindings, bootstrap manifest, stateless `command.invoke`, and stateful command sessions.
 
-**Architecture:** `BotRegistry` (singleton) owns bot identity, tokens, global command catalog, and `bot_command_names` (global slash namespace). `ChatChannel` owns `channel_command_bindings` + `command_manifest_version` + stateful sessions; manifest is projected locally without BotRegistry on bootstrap hot path. Allow binding reads BotRegistry once at PATCH time and stores `command_snapshot_json`. `UserConnection` routes WS `command.invoke` to ChatChannel; stateless delivery reuses existing `bot_delivery_outbox` → `BotConnection` pipeline; stateful sessions add `session.*` Bot Gateway frames and `stateful_session_inputs` queue fed from `message.created`.
+**Architecture:** `BotRegistry` (singleton) owns bot identity, tokens, global command catalog, and `bot_command_names` (global slash namespace). `ChatChannel` owns `channel_command_bindings` + `command_manifest_version` + stateful sessions + `stateful_session_inputs`; manifest is projected locally without BotRegistry on bootstrap hot path. **`BotConnection` (by `bot_id`) owns `active_stateful_session_refs`** — a reconnect routing index `{session_id, channel_id, bot_id, status}` so reconnect can find which ChatChannel DOs to call without enumerating all channels. Allow binding reads BotRegistry once at PATCH time and stores `command_snapshot_json`. `UserConnection` routes WS `command.invoke` to ChatChannel; stateless delivery reuses existing `bot_delivery_outbox` → `BotConnection` pipeline; stateful sessions add `session.*` Bot Gateway frames and input replay via refs + per-channel input rows.
 
 **Tech Stack:** Cloudflare Workers + Durable Objects (SQLite), Hono, vitest-pool-workers, jose (browser JWT), existing scheduler/outbox/idempotency patterns.
 
@@ -68,7 +68,8 @@ Read before editing:
 - `src/do/bot-registry.ts` — catalog sync + bot CRUD + directory search + `/internal/command-get`
 - `src/do/chat-channel.ts` — remove bot-install; new binding/manifest/invoke/stateful handlers
 - `src/do/chat-channel/routes/bot-routes.ts` — route map updates
-- `src/do/bot-connection.ts` — session WS frames
+- `src/do/migrations/bot-connection.ts` — add `active_stateful_session_refs` to baseline
+- `src/do/bot-connection.ts` — session WS frames + session ref index + reconnect resume
 - `src/do/user-connection.ts` — wire `command.invoke`
 - `src/chat/channel-events.ts` — `buildCommandBindingUpdatedPayload` + manifest delta
 - `src/chat/command-options.ts` — `execution.mode` stateful config validation
@@ -381,7 +382,7 @@ Create `test/chat/slash-token.test.ts`:
 
 ```ts
 import { describe, expect, it } from "vitest";
-import { normalizeSlashToken, validateSlashToken } from "../../src/chat/slash-token";
+import { normalizeSlashToken, validateSlashToken, collectSlashTokens } from "../../src/chat/slash-token";
 
 describe("normalizeSlashToken", () => {
   it("strips leading slashes and lowercases", () => {
@@ -1090,18 +1091,62 @@ git commit -m "feat(ws): implement stateless command.invoke pipeline"
   it("closes session with STATEFUL_INPUT_BACKLOG_OVERFLOW when pending inputs exceed max", async () => {
     // pending rows > 1000 → session closed, mutex released
   });
+
+  it("offline stateful invoke returns BOT_OFFLINE and creates no session row", async () => {
+    // BotConnection disconnected → command_error BOT_OFFLINE, no stateful_command_sessions insert, mutex free
+  });
+
+  it("reconnect uses BotConnection session refs to resume inputs from ChatChannel", async () => {
+    // active ref {session_id, channel_id}; reconnect → BotConnection fetches ChatChannel /internal/stateful-session-inputs
+  });
 ```
+
+- [ ] **Step 1b: BotConnection session routing index (required for resume)**
+
+`BotConnection` is named by `bot_id` and **cannot** enumerate ChatChannel DOs. Reconnect resume therefore requires a **bot-scoped session ref index** owned by `BotConnection`.
+
+Add to `src/do/migrations/bot-connection.ts` baseline:
+
+```sql
+CREATE TABLE active_stateful_session_refs (
+  session_id   TEXT PRIMARY KEY,
+  channel_id   TEXT NOT NULL,
+  bot_id       TEXT NOT NULL,
+  status       TEXT NOT NULL,   -- starting | active | suspended | closing
+  updated_at   TEXT NOT NULL
+);
+CREATE INDEX idx_active_stateful_session_refs_bot_status
+  ON active_stateful_session_refs(bot_id, status, updated_at);
+```
+
+Lifecycle (ChatChannel orchestrates, BotConnection stores refs):
+
+1. **Register ref** — when ChatChannel creates `status=starting` session and enqueues `session.start`, it calls `BotConnection /internal/stateful-session-ref-upsert` with `{session_id, channel_id, bot_id, status:"starting"}` in the same logical flow (after ChatChannel transaction commits).
+2. **Update ref** — on `session.started` → `status=active`; on `suspended`/`closing` transitions update `status` + `updated_at`.
+3. **Delete ref** — on `closed`/`expired`/`failed` → remove row.
+
+BotConnection internal routes:
+
+- `POST /internal/stateful-session-ref-upsert`
+- `POST /internal/stateful-session-ref-delete`
+
+ChatChannel internal route for resume payload:
+
+- `GET /internal/stateful-session-inputs?session_id=` — returns session row + inputs where `seq > input_last_acked_seq` ordered by `seq` (active sessions only).
 
 - [ ] **Step 2: Implement stateful invoke branch**
 
-On stateful `command.invoke`:
+**Precheck (before any session row):** Query `BotConnection /internal/connection-state` for target `bot_id`. If offline → return `BOT_OFFLINE` immediately. **Do not** insert `stateful_command_sessions`, **do not** occupy channel mutex.
+
+On stateful `command.invoke` (bot online):
 
 1. Insert `stateful_command_sessions` with `status=starting` (partial unique index enforces mutex)
-2. Enqueue `session.start` to BotConnection (extend `bot_delivery_outbox.kind` with `session_start` or dedicated session outbox — pick one and document in code)
-3. Return committed ack including `session_id`
-4. **Do not** emit `stateful_session.started` yet
-5. When Bot sends `session.started`: ChatChannel marks session `active`, then emits **exactly one** `stateful_session.started` (payload `status=active`)
-6. If Bot does not ack `session.started` before start timeout: mark session `failed`/`closed`, release mutex, optionally notify bot
+2. Call `BotConnection /internal/stateful-session-ref-upsert` to register `{session_id, channel_id, bot_id, status:"starting"}`
+3. Enqueue `session.start` to BotConnection (extend `bot_delivery_outbox.kind` with `session_start` or dedicated session outbox — pick one and document in code)
+4. Return committed ack including `session_id`
+5. **Do not** emit `stateful_session.started` yet
+6. When Bot sends `session.started`: ChatChannel marks session `active`, updates ref `status=active`, emits **exactly one** `stateful_session.started` (payload `status=active`)
+7. If Bot does not ack `session.started` before start timeout: mark session `failed`/`closed`, **delete ref**, release mutex, optionally notify bot
 
 - [ ] **Step 3: Hook message.created (active sessions only)**
 
@@ -1124,10 +1169,12 @@ Implement `matchesListenRules(message, rules, session)` in `src/chat/stateful-se
 
 On Bot Gateway `hello` / connect:
 
-1. BotConnection calls ChatChannel `/internal/stateful-sessions-active?bot_id=`
-2. For each active session, ChatChannel returns inputs where `seq > input_last_acked_seq` ordered by `seq`
+1. BotConnection reads **local** `active_stateful_session_refs WHERE bot_id=? AND status IN ('starting','active','suspended','closing')`
+2. For each ref, `ChatChannel(channel_id).fetch('/internal/stateful-session-inputs?session_id=...')` — returns inputs where `seq > input_last_acked_seq` ordered by `seq`
 3. BotConnection sends `session.input` frames in order (at-least-once; Bot dedupes by `seq`)
-4. If count of `pending|sent` inputs > `max_pending_inputs` (default 1000): close session with `STATEFUL_INPUT_BACKLOG_OVERFLOW`, emit `stateful_session.closed`, release mutex
+4. If ChatChannel reports pending|sent input count > `max_pending_inputs` (default 1000): ChatChannel closes session with `STATEFUL_INPUT_BACKLOG_OVERFLOW`, emits `stateful_session.closed`, deletes ref, releases mutex
+
+**Do not** implement reconnect by calling a non-existent global ChatChannel enumerator or `ChatChannel /internal/stateful-sessions-active?bot_id=` (ChatChannel is per-channel; it cannot list all channels for a bot).
 
 - [ ] **Step 6: Session close paths**
 
@@ -1136,7 +1183,7 @@ On Bot Gateway `hello` / connect:
 - TTL alarm via scheduler due table on `stateful_command_sessions.expires_at`
 - Bot offline grace 120s during active session
 
-Each transitions to closed/expired/failed, emits `stateful_session.closed`, releases mutex, stops new input enqueue.
+Each transitions to closed/expired/failed, emits `stateful_session.closed`, **deletes BotConnection session ref**, releases mutex, stops new input enqueue.
 
 - [ ] **Step 7: HTTP routes GET/POST stateful-session**
 
@@ -1162,11 +1209,22 @@ git commit -m "feat(stateful): channel mutex sessions with durable input resume"
 - Modify: `docs/bot-developer-guide.md`
 - Modify: archive projection code if it references removed tables
 
-- [ ] **Step 1: Delete obsolete tests and grep for bot-installations**
+- [ ] **Step 1: Delete obsolete tests and grep cleanup scope**
 
-Run: `rg "bot-installations|bot_installations|channel_command_names|event_capabilities" src test docs`
+Run runtime/code grep (must be clean):
 
-Remove or rewrite every hit.
+```bash
+rg "bot-installations|bot_installations|channel_command_names|bot_event_capabilities" src test
+```
+
+For each hit in `src/` or `test/`: remove or rewrite (no leftover installation model code/tests).
+
+Docs handling (do **not** delete historical mentions):
+
+- `docs/bot-developer-guide.md` — rewrite for new model (required)
+- `docs/api-contract/2026-06-28-bot-slash-command-contract-addendum.md`, `docs/superpowers/specs/`, `docs/superpowers/plans/` — **allowed** to mention removed routes/tables as non-goals or migration notes; do not strip these references
+
+Archive projection (`src/archive/`): update or remove references to deleted ChatChannel tables if present.
 
 - [ ] **Step 2: Update bot developer guide**
 
