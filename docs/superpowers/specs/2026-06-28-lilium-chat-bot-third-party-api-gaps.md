@@ -329,7 +329,58 @@ History / replay **不**含 streaming 中途正文；离线 reconnect 仅 finali
 
 ---
 
-## 6. 公开文档维护规则
+## 7. Rich UI components v2 + `interaction_policy`
+
+**目标：** Bot 消息内嵌交互控件覆盖常见表单场景；平台提供有序事件流与结构性门禁；业务冲突由 Bot 裁决。
+
+**Contract：** `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` §3.8（v2.18）、§9.6、§11。
+
+### 7.1 组件 kind（normative）
+
+| kind | 用途 | submit 触发 |
+| --- | --- | --- |
+| `button` | 单次动作 | 点击 |
+| `select` | 下拉单选 | 选中 |
+| `radio` | 可见单选 | 选中 |
+| `checkbox` | 单项布尔 | toggle |
+| `checkbox_group` | 多项复选 | 点 `submit_label` |
+| `text_input` | 文本输入 | Enter（单行）或 `submit_label` |
+
+`value` 类型见 contract §9.6 表。
+
+### 7.2 `interaction_policy`（normative）
+
+| policy | 平台行为 |
+| --- | --- |
+| `multi`（默认） | 可见成员均可提交；Bot 处理并发业务冲突 |
+| `per_user_once` | 每用户每 component 仅一条成功 interaction |
+| `exclusive` | 全频道首个成功 submit 同事务 `disabled=true` |
+| `targeted` | 仅 `target_user_id` 可提交 |
+
+**职责分界：**
+
+- **平台：** policy 门禁 + per-channel 有序 timeline + `message_interaction` delivery 顺序与 committed interaction 一致
+- **Bot：** 余额/库存/游戏状态等业务冲突；`multi` 下可能收到多条 delivery
+
+### 7.3 实现缺口
+
+| 层 | 状态 |
+| --- | --- |
+| Contract §3.8 / §9.6 / §11 | **v2.18 已定稿**（本文同步） |
+| `src/contract/message.ts` | 类型已扩展；`validateComponents` **未实现** |
+| ChatChannel `interaction.submit` | **未实现**；`user-connection.ts` 仍 `unsupported command` |
+| `interactions` 表 | 需 `UNIQUE(message_id, component_id, actor_user_id)` 支撑 `per_user_once`（migration） |
+| `exclusive` 原子 disable | 在 submit 事务内 UPDATE `components_json`，不等 bot effect |
+| Bot effect 管线 | **未实现**（§2.1） |
+| `toolbear_ui` `BotComponents.vue` | 仅 `button`/`select`；需补 radio/checkbox/checkbox_group/text_input + policy UX |
+
+**Phase 7 plan 对齐：** `docs/superpowers/plans/2026-06-26-lilium-chat-phase-7.md` Task 7c-components / 7d 实现时以 contract v2.18 为准（非旧 `{button, select}` 范围）。
+
+**刻意不在 v1：** `modal` / `form` 容器 / 多字段一次性 submit object — 需另开 contract 修订。
+
+---
+
+## 8. 公开文档维护规则
 
 1. `lilium-openapi/docs/lilium-chat-bot-api-design.md` **不得**出现「尚未实现」「缺口」「能力矩阵」「预留 scope」等表述。
 2. 某能力在本表对应条目关闭且生产可用后，从本文删除或标为 **Done**，并同步扩充公开文档。

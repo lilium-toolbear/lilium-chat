@@ -96,28 +96,73 @@ export interface StickerMessageProjection {
   blurhash: string | null;
 }
 
-export interface ButtonMessageComponent {
+export interface MessageComponentBase {
   component_id: ChatId;
+  custom_id: string;
+  disabled: boolean;
+  interaction_policy?: "multi" | "per_user_once" | "exclusive" | "targeted";
+  target_user_id?: ChatId;
+}
+
+export interface ButtonMessageComponent extends MessageComponentBase {
   kind: "button";
   style: "primary" | "secondary" | "danger";
   label: string;
-  custom_id: string;
-  disabled: boolean;
 }
 
-export interface SelectMessageComponent {
-  component_id: ChatId;
+export interface SelectMessageComponent extends MessageComponentBase {
   kind: "select";
   label: string;
-  custom_id: string;
-  disabled: boolean;
   options: Array<{
     value: string;
     label: string;
   }>;
 }
 
-export type MessageComponent = ButtonMessageComponent | SelectMessageComponent;
+export interface RadioMessageComponent extends MessageComponentBase {
+  kind: "radio";
+  label: string;
+  options: Array<{
+    value: string;
+    label: string;
+  }>;
+}
+
+export interface CheckboxMessageComponent extends MessageComponentBase {
+  kind: "checkbox";
+  label: string;
+  default_checked: boolean;
+}
+
+export interface CheckboxGroupMessageComponent extends MessageComponentBase {
+  kind: "checkbox_group";
+  label: string;
+  submit_label: string;
+  options: Array<{
+    value: string;
+    label: string;
+  }>;
+  min_selected: number;
+  max_selected: number;
+}
+
+export interface TextInputMessageComponent extends MessageComponentBase {
+  kind: "text_input";
+  label: string;
+  placeholder?: string;
+  multiline: boolean;
+  min_length: number;
+  max_length: number;
+  submit_label: string;
+}
+
+export type MessageComponent =
+  | ButtonMessageComponent
+  | SelectMessageComponent
+  | RadioMessageComponent
+  | CheckboxMessageComponent
+  | CheckboxGroupMessageComponent
+  | TextInputMessageComponent;
 
 export interface CommandInvocationProjection {
   bot_command_id: ChatId;
