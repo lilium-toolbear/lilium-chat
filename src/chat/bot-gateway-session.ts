@@ -1,4 +1,5 @@
 import { BOT_GATEWAY_API_VERSION } from "../contract/bot-gateway";
+import type { WireChatMessage } from "../contract/message";
 import { isRecord } from "../contract/utils";
 
 export interface SessionStartFrame {
@@ -31,7 +32,13 @@ export interface SessionInputFrame {
   channel_id: string;
   seq: number;
   event: { event_id: string; type: string; occurred_at: string };
-  message: Record<string, unknown>;
+  message: WireChatMessage;
+}
+
+/** JSON persisted in `stateful_session_inputs.message_projection_json`. */
+export interface StatefulSessionInputStored {
+  event: { event_id: string; type: string; occurred_at: string };
+  message: WireChatMessage;
 }
 
 export interface ParsedSessionStarted {

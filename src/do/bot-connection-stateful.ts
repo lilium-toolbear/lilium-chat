@@ -1,6 +1,7 @@
 import type { Env } from "../env";
 import { RESUMABLE_REF_STATUSES } from "../chat/stateful-session";
 import { buildSessionInput, type SessionInputFrame } from "../chat/bot-gateway-session";
+import type { WireChatMessage } from "../contract/message";
 
 export interface SessionRefRow {
   session_id: string;
@@ -71,7 +72,7 @@ export async function resumeStatefulSessions(
         event_id: string;
         event_type: string;
         occurred_at: string;
-        message: Record<string, unknown>;
+        message: WireChatMessage;
       }>;
     };
     if (!body.session || body.session.status === "closed" || body.session.status === "failed" || body.session.status === "expired") {

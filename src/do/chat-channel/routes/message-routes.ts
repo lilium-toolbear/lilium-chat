@@ -441,7 +441,7 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
           senderUserId: userId,
           senderBotId: null,
           messageType: b.type,
-          messageProjection: ackMessage.message as Record<string, unknown>,
+          messageProjection: ackMessage.message,
         });
       }
       return Response.json(ackPayload.payload as MessageMutationAckPayload);

@@ -1,4 +1,4 @@
-import type { CommandStatefulConfig } from "../contract/bot-api";
+import type { CommandBindingSnapshotExecution, CommandStatefulConfig } from "../contract/bot-api";
 import { isRecord } from "../contract/utils";
 
 export interface ListenRules {
@@ -24,8 +24,10 @@ export function listenRulesFromStatefulConfig(config: CommandStatefulConfig): Li
   };
 }
 
-export function parseStatefulConfigFromSnapshot(execution: Record<string, unknown>): CommandStatefulConfig | null {
-  if (execution.mode !== "stateful" || !isRecord(execution.stateful)) return null;
+export function parseStatefulConfigFromSnapshot(
+  execution: CommandBindingSnapshotExecution | Record<string, unknown>,
+): CommandStatefulConfig | null {
+  if (!isRecord(execution) || execution.mode !== "stateful" || !isRecord(execution.stateful)) return null;
   const s = execution.stateful;
   if (s.mutex_scope !== "channel") return null;
   if (typeof s.default_ttl_seconds !== "number" || typeof s.max_ttl_seconds !== "number") return null;

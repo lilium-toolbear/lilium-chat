@@ -13,6 +13,7 @@ import type {
   StatefulSessionRefSummary,
 } from "../contract/persisted";
 import type { CommandManifestDelta } from "../contract/bot-api";
+import type { StatefulSessionSummary } from "../contract/events";
 import type { ManagementWirePayload } from "../contract/wire-frames";
 import { fallbackUserDisplayName, type UserSummary } from "../contract/primitives";
 
@@ -229,10 +230,16 @@ export function resolveActorWithMap(
   const sessionRef = (tail as { session?: StatefulSessionRefSummary }).session;
   if (sessionRef?.started_by_user_id) {
     const { started_by_user_id, ...sessionRest } = sessionRef;
-    (wire as { session?: Record<string, unknown> }).session = {
-      ...sessionRest,
+    const session: StatefulSessionSummary = {
+      session_id: sessionRest.session_id,
+      bot_command_id: sessionRest.bot_command_id,
+      command_name: sessionRest.command_name,
+      status: sessionRest.status,
+      started_at: sessionRest.started_at,
+      expires_at: sessionRest.expires_at,
       started_by: map.get(started_by_user_id) ?? fallbackUserSummary(started_by_user_id),
     };
+    (wire as { session?: StatefulSessionSummary }).session = session;
   }
 
   return wire;

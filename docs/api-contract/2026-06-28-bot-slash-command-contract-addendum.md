@@ -148,3 +148,7 @@ Reconnect resume: `BotConnection` reads bot-scoped `active_stateful_session_refs
 | `BOT_DISABLED` | 403 | no |
 
 `BOT_OFFLINE` remains `503` retryable (existing).
+
+## Stateful `command.invoke` success ack
+
+Stateful invoke success ack differs from stateless: it returns `channel_id`, `invocation_id`, and `session_id` only — **no `event_id`**. The `stateful_session.started` channel event (with its own `event_id`) is emitted only after the bot sends `session.started`.

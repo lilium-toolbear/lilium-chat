@@ -1,48 +1,3 @@
-export interface MessageEventSubscriptionFilters {
-  message_types: string[];
-  include_bot_messages: boolean;
-  include_own_messages: boolean;
-  only_when_mentioned: boolean;
-}
-
-export type CommandPolicyEntry = boolean | { enabled?: boolean; permission_override?: string };
-export type CommandPolicyMap = Record<string, CommandPolicyEntry>;
-
-export type EventSubscriptionPolicyEntry =
-  | boolean
-  | { enabled?: boolean; filters?: MessageEventSubscriptionFilters | Record<string, unknown> };
-export type EventSubscriptionPolicyMap = Record<string, EventSubscriptionPolicyEntry>;
-
-export interface CommandBindingProjection {
-  binding_id: string;
-  bot_command_id: string;
-  name: string;
-  aliases: string[];
-  status: string;
-  permission_override: string | null;
-  default_member_permission: string;
-  definition_hash: string;
-}
-
-export interface BotEventSubscriptionProjection {
-  subscription_id: string;
-  event_type: string;
-  status: string;
-  filters: MessageEventSubscriptionFilters;
-}
-
-export interface BotInstallResponse {
-  bot_id: string;
-  status: string;
-  bindings: CommandBindingProjection[];
-  subscriptions: BotEventSubscriptionProjection[];
-}
-
-export interface BotInstallUpdateResponse {
-  bot_id: string;
-  status: string;
-}
-
 export interface BotCommandCatalogEntry {
   bot_command_id: string;
   name: string;
@@ -81,6 +36,23 @@ export interface CommandStatefulConfig {
 export interface CommandExecutionSpec {
   mode: CommandExecutionMode;
   stateful?: CommandStatefulConfig;
+}
+
+/** Persisted on `channel_command_bindings.command_snapshot_json`. */
+export interface CommandBindingSnapshotExecution extends CommandExecutionSpec {
+  schema_version?: number;
+  definition_hash?: string;
+}
+
+export interface CommandBindingSnapshot {
+  bot_command_id: string;
+  name: string;
+  aliases: string[];
+  description: string;
+  bot: CommandManifestBotSummary;
+  options: unknown[];
+  default_member_permission: "member" | "admin" | "owner";
+  execution: CommandBindingSnapshotExecution;
 }
 
 export interface CommandManifestBotSummary {
@@ -149,4 +121,3 @@ export interface BotTokenCreated {
   created_at: string;
   expires_at: string | null;
 }
-

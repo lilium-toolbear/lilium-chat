@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeSlashToken, validateSlashToken, collectSlashTokens } from "../../src/chat/slash-token";
+import { normalizeSlashToken, validateSlashToken, collectSlashTokens, invokedNameMatchesSnapshot } from "../../src/chat/slash-token";
 
 describe("normalizeSlashToken", () => {
   it("strips leading slashes and lowercases", () => {
@@ -43,5 +43,17 @@ describe("collectSlashTokens", () => {
 
   it("rejects duplicate canonical/alias in same request", () => {
     expect(collectSlashTokens("ask", ["ASK"])).toEqual({ ok: false, error: "duplicate_in_request" });
+  });
+});
+
+describe("invokedNameMatchesSnapshot", () => {
+  it("accepts empty invoked_name", () => {
+    expect(invokedNameMatchesSnapshot("", "werewolf", ["ww"])).toBe(true);
+  });
+
+  it("matches canonical or alias tokens", () => {
+    expect(invokedNameMatchesSnapshot("/werewolf", "werewolf", ["ww"])).toBe(true);
+    expect(invokedNameMatchesSnapshot("WW", "werewolf", ["ww"])).toBe(true);
+    expect(invokedNameMatchesSnapshot("poker", "werewolf", ["ww"])).toBe(false);
   });
 });

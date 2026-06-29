@@ -3,6 +3,7 @@ import type {
   CommandManifestItem,
   CommandManifestResponse,
 } from "../contract/bot-api";
+import { parseCommandBindingSnapshot } from "./command-snapshot";
 
 type PermissionLevel = CommandManifestItem["effective_member_permission"];
 
@@ -10,17 +11,6 @@ export interface CommandBindingManifestRow {
   status: string;
   command_snapshot_json: string;
   permission_override: string | null;
-}
-
-interface CommandSnapshotPayload {
-  bot_command_id: string;
-  name: string;
-  aliases: string[];
-  description: string;
-  bot: CommandManifestItem["bot"];
-  options: unknown[];
-  default_member_permission: PermissionLevel;
-  execution: CommandManifestItem["execution"];
 }
 
 export interface ManifestDeltaApplyResult {
@@ -36,7 +26,7 @@ export function projectCommandManifest(
   const items: CommandManifestItem[] = [];
   for (const row of bindingRows) {
     if (row.status !== "allowed") continue;
-    const snapshot = parseSnapshot(row.command_snapshot_json);
+    const snapshot = parseCommandBindingSnapshot(row.command_snapshot_json);
     if (!snapshot) continue;
     const effectivePermission = normalizePermission(
       row.permission_override ?? snapshot.default_member_permission,
@@ -116,36 +106,6 @@ export function applyCommandManifestDelta(
       items: current.items.filter((item) => item.bot_command_id !== removeBotCommandId),
     },
   };
-}
-
-function parseSnapshot(raw: string): CommandSnapshotPayload | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (!isCommandSnapshotPayload(parsed)) return null;
-  return parsed;
-}
-
-function isCommandSnapshotPayload(value: unknown): value is CommandSnapshotPayload {
-  if (!value || typeof value !== "object") return false;
-  const obj = value as Partial<CommandSnapshotPayload>;
-  return (
-    typeof obj.bot_command_id === "string" &&
-    typeof obj.name === "string" &&
-    Array.isArray(obj.aliases) &&
-    typeof obj.description === "string" &&
-    !!obj.bot &&
-    typeof obj.bot.bot_id === "string" &&
-    typeof obj.bot.display_name === "string" &&
-    (typeof obj.bot.avatar_url === "string" || obj.bot.avatar_url === null) &&
-    Array.isArray(obj.options) &&
-    !!obj.execution &&
-    typeof obj.execution.mode === "string" &&
-    isPermissionLevel(obj.default_member_permission)
-  );
 }
 
 function normalizePermission(value: string | null, fallback: PermissionLevel): PermissionLevel {

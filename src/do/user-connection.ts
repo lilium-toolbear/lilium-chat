@@ -23,6 +23,13 @@ interface SendError {
   code: string;
   message: string;
   retryable: boolean;
+  active_session?: {
+    session_id: string;
+    command_name: string;
+    started_by: { user_id: string; display_name: string; avatar_url: string | null };
+    started_at: string;
+    expires_at: string;
+  };
 }
 
 interface DeliverResult {
@@ -117,12 +124,18 @@ function normalizeEventError(payload: unknown): SendError {
     && payload.error !== null
     && typeof payload.error === "object"
   ) {
-    const e = payload.error as { code?: unknown; message?: unknown; retryable?: unknown };
+    const e = payload.error as {
+      code?: unknown;
+      message?: unknown;
+      retryable?: unknown;
+      active_session?: SendError["active_session"];
+    };
     if (typeof e.code === "string" && typeof e.message === "string") {
       return {
         code: e.code,
         message: e.message,
         retryable: typeof e.retryable === "boolean" ? e.retryable : false,
+        ...(e.active_session ? { active_session: e.active_session } : {}),
       };
     }
   }

@@ -81,8 +81,13 @@ import {
   type StatefulSessionHost,
 } from "./chat-channel/stateful-session-handlers";
 import { buildManifestRemoveDelta, buildManifestUpsertDelta, projectCommandManifest } from "../chat/command-manifest";
+import { parseCommandBindingSnapshot } from "../chat/command-snapshot";
 import type { CommandOption } from "../chat/command-options";
-import { parseStatefulConfigFromSnapshot } from "../chat/stateful-session";
+import {
+  flushStatefulBotDeliveryRow,
+  STATEFUL_BOT_DELIVERY_KINDS,
+} from "../chat/stateful-bot-delivery";
+import { invokedNameMatchesSnapshot } from "../chat/slash-token";
 
 interface OutboxRow {
   outbox_id: string;
@@ -95,25 +100,18 @@ interface BotDeliveryOutboxRow {
   outbox_id: string;
   channel_id: string;
   bot_id: string;
-  kind: "command_invocation" | "message_interaction" | "message_event";
+  kind:
+    | "command_invocation"
+    | "message_interaction"
+    | "message_event"
+    | "stateful_session_start"
+    | "stateful_session_ref_upsert"
+    | "stateful_session_input"
+    | "stateful_session_close";
   invocation_id: string | null;
   interaction_id: string | null;
   event_id: string | null;
   request_json: string;
-}
-
-interface CommandSnapshotForInvoke {
-  bot_command_id: string;
-  name: string;
-  aliases: string[];
-  description: string;
-  bot: CommandManifestItem["bot"];
-  options: CommandOption[];
-  default_member_permission: "member" | "admin" | "owner";
-  execution: CommandManifestItem["execution"] & {
-    schema_version?: number;
-    definition_hash?: string;
-  };
 }
 
 export class ChatChannel extends DurableObject<Env> {
@@ -753,6 +751,30 @@ export class ChatChannel extends DurableObject<Env> {
 
   private async flushBotDeliveryOutboxRows(rows: BotDeliveryOutboxRow[], nowIso: string): Promise<void> {
     for (const row of rows) {
+      if (
+        row.kind === STATEFUL_BOT_DELIVERY_KINDS.sessionStart ||
+        row.kind === STATEFUL_BOT_DELIVERY_KINDS.sessionRefUpsert ||
+        row.kind === STATEFUL_BOT_DELIVERY_KINDS.sessionInput ||
+        row.kind === STATEFUL_BOT_DELIVERY_KINDS.sessionClose
+      ) {
+        try {
+          const result = await flushStatefulBotDeliveryRow(this.env, this.ctx.storage.sql, row, nowIso);
+          if (!result.ok) {
+            await this.bumpBotDeliveryRetry(row.outbox_id, nowIso, result.error);
+            continue;
+          }
+          this.ctx.storage.sql.exec(
+            "UPDATE bot_delivery_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
+            nowIso,
+            row.outbox_id,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.bumpBotDeliveryRetry(row.outbox_id, nowIso, msg);
+        }
+        continue;
+      }
+
       const targetId = row.kind === "command_invocation"
         ? row.invocation_id
         : row.kind === "message_interaction"
@@ -873,77 +895,8 @@ export class ChatChannel extends DurableObject<Env> {
     return this.memberRoleRank(callerRole) >= this.memberRoleRank(requiredRole);
   }
 
-  private parseInvokeSnapshot(raw: string): CommandSnapshotForInvoke | null {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return null;
-    }
-    if (!isRecord(parsed)) return null;
-    const options = Array.isArray(parsed.options) ? parsed.options : [];
-    const normalizedOptions: CommandOption[] = [];
-    for (const option of options) {
-      if (!isRecord(option) || typeof option.name !== "string" || typeof option.type !== "string") {
-        return null;
-      }
-      const normalized: CommandOption = { name: option.name, type: option.type as CommandOption["type"] };
-      if (typeof option.required === "boolean") normalized.required = option.required;
-      if (typeof option.description === "string") normalized.description = option.description;
-      if (typeof option.min === "number") normalized.min = option.min;
-      if (typeof option.max === "number") normalized.max = option.max;
-      normalizedOptions.push(normalized);
-    }
-    if (
-      typeof parsed.bot_command_id !== "string" ||
-      typeof parsed.name !== "string" ||
-      !Array.isArray(parsed.aliases) ||
-      typeof parsed.description !== "string" ||
-      !isRecord(parsed.bot) ||
-      typeof parsed.bot.bot_id !== "string" ||
-      typeof parsed.bot.display_name !== "string" ||
-      (parsed.bot.avatar_url !== null && typeof parsed.bot.avatar_url !== "string") ||
-      (parsed.default_member_permission !== "member"
-        && parsed.default_member_permission !== "admin"
-        && parsed.default_member_permission !== "owner") ||
-      !isRecord(parsed.execution) ||
-      (parsed.execution.mode !== "stateless" && parsed.execution.mode !== "stateful")
-    ) {
-      return null;
-    }
-
-    const statefulConfig = parsed.execution.mode === "stateful"
-      ? parseStatefulConfigFromSnapshot(parsed.execution as Record<string, unknown>)
-      : null;
-    if (parsed.execution.mode === "stateful" && !statefulConfig) {
-      return null;
-    }
-
-    const execution: CommandSnapshotForInvoke["execution"] = {
-      mode: parsed.execution.mode,
-      ...(statefulConfig ? { stateful: statefulConfig } : {}),
-      ...(typeof parsed.execution.schema_version === "number"
-        ? { schema_version: parsed.execution.schema_version }
-        : {}),
-      ...(typeof parsed.execution.definition_hash === "string"
-        ? { definition_hash: parsed.execution.definition_hash }
-        : {}),
-    };
-
-    return {
-      bot_command_id: parsed.bot_command_id,
-      name: parsed.name,
-      aliases: parsed.aliases.filter((alias): alias is string => typeof alias === "string"),
-      description: parsed.description,
-      bot: {
-        bot_id: parsed.bot.bot_id,
-        display_name: parsed.bot.display_name,
-        avatar_url: parsed.bot.avatar_url ?? null,
-      },
-      options: normalizedOptions,
-      default_member_permission: parsed.default_member_permission,
-      execution,
-    };
+  private parseInvokeSnapshot(raw: string) {
+    return parseCommandBindingSnapshot(raw);
   }
 
   private validateInvokeOptions(
@@ -1191,6 +1144,12 @@ export class ChatChannel extends DurableObject<Env> {
     if (!optionsValidation.ok) {
       return this.botInstallError("COMMAND_OPTIONS_INVALID", optionsValidation.message);
     }
+    if (!invokedNameMatchesSnapshot(invokedName, snapshot.name, snapshot.aliases)) {
+      return this.botInstallError(
+        "COMMAND_OPTIONS_INVALID",
+        "invoked_name does not match command canonical name or aliases",
+      );
+    }
 
     const connectionRes = await this.env.BOT_CONNECTION.getByName(binding.bot_id).fetch(
       new Request("https://x/internal/connection-state"),
@@ -1226,7 +1185,7 @@ export class ChatChannel extends DurableObject<Env> {
         operationId,
         invokedName,
         options,
-        snapshot: snapshot as import("./chat-channel/stateful-session-handlers").InvokeSnapshot,
+        snapshot,
         bindingBotId: binding.bot_id,
         bindingMaxTtl: binding.stateful_max_ttl_seconds,
         requestHash,

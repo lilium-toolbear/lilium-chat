@@ -115,7 +115,9 @@ async function invokeStatefulCommand(input: {
   channelId: string;
   botCommandId: string;
   commandId?: string;
-}): Promise<{ ws: WebSocket; ack: { payload?: { session_id?: string } } }> {
+  invokedName?: string;
+  options?: Record<string, { type: string; value: unknown }>;
+}): Promise<{ ws: WebSocket; ack: { payload?: { session_id?: string }; error?: { code?: string; active_session?: Record<string, unknown> } } }> {
   const { ws } = await upgradeUserConnection(input.userId);
   ws.send(JSON.stringify({
     frame_type: "command",
@@ -124,16 +126,16 @@ async function invokeStatefulCommand(input: {
     channel_id: input.channelId,
     payload: {
       bot_command_id: input.botCommandId,
-      invoked_name: "werewolf",
+      invoked_name: input.invokedName ?? "werewolf",
       command_manifest_version: 1,
-      options: {},
+      options: input.options ?? {},
     },
   }));
   const ack = JSON.parse(await nextAck(ws)) as {
     frame_type: string;
     status: string;
     payload?: { session_id?: string };
-    error?: { code?: string };
+    error?: { code?: string; active_session?: Record<string, unknown> };
   };
   return { ws, ack };
 }
@@ -196,9 +198,93 @@ describe("stateful command sessions", () => {
       frame_type: "command_error",
       error: { code: "STATEFUL_SESSION_BUSY" },
     });
+    expect(second.ack.error?.active_session).toMatchObject({
+      session_id: expect.any(String),
+      command_name: "werewolf",
+      started_by: expect.objectContaining({ user_id: userId }),
+      started_at: expect.any(String),
+      expires_at: expect.any(String),
+    });
 
     first.ws.close();
     second.ws.close();
+  });
+
+  it("returns IDEMPOTENCY_CONFLICT before busy when same command_id has different body", async () => {
+    const userId = `stateful-user-${crypto.randomUUID()}`;
+    const channelId = crypto.randomUUID();
+    const botId = `stateful-bot-${crypto.randomUUID()}`;
+    const botCommandId = `stateful-cmd-${crypto.randomUUID()}`;
+    const commandId = `idem-${crypto.randomUUID()}`;
+
+    await createOwnedTestChannel(
+      env as unknown as Pick<import("../../src/env").Env, "CHAT_CHANNEL">,
+      userId,
+      { channelId, title: "Stateful Idempotency" },
+    );
+    await seedStatefulBinding({ channelId, userId, botId, botCommandId, manifestVersion: 1 });
+    const botGateway = await openBotGateway(botId);
+    openedBotSockets.push(botGateway.ws);
+
+    const first = await invokeStatefulCommand({ userId, channelId, botCommandId, commandId });
+    expect(first.ack).toMatchObject({ frame_type: "command_ack", status: "committed" });
+
+    const { ws } = await upgradeUserConnection(userId);
+    ws.send(JSON.stringify({
+      frame_type: "command",
+      command: "command.invoke",
+      command_id: commandId,
+      channel_id: channelId,
+      payload: {
+        bot_command_id: botCommandId,
+        invoked_name: "",
+        command_manifest_version: 1,
+        options: {},
+      },
+    }));
+    const conflictAck = JSON.parse(await nextAck(ws)) as {
+      frame_type: string;
+      error?: { code?: string };
+    };
+    expect(conflictAck).toMatchObject({
+      frame_type: "command_error",
+      error: { code: "IDEMPOTENCY_CONFLICT" },
+    });
+    ws.close();
+    first.ws.close();
+  });
+
+  it("enqueues stateful session start in bot_delivery_outbox on invoke", async () => {
+    const userId = `stateful-user-${crypto.randomUUID()}`;
+    const channelId = crypto.randomUUID();
+    const botId = `stateful-bot-${crypto.randomUUID()}`;
+    const botCommandId = `stateful-cmd-${crypto.randomUUID()}`;
+
+    await createOwnedTestChannel(
+      env as unknown as Pick<import("../../src/env").Env, "CHAT_CHANNEL">,
+      userId,
+      { channelId, title: "Stateful Outbox" },
+    );
+    await seedStatefulBinding({ channelId, userId, botId, botCommandId, manifestVersion: 1 });
+    const botGateway = await openBotGateway(botId);
+    openedBotSockets.push(botGateway.ws);
+
+    const { ws, ack } = await invokeStatefulCommand({ userId, channelId, botCommandId });
+    const sessionId = ack.payload?.session_id as string;
+    expect(sessionId).toBeTruthy();
+
+    await withChannel(channelId, (ctx) => {
+      const row = ctx.storage.sql
+        .exec(
+          "SELECT kind, status, event_id FROM bot_delivery_outbox WHERE kind='stateful_session_start' AND event_id=?",
+          sessionId,
+        )
+        .toArray()[0] as { kind: string; status: string; event_id: string } | undefined;
+      expect(row?.kind).toBe("stateful_session_start");
+      expect(row?.event_id).toBe(sessionId);
+      expect(["pending", "delivered"]).toContain(row?.status);
+    });
+    ws.close();
   });
 
   it("does not emit stateful_session.started until bot sends session.started", async () => {
@@ -264,6 +350,34 @@ describe("stateful command sessions", () => {
       await new Promise((r) => setTimeout(r, 50));
     }
     throw new Error("stateful_session.started not emitted");
+  });
+
+  it("rejects invoked_name that does not match command snapshot", async () => {
+    const userId = `stateful-user-${crypto.randomUUID()}`;
+    const channelId = crypto.randomUUID();
+    const botId = `stateful-bot-${crypto.randomUUID()}`;
+    const botCommandId = `stateful-cmd-${crypto.randomUUID()}`;
+
+    await createOwnedTestChannel(
+      env as unknown as Pick<import("../../src/env").Env, "CHAT_CHANNEL">,
+      userId,
+      { channelId, title: "Invoked Name" },
+    );
+    await seedStatefulBinding({ channelId, userId, botId, botCommandId, manifestVersion: 1 });
+    const botGateway = await openBotGateway(botId);
+    openedBotSockets.push(botGateway.ws);
+
+    const { ws, ack } = await invokeStatefulCommand({
+      userId,
+      channelId,
+      botCommandId,
+      invokedName: "poker",
+    });
+    expect(ack).toMatchObject({
+      frame_type: "command_error",
+      error: { code: "COMMAND_OPTIONS_INVALID" },
+    });
+    ws.close();
   });
 
   it("reconnect uses BotConnection session refs to resume inputs from ChatChannel", async () => {

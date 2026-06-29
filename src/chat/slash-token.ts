@@ -59,3 +59,15 @@ export function collectSlashTokens(name: string, aliases: string[]): CollectSlas
     all: [canonicalResult.token, ...normalizedAliases],
   };
 }
+
+/** Returns true when invoked_name is empty (optional) or matches snapshot canonical/alias tokens. */
+export function invokedNameMatchesSnapshot(
+  invokedName: string,
+  canonicalName: string,
+  aliases: readonly string[],
+): boolean {
+  if (!invokedName.trim()) return true;
+  const normalized = normalizeSlashToken(invokedName);
+  if (normalized === normalizeSlashToken(canonicalName)) return true;
+  return aliases.some((alias) => normalizeSlashToken(alias) === normalized);
+}
