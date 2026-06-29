@@ -1,4 +1,8 @@
-import type { MessageLifecycleStatus, ReplySnapshot } from "../contract/message";
+import type {
+  MessageLifecycleStatus,
+  ReplySnapshot,
+  ReplySnapshotMediaPreview,
+} from "../contract/message";
 import type { MessageRow } from "../contract/persisted";
 import { fallbackUserDisplayName } from "../contract/primitives";
 import {
@@ -6,7 +10,11 @@ import {
   PLATFORM_BOT_ID,
 } from "./platform-commands";
 
-const PREVIEW_MAX_LEN = 120;
+export const REPLY_TEXT_PREVIEW_MAX_LEN = 120;
+
+type SqlExec = {
+  exec: (query: string, ...params: unknown[]) => { toArray: () => unknown[] };
+};
 
 export function replyTargetSenderDisplayName(target: MessageRow): string {
   if (target.sender_kind === "user" && target.sender_user_id) {
@@ -19,25 +27,96 @@ export function replyTargetSenderDisplayName(target: MessageRow): string {
   return "系统";
 }
 
-export function replyTextPreview(target: Pick<MessageRow, "type" | "text" | "status">): string {
+export function replyTextPreview(
+  target: Pick<MessageRow, "type" | "text" | "status">,
+  options?: { hasMediaPreview?: boolean },
+): string {
   if (target.status === "deleted" || target.status === "recalled") {
     return "";
   }
-  if (target.type === "image") return "[图片]";
-  if (target.type === "sticker") return "[表情]";
+  if (target.type === "image") {
+    return options?.hasMediaPreview ? "" : "[图片]";
+  }
+  if (target.type === "sticker") {
+    return options?.hasMediaPreview ? "" : "[表情]";
+  }
   const text = (target.text ?? "").trim();
   if (!text) return "";
-  if (text.length <= PREVIEW_MAX_LEN) return text;
-  return `${text.slice(0, PREVIEW_MAX_LEN)}…`;
+  if (text.length <= REPLY_TEXT_PREVIEW_MAX_LEN) return text;
+  return `${text.slice(0, REPLY_TEXT_PREVIEW_MAX_LEN)}…`;
 }
 
-export function buildReplySnapshot(target: MessageRow, senderDisplayName: string): ReplySnapshot {
-  return {
+export function loadReplySnapshotMedia(
+  sql: SqlExec,
+  messageId: string,
+  messageType: string,
+): ReplySnapshotMediaPreview | null {
+  if (messageType === "sticker") {
+    const row = sql
+      .exec(
+        "SELECT url, blurhash, width, height FROM message_stickers WHERE message_id=? LIMIT 1",
+        messageId,
+      )
+      .toArray()[0] as {
+      url: string;
+      blurhash: string | null;
+      width: number;
+      height: number;
+    } | undefined;
+    if (!row?.url) return null;
+    return {
+      kind: "sticker",
+      url: row.url,
+      blurhash: row.blurhash,
+      width: row.width,
+      height: row.height,
+    };
+  }
+  if (messageType === "image") {
+    const row = sql
+      .exec(
+        `SELECT a.url, a.blurhash, a.width, a.height
+         FROM message_attachments ma
+         INNER JOIN attachments a ON a.attachment_id = ma.attachment_id
+         WHERE ma.message_id=?
+         ORDER BY ma.attachment_id ASC
+         LIMIT 1`,
+        messageId,
+      )
+      .toArray()[0] as {
+      url: string;
+      blurhash: string | null;
+      width: number;
+      height: number;
+    } | undefined;
+    if (!row?.url) return null;
+    return {
+      kind: "image",
+      url: row.url,
+      blurhash: row.blurhash,
+      width: row.width,
+      height: row.height,
+    };
+  }
+  return null;
+}
+
+export function buildReplySnapshot(
+  target: MessageRow,
+  senderDisplayName: string,
+  options?: { mediaPreview?: ReplySnapshotMediaPreview | null },
+): ReplySnapshot {
+  const mediaPreview = options?.mediaPreview ?? null;
+  const snapshot: ReplySnapshot = {
     message_id: target.message_id,
     sender_display_name: senderDisplayName,
-    text_preview: replyTextPreview(target),
+    text_preview: replyTextPreview(target, { hasMediaPreview: Boolean(mediaPreview) }),
     status: target.status as MessageLifecycleStatus,
   };
+  if (mediaPreview) {
+    snapshot.media_preview = mediaPreview;
+  }
+  return snapshot;
 }
 
 export function parseStoredReplySnapshot(raw: string | null): ReplySnapshot | null {
@@ -59,6 +138,7 @@ export function sanitizeReplySnapshotForBrowser(
       ...snapshot,
       status: targetStatus,
       text_preview: "",
+      media_preview: null,
     };
   }
   if (targetStatus && targetStatus !== snapshot.status) {

@@ -36,6 +36,8 @@ export interface InsertUserCommandInvocationMessageInput {
   membershipVersion: number;
   senderSummary: LiveUserSummary;
   messageId?: string;
+  reply_to?: string | null;
+  reply_snapshot_json?: string | null;
 }
 
 export interface InsertUserCommandInvocationMessageResult {
@@ -59,6 +61,8 @@ export function insertUserCommandInvocationMessage(
   const messageId = input.messageId ?? uuidv7(input.nowMs);
   const eventId = host.nextEventId(input.nowMs);
   const dedupePrincipalKey = `user:${input.userId}`;
+  const replyTo = input.reply_to ?? null;
+  const replySnapshotJson = input.reply_snapshot_json ?? null;
 
   const messageRow: MessageRow = {
     message_id: messageId,
@@ -71,8 +75,8 @@ export function insertUserCommandInvocationMessage(
     format: "plain",
     status: "normal",
     text: displayText,
-    reply_to: null,
-    reply_snapshot_json: null,
+    reply_to: replyTo,
+    reply_snapshot_json: replySnapshotJson,
     stream_state: "none",
     created_at: input.now,
     updated_at: input.now,
@@ -86,20 +90,28 @@ export function insertUserCommandInvocationMessage(
   host.ctx.storage.sql.exec(
     `INSERT INTO messages (
        message_id, command_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
-       sender_bot_id, type, format, status, text, reply_to, invocation_json, stream_state, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, 'user', ?, NULL, 'text', 'plain', 'normal', ?, NULL, ?, 'none', ?, ?)`,
+       sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, invocation_json, stream_state, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, 'user', ?, NULL, 'text', 'plain', 'normal', ?, ?, ?, ?, 'none', ?, ?)`,
     messageId,
     input.operationId,
     dedupePrincipalKey,
     input.channelId,
     input.userId,
     displayText,
+    replyTo,
+    replySnapshotJson,
     invocationJson,
     input.now,
     input.now,
   );
 
-  const liveMessage = projectMessageForBrowser(messageRow, { senderSummary: input.senderSummary });
+  const replyTargetStatus = replySnapshotJson
+    ? (JSON.parse(replySnapshotJson) as { status?: string }).status
+    : undefined;
+  const liveMessage = projectMessageForBrowser(messageRow, {
+    senderSummary: input.senderSummary,
+    replyTargetStatus,
+  });
   const liveEventFrame = buildEventFrame({
     event_id: eventId,
     type: "message.created",

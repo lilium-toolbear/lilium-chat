@@ -318,7 +318,13 @@ describe("command.invoke", () => {
     }));
     const ack = JSON.parse(await nextAck(ws)) as {
       status: string;
-      payload?: { invocation_id?: string };
+      payload?: {
+        invocation_id?: string;
+        invocation_message?: {
+          reply_to?: string | null;
+          reply_snapshot?: { message_id?: string; text_preview?: string } | null;
+        };
+      };
     };
     expect(ack.status).toBe("committed");
 
@@ -335,7 +341,25 @@ describe("command.invoke", () => {
       expect(request.reply_to?.message_id).toBe(targetMessageId);
       expect(request.reply_to?.text).toBe("hello");
       expect(request.reply_to?.sender?.kind).toBe("user");
+
+      const invocationMessage = ctx.storage.sql
+        .exec(
+          "SELECT reply_to, reply_snapshot_json FROM messages WHERE channel_id=? AND invocation_json IS NOT NULL",
+          channelId,
+        )
+        .toArray()[0] as { reply_to: string; reply_snapshot_json: string } | undefined;
+      expect(invocationMessage?.reply_to).toBe(targetMessageId);
+      const snapshot = JSON.parse(invocationMessage?.reply_snapshot_json ?? "{}") as {
+        message_id?: string;
+        text_preview?: string;
+      };
+      expect(snapshot.message_id).toBe(targetMessageId);
+      expect(snapshot.text_preview).toBe("hello");
     });
+
+    expect(ack.payload?.invocation_message?.reply_to).toBe(targetMessageId);
+    expect(ack.payload?.invocation_message?.reply_snapshot?.message_id).toBe(targetMessageId);
+    expect(ack.payload?.invocation_message?.reply_snapshot?.text_preview).toBe("hello");
 
     ws.close();
   });

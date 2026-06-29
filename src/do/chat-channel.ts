@@ -105,7 +105,7 @@ import {
   STATEFUL_BOT_DELIVERY_KINDS,
 } from "../chat/stateful-bot-delivery";
 import { invokedNameMatchesSnapshot } from "../chat/slash-token";
-import { buildReplySnapshot } from "../chat/reply-snapshot";
+import { buildReplySnapshot, loadReplySnapshotMedia, replyTargetSenderDisplayName } from "../chat/reply-snapshot";
 import { projectCommandInvokeReplyContext } from "../chat/command-invoke-reply";
 import { insertUserCommandInvocationMessage, type InvocationMessageHost } from "./chat-channel/invocation-message";
 
@@ -339,10 +339,10 @@ export class ChatChannel extends DurableObject<Env> {
     channelId: string,
     replyToMessageId: string | null,
   ): Promise<
-    | { ok: true; reply_to: CommandInvocationReplyContext | null }
+    | { ok: true; reply_to: CommandInvocationReplyContext | null; reply_snapshot_json: string | null }
     | { ok: false; code: string; message: string }
   > {
-    if (!replyToMessageId) return { ok: true, reply_to: null };
+    if (!replyToMessageId) return { ok: true, reply_to: null, reply_snapshot_json: null };
 
     const targetRow = this.ctx.storage.sql
       .exec(
@@ -365,9 +365,19 @@ export class ChatChannel extends DurableObject<Env> {
       senderSummary = actorMap.get(targetRow.sender_user_id) ?? null;
     }
 
+    const targetSenderDisplayName = senderSummary?.display_name ?? replyTargetSenderDisplayName(targetRow);
+    const mediaPreview = loadReplySnapshotMedia(
+      this.ctx.storage.sql,
+      targetRow.message_id,
+      targetRow.type,
+    );
+
     return {
       ok: true,
       reply_to: projectCommandInvokeReplyContext(targetRow, senderSummary),
+      reply_snapshot_json: JSON.stringify(
+        buildReplySnapshot(targetRow, targetSenderDisplayName, { mediaPreview }),
+      ),
     };
   }
 
@@ -1298,6 +1308,7 @@ export class ChatChannel extends DurableObject<Env> {
       return this.botInstallError(replyResolution.code, replyResolution.message);
     }
     const invokeReplyTo = replyResolution.reply_to;
+    const invokeReplySnapshotJson = replyResolution.reply_snapshot_json;
 
     if (snapshot.execution.mode === "stateful") {
       return handleStatefulCommandInvoke(this as unknown as StatefulSessionHost, {
@@ -1410,6 +1421,8 @@ export class ChatChannel extends DurableObject<Env> {
         membershipVersion: currentMeta.membership_version,
         senderSummary: actor,
         messageId: uuidv7(nowMs),
+        reply_to: replyToMessageId,
+        reply_snapshot_json: invokeReplySnapshotJson,
       });
 
       const invocationId = uuidv7(nowMs + 1);

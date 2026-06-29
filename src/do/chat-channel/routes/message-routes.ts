@@ -6,7 +6,7 @@ import {
   type UserSummary as LiveUserSummary,
 } from "../../../chat/event-broadcast";
 import { projectMessageForBrowser, type MessageStickerSnapshot } from "../../../chat/message-projection";
-import { buildReplySnapshot, replyTargetSenderDisplayName } from "../../../chat/reply-snapshot";
+import { buildReplySnapshot, loadReplySnapshotMedia, replyTargetSenderDisplayName } from "../../../chat/reply-snapshot";
 import { projectAttachmentForBrowser, type AttachmentRow as ChatAttachmentRow } from "../../../chat/attachment-projection";
 import type { MessageRow } from "../../../contract/persisted";
 import type { MessageImageAttachment } from "../../../contract/message";
@@ -104,7 +104,10 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
           // fallback handled by replyTargetSenderDisplayName
         }
       }
-      replySnapshotJson = JSON.stringify(buildReplySnapshot(targetRow, targetSenderDisplayName));
+      const mediaPreview = loadReplySnapshotMedia(host.ctx.storage.sql, targetRow.message_id, targetRow.type);
+      replySnapshotJson = JSON.stringify(
+        buildReplySnapshot(targetRow, targetSenderDisplayName, { mediaPreview }),
+      );
     }
 
     const requestHash = JSON.stringify({
