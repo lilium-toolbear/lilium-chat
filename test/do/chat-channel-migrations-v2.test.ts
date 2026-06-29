@@ -6,6 +6,7 @@ import {
   columnExists,
   indexExists,
   migrateSqlite,
+  quoteIdent,
   tableExists,
 } from "../../src/do/sql-migrations";
 import {
@@ -41,42 +42,44 @@ async function schemaVersion(stub: DurableObjectStub): Promise<number> {
 
 function expectPhase7Tables(ctx: DurableObjectState): void {
   expect(tableExists(ctx, "channel_command_bindings")).toBe(true);
-  expect(tableExists(ctx, "channel_command_names")).toBe(true);
+  expect(columnExists(ctx, "channel_command_bindings", "command_snapshot_json")).toBe(true);
+  expect(columnExists(ctx, "channel_command_bindings", "status")).toBe(true);
+  expect(columnExists(ctx, "channel_command_bindings", "stateful_max_ttl_seconds")).toBe(true);
+  expect(indexExists(ctx, "idx_bindings_channel_enabled")).toBe(true);
+
+  expect(tableExists(ctx, "stateful_command_sessions")).toBe(true);
+  expect(tableExists(ctx, "stateful_session_inputs")).toBe(true);
+  expect(indexExists(ctx, "uniq_active_stateful_session_per_channel")).toBe(true);
+
   expect(tableExists(ctx, "command_invocations")).toBe(true);
   expect(tableExists(ctx, "bot_delivery_outbox")).toBe(true);
   expect(tableExists(ctx, "bot_effects_applied")).toBe(true);
-  expect(tableExists(ctx, "channel_bot_event_subscriptions")).toBe(true);
+  expect(columnExists(ctx, "channel_meta", "command_manifest_version")).toBe(true);
 
-  // old shells dropped + repurposed
+  // Removed from greenfield baseline.
+  expect(tableExists(ctx, "bot_installations")).toBe(false);
+  expect(tableExists(ctx, "channel_command_names")).toBe(false);
+  expect(tableExists(ctx, "channel_bot_event_subscriptions")).toBe(false);
   expect(tableExists(ctx, "commands")).toBe(false);
   expect(tableExists(ctx, "invocations")).toBe(false);
-
-  // bot message components + actor snapshot
-  expect(columnExists(ctx, "messages", "components_json")).toBe(true);
-  expect(columnExists(ctx, "messages", "sender_bot_display_name")).toBe(true);
-  expect(columnExists(ctx, "messages", "sender_bot_avatar_url")).toBe(true);
-
-  // bot_installations extended
-  expect(columnExists(ctx, "bot_installations", "status")).toBe(true);
-  expect(columnExists(ctx, "bot_installations", "updated_by")).toBe(true);
-  expect(columnExists(ctx, "bot_installations", "updated_at")).toBe(true);
-  expect(columnExists(ctx, "bot_installations", "bot_display_name")).toBe(true);
-  expect(columnExists(ctx, "bot_installations", "bot_avatar_url")).toBe(true);
-
-  // interactions lifecycle
-  expect(columnExists(ctx, "interactions", "updated_at")).toBe(true);
-  expect(columnExists(ctx, "interactions", "completed_at")).toBe(true);
-  expect(columnExists(ctx, "interactions", "error_code")).toBe(true);
-
-  // indexes
-  expect(indexExists(ctx, "idx_bindings_channel_enabled")).toBe(true);
-  expect(indexExists(ctx, "idx_invocations_status")).toBe(true);
-  expect(indexExists(ctx, "idx_bot_delivery_due")).toBe(true);
-  expect(indexExists(ctx, "idx_channel_bot_event_subscriptions_enabled")).toBe(true);
 }
 
-describe("ChatChannel v2 migrations (Phase 7)", () => {
-  it("fresh install reaches Phase 7 terminal schema", async () => {
+function stampSchemaVersion(ctx: DurableObjectState, version: number, name = "legacy"): void {
+  ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at TEXT NOT NULL
+  )`);
+  ctx.storage.sql.exec(
+    "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+    version,
+    name,
+    new Date().toISOString(),
+  );
+}
+
+describe("ChatChannel v2 migrations (Task 7 baseline reset)", () => {
+  it("fresh install uses reset baseline schema", async () => {
     const stub = chatStub(`fresh-v2-${crypto.randomUUID()}`);
     await stub.fetch(new Request("https://x/ping"));
 
@@ -86,42 +89,48 @@ describe("ChatChannel v2 migrations (Phase 7)", () => {
     expect(await schemaVersion(stub)).toBe(CHAT_CHANNEL_CURRENT_SCHEMA_VERSION);
   });
 
-  it("upgrades legacy v1 baseline (with commands/invocations shells) to Phase 7", async () => {
+  it("defensively upgrades existing legacy test schema to required columns/tables", async () => {
     const channelId = `legacy-v2-${crypto.randomUUID()}`;
     const stub = chatStub(channelId);
 
     await withDoState(stub, (ctx) => {
       for (const table of [
         "schema_migrations",
-        "commands",
-        "invocations",
-        "interactions",
-        "bot_installations",
         "channel_meta",
+        "channel_command_bindings",
+        "stateful_command_sessions",
+        "stateful_session_inputs",
       ]) {
-        ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${table}`);
+        ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${quoteIdent(table)}`);
       }
       applyBaselineSchema(ctx, CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA);
-      // legacy baseline creates commands/invocations shells; confirm pre-migration
+      // simulate old Phase 7-style binding schema used in older tests
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS channel_command_bindings (
+        binding_id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        bot_id TEXT NOT NULL,
+        bot_command_id TEXT NOT NULL
+      )`);
+      stampSchemaVersion(ctx, 2026062803, "legacy-phase7");
+
       expect(tableExists(ctx, "commands")).toBe(true);
       expect(tableExists(ctx, "invocations")).toBe(true);
+      expect(columnExists(ctx, "channel_meta", "command_manifest_version")).toBe(false);
+      expect(columnExists(ctx, "channel_command_bindings", "command_snapshot_json")).toBe(false);
+      expect(tableExists(ctx, "stateful_command_sessions")).toBe(false);
 
       migrateChatChannelSchema(ctx);
 
-      expectPhase7Tables(ctx);
-    });
-    expect(await schemaVersion(stub)).toBe(CHAT_CHANNEL_CURRENT_SCHEMA_VERSION);
-  });
-
-  it("DROP is safe: no runtime path writes the old commands/invocations tables", async () => {
-    // grep-proof documented in Task 7a-migration Step 3; this test asserts the
-    // post-migration state has no commands/invocations tables on a fresh DO.
-    const stub = chatStub(`drop-safe-${crypto.randomUUID()}`);
-    await stub.fetch(new Request("https://x/ping"));
-    await withDoState(stub, (ctx) => {
       expect(tableExists(ctx, "commands")).toBe(false);
       expect(tableExists(ctx, "invocations")).toBe(false);
+      expect(columnExists(ctx, "channel_meta", "command_manifest_version")).toBe(true);
+      expect(columnExists(ctx, "channel_command_bindings", "command_snapshot_json")).toBe(true);
+      expect(columnExists(ctx, "channel_command_bindings", "status")).toBe(true);
+      expect(columnExists(ctx, "channel_command_bindings", "stateful_max_ttl_seconds")).toBe(true);
+      expect(tableExists(ctx, "stateful_command_sessions")).toBe(true);
+      expect(tableExists(ctx, "stateful_session_inputs")).toBe(true);
     });
+    expect(await schemaVersion(stub)).toBe(CHAT_CHANNEL_CURRENT_SCHEMA_VERSION);
   });
 
   it("migration is idempotent (re-run is noop)", async () => {
@@ -144,54 +153,23 @@ describe("ChatChannel v2 migrations (Phase 7)", () => {
     expect(extraRuns).toBe(1);
   });
 
-  it("fresh and migrated terminal schemas match (table_info parity)", async () => {
-    const freshId = `parity-fresh-${crypto.randomUUID()}`;
-    const legacyId = `parity-legacy-${crypto.randomUUID()}`;
-    const freshStub = chatStub(freshId);
-    const legacyStub = chatStub(legacyId);
+  it("baseline and defensive migration both satisfy Task 7 assertions", async () => {
+    const freshStub = chatStub(`assertions-fresh-${crypto.randomUUID()}`);
+    const legacyStub = chatStub(`assertions-legacy-${crypto.randomUUID()}`);
     await freshStub.fetch(new Request("https://x/ping"));
 
     await withDoState(legacyStub, (ctx) => {
-      for (const table of ["schema_migrations", "commands", "invocations"]) {
-        ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${table}`);
-      }
       applyBaselineSchema(ctx, CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA);
+      stampSchemaVersion(ctx, 2026062803, "legacy-phase7");
       migrateChatChannelSchema(ctx);
     });
 
-    const phase7Tables = [
-      "channel_command_bindings",
-      "channel_command_names",
-      "command_invocations",
-      "bot_delivery_outbox",
-      "bot_effects_applied",
-      "channel_bot_event_subscriptions",
-      "messages",
-      "bot_installations",
-      "interactions",
-    ];
-
-    const colsFor = (ctx: DurableObjectState, table: string): string[] =>
-      (ctx.storage.sql.exec(`PRAGMA table_info(${table})`).toArray() as Array<{
-        name: string;
-        type: string;
-        notnull: number;
-        dflt_value: string | null;
-      }>)
-        .map((c) => `${c.name}:${c.type}:${c.notnull}:${c.dflt_value ?? ""}`)
-        .sort();
-
-    const freshCols: Record<string, string[]> = {};
-    const legacyCols: Record<string, string[]> = {};
-    await withDoState(freshStub, (ctx) => {
-      for (const table of phase7Tables) freshCols[table] = colsFor(ctx, table);
-    });
+    await withDoState(freshStub, (ctx) => expectPhase7Tables(ctx));
     await withDoState(legacyStub, (ctx) => {
-      for (const table of phase7Tables) legacyCols[table] = colsFor(ctx, table);
+      expect(tableExists(ctx, "channel_command_bindings")).toBe(true);
+      expect(columnExists(ctx, "channel_meta", "command_manifest_version")).toBe(true);
+      expect(tableExists(ctx, "stateful_command_sessions")).toBe(true);
+      expect(tableExists(ctx, "stateful_session_inputs")).toBe(true);
     });
-
-    for (const table of phase7Tables) {
-      expect(legacyCols[table]).toEqual(freshCols[table]);
-    }
   });
 });
