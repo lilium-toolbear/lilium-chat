@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { getNamedDo } from "../helpers";
 
 describe("ChannelFanout leases", () => {
-  it("rejects legacy register-online with 410 and uses fanout_leases for enqueue", async () => {
+  it("rejects legacy register-online and removes stale fanout leases on enqueue", async () => {
     const channelId = "ch-leases-1";
     const userId = "u-leases-1";
     const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
@@ -45,9 +45,9 @@ describe("ChannelFanout leases", () => {
 
     const dump = (await (await fanout.fetch(new Request("https://x/dump", {
       headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
-    }))).json()) as { queue: Array<{ target_session_id: string }> };
-    expect(dump.queue.length).toBe(1);
-    expect(dump.queue[0]?.target_session_id).toBe("s-1");
+    }))).json()) as { leases: Array<{ lease_id: string }>; queue: Array<{ target_session_id: string }> };
+    expect(dump.leases.some((l) => l.lease_id === "lease-1")).toBe(false);
+    expect(dump.queue).toEqual([]);
   });
 
   it("deletes stale fanout lease when deliver returns membership_not_active", async () => {
@@ -121,7 +121,7 @@ describe("ChannelFanout leases", () => {
       }))).json()) as { leases: Array<{ lease_id: string }>; queue: Array<{ status: string }> };
       if (!dump.leases.some((l) => l.lease_id === "lease-stale")) {
         leaseGone = true;
-        expect(dump.queue[0]?.status).toBe("delivered");
+        expect(dump.queue).toEqual([]);
         break;
       }
       await new Promise((r) => setTimeout(r, 50));

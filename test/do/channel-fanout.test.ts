@@ -45,7 +45,7 @@ async function seedDeliverableLease(
 }
 
 describe("ChannelFanout DO", () => {
-  it("registers a lease, enqueues an event, and delivers to UserConnection on alarm", async () => {
+  it("delivers to live leases without writing fanout_queue rows", async () => {
     const channelId = "ch-fanout-1";
     const userId = "u-fanout-1";
     const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
@@ -88,31 +88,11 @@ describe("ChannelFanout DO", () => {
     expect(enq.status).toBe(200);
 
     const dump1 = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as {
+      events: Array<{ event_id: string }>;
       queue: Array<{ target_session_id: string; status: string }>;
     };
-    expect(dump1.queue.length).toBe(1);
-    expect(dump1.queue.at(0)?.status).toBe("pending");
-
-    const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
-    await runDurableObjectAlarm(fanout);
-
-    let delivered = false;
-    for (let i = 0; i < 60; i++) {
-      const dump2 = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as {
-        queue: Array<{ target_session_id: string; status: string; attempts?: number; last_error?: string | null }>;
-      };
-      const row = dump2.queue.at(0);
-      if (row?.status === "delivered") {
-        delivered = true;
-        break;
-      }
-      if (row?.status === "dead_letter") {
-        throw new Error(`fanout dead_letter: attempts=${row.attempts} last_error=${JSON.stringify(row.last_error)}`);
-      }
-      await runDurableObjectAlarm(fanout);
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    expect(delivered).toBe(true);
+    expect(dump1.events).toEqual([]);
+    expect(dump1.queue).toEqual([]);
 
     const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1" } }))).json()) as { event_json: string | null };
     expect(probe.event_json).toContain('"event_id":"e-1"');
@@ -155,15 +135,26 @@ describe("ChannelFanout DO", () => {
     ).toEqual([]);
   });
 
-  it("fanout-enqueue is idempotent on event_id (second enqueue does not double the queue)", async () => {
+  it("queues retryable delivery failures idempotently", async () => {
     const channelId = "ch-fanout-3";
+    const userId = "u-fanout-3";
     const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
 
-    await fanout.fetch(new Request("https://x/lease-upsert", {
-      method: "POST",
-      headers: { "X-Channel-Id": channelId, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: "u-3", session_id: "s-3", lease_id: "lease-3", membership_version: 0 }),
+    const uc = getNamedDo(env.USER_CONNECTION as unknown as Parameters<typeof getNamedDo>[0], userId);
+    const wsRes = await uc.fetch(new Request("https://x/ws", {
+      headers: { Upgrade: "websocket", "X-Verified-User-Id": userId },
     }));
+    const ws = wsRes.webSocket as WebSocket;
+    ws.accept();
+
+    let sessionId = "";
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(uc, async (_instance: unknown, state: { getWebSockets: () => WebSocket[] }) => {
+      const socket = state.getWebSockets()[0];
+      const att = socket?.deserializeAttachment() as { session_id?: string } | null;
+      sessionId = att?.session_id ?? "";
+    });
+    await seedDeliverableLease(uc, fanout, channelId, userId, sessionId, "lease-3", 0);
 
     for (let i = 0; i < 2; i++) {
       await fanout.fetch(new Request("https://x/fanout-enqueue", {
@@ -177,5 +168,7 @@ describe("ChannelFanout DO", () => {
       queue: Array<{ event_id: string }>;
     };
     expect(dump.queue.filter((q) => q.event_id === "e-3").length).toBe(1);
+
+    ws.close();
   });
 });

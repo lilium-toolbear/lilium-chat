@@ -33,6 +33,12 @@ interface DeliverResponse {
   reason?: string;
 }
 
+interface FanoutLeaseTarget {
+  user_id: string;
+  session_id: string;
+  lease_id: string;
+}
+
 export class ChannelFanout extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -169,37 +175,27 @@ export class ChannelFanout extends DurableObject<Env> {
       const ts = nowIso();
       this.pruneExpiredLeases(channelId, ts);
 
-      this.ctx.storage.sql.exec(
-        "INSERT OR IGNORE INTO fanout_events (channel_id, event_id, event_json, membership_version_at_event, created_at) VALUES (?, ?, ?, ?, ?)",
-        channelId,
-        body.event_id,
-        body.event_json,
-        body.membership_version_at_event ?? 0,
-        ts,
-      );
-
       const sessions = this.ctx.storage.sql
         .exec(
           "SELECT user_id, session_id, lease_id FROM fanout_leases WHERE channel_id=? AND expires_at > ?",
           channelId,
           ts,
         )
-        .toArray() as Array<{ user_id: string; session_id: string; lease_id: string }>;
+        .toArray() as unknown as FanoutLeaseTarget[];
+      let queued = false;
       for (const s of sessions) {
-        this.ctx.storage.sql.exec(
-          "INSERT OR IGNORE INTO fanout_queue (queue_id, channel_id, event_id, target_session_id, target_user_id, target_lease_id, status, next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-          `${body.event_id}:${s.session_id}`,
-          channelId,
-          body.event_id,
-          s.session_id,
-          s.user_id,
-          s.lease_id,
-          ts,
-          ts,
-        );
+        let result: { delivered: boolean; stale: boolean };
+        try {
+          result = await this.deliverToLease(channelId, s, body.event_id, body.event_json, body.membership_version_at_event ?? 0);
+        } catch {
+          result = { delivered: false, stale: false };
+        }
+        if (result.delivered || result.stale) continue;
+        this.enqueueFanoutRetry(channelId, s, body.event_id, body.event_json, body.membership_version_at_event ?? 0, ts);
+        queued = true;
       }
 
-      await scheduleFanoutAlarm(this.ctx, ts);
+      if (queued) await scheduleFanoutAlarm(this.ctx, ts);
       return Response.json({ ok: true, delivered_to: sessions.length });
     }
 
@@ -356,5 +352,78 @@ export class ChannelFanout extends DurableObject<Env> {
         reason: "expired",
       });
     }
+  }
+
+  private async deliverToLease(
+    channelId: string,
+    targetLease: FanoutLeaseTarget,
+    eventId: string,
+    eventJson: string,
+    membershipVersionAtEvent: number,
+  ): Promise<{ delivered: boolean; stale: boolean }> {
+    const target = this.env.USER_CONNECTION.getByName(targetLease.user_id);
+    const res = await target.fetch(new Request("https://x/deliver", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Channel-Id": channelId,
+      },
+      body: JSON.stringify({
+        lease_id: targetLease.lease_id,
+        channel_id: channelId,
+        session_id: targetLease.session_id,
+        event_id: eventId,
+        event_json: eventJson,
+        membership_version_at_event: membershipVersionAtEvent,
+      }),
+    }));
+    if (!res.ok) return { delivered: false, stale: false };
+
+    const body = (await res.json()) as DeliverResponse;
+    if (body.delivered) return { delivered: true, stale: false };
+
+    const reason = body.reason ?? "unknown";
+    if (!STALE_LEASE_REASONS.has(reason)) return { delivered: false, stale: false };
+
+    this.ctx.storage.sql.exec(
+      "DELETE FROM fanout_leases WHERE channel_id=? AND lease_id=?",
+      channelId,
+      targetLease.lease_id,
+    );
+    console.log("fanout_lease_deleted", {
+      channel_id: channelId,
+      lease_id: targetLease.lease_id,
+      reason,
+    });
+    return { delivered: false, stale: true };
+  }
+
+  private enqueueFanoutRetry(
+    channelId: string,
+    targetLease: FanoutLeaseTarget,
+    eventId: string,
+    eventJson: string,
+    membershipVersionAtEvent: number,
+    ts: string,
+  ): void {
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO fanout_events (channel_id, event_id, event_json, membership_version_at_event, created_at) VALUES (?, ?, ?, ?, ?)",
+      channelId,
+      eventId,
+      eventJson,
+      membershipVersionAtEvent,
+      ts,
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO fanout_queue (queue_id, channel_id, event_id, target_session_id, target_user_id, target_lease_id, status, next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+      `${eventId}:${targetLease.session_id}`,
+      channelId,
+      eventId,
+      targetLease.session_id,
+      targetLease.user_id,
+      targetLease.lease_id,
+      ts,
+      ts,
+    );
   }
 }
