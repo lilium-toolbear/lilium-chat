@@ -6,6 +6,10 @@ import {
   PLATFORM_BOT_DISPLAY_NAME,
   PLATFORM_BOT_ID,
 } from "./platform-commands";
+import {
+  parseStoredReplySnapshot,
+  sanitizeReplySnapshotForBrowser,
+} from "./reply-snapshot";
 
 export interface MessageMention {
   user_id: string;
@@ -32,18 +36,15 @@ export function projectMessageForBrowser(
     attachments?: MessageImageAttachment[];
     sticker?: MessageStickerSnapshot | null;
     components?: WireChatMessage["components"];
+    replyTargetStatus?: string | null;
   } = {},
 ): WireChatMessage {
   const hidden = row.status === "deleted" || row.status === "recalled";
 
-  let replySnapshot: WireChatMessage["reply_snapshot"] = null;
-  if (row.reply_snapshot_json) {
-    try {
-      replySnapshot = JSON.parse(row.reply_snapshot_json) as WireChatMessage["reply_snapshot"];
-    } catch {
-      replySnapshot = null;
-    }
-  }
+  const replySnapshot = sanitizeReplySnapshotForBrowser(
+    parseStoredReplySnapshot(row.reply_snapshot_json),
+    opts.replyTargetStatus,
+  );
 
   let sender: WireChatMessage["sender"];
   if (row.sender_kind === "user" && row.sender_user_id) {

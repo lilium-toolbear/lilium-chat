@@ -21,6 +21,7 @@ export async function projectMessagesForBrowser(
 ): Promise<ProjectedMessage[]> {
   const senderUserIds = [...new Set(rows.filter((r) => r.sender_kind === "user" && r.sender_user_id).map((r) => r.sender_user_id as string))];
   const map = await resolveUserSummaries(senderUserIds, env);
+  const statusByMessageId = new Map(rows.map((row) => [row.message_id, row.status]));
 
   return rows.map((row) => {
     let senderSummary: UserSummary | null = null;
@@ -41,6 +42,7 @@ export async function projectMessagesForBrowser(
       mentions: mentionsByMessage[row.message_id] ?? [],
       attachments,
       sticker: stickersByMessage[row.message_id] ?? null,
+      replyTargetStatus: row.reply_to ? statusByMessageId.get(row.reply_to) : undefined,
     });
   });
 }
