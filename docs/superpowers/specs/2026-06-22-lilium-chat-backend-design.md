@@ -5,7 +5,7 @@
 范围：lilium-chat 仓库（Cloudflare Worker + Durable Object 纯后端）的实现设计
 参考：
 
-- `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（权威 Browser/Bot API contract v2.10，v4.3-aligned）
+- `docs/api-contract.md`（权威 Browser/Bot API contract v2.10，v4.3-aligned）
 - `dzmm_archive/docs/plans/2026-06-21-toolbear-chat-api-contract.md`（原始 API contract v1，本设计 v2 有 cursor 形状偏离，见第 0.2 节）
 - `dzmm_archive/docs/plans/2026-06-20-lilium-chat-product-requirements.md`（PRD）
 - `dzmm_archive/docs/plans/2026-06-20-lilium-chat-technical-architecture.md`（技术架构）
@@ -1654,7 +1654,7 @@ per-channel cursor 改动需同步落到前端状态模型（`chatConnectionStor
 
 ## 9. API contract v2.2 修订（per-channel cursor + 前端缺口收口）
 
-per-channel cursor 是产品方确认的 contract API 形状修订（见第 0.2 节 E）。已落地为权威 contract v2.2：`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（本仓库），与 2026-06-21 原 contract（dzmm_archive）并存，明确 delta：
+per-channel cursor 是产品方确认的 contract API 形状修订（见第 0.2 节 E）。已落地为权威 contract v2.2：`docs/api-contract.md`（本仓库），与 2026-06-21 原 contract（dzmm_archive）并存，明确 delta：
 
 - `GET /api/chat/bootstrap` 响应 `event_state` 改为：
 
@@ -1726,7 +1726,7 @@ per-channel cursor 是产品方确认的 contract API 形状修订（见第 0.2 
 - 不定义通用 `NOT_FOUND`；新增 `INVITE_NOT_FOUND`，并保留 `CHANNEL_NOT_FOUND`、`MESSAGE_NOT_FOUND`、`MEMBER_NOT_FOUND`。
 - 群聊标签列为 Browser API v1 disabled 只读占位；免打扰列为 browser local-only non-server state。
 
-权威 contract v2.2 已落本仓库 `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（含 per-channel cursor + committed_ack + 幂等简化 + ROUTE_INDEX_PENDING（v4.0 仅 invite-code 路由保留）+ dissolve + system.notice + 资源级 not-found code + 风险登记 delta；v4.0 追加 channel-scoped message API + WS write path + command_id/operation_id 幂等；v4.1 追加 Phase E personal stickers + sticker save/send API 形状，详见下方 v4.1 delta）。前端开工前须按此 contract 接入，并与前端 `chatConnectionStore` 重构同步（`last_event_id` → per-channel map）。后端阶段 1/2 实现按 contract 形状，不实现原 2026-06-21 contract 的单全局 cursor 与 accepted-only ack。
+权威 contract v2.2 已落本仓库 `docs/api-contract.md`（含 per-channel cursor + committed_ack + 幂等简化 + ROUTE_INDEX_PENDING（v4.0 仅 invite-code 路由保留）+ dissolve + system.notice + 资源级 not-found code + 风险登记 delta；v4.0 追加 channel-scoped message API + WS write path + command_id/operation_id 幂等；v4.1 追加 Phase E personal stickers + sticker save/send API 形状，详见下方 v4.1 delta）。前端开工前须按此 contract 接入，并与前端 `chatConnectionStore` 重构同步（`last_event_id` → per-channel map）。后端阶段 1/2 实现按 contract 形状，不实现原 2026-06-21 contract 的单全局 cursor 与 accepted-only ack。
 
 **v4.1 追加 delta（Phase E personal stickers）：**
 

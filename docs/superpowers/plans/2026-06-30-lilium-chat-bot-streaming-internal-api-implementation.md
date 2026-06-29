@@ -6,7 +6,7 @@
 
 **Authority (normative, in order):**
 
-1. `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` §16–§17 (v2.19 internal addendum)
+1. `docs/api-contract.md` §16–§17 (v2.19 internal addendum)
 2. `docs/superpowers/specs/2026-06-30-lilium-chat-bot-streaming-and-internal-api-spec.md`
 3. `docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` v4.4 + existing Phase 7 slash addenda
 

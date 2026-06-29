@@ -7,7 +7,7 @@
 | 生产 API Base | `https://chat.kuma.homes` |
 | Bot Gateway WS | `wss://chat.kuma.homes/api/chat/bot/ws` |
 | 协议版本 | `lilium.chat.bot.v1` |
-| 权威 Contract | [`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`](./api-contract/2026-06-22-toolbear-chat-api-contract.md) §9 |
+| 权威 Contract | [`docs/api-contract.md`](../api-contract.md) §9 |
 
 ---
 
@@ -788,7 +788,7 @@ Slash Command 后端 spec：[`docs/superpowers/specs/2026-06-28-lilium-chat-bot-
 
 ## 13. 参考
 
-- API Contract §9：[`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`](./api-contract/2026-06-22-toolbear-chat-api-contract.md)
+- API Contract §9：[`docs/api-contract.md`](../api-contract.md)
 - 后端设计 § Bot：[`docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md`](./superpowers/specs/2026-06-22-lilium-chat-backend-design.md)
 - Bot Gateway 协议常量：`src/contract/bot-gateway.ts`（`BOT_GATEWAY_API_VERSION = "lilium.chat.bot.v1"`）
 - TypeScript 类型：`src/contract/bot-api.ts`

@@ -6,7 +6,7 @@
 权威来源：
 
 - API contract addendum：`docs/api-contract/2026-06-27-dm-api-contract-addendum.md`
-- 主 contract：`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（v2.12+）
+- 主 contract：`docs/api-contract.md`（v2.12+）
 - 后端基线：`docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md`（v4.4）
 - 前端 spec：`dzmm_archive/docs/plans/2026-06-27-lilium-chat-dm-frontend-spec.md`
 

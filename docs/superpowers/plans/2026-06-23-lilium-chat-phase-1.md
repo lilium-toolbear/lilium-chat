@@ -74,7 +74,7 @@ test/
 
   All Phase 1 tests import `getNamedDo` from `../../test/helpers` and use `getNamedDo(env.X, name)` instead of `env.X.getByName(name)`. (Phase 0 tests used `idFromName+get` directly; this centralizes the pattern.) Production code keeps `c.env.X.getByName(...)`.
 
-- **v3.1 per-channel cursor contract delta is the implementation target** (`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` §4.1 / §10).
+- **v3.1 per-channel cursor contract delta is the implementation target** (`docs/api-contract.md` §4.1 / §10).
 - **projection_outbox flush path is tested end-to-end**: ChatChannel join → alarm/flush → UserDirectory my_channels contains the channel (see Task 1 Step 4 test additions + `src/chat/projection.test.ts`).
 
 ---

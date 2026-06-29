@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-Copied verbatim from the design (`docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` v3.2) and contract (`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` v2):
+Copied verbatim from the design (`docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` v3.2) and contract (`docs/api-contract.md` v2):
 
 - **Compatibility:** `compatibility_date = "2026-06-22"`, `compatibility_flags = ["nodejs_compat"]` (required by `pg` + Hyperdrive; Hono needs none).
 - **DO base class:** `import { DurableObject } from "cloudflare:workers"`; `class X extends DurableObject<Env> { constructor(ctx: DurableObjectState, env: Env) { super(ctx, env); ... } }`. DOs use SQLite via `ctx.storage.sql.exec(...)`.

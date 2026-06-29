@@ -57,8 +57,11 @@ Do not push or deploy unless explicitly asked — the operator deploys.
 ## Architecture
 
 Authoritative design references, in priority order:
-1. `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` — the Browser/Bot API
-   contract. When code and contract disagree, the contract wins and code changes.
+1. `docs/api-contract.md` — the Browser/Bot API contract (single source of truth).
+   When code and contract disagree, the contract wins and code changes. All API
+   changes must update this file and add a revision-record entry. `docs/api-contract/`
+   holds patches/discussion/changelog only — not authoritative (see
+   `docs/api-contract/README.md`).
 2. `docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` — backend design spec
    (currently v4.2). Its §0 has a layered revision history (v2→v3→v3.x→v4.0) documenting
    *why* each platform-impossible pattern was rejected. Read §0 before attempting any

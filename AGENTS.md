@@ -29,7 +29,13 @@ Vitest runs through `@cloudflare/vitest-pool-workers` with `wrangler.test.jsonc`
 
 ## Architecture & Workflow Notes
 
-`docs/api-contract/` is authoritative when code and docs disagree. Read `CLAUDE.md` before changing cross-DO consistency, idempotency, scheduling, migrations, WebSocket routing, or Worker bindings. Do not call `ctx.storage.setAlarm` directly; use the shared scheduler. Add SQLite changes through new migration versions, not baseline edits. Regenerate, never hand-edit, `worker-configuration.d.ts`.
+### API contract (source of truth)
+
+- **Authoritative contract:** [`docs/api-contract.md`](docs/api-contract.md) — the single Browser/Bot API source of truth. When code and this file disagree, the contract wins and code changes.
+- **All API wire-shape changes** must update `docs/api-contract.md` and append an entry to its in-document **修订记录** (revision record) with version, date, and delta summary.
+- **`docs/api-contract/`** is for dated patches, discussion drafts, and changelog/redirect stubs only — **not** normative. After a patch is merged into `docs/api-contract.md`, keep the addendum file as historical trace or replace it with a redirect stub. See [`docs/api-contract/README.md`](docs/api-contract/README.md).
+
+Read `CLAUDE.md` before changing cross-DO consistency, idempotency, scheduling, migrations, WebSocket routing, or Worker bindings. Do not call `ctx.storage.setAlarm` directly; use the shared scheduler. Add SQLite changes through new migration versions, not baseline edits. Regenerate, never hand-edit, `worker-configuration.d.ts`.
 
 ### DO SQLite migrations and PG archive parity (required)
 

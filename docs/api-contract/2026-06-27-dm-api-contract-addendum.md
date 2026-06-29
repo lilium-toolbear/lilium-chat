@@ -1,15 +1,16 @@
 # DM API Contract Addendum
 
-状态：实现前 API contract addendum v1.1  
-日期：2026-06-27  
-范围：`POST /api/chat/dms`、`ChannelSummary.dm_peer`、DM 禁用矩阵、错误码、权限  
+状态：已合并进主 contract v2.13 — **非权威** patch trace
+日期：2026-06-27
+范围：`POST /api/chat/dms`、`ChannelSummary.dm_peer`、DM 禁用矩阵、错误码、权限
+权威 contract：`docs/api-contract.md`（v2.13+）
 权威来源：
 
-- 主 contract：`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`（v2.12+）
+- 主 contract（已合并）：`docs/api-contract.md`（v2.13+）
 - 后端设计：`docs/plans/2026-06-27-dm-channel-design.md`
 - 前端 spec：`dzmm_archive/docs/plans/2026-06-27-lilium-chat-dm-frontend-spec.md`
 
-本 addendum 在合并进主 contract 前作为 delta 权威。冲突时：**本 addendum 的 DM 章节优先**；其余仍以主 contract 为准。
+本 addendum 内容已合并进 `docs/api-contract.md` v2.13；保留本文件仅供历史 trace。
 
 ## 修订摘要
 
@@ -313,7 +314,7 @@ GET /api/chat/channels/{channel_id}/members/{user_id}
 
 ### Phase DM-0（本文件）
 
-合约补丁就绪后，将 §1–§6 合并进 `2026-06-22-toolbear-chat-api-contract.md` 作为 **v2.13** revision entry，并更新 §1.1 路由表、§3.2/§3.3、§11、§12 阶段列表。
+合约补丁就绪后，将 §1–§6 合并进 `docs/api-contract.md` 作为 **v2.13** revision entry，并更新 §1.1 路由表、§3.2/§3.3、§11、§12 阶段列表。
 
 ### 验收（contract 层）
 

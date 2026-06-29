@@ -6,7 +6,7 @@
 
 **Design authority:** `docs/plans/2026-06-27-userconnection-live-subscription-redesign.md` (v1.1)
 
-**Contract authority:** `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` §v2.12 (`session.live_start`, `session.heartbeat`, affected-user live resync; no `channel.subscribe` in v1)
+**Contract authority:** `docs/api-contract.md` §v2.12 (`session.live_start`, `session.heartbeat`, affected-user live resync; no `channel.subscribe` in v1)
 
 **Architecture:**
 

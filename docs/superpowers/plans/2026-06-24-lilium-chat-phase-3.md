@@ -48,7 +48,7 @@
 - `src/do/user-directory.ts` — add `idempotency_keys` table (create coordinator) + `POST /internal/channel-create-coordinate` (state machine: SELECT inside txn → cached / conflict / mint+`creating` / `creating`-re-call) + `POST /internal/read-state` (monotonic `last_read_event_id` floor + advance flag + emit `read_state.updated` via ChatChannel) + extend `/my-channels` is unchanged (already returns `last_read_event_id`).
 - `src/do/chat-channel.ts` — add `/internal/create-channel`, `/internal/update-channel`, `/internal/dissolve`, `/internal/members-add`, `/internal/members-update-role`, `/internal/members-remove`, `/internal/members-list`, `/internal/members-get`, `/internal/read-state-event`, `/internal/unread-count`; add private helpers `assertNotDissolved`, `activeRole`, `cachedResponse`, `persistEventAndFanout`, `resolveActorMap`; extract `markMemberLeftAndEnqueueFanoutUnregisterSync` (sync core) + reframing the Phase 2 async helper as a thin wrapper; add the dissolved write-gate to `/internal/message-send` and `/internal/join`; refactor `/internal/replay` to resolve management-event actors (Task 4b). Add the new payload-builder imports.
 - `src/index.ts` — register the 9 new routes.
-- `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` — §5.2b: add the create-coordinator rule (v2.5 delta note). Revision record: add v2.5 line.
+- `docs/api-contract.md` — §5.2b: add the create-coordinator rule (v2.5 delta note). Revision record: add v2.5 line.
 - `docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` — §8 阶段3 / §3.5a: record the create-coordinator rule + the `UserDirectory.idempotency_keys` table. §0.6: add v3.5 revision entry.
 
 **Do NOT touch:** `src/do/channel-fanout.ts` (register/unregister/fanout already correct), `src/do/user-connection.ts`, `src/routes/ws.ts`, `src/routes/events.ts`, `src/routes/channels.ts` / `messages.ts`, `src/auth/jwt.ts`, `src/ids/uuidv7.ts`, `src/profile/resolve.ts`, wrangler configs.
@@ -85,7 +85,7 @@ Expected: `1263a4a` (Phase 3 prep close). Note it; subsequent task commits build
 ## Task 1: Align docs to the create-coordinator rule + add Phase 3 error codes
 
 **Files:**
-- Modify: `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` (§5.2b, revision record)
+- Modify: `docs/api-contract.md` (§5.2b, revision record)
 - Modify: `docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` (§8 阶段3, §3.5a, §0.6)
 - Modify: `src/errors.ts` (add `MEMBER_NOT_FOUND`, `CHANNEL_DISSOLVED`, `INVITE_NOT_FOUND`)
 - Test: `test/errors.test.ts` (Create)
@@ -100,7 +100,7 @@ Expected: `1263a4a` (Phase 3 prep close). Note it; subsequent task commits build
 
 - [ ] **Step 1: Amend contract §5.2b**
 
-In `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`, find the `### 5.2b 创建频道` section's 路由 paragraph (currently: `路由：频道 channel_id（UUIDv7）即 ChatChannel DO 的 name（系统公共频道例外，DO name 为 system-general）。`). Replace that paragraph with:
+In `docs/api-contract.md`, find the `### 5.2b 创建频道` section's 路由 paragraph (currently: `路由：频道 channel_id（UUIDv7）即 ChatChannel DO 的 name（系统公共频道例外，DO name 为 system-general）。`). Replace that paragraph with:
 ```markdown
 路由与幂等（v2.5 delta）：创建频道的幂等由 `UserDirectory(creator_user_id)` 协调，不由 Worker 现场 mint 的 `ChatChannel` DO 承担。Worker 路由到 `UserDirectory(user_id)`，后者在其 `idempotency_keys` 事务内 mint `channel_id`（UUIDv7，即 `ChatChannel` DO name；系统频道例外，DO name=`system-general`），状态机 `creating`→`completed`，持久化 `channel_id`，再调用 `ChatChannel(channel_id).createChannel`（单事务原子写入，`channel_meta` 存在性即幂等 guard）。同一 `(user, operation=channel.create, key)` + 相同 `request_hash` 重试命中同一 `UserDirectory` DO → 同一 `channel_id` → 同一 `ChatChannel` DO → 缓存结果；不同 `request_hash` 返回 `409 IDEMPOTENCY_CONFLICT`。崩溃窗口：`status=creating` 时 retry 重新调用同一 `ChatChannel(channel_id).createChannel`（幂等返回已提交行）后标 `completed`，不重复建群。跨 DO 仍为 best-effort（无 2PC）。
 ```
@@ -180,7 +180,7 @@ Expected: all 3 PASS; typecheck clean.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add docs/api-contract/2026-06-22-toolbear-chat-api-contract.md docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md src/errors.ts test/errors.test.ts
+git add docs/api-contract.md docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md src/errors.ts test/errors.test.ts
 git -c user.name=kuma -c user.email=kuma@kuma.homes commit -m "docs+errors: v2.5/v3.5 create-coordinator rule + MEMBER_NOT_FOUND/CHANNEL_DISSOLVED/INVITE_NOT_FOUND codes"
 ```
 

@@ -6,7 +6,7 @@
 
 > **2026-06-30 收口：** 本文是历史讨论稿和 gap tracker，**不再**作为实现计划或 contract 的规范来源。下一步实现应引用：
 >
-> - **Internal contract（normative wire shape）：** `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` **§16–§17**（v2.19 internal addendum）
+> - **Internal contract（normative wire shape）：** `docs/api-contract.md` **§16–§17**（v2.19 internal addendum）
 > - **Backend spec（normative 实现不变量）：** `docs/superpowers/specs/2026-06-30-lilium-chat-bot-streaming-and-internal-api-spec.md`
 > - **Implementation plan：** `docs/superpowers/plans/2026-06-30-lilium-chat-bot-streaming-internal-api-implementation.md`
 >
@@ -340,7 +340,7 @@ History / replay **不**含 streaming 中途正文；离线 reconnect 仅 finali
 
 **目标：** Bot 消息内嵌交互控件覆盖常见表单场景；平台提供有序事件流与结构性门禁；业务冲突由 Bot 裁决。
 
-**Contract：** `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` §3.8（v2.18）、§9.6、§11。
+**Contract：** `docs/api-contract.md` §3.8（v2.18）、§9.6、§11。
 
 ### 7.1 组件 kind（normative）
 

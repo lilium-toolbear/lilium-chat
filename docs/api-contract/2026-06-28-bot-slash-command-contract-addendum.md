@@ -1,10 +1,11 @@
 # Bot Slash Command Contract Addendum
 
-状态：实现前 API contract addendum（相对 v2.15 + DM addendum）
+状态：已合并进主 contract v2.16 — **非权威** patch trace
 日期：2026-06-28
+权威 contract：`docs/api-contract.md`（v2.16+）
 权威来源：`docs/superpowers/specs/2026-06-28-lilium-chat-bot-spec-revised.md`
 
-本 addendum 描述 Slash Command 产品模型对 Browser/Bot API 的变更。与 base contract 冲突处以本文件 + spec 为准。
+本 addendum 描述 Slash Command 产品模型对 Browser/Bot API 的变更。内容已合并进 `docs/api-contract.md`；保留本文件仅供历史 trace。
 
 ## Removed Bot HTTP routes
 

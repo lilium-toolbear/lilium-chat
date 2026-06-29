@@ -5,7 +5,7 @@
 
 本 addendum 已合并入主 contract，不再单独维护。
 
-**Normative location:** `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` **§16**（v2.19 internal contract addendum）与 **§17**（实现不变量）。
+**Normative location:** `docs/api-contract.md` **§16**（v2.19 internal contract addendum）与 **§17**（实现不变量）。
 
 **Backend spec:** `docs/superpowers/specs/2026-06-30-lilium-chat-bot-streaming-and-internal-api-spec.md`
 

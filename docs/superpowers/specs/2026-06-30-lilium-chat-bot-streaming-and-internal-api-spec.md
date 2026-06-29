@@ -2,12 +2,12 @@
 
 状态：内部实现前 spec patch  
 日期：2026-06-30  
-对应 contract：`docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` **§16–§17**（v2.19 internal addendum）  
+对应 contract：`docs/api-contract.md` **§16–§17**（v2.19 internal addendum）
 基线：`docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` v4.4 + Bot Phase 7/Stateful addenda
 
 本 spec patch 把原讨论稿 `2026-06-28-lilium-chat-bot-third-party-api-gaps.md` 中可执行的架构决策收口为内部实现规范。第三方公开文档暂不更新；实现完成后再从生产可用能力整理外部说明。
 
-**Normative contract:** 主 contract `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` §16–§17。本文是后端实现视角的 spec patch，与 §16 wire shape 对齐。
+**Normative contract:** 主 contract `docs/api-contract.md` §16–§17。本文是后端实现视角的 spec patch，与 §16 wire shape 对齐。
 
 ## 1. Authority And Supersession
 

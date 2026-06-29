@@ -287,13 +287,13 @@ git commit -m "feat(routes): GET /api/chat/channels/directory public catalog"
 ### Task D1: Contract §1.1 route table fix + directory row shape documentation
 
 **Files:**
-- Modify: `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md`
+- Modify: `docs/api-contract.md`
 
 - [ ] **Step 1:** Edit §1.1 routes table: change `GET /api/chat/channels/{channel_id}/public-catalog` → `GET /api/chat/channels/directory` (remove the erroneous `{channel_id}`). Add a revision entry `v2.9 (2026-06-26): Phase 6 tail — public directory + join implemented; §1.1 route corrected to /channels/directory (matches §5.6); directory row shape finalized (last_message_preview=null, unread_count=0, kind/visibility constants); directory sort = COALESCE(last_message_at, updated_at) DESC, channel_id DESC; join idempotency cache exception documented (cached response = membership result {role, joined_at}; the `channel` field is re-inflated per call and may differ in transient fields like title/avatar, but membership is stable — this is a join-specific exception to the v4.0 "cache full ack payload" rule because ChannelDetail is mutable post-join while membership is not); join response `membership.role` reflects the caller's actual current role (owner/admin/member), not a hardcoded 'member'`.
 - [ ] **Step 2:** In §5.6, add a note clarifying `last_message_preview=null` and `unread_count=0` in the current implementation, and that `kind`/`visibility` are constants (`channel`/`public_listed`) for directory rows.
 - [ ] **Step 3:** Commit:
 ```bash
-git add docs/api-contract/2026-06-22-toolbear-chat-api-contract.md
+git add docs/api-contract.md
 git commit -m "docs(chat): contract v2.9 — Phase 6 directory route + row shape"
 ```
 
