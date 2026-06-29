@@ -9,7 +9,7 @@ import {
 } from "../sql-migrations";
 import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
 
-export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026062901;
+export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026062902;
 
 export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS channel_meta (
@@ -33,6 +33,7 @@ export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
     status TEXT NOT NULL DEFAULT 'normal', text TEXT, reply_to TEXT,
     reply_snapshot_json TEXT, components_json TEXT NOT NULL DEFAULT '[]',
     sender_bot_display_name TEXT, sender_bot_avatar_url TEXT,
+    invocation_json TEXT,
     stream_state TEXT NOT NULL DEFAULT 'none',
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL, edited_at TEXT,
     deleted_at TEXT, deleted_by TEXT, recalled_at TEXT,
@@ -292,7 +293,7 @@ export const chatChannelBaseline: BaselineDetector = {
 
 export const chatChannelMigrations: SqlMigration[] = [
   {
-    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    version: 2026062901,
     name: "defensive migration for legacy test schemas",
     up(ctx) {
       for (const legacyTable of [
@@ -496,6 +497,15 @@ export const chatChannelMigrations: SqlMigration[] = [
         )`);
       }
       applyArchiveOutboxMigration(ctx);
+    },
+  },
+  {
+    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    name: "messages invocation_json for slash command display",
+    up(ctx) {
+      if (tableExists(ctx, "messages") && !columnExists(ctx, "messages", "invocation_json")) {
+        ctx.storage.sql.exec("ALTER TABLE messages ADD COLUMN invocation_json TEXT");
+      }
     },
   },
 ];

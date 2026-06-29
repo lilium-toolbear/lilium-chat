@@ -33,7 +33,7 @@ export const REPLAY_TABLES: Record<string, ReplayTableConfig> = {
   chat_messages: {
     pgTable: "chat.messages",
     pk: ["message_id"],
-    jsonColumns: new Set(["reply_snapshot_json"]),
+    jsonColumns: new Set(["reply_snapshot_json", "invocation_json"]),
   },
   chat_message_edits: {
     pgTable: "chat.message_edits",

@@ -110,6 +110,12 @@ export interface SelectMessageComponent {
 
 export type MessageComponent = ButtonMessageComponent | SelectMessageComponent;
 
+export interface CommandInvocationProjection {
+  bot_command_id: ChatId;
+  invoked_name: string;
+  options: Record<string, { type: string; value: unknown }>;
+}
+
 export interface ChatMessage {
   message_id: ChatId;
   command_id: ChatId;
@@ -126,6 +132,7 @@ export interface ChatMessage {
   sticker: StickerMessageProjection | null;
   components: MessageComponent[];
   mentions: Mention[];
+  command_invocation?: CommandInvocationProjection | null;
   created_at: IsoDateTimeString;
   updated_at: IsoDateTimeString;
   edited_at: IsoDateTimeString | null;

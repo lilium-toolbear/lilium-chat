@@ -4,6 +4,7 @@ import { fallbackUserDisplayName, type UserSummary } from "../contract/primitive
 import type { WireChatMessage } from "../contract/message";
 import { buildWireEventFrame, type EventFrame } from "../contract/wire-frames";
 import type { ChatEventPayloadByType, ChatEventType } from "../contract/events";
+import { parseInvocationJson } from "./command-invocation";
 
 export type { UserSummary };
 
@@ -38,6 +39,7 @@ export function buildMessageCreatedPayload(raw: {
   type: string;
   format: string;
   text: string | null;
+  invocation_json?: string | null;
 }): MessagePersistedPayload {
   let replySnapshot: unknown = null;
   if (raw.reply_snapshot_json) {
@@ -47,6 +49,7 @@ export function buildMessageCreatedPayload(raw: {
       replySnapshot = null;
     }
   }
+  const commandInvocation = parseInvocationJson(raw.invocation_json);
 
   return {
     message: {
@@ -68,6 +71,7 @@ export function buildMessageCreatedPayload(raw: {
       attachments: [],
       components: [],
       mentions: [],
+      ...(commandInvocation ? { command_invocation: commandInvocation } : {}),
       created_at: raw.created_at,
       updated_at: raw.updated_at,
       edited_at: raw.edited_at,
@@ -118,6 +122,7 @@ export async function resolveSenderForLiveBroadcast(
       sticker: null,
       components: [],
       mentions: [],
+      command_invocation: payload.message.command_invocation as WireChatMessage["command_invocation"],
     },
   };
 }

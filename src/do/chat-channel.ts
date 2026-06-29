@@ -105,6 +105,7 @@ import {
   STATEFUL_BOT_DELIVERY_KINDS,
 } from "../chat/stateful-bot-delivery";
 import { invokedNameMatchesSnapshot } from "../chat/slash-token";
+import { insertUserCommandInvocationMessage, type InvocationMessageHost } from "./chat-channel/invocation-message";
 
 interface OutboxRow {
   outbox_id: string;
@@ -453,7 +454,7 @@ export class ChatChannel extends DurableObject<Env> {
 
       const row = this.ctx.storage.sql
         .exec(
-          "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE message_id=? AND channel_id=?",
+          "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at, invocation_json FROM messages WHERE message_id=? AND channel_id=?",
           input.messageId, input.channelId,
         )
         .toArray()[0] as MessageRow | undefined;
@@ -520,6 +521,7 @@ export class ChatChannel extends DurableObject<Env> {
         type: updatedRow.type,
         format: updatedRow.format,
         text: updatedRow.text,
+        invocation_json: updatedRow.invocation_json,
       });
       this.ctx.storage.sql.exec(
         "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, ?, ?, 'user', ?, ?, ?, ?)",
@@ -1345,7 +1347,21 @@ export class ChatChannel extends DurableObject<Env> {
         };
       }
 
-      const invocationId = uuidv7(nowMs);
+      const invocationMessage = insertUserCommandInvocationMessage(this as unknown as InvocationMessageHost, {
+        userId,
+        channelId,
+        operationId,
+        botCommandId,
+        invokedName: invokedName || currentSnapshot.name,
+        options,
+        now,
+        nowMs,
+        membershipVersion: currentMeta.membership_version,
+        senderSummary: actor,
+        messageId: uuidv7(nowMs),
+      });
+
+      const invocationId = uuidv7(nowMs + 1);
       this.ctx.storage.sql.exec(
         `INSERT INTO command_invocations (
            invocation_id, channel_id, command_id, invoker_user_id, bot_id, bot_command_id, command_name,
@@ -1369,7 +1385,7 @@ export class ChatChannel extends DurableObject<Env> {
         now,
       );
 
-      const eventId = this.nextEventId(nowMs);
+      const eventId = this.nextEventId(nowMs + 2);
       const persistedPayload = {
         invocation: { invocation_id: invocationId, status: "pending", created_at: now },
         command_id: operationId,
@@ -1431,7 +1447,12 @@ export class ChatChannel extends DurableObject<Env> {
         now,
       );
 
-      const responseBody = { channel_id: channelId, invocation_id: invocationId, event_id: eventId };
+      const responseBody = {
+        channel_id: channelId,
+        invocation_id: invocationId,
+        event_id: eventId,
+        invocation_message: invocationMessage.liveMessage,
+      };
       this.ctx.storage.sql.exec(
         "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, ?, ?, ?, ?, 'completed', ?, ?)",
         userId,
@@ -1443,9 +1464,16 @@ export class ChatChannel extends DurableObject<Env> {
         idemExpiresAt,
       );
 
-      appendChatChannelArchive(this.ctx, channelId, now, [eventId], () =>
+      appendChatChannelArchive(this.ctx, channelId, now, [invocationMessage.invocationEventId, eventId], () =>
         collectDefinedChanges([
+          upsertMessageChange(
+            this.ctx.storage.sql,
+            invocationMessage.invocationMessageId,
+            channelId,
+            rvEvent(invocationMessage.invocationEventId),
+          ),
           upsertCommandInvocationChange(this.ctx.storage.sql, invocationId, rvEvent(eventId)),
+          upsertEventChange(this.ctx.storage.sql, invocationMessage.invocationEventId),
           upsertEventChange(this.ctx.storage.sql, eventId),
         ]),
       );
@@ -1485,6 +1513,13 @@ export class ChatChannel extends DurableObject<Env> {
     const commandOption = typeof commandOptionRaw === "string" ? commandOptionRaw : undefined;
     const helpText = buildPlatformHelpText(manifest.items, commandOption);
 
+    const actorMap = await this.resolveActorMap([input.userId]);
+    const senderSummary = actorMap.get(input.userId) ?? {
+      user_id: input.userId,
+      display_name: fallbackUserDisplayName(input.userId),
+      avatar_url: null,
+    };
+
     const txResult = this.ctx.storage.transactionSync(() => {
       const idem = this.ctx.storage.sql
         .exec(
@@ -1499,9 +1534,23 @@ export class ChatChannel extends DurableObject<Env> {
         return { kind: "cached" as const, responseJson: idem.response_json ?? "{}" };
       }
 
-      const messageId = uuidv7(input.nowMs);
-      const invocationId = uuidv7(input.nowMs + 1);
-      const eventId = this.nextEventId(input.nowMs + 2);
+      const invocationMessage = insertUserCommandInvocationMessage(this as unknown as InvocationMessageHost, {
+        userId: input.userId,
+        channelId: input.channelId,
+        operationId: input.operationId,
+        botCommandId: PLATFORM_HELP_BOT_COMMAND_ID,
+        invokedName: PLATFORM_HELP_NAME,
+        options: input.options,
+        now: input.now,
+        nowMs: input.nowMs,
+        membershipVersion: input.membershipVersion,
+        senderSummary,
+        messageId: uuidv7(input.nowMs),
+      });
+
+      const messageId = uuidv7(input.nowMs + 1);
+      const invocationId = uuidv7(input.nowMs + 2);
+      const eventId = this.nextEventId(input.nowMs + 3);
 
       this.ctx.storage.sql.exec(
         `INSERT INTO messages (
@@ -1511,7 +1560,7 @@ export class ChatChannel extends DurableObject<Env> {
          ) VALUES (?, ?, ?, ?, 'bot', NULL, ?, ?, ?, 'text', 'markdown', 'normal', ?, NULL, 'none', ?, ?)`,
         messageId,
         input.operationId,
-        `user:${input.userId}`,
+        `bot:${PLATFORM_BOT_ID}`,
         input.channelId,
         PLATFORM_BOT_ID,
         PLATFORM_BOT_DISPLAY_NAME,
@@ -1618,6 +1667,7 @@ export class ChatChannel extends DurableObject<Env> {
         event_id: eventId,
         message_id: messageId,
         message: liveMessage,
+        invocation_message: invocationMessage.liveMessage,
       };
       this.ctx.storage.sql.exec(
         "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, ?, ?, ?, ?, 'completed', ?, ?)",
@@ -1630,10 +1680,17 @@ export class ChatChannel extends DurableObject<Env> {
         input.idemExpiresAt,
       );
 
-      appendChatChannelArchive(this.ctx, input.channelId, input.now, [eventId], () =>
+      appendChatChannelArchive(this.ctx, input.channelId, input.now, [invocationMessage.invocationEventId, eventId], () =>
         collectDefinedChanges([
+          upsertMessageChange(
+            this.ctx.storage.sql,
+            invocationMessage.invocationMessageId,
+            input.channelId,
+            rvEvent(invocationMessage.invocationEventId),
+          ),
           upsertMessageChange(this.ctx.storage.sql, messageId, input.channelId, rvEvent(eventId)),
           upsertCommandInvocationChange(this.ctx.storage.sql, invocationId, rvEvent(eventId)),
+          upsertEventChange(this.ctx.storage.sql, invocationMessage.invocationEventId),
           upsertEventChange(this.ctx.storage.sql, eventId),
         ]),
       );

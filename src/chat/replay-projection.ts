@@ -76,7 +76,7 @@ function projectReplayMessagePayload(
   }
   const messageRow = sql
     .exec(
-      "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at FROM messages WHERE message_id=?",
+      "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at, invocation_json FROM messages WHERE message_id=?",
       messageId,
     )
     .toArray()[0] as MessageRow | undefined;

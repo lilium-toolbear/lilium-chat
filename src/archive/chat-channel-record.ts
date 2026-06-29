@@ -90,7 +90,7 @@ function readMessage(sql: SqlStorage, messageId: string, channelId: string): Rec
     .exec(
       `SELECT message_id, command_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
               sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state,
-              created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at
+              created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at, invocation_json
        FROM messages WHERE message_id=? AND channel_id=?`,
       messageId,
       channelId,

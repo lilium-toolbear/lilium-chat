@@ -6,6 +6,7 @@ import {
   PLATFORM_BOT_DISPLAY_NAME,
   PLATFORM_BOT_ID,
 } from "./platform-commands";
+import { parseInvocationJson } from "./command-invocation";
 import {
   parseStoredReplySnapshot,
   sanitizeReplySnapshotForBrowser,
@@ -92,6 +93,7 @@ export function projectMessageForBrowser(
     sticker: hidden ? null : (opts.sticker ?? null),
     components: hidden ? [] : (opts.components ?? []),
     mentions: hidden ? [] : ((opts.mentions ?? []) as Mention[]),
+    command_invocation: hidden ? null : parseInvocationJson(row.invocation_json),
     created_at: row.created_at,
     updated_at: row.updated_at,
     edited_at: row.edited_at,

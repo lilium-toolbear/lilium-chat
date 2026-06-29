@@ -118,6 +118,7 @@ export interface PersistedMessageSnapshot {
   attachments: unknown[];
   components: unknown[];
   mentions: unknown[];
+  command_invocation?: unknown;
   created_at: string;
   updated_at: string;
   edited_at: string | null;
@@ -149,6 +150,7 @@ export interface MessageRow {
   deleted_at: string | null;
   deleted_by: string | null;
   recalled_at: string | null;
+  invocation_json?: string | null;
 }
 
 export interface MessagePersistedPayload {

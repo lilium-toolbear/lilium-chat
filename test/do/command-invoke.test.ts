@@ -127,13 +127,26 @@ describe("command.invoke", () => {
       frame_type: string;
       command: string;
       status: string;
-      payload?: { invocation_id?: string; event_id?: string };
+      payload?: {
+        invocation_id?: string;
+        event_id?: string;
+        invocation_message?: {
+          text?: string;
+          command_invocation?: {
+            bot_command_id?: string;
+            invoked_name?: string;
+          };
+        };
+      };
     };
     expect(ack.frame_type).toBe("command_ack");
     expect(ack.command).toBe("command.invoke");
     expect(ack.status).toBe("committed");
     expect(ack.payload?.invocation_id).toBeTruthy();
     expect(ack.payload?.event_id).toBeTruthy();
+    expect(ack.payload?.invocation_message?.text).toBe("/ask hello");
+    expect(ack.payload?.invocation_message?.command_invocation?.bot_command_id).toBe(botCommandId);
+    expect(ack.payload?.invocation_message?.command_invocation?.invoked_name).toBe("ask");
     const invocationId = ack.payload?.invocation_id as string;
 
     await withChannel(channelId, (ctx) => {
@@ -165,6 +178,20 @@ describe("command.invoke", () => {
       expect(outbox?.kind).toBe("command_invocation");
       expect(outbox?.invocation_id).toBe(invocationId);
       expect(outbox?.status).toBe("pending");
+
+      const invocationMessage = ctx.storage.sql
+        .exec(
+          "SELECT text, invocation_json FROM messages WHERE channel_id=? AND invocation_json IS NOT NULL",
+          channelId,
+        )
+        .toArray()[0] as { text: string; invocation_json: string } | undefined;
+      expect(invocationMessage?.text).toBe("/ask hello");
+      const storedInvocation = JSON.parse(invocationMessage?.invocation_json ?? "{}") as {
+        bot_command_id?: string;
+        invoked_name?: string;
+      };
+      expect(storedInvocation.bot_command_id).toBe(botCommandId);
+      expect(storedInvocation.invoked_name).toBe("ask");
     });
 
     ws.close();
