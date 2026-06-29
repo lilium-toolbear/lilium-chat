@@ -28,7 +28,7 @@ Read before editing:
 
 ## Global Constraints
 
-- **Greenfield DB:** No migration from old installation data. Rewrite baseline schemas + bump `*_CURRENT_SCHEMA_VERSION`. Delete `bot_installations`, `channel_command_names`, `channel_bot_event_subscriptions`, `bot_event_capabilities` from ChatChannel/BotRegistry.
+- **Greenfield DB:** Database is empty — **no product migration, no data preservation, no upgrade path from old installation schema.** Rewrite `*_BASELINE_SCHEMA` and bump `*_CURRENT_SCHEMA_VERSION` only because the migration runner requires a version stamp. Do **not** add `up()` steps that upgrade v3→v4 or preserve old rows. If the runner requires a versioned `up()` for local/test DO stores, it is a **defensive schema reset only** (e.g. `DROP TABLE IF EXISTS` + recreate), not a compatibility migration. Delete `bot_installations`, `channel_command_names`, `channel_bot_event_subscriptions`, `bot_event_capabilities` from ChatChannel/BotRegistry baselines — they must not appear in fresh-create schema.
 - **Product model:** Users/admins manage **Slash Commands**, not Bot installations. No `POST .../bot-installations`.
 - **Global slash namespace:** `bot_command_names(slash_token PK)` lives in BotRegistry. Conflict at catalog sync time, not per-channel.
 - **Manifest hot path:** `GET /api/chat/bootstrap?channel_id=` and slash palette must not call BotRegistry. Manifest built from `channel_command_bindings` only.
@@ -63,8 +63,8 @@ Read before editing:
 
 **Modify:**
 
-- `src/do/migrations/bot-registry.ts` — v4 schema (global names, execution_mode, drop event_capabilities)
-- `src/do/migrations/chat-channel.ts` — v3 schema (new bindings, stateful tables, drop install tables)
+- `src/do/migrations/bot-registry.ts` — baseline schema reset (global names, execution_mode; no `bot_event_capabilities`)
+- `src/do/migrations/chat-channel.ts` — baseline schema reset (new bindings, stateful tables; no install tables)
 - `src/do/bot-registry.ts` — catalog sync + bot CRUD + directory search + `/internal/command-get`
 - `src/do/chat-channel.ts` — remove bot-install; new binding/manifest/invoke/stateful handlers
 - `src/do/chat-channel/routes/bot-routes.ts` — route map updates
@@ -99,13 +99,15 @@ Read before editing:
 - Modify: `src/contract/persisted.ts`
 - Modify: `src/errors.ts`
 - Test: `test/errors.test.ts`
+- Test: `test/chat/channel-events-binding-updated.test.ts` (persisted + replay delta)
 
 - [ ] **Step 1: Write contract addendum**
 
 Create `docs/api-contract/2026-06-28-bot-slash-command-contract-addendum.md` documenting:
 
 - Remove Browser routes: `POST/PATCH .../bot-installations`, `PATCH .../event-subscriptions/message.created`
-- Add Browser routes: `POST/GET /api/chat/bots`, `POST/DELETE .../tokens`, `GET /api/chat/commands/directory`, `GET/POST .../stateful-session`
+- Add Browser routes: `POST/GET /api/chat/bots`, `GET /api/chat/bots/{bot_id}`, `GET /api/chat/bots/{bot_id}/tokens`, `POST/DELETE .../tokens`, `GET /api/chat/commands/directory`, `GET/POST .../stateful-session`
+- Defer (document explicitly): `PATCH /api/chat/bots/{bot_id}` — v1.1
 - Change `PATCH .../commands/{bot_command_id}` to `{ status, permission_override?, stateful_max_ttl_seconds? }`
 - Change `GET .../commands` to full manifest `{ version, items[] }` (no required `?prefix=`)
 - Change `PUT /bot/commands` to include `execution.mode` / `execution.stateful`; remove `event_capabilities`, `default_enabled_on_install`
@@ -248,6 +250,86 @@ export interface StatefulSessionClosedPayload {
 
 Register in `ChatEventWirePayloadMap` and `DOMAIN_TIMELINE_EVENT_TYPES` for the three stateful events.
 
+- [ ] **Step 3b: Persist `command_manifest_delta` on wire and replay paths**
+
+Extend `CommandBindingUpdatedPersistedPayload` in `src/contract/persisted.ts`:
+
+```ts
+import type { CommandManifestDelta } from "./bot-api";
+
+export interface CommandBindingUpdatedPersistedPayload extends ActorPersistedFields {
+  channel_id: string;
+  bot_id: string;
+  bot_command_id: string;
+  binding_changes: Record<string, { before: unknown; after: unknown }>;
+  command_manifest_delta: CommandManifestDelta;
+}
+```
+
+Update `buildCommandBindingUpdatedPayload` in `src/chat/channel-events.ts`:
+
+```ts
+export function buildCommandBindingUpdatedPayload(raw: {
+  channel_id: string;
+  bot_id: string;
+  bot_command_id: string;
+  binding_changes: Record<string, { before: unknown; after: unknown }>;
+  actor_kind: string;
+  actor_id: string;
+  command_manifest_delta: CommandManifestDelta;
+}): CommandBindingUpdatedPersistedPayload {
+  return {
+    channel_id: raw.channel_id,
+    bot_id: raw.bot_id,
+    bot_command_id: raw.bot_command_id,
+    binding_changes: raw.binding_changes,
+    actor_kind: raw.actor_kind,
+    actor_id: raw.actor_id,
+    command_manifest_delta: raw.command_manifest_delta,
+  };
+}
+```
+
+In `resolveActorWithMap` / management replay projection: pass `command_manifest_delta` through unchanged (it is already a Browser projection shape; do not strip it on replay).
+
+Write `test/chat/channel-events-binding-updated.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { buildCommandBindingUpdatedPayload } from "../../src/chat/channel-events";
+
+describe("buildCommandBindingUpdatedPayload", () => {
+  it("persists command_manifest_delta for replay", () => {
+    const payload = buildCommandBindingUpdatedPayload({
+      channel_id: "ch-1",
+      bot_id: "bot-1",
+      bot_command_id: "cmd-1",
+      binding_changes: { status: { before: "blocked", after: "allowed" } },
+      actor_kind: "user",
+      actor_id: "user-1",
+      command_manifest_delta: {
+        op: "upsert",
+        manifest_version: 2,
+        item: {
+          bot_command_id: "cmd-1",
+          name: "ask",
+          aliases: [],
+          description: "Ask",
+          bot: { bot_id: "bot-1", display_name: "Bot", avatar_url: null },
+          options: [],
+          effective_member_permission: "member",
+          execution: { mode: "stateless" },
+        },
+      },
+    });
+    expect(payload.command_manifest_delta.op).toBe("upsert");
+    expect(payload.command_manifest_delta.manifest_version).toBe(2);
+  });
+});
+```
+
+Add integration test (in `test/routes/channel-commands.test.ts` or dedicated file): fetch channel timeline/history after binding update and assert replayed `command.binding_updated` event wire payload still includes `command_manifest_delta`.
+
 - [ ] **Step 4: Add error codes to `src/errors.ts`**
 
 ```ts
@@ -279,7 +361,8 @@ Expected: PASS (fix any broken references from payload shape change)
 
 ```bash
 git add docs/api-contract/2026-06-28-bot-slash-command-contract-addendum.md \
-  src/contract/bot-api.ts src/contract/events.ts src/contract/persisted.ts src/errors.ts
+  src/contract/bot-api.ts src/contract/events.ts src/contract/persisted.ts \
+  src/chat/channel-events.ts src/errors.ts test/chat/channel-events-binding-updated.test.ts
 git commit -m "docs(contract): add bot slash command addendum and shared types"
 ```
 
@@ -328,6 +411,22 @@ describe("validateSlashToken", () => {
     expect(validateSlashToken("狼人杀")).toEqual({ ok: true, token: "狼人杀" });
   });
 });
+
+describe("collectSlashTokens", () => {
+  it("returns canonical, aliases, and all tokens", () => {
+    const out = collectSlashTokens("/Ask", ["AI"]);
+    expect(out).toEqual({
+      ok: true,
+      canonical: "ask",
+      aliases: ["ai"],
+      all: ["ask", "ai"],
+    });
+  });
+
+  it("rejects duplicate canonical/alias in same request", () => {
+    expect(collectSlashTokens("ask", ["ASK"])).toEqual({ ok: false, error: "duplicate_in_request" });
+  });
+});
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -339,15 +438,30 @@ Expected: FAIL — module not found
 - [ ] **Step 3: Implement `src/chat/slash-token.ts`**
 
 ```ts
-export interface SlashTokenResult {
-  ok: boolean;
-  token?: string;
-  error?: string;
+export interface SlashTokenOk {
+  ok: true;
+  token: string;
 }
+
+export interface SlashTokenError {
+  ok: false;
+  error: string;
+}
+
+export type SlashTokenResult = SlashTokenOk | SlashTokenError;
+
+export interface CollectedSlashTokens {
+  ok: true;
+  canonical: string;
+  aliases: string[];
+  all: string[];
+}
+
+export type CollectSlashTokensResult = CollectedSlashTokens | SlashTokenError;
 
 export function normalizeSlashToken(input: string): string {
   return input
-   .trim()
+    .trim()
     .replace(/^\/+/, "")
     .normalize("NFKC")
     .toLowerCase();
@@ -363,17 +477,27 @@ export function validateSlashToken(raw: string): SlashTokenResult {
   return { ok: true, token };
 }
 
-export function collectSlashTokens(name: string, aliases: string[]): SlashTokenResult {
-  const tokens: string[] = [];
-  const seen = new Set<string>();
-  for (const raw of [name, ...aliases]) {
+export function collectSlashTokens(name: string, aliases: string[]): CollectSlashTokensResult {
+  const canonicalResult = validateSlashToken(name);
+  if (!canonicalResult.ok) return canonicalResult;
+
+  const normalizedAliases: string[] = [];
+  const seen = new Set<string>([canonicalResult.token]);
+
+  for (const raw of aliases) {
     const v = validateSlashToken(String(raw));
-    if (!v.ok || !v.token) return v;
+    if (!v.ok) return v;
     if (seen.has(v.token)) return { ok: false, error: "duplicate_in_request" };
     seen.add(v.token);
-    tokens.push(v.token);
+    normalizedAliases.push(v.token);
   }
-  return { ok: true, token: tokens[0] };
+
+  return {
+    ok: true,
+    canonical: canonicalResult.token,
+    aliases: normalizedAliases,
+    all: [canonicalResult.token, ...normalizedAliases],
+  };
 }
 ```
 
@@ -392,20 +516,21 @@ git commit -m "feat(chat): add global slash token normalization helpers"
 
 ---
 
-## Task 3: BotRegistry Schema v4 (Global Namespace)
+## Task 3: BotRegistry Baseline Schema Reset (Global Namespace)
 
 **Files:**
 
-- Modify: `src/do/migrations/bot-registry.ts`
-- Modify: `src/do/migrations/bot-registry.ts` baseline
+- Modify: `src/do/migrations/bot-registry.ts` (rewrite `BOT_REGISTRY_BASELINE_SCHEMA` + bump version)
 - Test: `test/do/bot-registry-migrations.test.ts`
 
-- [ ] **Step 1: Write failing migration test**
+**Greenfield rule:** This task rewrites the **fresh-create baseline only**. Do not implement a product migration path from Phase 7 schema. Tests assert new tables exist on fresh DO construction and removed tables are absent from baseline SQL.
+
+- [ ] **Step 1: Write failing baseline schema test**
 
 Add to `test/do/bot-registry-migrations.test.ts`:
 
 ```ts
-  it("v4 creates bot_command_names global namespace table", async () => {
+  it("fresh BotRegistry baseline includes bot_command_names and excludes bot_event_capabilities", async () => {
     await withRegistry((ctx) => {
       expect(tableExists(ctx, "bot_command_names")).toBe(true);
       expect(tableExists(ctx, "bot_event_capabilities")).toBe(false);
@@ -417,16 +542,16 @@ Add to `test/do/bot-registry-migrations.test.ts`:
 
 Run: `npx vitest run test/do/bot-registry-migrations.test.ts --no-file-parallelism --test-timeout=60000 --hook-timeout=60000`
 
-- [ ] **Step 3: Implement migration v4**
+- [ ] **Step 3: Rewrite BotRegistry baseline schema**
 
 In `src/do/migrations/bot-registry.ts`:
 
-- Set `BOT_REGISTRY_CURRENT_SCHEMA_VERSION = 4`
-- Update baseline `bot_apps`: add `description`, `visibility`; remove `callback_url`
-- Update baseline `bot_tokens`: add `token_id`-scoped columns per spec §6.1
-- Update baseline `bot_commands`: add `execution_mode`, `stateful_config_json`, `status`; remove `default_enabled_on_install`, `enabled`
-- Add baseline `bot_command_names`
-- Add migration v4 `up()` that DROP TABLE IF EXISTS `bot_event_capabilities` and CREATE `bot_command_names` if upgrading from v3
+- Bump `BOT_REGISTRY_CURRENT_SCHEMA_VERSION` (e.g. `4`) because the runner requires a version stamp
+- **Rewrite `BOT_REGISTRY_BASELINE_SCHEMA`** in full — do not layer v4 `up()` on top of old Phase 7 tables as a compatibility path
+- `bot_apps`: add `description`, `visibility`; remove `callback_url`
+- `bot_tokens`: columns per spec §6.1 (`token_id`, `name`, `scopes_json`, `expires_at`, `last_used_at`, `revoked_at`)
+- `bot_commands`: add `execution_mode`, `stateful_config_json`, `status`; remove `default_enabled_on_install`, `enabled`
+- Add `bot_command_names` to baseline:
 
 ```sql
 CREATE TABLE IF NOT EXISTS bot_command_names (
@@ -438,7 +563,10 @@ CREATE TABLE IF NOT EXISTS bot_command_names (
 );
 ```
 
-- [ ] **Step 4: Run migration tests**
+- **Do not** include `bot_event_capabilities` in baseline
+- If the migration runner requires a versioned `up()` for local/test DO stores that already ran an older version, that `up()` is **defensive reset only** (`DROP TABLE IF EXISTS` + recreate). No row preservation, no upgrade semantics.
+
+- [ ] **Step 4: Run baseline schema tests**
 
 Expected: PASS
 
@@ -446,7 +574,7 @@ Expected: PASS
 
 ```bash
 git add src/do/migrations/bot-registry.ts test/do/bot-registry-migrations.test.ts
-git commit -m "feat(do): bot registry v4 global slash namespace schema"
+git commit -m "feat(do): reset bot registry baseline for global slash namespace"
 ```
 
 ---
@@ -508,10 +636,10 @@ Add validation for `execution.mode` and nested `stateful` block per spec §7.2.
 
 Inside `transactionSync`:
 
-1. Normalize all tokens via `validateSlashToken` / request-local dedupe
-2. For each token, `SELECT bot_command_id FROM bot_command_names WHERE slash_token=?` — if row exists for different command, abort whole request with conflict payload
+1. Normalize via `collectSlashTokens(name, aliases)` — use `all` for global conflict checks
+2. For each token in `collected.all`, `SELECT bot_command_id FROM bot_command_names WHERE slash_token=?` — if row exists for a different `bot_command_id`, abort whole request with `COMMAND_NAME_CONFLICT` payload
 3. Upsert `bot_commands`, replace `bot_command_aliases`, replace `bot_command_names` rows for this bot atomically
-4. Remove all `bot_event_capabilities` writes
+4. Do not write `bot_event_capabilities` (table removed)
 
 - [ ] **Step 5: Update `src/routes/bot.ts`**
 
@@ -532,7 +660,7 @@ git commit -m "feat(bot): global slash namespace on catalog sync"
 
 ---
 
-## Task 5: Browser Bot Developer API
+## Task 5: Browser Bot Developer API (v1 scope)
 
 **Files:**
 
@@ -541,11 +669,34 @@ git commit -m "feat(bot): global slash namespace on catalog sync"
 - Modify: `src/index.ts`
 - Create: `test/routes/bots.test.ts`
 
-- [ ] **Step 1: Write failing test for POST /api/chat/bots**
+**v1 scope (explicit):**
 
-Create `test/routes/bots.test.ts` with browser JWT owner creating bot + receiving one-time plaintext token (spec §7.1).
+```text
+In scope:
+  POST   /api/chat/bots
+  GET    /api/chat/bots
+  GET    /api/chat/bots/{bot_id}
+  GET    /api/chat/bots/{bot_id}/tokens
+  POST   /api/chat/bots/{bot_id}/tokens
+  DELETE /api/chat/bots/{bot_id}/tokens/{token_id}
 
-- [ ] **Step 2: Run test — expect FAIL**
+Deferred (document in contract addendum, do not implement in this task):
+  PATCH  /api/chat/bots/{bot_id}   — bot profile update; spec §13.1 security rule deferred to v1.1
+```
+
+`GET /bots/{bot_id}` is required so the developer UI can open a bot detail + token list without scanning the list endpoint. `PATCH` is explicitly deferred.
+
+- [ ] **Step 1: Write failing tests**
+
+Create `test/routes/bots.test.ts` covering:
+
+- `POST /api/chat/bots` — owner creates bot + optional one-time plaintext token (spec §7.1)
+- `GET /api/chat/bots` — list with `command_count`
+- `GET /api/chat/bots/{bot_id}` — owner can read own bot; non-owner → `403`
+- `GET /api/chat/bots/{bot_id}/tokens` — lists token metadata (no plaintext)
+- `POST /api/chat/bots/{bot_id}/tokens` + `DELETE .../tokens/{token_id}`
+
+- [ ] **Step 2: Run tests — expect FAIL**
 
 - [ ] **Step 3: Implement BotRegistry internals**
 
@@ -553,6 +704,8 @@ Add routes on BotRegistry DO:
 
 - `POST /internal/bots-create` — insert `bot_apps`, optional `bot_tokens`, return `{ bot, initial_token? }`
 - `GET /internal/bots-list?owner_user_id=` — cursor list with `command_count`
+- `GET /internal/bots-get?bot_id=` — single bot row (owner check in Worker)
+- `GET /internal/bots-tokens-list?bot_id=` — token metadata rows (no plaintext)
 - `POST /internal/bots-token-create`
 - `POST /internal/bots-token-revoke`
 
@@ -563,11 +716,13 @@ Token plaintext format: `lcbot_` + base64url random; store SHA-256 hash only.
 ```ts
 app.post("/api/chat/bots", (c) => createBotHandler(c));
 app.get("/api/chat/bots", (c) => listBotsHandler(c));
+app.get("/api/chat/bots/:bot_id", (c) => getBotHandler(c));
+app.get("/api/chat/bots/:bot_id/tokens", (c) => listBotTokensHandler(c));
 app.post("/api/chat/bots/:bot_id/tokens", (c) => createBotTokenHandler(c));
 app.delete("/api/chat/bots/:bot_id/tokens/:token_id", (c) => revokeBotTokenHandler(c));
 ```
 
-Verify `owner_user_id === jwt user_id` on token mutations.
+Verify `owner_user_id === jwt user_id` on all `/:bot_id` mutations and reads.
 
 - [ ] **Step 5: Run tests + typecheck**
 
@@ -575,7 +730,7 @@ Verify `owner_user_id === jwt user_id` on token mutations.
 
 ```bash
 git add src/routes/bots.ts src/do/bot-registry.ts src/index.ts test/routes/bots.test.ts
-git commit -m "feat(api): browser bot developer CRUD and token management"
+git commit -m "feat(api): browser bot developer list/detail and token management"
 ```
 
 ---
@@ -604,25 +759,27 @@ git commit -m "feat(api): global command directory for admin search"
 
 ---
 
-## Task 7: ChatChannel Schema v3 (Bindings + Stateful)
+## Task 7: ChatChannel Baseline Schema Reset (Bindings + Stateful)
 
 **Files:**
 
-- Modify: `src/do/migrations/chat-channel.ts`
+- Modify: `src/do/migrations/chat-channel.ts` (rewrite `CHAT_CHANNEL_BASELINE_SCHEMA` + bump version)
 - Test: `test/do/chat-channel-migrations-v2.test.ts` (rename/update)
 
-- [ ] **Step 1: Write failing tests for new tables**
+**Greenfield rule:** Rewrite fresh-create baseline. Removed tables (`bot_installations`, `channel_command_names`, `channel_bot_event_subscriptions`) must not appear in baseline SQL. No product migration from Phase 7 binding shape.
 
-Assert presence of:
+- [ ] **Step 1: Write failing baseline schema tests**
 
-- `channel_command_bindings` with `command_snapshot_json`, `status`, `stateful_max_ttl_seconds`
-- `stateful_command_sessions`, `stateful_session_inputs`
-- `channel_meta.command_manifest_version`
-- Absence of: `bot_installations`, `channel_command_names`, `channel_bot_event_subscriptions`
+Assert on fresh ChatChannel DO:
 
-- [ ] **Step 2: Implement schema v3**
+- `channel_command_bindings` exists with `command_snapshot_json`, `status`, `stateful_max_ttl_seconds`
+- `stateful_command_sessions`, `stateful_session_inputs` exist
+- `channel_meta.command_manifest_version` exists
+- `bot_installations`, `channel_command_names`, `channel_bot_event_subscriptions` **do not** exist
 
-Replace binding table shape:
+- [ ] **Step 2: Rewrite ChatChannel baseline schema**
+
+Replace binding table in baseline:
 
 ```sql
 CREATE TABLE channel_command_bindings (
@@ -647,12 +804,14 @@ ON stateful_command_sessions(channel_id)
 WHERE status IN ('starting', 'active', 'suspended', 'closing');
 ```
 
-- [ ] **Step 3: Run migration tests**
+Add `command_manifest_version` to `channel_meta` baseline definition.
+
+- [ ] **Step 3: Run baseline schema tests**
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git commit -m "feat(do): chat channel v3 slash binding and stateful session schema"
+git commit -m "feat(do): reset chat channel baseline for slash bindings and stateful sessions"
 ```
 
 ---
@@ -778,7 +937,21 @@ app.get("/api/chat/channels/:channel_id/commands", ...);
 
 - [ ] **Step 4: Change GET commands to full manifest (no prefix requirement)**
 
-Return `{ version, items }` from `projectCommandManifest`. Remove prefix filter from hot-path handler (deprecated query param may return 400 or ignore — pick ignore with test asserting full list).
+Return `{ version, items }` from `projectCommandManifest`. Remove prefix filter from hot-path handler (deprecated `?prefix=` query param: ignore and return full manifest; test asserts full list returned even when `?prefix=` present).
+
+- [ ] **Step 4b: DM channel command routes**
+
+Per DM addendum, pick one consistent behavior and test it:
+
+```ts
+  it("GET /channels/{dm_id}/commands returns empty manifest", async () => {
+    // { version: 0, items: [] }
+  });
+
+  it("PATCH /channels/{dm_id}/commands/{bot_command_id} returns UNSUPPORTED_CHANNEL_KIND", async () => {
+    // 409 UNSUPPORTED_CHANNEL_KIND
+  });
+```
 
 - [ ] **Step 5: Run channel command tests**
 
@@ -892,46 +1065,91 @@ git commit -m "feat(ws): implement stateless command.invoke pipeline"
 - Create: `src/routes/stateful-session.ts`
 - Create: `test/do/stateful-session.test.ts`
 
-- [ ] **Step 1: Write failing mutex test**
+**Event timing rule (normative):** Emit `stateful_session.started` **only after** Bot sends `session.started` and ChatChannel marks the session `active`. Do **not** fanout `stateful_session.started` while status is `starting`. The invoke ack may return `session_id` immediately; the channel-visible started event waits for bot ack.
 
-Two stateful invokes same channel → second returns `STATEFUL_SESSION_BUSY` with `active_session` in error.
+- [ ] **Step 1: Write failing tests**
+
+```ts
+  it("returns STATEFUL_SESSION_BUSY when second stateful invoke races same channel", async () => {
+    // first invoke succeeds with session_id; second returns STATEFUL_SESSION_BUSY + active_session
+  });
+
+  it("does not emit stateful_session.started until bot sends session.started", async () => {
+    // after invoke ack: no stateful_session.started in channel events/fanout
+    // after bot session.started: exactly one stateful_session.started with status=active
+  });
+
+  it("closes starting session on bot start timeout and releases mutex", async () => {
+    // session stays starting past timeout → status failed/closed, mutex released, no started event
+  });
+
+  it("replays unacked session.input rows after bot reconnect", async () => {
+    // disconnect bot; enqueue inputs; reconnect; BotConnection receives session.input for seq > input_last_acked_seq
+  });
+
+  it("closes session with STATEFUL_INPUT_BACKLOG_OVERFLOW when pending inputs exceed max", async () => {
+    // pending rows > 1000 → session closed, mutex released
+  });
+```
 
 - [ ] **Step 2: Implement stateful invoke branch**
 
-On stateful command:
+On stateful `command.invoke`:
 
-1. Insert session `status=starting` (unique index enforces mutex)
-2. Enqueue BotConnection message kind `session_start` (new outbox kind or dedicated session queue table — prefer extending `bot_delivery_outbox.kind` with `session_start`)
-3. Return ack including `session_id`
-4. On bot `session.started`: mark active, emit `stateful_session.started`
+1. Insert `stateful_command_sessions` with `status=starting` (partial unique index enforces mutex)
+2. Enqueue `session.start` to BotConnection (extend `bot_delivery_outbox.kind` with `session_start` or dedicated session outbox — pick one and document in code)
+3. Return committed ack including `session_id`
+4. **Do not** emit `stateful_session.started` yet
+5. When Bot sends `session.started`: ChatChannel marks session `active`, then emits **exactly one** `stateful_session.started` (payload `status=active`)
+6. If Bot does not ack `session.started` before start timeout: mark session `failed`/`closed`, release mutex, optionally notify bot
 
-- [ ] **Step 3: Hook message.created**
+- [ ] **Step 3: Hook message.created (active sessions only)**
 
-After normal message write, if active session matches `listen_rules_json`, insert `stateful_session_inputs` with monotonic seq; push `session.input` frame to bot.
+After normal message write, if **active** session matches `listen_rules_json`:
 
-Implement `matchesListenRules(message, rules, session)` in `src/chat/stateful-session.ts`.
+1. Insert `stateful_session_inputs` with `status=pending`, monotonic `seq`
+2. Increment `input_next_seq`
+3. Enqueue `session.input` to BotConnection
 
-- [ ] **Step 4: Session close paths**
+Implement `matchesListenRules(message, rules, session)` in `src/chat/stateful-session.ts`. Ignore messages while session is `starting`.
+
+- [ ] **Step 4: Input ack + send status**
+
+`stateful_session_inputs.status`: `pending | sent | acked | expired`
+
+- On BotConnection push `session.input`: mark row `sent`
+- On Bot `session.input_ack` with `last_received_seq`: ChatChannel updates `input_last_acked_seq`, marks inputs `seq <= last_received_seq` as `acked`
+
+- [ ] **Step 5: Resume / redelivery on Bot reconnect**
+
+On Bot Gateway `hello` / connect:
+
+1. BotConnection calls ChatChannel `/internal/stateful-sessions-active?bot_id=`
+2. For each active session, ChatChannel returns inputs where `seq > input_last_acked_seq` ordered by `seq`
+3. BotConnection sends `session.input` frames in order (at-least-once; Bot dedupes by `seq`)
+4. If count of `pending|sent` inputs > `max_pending_inputs` (default 1000): close session with `STATEFUL_INPUT_BACKLOG_OVERFLOW`, emit `stateful_session.closed`, release mutex
+
+- [ ] **Step 6: Session close paths**
 
 - Bot `session.close`
 - `POST /channels/{id}/stateful-session/stop`
 - TTL alarm via scheduler due table on `stateful_command_sessions.expires_at`
-- Bot offline grace 120s
+- Bot offline grace 120s during active session
 
-Each transitions to closed, emits `stateful_session.closed`, releases mutex.
+Each transitions to closed/expired/failed, emits `stateful_session.closed`, releases mutex, stops new input enqueue.
 
-- [ ] **Step 5: HTTP routes GET/POST stateful-session**
+- [ ] **Step 7: HTTP routes GET/POST stateful-session**
 
-- [ ] **Step 6: BotConnection session frame routing**
+- [ ] **Step 8: BotConnection session frame routing**
 
 Parse/send: `session.start`, `session.started`, `session.input`, `session.input_ack`, `session.effects`, `session.effects_ack`, `session.close`, `session.closed`.
 
-- [ ] **Step 7: Run stateful tests (spec §15.6)**
+- [ ] **Step 9: Run stateful tests (spec §15.6)**
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git commit -m "feat(stateful): channel mutex sessions with bot gateway protocol"
+git commit -m "feat(stateful): channel mutex sessions with durable input resume"
 ```
 
 ---
@@ -976,7 +1194,7 @@ git commit -m "chore(bot): remove installation model and update developer guide"
 | §6.1 BotRegistry schema | Tasks 3–4 |
 | §6.2 ChatChannel bindings | Tasks 7, 9 |
 | §6.3 Stateful tables | Tasks 7, 12 |
-| §7.1 Bot developer API | Task 5 |
+| §7.1 Bot developer API | Task 5 (PATCH deferred v1.1) |
 | §7.2 Catalog sync | Task 4 |
 | §7.3 Command directory | Task 6 |
 | §7.4 Bootstrap manifest | Task 10 |
@@ -991,7 +1209,7 @@ git commit -m "chore(bot): remove installation model and update developer guide"
 | §14 Error codes | Task 1 |
 | §15 Tests | Each task |
 
-**Out of scope (explicit non-goals):** bot marketplace, per-channel alias, HTTP bot send path changes, passive `message_event` subscriptions, migration tasks.
+**Out of scope (explicit non-goals):** bot marketplace, per-channel alias, HTTP bot send path changes, passive `message_event` subscriptions, product migration tasks, `PATCH /api/chat/bots/{bot_id}` (deferred v1.1).
 
 ---
 
