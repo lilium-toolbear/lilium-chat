@@ -46,20 +46,17 @@ export interface BotInstallUpdateResponse {
 export interface BotCommandCatalogEntry {
   bot_command_id: string;
   name: string;
+  aliases: string[];
+  status: string;
+  execution_mode: CommandExecutionMode;
+  stateful_config: CommandStatefulConfig | null;
   definition_hash: string;
   schema_version: number;
   updated_at: string;
 }
 
-export interface BotEventCapabilityCatalogEntry {
-  event_type: string;
-  default_enabled_on_install: boolean;
-  updated_at: string;
-}
-
 export interface BotCommandsSyncResponse {
   commands: BotCommandCatalogEntry[];
-  event_capabilities: BotEventCapabilityCatalogEntry[];
 }
 
 export interface CommandBindingUpdateResponse {

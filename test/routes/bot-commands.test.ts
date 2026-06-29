@@ -31,25 +31,29 @@ async function seedBot(opts: {
   const tokenHash = await hashBotToken(opts.token);
   await withRegistry((ctx) => {
     ctx.storage.sql.exec(
-      `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, callback_url, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, description, visibility, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       opts.botId,
       "owner-1",
       "Catalog Bot",
       null,
-      "https://example.test/callback",
+      null,
+      "private",
       opts.status ?? "active",
       "2026-06-26T00:00:00.000Z",
       "2026-06-26T00:00:00.000Z",
     );
     ctx.storage.sql.exec(
-      `INSERT INTO bot_tokens (token_id, bot_id, token_hash, scopes, created_at, revoked_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO bot_tokens (token_id, bot_id, name, token_hash, scopes_json, created_at, expires_at, last_used_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       `tok-${opts.botId}`,
       opts.botId,
+      "default",
       tokenHash,
       JSON.stringify(opts.scopes ?? ["chat:commands:manage"]),
       "2026-06-26T00:00:00.000Z",
+      null,
+      null,
       opts.revoked ? "2026-06-26T00:00:00.000Z" : null,
     );
   });
@@ -59,8 +63,8 @@ async function seedBot(opts: {
 async function cleanupBot(botId: string): Promise<void> {
   await withRegistry((ctx) => {
     ctx.storage.sql.exec("DELETE FROM bot_command_aliases WHERE bot_id=?", botId);
+    ctx.storage.sql.exec("DELETE FROM bot_command_names WHERE bot_id=?", botId);
     ctx.storage.sql.exec("DELETE FROM bot_commands WHERE bot_id=?", botId);
-    ctx.storage.sql.exec("DELETE FROM bot_event_capabilities WHERE bot_id=?", botId);
     ctx.storage.sql.exec("DELETE FROM bot_idempotency_keys WHERE principal_id=?", botId);
     ctx.storage.sql.exec("DELETE FROM bot_tokens WHERE bot_id=?", botId);
     ctx.storage.sql.exec("DELETE FROM bot_apps WHERE bot_id=?", botId);
@@ -100,38 +104,35 @@ const ASK_COMMAND = {
     { name: "count", type: "integer", required: false, min: 1, max: 10 },
   ],
   default_member_permission: "member",
-  default_enabled_on_install: true,
+  execution: { mode: "stateless" as const },
 };
 
 describe("PUT /api/chat/bot/commands (7a-catalog-sync)", () => {
-  it("registers a command catalog + aliases + event_capabilities", async () => {
+  it("registers a command catalog + aliases", async () => {
     const botId = `cat-ok-${crypto.randomUUID()}`;
     await seedBot({ botId, token: "secret-cat-ok" });
     const res = await botPut(
       "secret-cat-ok",
       {
         commands: [ASK_COMMAND],
-        event_capabilities: [
-          {
-            event_type: "message.created",
-            default_enabled_on_install: false,
-            default_filters: { message_types: ["text"] },
-          },
-        ],
       },
       "key-1",
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
-      commands: Array<{ bot_command_id: string; name: string; aliases: string[]; enabled: boolean; default_enabled_on_install: boolean }>;
-      event_capabilities: Array<{ event_type: string; default_enabled_on_install: boolean }>;
+      commands: Array<{
+        bot_command_id: string;
+        name: string;
+        aliases: string[];
+        status: string;
+        execution_mode: string;
+      }>;
     };
     expect(body.commands).toHaveLength(1);
     expect(body.commands[0]!.name).toBe("ask");
     expect(body.commands[0]!.aliases).toEqual(["ai", "chat"]);
-    expect(body.commands[0]!.enabled).toBe(true);
-    expect(body.commands[0]!.default_enabled_on_install).toBe(true);
-    expect(body.event_capabilities[0]!.event_type).toBe("message.created");
+    expect(body.commands[0]!.status).toBe("active");
+    expect(body.commands[0]!.execution_mode).toBe("stateless");
   });
 
   it("is idempotent: same Idempotency-Key + same body returns the same response", async () => {
@@ -205,20 +206,6 @@ describe("PUT /api/chat/bot/commands (7a-catalog-sync)", () => {
     expect(body.error.code).toBe("INVALID_COMMAND_OPTIONS");
   });
 
-  it("returns 422 for non-message.created event_type", async () => {
-    const botId = `cat-badcap-${crypto.randomUUID()}`;
-    await seedBot({ botId, token: "secret-cat-badcap" });
-    const res = await botPut(
-      "secret-cat-badcap",
-      {
-        commands: [ASK_COMMAND],
-        event_capabilities: [{ event_type: "message.updated" }],
-      },
-      "key-badcap",
-    );
-    expect(res.status).toBe(422);
-  });
-
   it("returns 401 for a revoked token", async () => {
     const botId = `cat-revoked-${crypto.randomUUID()}`;
     await seedBot({ botId, token: "secret-cat-revoked", revoked: true });
@@ -245,5 +232,32 @@ describe("PUT /api/chat/bot/commands (7a-catalog-sync)", () => {
       env,
     );
     expect(res.status).toBe(422);
+  });
+
+  it("returns COMMAND_NAME_CONFLICT when two bots register the same slash token", async () => {
+    const botA = `cat-conflict-a-${crypto.randomUUID()}`;
+    const botB = `cat-conflict-b-${crypto.randomUUID()}`;
+    await seedBot({ botId: botA, token: "secret-conflict-a" });
+    await seedBot({ botId: botB, token: "secret-conflict-b" });
+
+    const syncA = await botPut("secret-conflict-a", { commands: [ASK_COMMAND] }, "key-conflict-a");
+    expect(syncA.status).toBe(200);
+
+    const syncB = await botPut(
+      "secret-conflict-b",
+      {
+        commands: [
+          {
+            ...ASK_COMMAND,
+            aliases: [],
+          },
+        ],
+      },
+      "key-conflict-b",
+    );
+    expect(syncB.status).toBe(409);
+    const body = (await syncB.json()) as { error: { code: string; conflict: { slash_token: string } } };
+    expect(body.error.code).toBe("COMMAND_NAME_CONFLICT");
+    expect(body.error.conflict.slash_token).toBe("ask");
   });
 });
