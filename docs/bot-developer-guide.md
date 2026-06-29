@@ -14,40 +14,51 @@
 ## 1. 架构概览
 
 ```
+Bot 开发者 (Browser JWT)
+  └─ POST /api/chat/bots 注册 Bot、管理 Token
+
 频道管理员 (Browser JWT)
-  └─ 安装 Bot、启用 command、配置 message.created 订阅
+  └─ PATCH /channels/{id}/commands/{bot_command_id}  allow/block 单条 slash command
 
 Bot 进程 (Bot Token)
-  ├─ PUT  /api/chat/bot/commands          同步全局 slash command 目录
+  ├─ PUT  /api/chat/bot/commands          同步全局 slash command catalog
   ├─ POST /api/chat/bot/channels/{id}/messages   主动发消息（可选 HTTP 路径）
-  └─ WS   /api/chat/bot/ws                常驻连接，接收 runtime delivery
+  └─ WS   /api/chat/bot/ws                常驻连接，接收 delivery 与 stateful session 帧
 
 频道用户 (Browser JWT + Browser WS)
-  └─ command.invoke / interaction.submit  → Chat 推 delivery 给 Bot WS
+  └─ command.invoke  → stateless delivery 或 stateful session.start
 ```
 
 **三条路径分离，不可混用：**
 
 | 路径 | 认证 | 用途 |
 |---|---|---|
-| Browser API | ToolBear browser JWT | 用户聊天、频道管理、Bot 安装 |
+| Browser API | ToolBear browser JWT | 用户聊天、频道管理、command allow/block |
 | Bot HTTP API | `Authorization: Bearer <bot_token>` | Bot 同步 catalog、主动发消息 |
-| Bot Gateway WS | 同上 + `Sec-WebSocket-Protocol: lilium.chat.bot.v1` | 接收 invocation / interaction / message_event |
+| Bot Gateway WS | 同上 + `Sec-WebSocket-Protocol: lilium.chat.bot.v1` | 接收 invocation、stateful `session.*` 帧 |
 
 Bot 与 Browser **不复用** WebSocket。Browser 走 `/api/chat/ws`（`lilium.chat.v2`），Bot 走 `/api/chat/bot/ws`（`lilium.chat.bot.v1`）。
+
+**Slash Command 模型要点：**
+
+- **全局命名空间**：`BotRegistry.bot_command_names` 保证全站 slash 名称唯一；Bot 通过 `PUT /bot/commands` 声明 catalog。
+- **频道 allow/block**：`ChatChannel.channel_command_bindings` 记录每条 command 在频道内是 `allowed` 还是 `blocked`；不再使用 per-channel 安装表。
+- **Stateful 会话**：`execution.mode=stateful` 的 command 在频道内互斥占用 mutex；Bot 通过 `session.start` / `session.input` / `session.close` 帧驱动会话。
 
 ---
 
 ## 2. 接入前置条件
 
-Bot 开发者需要平台侧完成以下步骤（通常由 ToolBear 运营或 Bot 所有者操作）：
+Bot 开发者需要完成：
 
-1. **注册 Bot 应用**：在 `BotRegistry` 中创建 `bot_id`，签发 Bot Token（明文只返回一次，服务端存 SHA-256 hash）。
-2. **频道安装**：频道 owner/admin 调用 Browser API 将 Bot 安装到目标频道。
-3. **（可选）启用 command binding**：安装时可按 catalog 的 `default_enabled_on_install` 自动创建 binding；也可后续单独 enable/disable。
-4. **（可选）配置被动订阅**：owner/admin 为已安装 Bot 启用 `message.created` 事件订阅及 filters。
+1. **注册 Bot 应用**：Browser JWT 调用 `POST /api/chat/bots` 创建 `bot_id` 并签发 Token（明文只返回一次）。
+2. **同步 catalog**：Bot 进程 `PUT /api/chat/bot/commands` 写入全局 command 定义（含 `execution.mode` / `execution.stateful`）。
+3. **频道 allow**：频道 owner/admin 对目标 command 调用 `PATCH .../commands/{bot_command_id}`，`status: "allowed"` 并携带 `command_snapshot`。
+4. **保持 Gateway 在线**：stateless invoke 与 stateful session 启动前都会检查 `BotConnection` 连接状态；离线返回 `BOT_OFFLINE`。
 
-Bot 只能在被安装且 `bot_installations.status=active` 的 **`kind=channel` 群聊频道**内工作。DM 频道不支持 Bot 安装、slash command、被动订阅与 Bot 发消息（返回 `409 UNSUPPORTED_CHANNEL_KIND`）。
+Bot 只能在 **`kind=channel` 群聊频道**内工作，且 command 必须被 allow。DM 不支持 slash command（返回 `409 UNSUPPORTED_CHANNEL_KIND`）。
+
+已移除的旧模型：`POST/PATCH .../bot-installations`、`channel_command_names`（频道级索引）、`bot_event_capabilities`（被动订阅 catalog）。
 
 ---
 
@@ -152,18 +163,28 @@ Content-Type: application/json
         }
       ],
       "default_member_permission": "member",
-      "default_enabled_on_install": true
-    }
-  ],
-  "event_capabilities": [
+      "execution": {
+        "mode": "stateless"
+      }
+    },
     {
-      "event_type": "message.created",
-      "default_enabled_on_install": false,
-      "default_filters": {
-        "message_types": ["text"],
-        "include_bot_messages": false,
-        "include_own_messages": false,
-        "only_when_mentioned": false
+      "name": "werewolf",
+      "aliases": [],
+      "description": "Start a stateful game session",
+      "options": [],
+      "default_member_permission": "member",
+      "execution": {
+        "mode": "stateful",
+        "stateful": {
+          "mutex_scope": "channel",
+          "default_ttl_seconds": 3600,
+          "max_ttl_seconds": 7200,
+          "listen_capability": {
+            "message_types": ["text"],
+            "include_bot_messages": false,
+            "include_own_messages": true
+          }
+        }
       }
     }
   ]
@@ -178,8 +199,8 @@ Content-Type: application/json
 | `commands[].aliases` | 同一 command 的别名；`command.invoke` 时通过 `invoked_name` 区分 |
 | `commands[].options[].type` | `string` \| `integer` \| `number` \| `boolean` \| `user` \| `channel` \| `role` |
 | `commands[].default_member_permission` | `member` \| `admin` \| `owner`；频道 binding 可用 `permission_override` 覆盖 |
-| `commands[].default_enabled_on_install` | 安装到频道时是否默认 enable 该 command |
-| `event_capabilities[]` | Bot 声明支持的被动事件；Phase 7 仅 `message.created` |
+| `commands[].execution.mode` | `stateless`（一次性 delivery）或 `stateful`（频道 mutex 会话） |
+| `commands[].execution.stateful` | stateful 模式必填：`mutex_scope`、`default_ttl_seconds`、`max_ttl_seconds`、`listen_capability` |
 
 **响应** `200`：
 
@@ -193,22 +214,15 @@ Content-Type: application/json
       "schema_version": 1,
       "updated_at": "2026-06-21T05:30:00Z"
     }
-  ],
-  "event_capabilities": [
-    {
-      "event_type": "message.created",
-      "default_enabled_on_install": false,
-      "updated_at": "2026-06-21T05:30:00Z"
-    }
   ]
 }
 ```
 
 **重要语义**：
 
-- 此接口只写 **全局 catalog**（`BotRegistry`），**不会**在任何频道自动 enable command。
-- 频道内 command 是否可用，由频道 admin 安装 Bot + command binding 决定。
-- 同一频道内 enabled command 的 slash 名称（canonical + aliases）不能冲突；冲突在 **binding 层**检测，返回 `COMMAND_NAME_CONFLICT`，不在 catalog sync 时检测。
+- 此接口只写 **全局 catalog**（`BotRegistry` + `bot_command_names`），**不会**自动 allow 到任何频道。
+- 频道内 command 是否可用，由频道 admin 对单条 command 执行 allow/block 决定。
+- 全局 slash 名称冲突在 catalog sync 时返回 `COMMAND_NAME_CONFLICT`。
 - `bot_command_id` 是 command 定义 ID，与 WS 帧顶层的 `command_id`（幂等 operation id）**不是同一概念**。
 
 **实现状态**：✅ 已实现
@@ -692,89 +706,66 @@ Authorization: Bearer <browser_jwt>
 
 ## 9. 频道管理 API（Browser JWT，非 Bot Token）
 
-Bot 开发者需协调频道管理员完成以下操作。
+Bot 开发者需协调频道管理员完成 command allow/block。
 
-### 9.1 安装 Bot
-
-```http
-POST /api/chat/channels/{channel_id}/bot-installations
-Authorization: Bearer <browser_jwt>
-Idempotency-Key: <uuidv7>
-```
-
-```json
-{
-  "bot_id": "00000000-0000-7000-8000-000000000601",
-  "initial_command_policy": {
-    "00000000-0000-7000-8000-000000000701": { "enabled": true }
-  },
-  "initial_event_subscriptions": {
-    "message.created": { "enabled": true }
-  }
-}
-```
-
-响应含 `bindings[]` 与 `subscriptions[]`。
-
-**实现状态**：✅
-
-### 9.2 卸载 Bot
-
-```http
-PATCH /api/chat/channels/{channel_id}/bot-installations/{bot_id}
-```
-
-```json
-{ "status": "removed" }
-```
-
-**实现状态**：✅
-
-### 9.3 启用/禁用 Command Binding
+### 9.1 Allow / Block Command Binding
 
 ```http
 PATCH /api/chat/channels/{channel_id}/commands/{bot_command_id}
-```
-
-```json
-{
-  "enabled": true,
-  "permission_override": "admin"
-}
-```
-
-**实现状态**：✅
-
-### 9.4 配置 message.created 被动订阅
-
-```http
-PATCH /api/chat/channels/{channel_id}/bot-installations/{bot_id}/event-subscriptions/message.created
 Authorization: Bearer <browser_jwt>
 Idempotency-Key: <uuidv7>
 ```
 
+Allow：
+
 ```json
 {
-  "enabled": true,
-  "filters": {
-    "message_types": ["text"],
-    "include_bot_messages": false,
-    "include_own_messages": false,
-    "only_when_mentioned": false
-  }
+  "status": "allowed",
+  "permission_override": "admin",
+  "stateful_max_ttl_seconds": 3600
 }
 ```
 
-| Filter | 默认 | 说明 |
-|---|---|---|
-| `message_types` | `["text"]` | 只投递匹配类型的消息 |
-| `include_bot_messages` | `false` | 是否包含任意 Bot 消息 |
-| `include_own_messages` | `false` | 是否包含本 Bot 自己发的消息 |
-| `only_when_mentioned` | `false` | 是否仅在 @提及本 Bot 时投递 |
+Block：
 
-被动订阅是 **observer/responder only**：无 consume / stop-propagation 语义。Bot effect 生成的消息不会触发同一 Bot 的 `message_event`（loop prevention）。
+```json
+{
+  "status": "blocked"
+}
+```
 
-**实现状态**：⏳ Contract 已定义，**HTTP 路由尚未注册**
+每次更新递增 `command_manifest_version` 并 fanout `command.binding_updated`。
+
+**实现状态**：✅
+
+### 9.2 查询频道 Command Manifest
+
+```http
+GET /api/chat/channels/{channel_id}/commands?prefix=as
+Authorization: Bearer <browser_jwt>
+```
+
+**实现状态**：✅
+
+### 9.3 Stateful Session 状态与停止
+
+```http
+GET /api/chat/channels/{channel_id}/stateful-session
+POST /api/chat/channels/{channel_id}/stateful-session/stop
+```
+
+Stop 请求体：`{ "session_id": "...", "reason": "admin_stop" }`。频道 owner/admin 或 session 发起者可 stop。
+
+**实现状态**：✅
+
+### 9.4 已移除：Bot 安装与被动订阅 API
+
+以下端点已删除，请勿再集成：
+
+- `POST/PATCH /api/chat/channels/{channel_id}/bot-installations`
+- `PATCH .../bot-installations/{bot_id}/event-subscriptions/message.created`
+
+Stateful command 的 `listen_capability` 取代独立的 `message.created` 被动订阅配置。
 
 ---
 
@@ -827,24 +818,21 @@ Idempotency-Key: <uuidv7>
 
 ## 12. 实现状态总览
 
-截至文档编写时（对照 `src/index.ts` 与 DO 实现）：
-
 | 端点 / 能力 | 状态 |
 |---|---|
-| `PUT /api/chat/bot/commands` | ✅ 已实现 |
-| `GET /api/chat/bot/ws`（upgrade + hello/ready/ping） | ✅ 已实现 |
-| Bot Gateway delivery 推送 | ✅ 已实现 |
-| `delivery_result` → effect 应用 | ⏳ 未实现 |
-| `POST /api/chat/bot/channels/{id}/messages` | ⏳ 未注册 |
-| Browser `command.invoke` → Bot delivery | ⏳ 未实现（当前返回 unsupported） |
-| Browser `interaction.submit` → Bot delivery | ⏳ 未实现 |
-| `PATCH .../event-subscriptions/message.created` | ⏳ 未注册 |
-| `message.created` → `message_event` delivery | ⏳ 未完整接线 |
-| `POST/PATCH .../bot-installations`（Browser） | ✅ 已实现 |
-| `PATCH .../commands/{bot_command_id}`（Browser） | ✅ 已实现 |
-| `GET .../commands?prefix=`（Browser） | ✅ 已实现 |
+| `PUT /api/chat/bot/commands`（含 stateful execution） | ✅ |
+| `GET /api/chat/bot/ws`（hello/ready + session 帧） | ✅ |
+| Stateless `command.invoke` → bot delivery | ✅ |
+| Stateful `command.invoke` → `session.start` / `session.input` | ✅ |
+| `GET/POST .../stateful-session`（Browser） | ✅ |
+| `PATCH .../commands/{bot_command_id}` allow/block | ✅ |
+| `POST /api/chat/bots` Bot 开发者 API | ✅ |
+| `GET /api/chat/commands/directory` | ✅ |
+| `delivery_result` → effect 应用 | ⏳ |
+| `POST /api/chat/bot/channels/{id}/messages` | ⏳ |
+| `POST/PATCH .../bot-installations` | ❌ 已移除 |
 
-完整 Phase 7 计划见 [`docs/superpowers/plans/2026-06-26-lilium-chat-phase-7.md`](./superpowers/plans/2026-06-26-lilium-chat-phase-7.md)。
+Slash Command 后端 spec：[`docs/superpowers/specs/2026-06-28-lilium-chat-bot-spec-revised.md`](./superpowers/specs/2026-06-28-lilium-chat-bot-spec-revised.md)
 
 ---
 

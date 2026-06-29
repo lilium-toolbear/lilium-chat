@@ -928,10 +928,8 @@ export class BotRegistry extends DurableObject<Env> {
   }
 
   /**
-   * Return the bot's full enabled command catalog + aliases + event
-   * capabilities + profile. Used by ChatChannel /internal/bot-install to
-   * build channel_command_bindings + channel_command_names +
-   * channel_bot_event_subscriptions snapshots.
+   * Return the bot's full enabled command catalog + aliases + profile.
+   * Used by ChatChannel when building channel_command_bindings snapshots.
    */
   private async handleBotCommands(url: URL): Promise<Response> {
     const botId = url.searchParams.get("bot_id");
