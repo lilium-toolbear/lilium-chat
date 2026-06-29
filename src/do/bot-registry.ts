@@ -182,6 +182,60 @@ function readBotAppArchiveRow(ctx: DurableObjectState, botId: string): Record<st
   };
 }
 
+function readBotTokenArchiveRow(ctx: DurableObjectState, tokenId: string): Record<string, unknown> | undefined {
+  const row = ctx.storage.sql
+    .exec(
+      "SELECT token_id, bot_id, name, token_hash, scopes_json, created_at, expires_at, last_used_at, revoked_at FROM bot_tokens WHERE token_id=?",
+      tokenId,
+    )
+    .toArray()[0] as
+    | {
+        token_id: string;
+        bot_id: string;
+        name: string;
+        token_hash: string;
+        scopes_json: string;
+        created_at: string;
+        expires_at: string | null;
+        last_used_at: string | null;
+        revoked_at: string | null;
+      }
+    | undefined;
+  if (!row) return undefined;
+  return {
+    token_id: row.token_id,
+    bot_id: row.bot_id,
+    name: row.name,
+    token_hash: row.token_hash,
+    scopes: row.scopes_json,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    last_used_at: row.last_used_at,
+    revoked_at: row.revoked_at,
+  };
+}
+
+function buildBotAppAndTokenArchiveChanges(
+  ctx: DurableObjectState,
+  botId: string,
+  tokenId: string | null,
+  sourceSeq: number,
+): ArchiveChange[] {
+  const rowVersion = rowVersionFromSeq(sourceSeq);
+  const changes: ArchiveChange[] = [];
+  const botApp = readBotAppArchiveRow(ctx, botId);
+  if (botApp) {
+    changes.push(archiveUpsert("chat_bot_apps", { bot_id: botId }, rowVersion, botApp));
+  }
+  if (tokenId) {
+    const tokenRow = readBotTokenArchiveRow(ctx, tokenId);
+    if (tokenRow) {
+      changes.push(archiveUpsert("chat_bot_tokens", { token_id: tokenId }, rowVersion, tokenRow));
+    }
+  }
+  return changes;
+}
+
 function encodeOffsetCursor(offset: number): string {
   return btoa(String(offset)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
@@ -403,7 +457,12 @@ export class BotRegistry extends DurableObject<Env> {
           tokenExpiresAt,
         );
       }
+      appendBotRegistryArchive(this.ctx, now, (sourceSeq) =>
+        buildBotAppAndTokenArchiveChanges(this.ctx, botId, tokenId, sourceSeq),
+      );
     });
+
+    await this.scheduleArchiveAlarm();
 
     return Response.json({
       bot: {
@@ -564,6 +623,8 @@ export class BotRegistry extends DurableObject<Env> {
       return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot not found" } }, { status: 404 });
     }
 
+    const botId = body.bot_id;
+    const tokenName = body.name.trim();
     const tokenScopes = Array.isArray(body.scopes)
       ? body.scopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0)
       : ["chat:runtime:connect", "chat:commands:manage"];
@@ -573,21 +634,33 @@ export class BotRegistry extends DurableObject<Env> {
     const tokenId = uuidv7(Date.now());
     const now = new Date().toISOString();
 
-    this.ctx.storage.sql.exec(
-      `INSERT INTO bot_tokens (token_id, bot_id, name, token_hash, scopes_json, created_at, expires_at, last_used_at, revoked_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
-      tokenId,
-      body.bot_id,
-      body.name.trim(),
-      tokenHash,
-      JSON.stringify(tokenScopes),
-      now,
-      tokenExpiresAt,
-    );
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO bot_tokens (token_id, bot_id, name, token_hash, scopes_json, created_at, expires_at, last_used_at, revoked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+        tokenId,
+        botId,
+        tokenName,
+        tokenHash,
+        JSON.stringify(tokenScopes),
+        now,
+        tokenExpiresAt,
+      );
+      appendBotRegistryArchive(this.ctx, now, (sourceSeq) => {
+        const rowVersion = rowVersionFromSeq(sourceSeq);
+        const tokenRow = readBotTokenArchiveRow(this.ctx, tokenId);
+        return tokenRow
+          ? [archiveUpsert("chat_bot_tokens", { token_id: tokenId }, rowVersion, tokenRow)]
+          : [];
+      });
+    });
+
+    await this.scheduleArchiveAlarm();
+
     return Response.json({
       token: {
         token_id: tokenId,
-        name: body.name.trim(),
+        name: tokenName,
         scopes: tokenScopes,
         plaintext: tokenPlaintext,
         created_at: now,
@@ -604,17 +677,41 @@ export class BotRegistry extends DurableObject<Env> {
         { status: 422 },
       );
     }
+    const botId = body.bot_id;
+    const tokenId = body.token_id;
     const row = this.ctx.storage.sql
-      .exec("SELECT revoked_at FROM bot_tokens WHERE token_id=? AND bot_id=?", body.token_id, body.bot_id)
+      .exec("SELECT revoked_at FROM bot_tokens WHERE token_id=? AND bot_id=?", tokenId, botId)
       .toArray()[0] as { revoked_at: string | null } | undefined;
     if (!row) {
       return Response.json({ error: { code: "BOT_TOKEN_INVALID", message: "token not found" } }, { status: 404 });
     }
     const revokedAt = row.revoked_at ?? new Date().toISOString();
-    if (!row.revoked_at) {
-      this.ctx.storage.sql.exec("UPDATE bot_tokens SET revoked_at=? WHERE token_id=? AND bot_id=?", revokedAt, body.token_id, body.bot_id);
+    const shouldArchive = row.revoked_at === null;
+    this.ctx.storage.transactionSync(() => {
+      if (shouldArchive) {
+        this.ctx.storage.sql.exec(
+          "UPDATE bot_tokens SET revoked_at=? WHERE token_id=? AND bot_id=?",
+          revokedAt,
+          tokenId,
+          botId,
+        );
+      }
+      if (shouldArchive) {
+        appendBotRegistryArchive(this.ctx, revokedAt, (sourceSeq) => {
+          const rowVersion = rowVersionFromSeq(sourceSeq);
+          const tokenRow = readBotTokenArchiveRow(this.ctx, tokenId);
+          return tokenRow
+            ? [archiveUpsert("chat_bot_tokens", { token_id: tokenId }, rowVersion, tokenRow)]
+            : [];
+        });
+      }
+    });
+
+    if (shouldArchive) {
+      await this.scheduleArchiveAlarm();
     }
-    return Response.json({ token_id: body.token_id, revoked_at: revokedAt });
+
+    return Response.json({ token_id: tokenId, revoked_at: revokedAt });
   }
 
   async scheduleArchiveAlarm(): Promise<void> {

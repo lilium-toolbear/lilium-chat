@@ -191,4 +191,81 @@ describe("Browser Bot Developer API", () => {
     expect(revokeBody.token_id).toBe(tokenBody.token.token_id);
     expect(revokeBody.revoked_at.length).toBeGreaterThan(0);
   });
+
+  it("bot create, token create, and revoke append archive_outbox (hash only, no plaintext)", async () => {
+    const userId = `bot-archive-owner-${crypto.randomUUID()}`;
+    const createRes = await browserReq(
+      userId,
+      "POST",
+      "/api/chat/bots",
+      {
+        display_name: "Archive Bot",
+        issue_initial_token: true,
+        initial_token_name: "initial",
+      },
+      `key-archive-create-${crypto.randomUUID()}`,
+    );
+    expect(createRes.status).toBe(201);
+    const created = (await createRes.json()) as {
+      bot: { bot_id: string };
+      initial_token?: { token_id: string; plaintext: string };
+    };
+    expect(created.initial_token?.plaintext.startsWith("lcbot_")).toBe(true);
+
+    const tokenRes = await browserReq(
+      userId,
+      "POST",
+      `/api/chat/bots/${created.bot.bot_id}/tokens`,
+      { name: "rotated" },
+      `key-archive-token-${crypto.randomUUID()}`,
+    );
+    expect(tokenRes.status).toBe(201);
+    const rotated = (await tokenRes.json()) as { token: { token_id: string; plaintext: string } };
+
+    const revokeRes = await browserReq(
+      userId,
+      "DELETE",
+      `/api/chat/bots/${created.bot.bot_id}/tokens/${rotated.token.token_id}`,
+      undefined,
+      `key-archive-revoke-${crypto.randomUUID()}`,
+    );
+    expect(revokeRes.status).toBe(200);
+
+    await withRegistry((ctx) => {
+      const rows = ctx.storage.sql
+        .exec("SELECT payload_json FROM archive_outbox ORDER BY source_seq")
+        .toArray() as Array<{ payload_json: string }>;
+      expect(rows.length).toBeGreaterThanOrEqual(3);
+
+      const changes = rows.flatMap((row) => {
+        const payload = JSON.parse(row.payload_json) as { changes: Array<{ table: string; op: string; after?: Record<string, unknown> }> };
+        return payload.changes;
+      });
+
+      const appUpserts = changes.filter((c) => c.table === "chat_bot_apps" && c.op === "upsert");
+      expect(appUpserts.some((c) => c.after?.bot_id === created.bot.bot_id)).toBe(true);
+
+      const tokenUpserts = changes.filter((c) => c.table === "chat_bot_tokens" && c.op === "upsert");
+      expect(
+        tokenUpserts.some(
+          (c) => c.after?.token_id === created.initial_token?.token_id && c.after?.revoked_at == null,
+        ),
+      ).toBe(true);
+      expect(
+        tokenUpserts.some(
+          (c) => c.after?.token_id === rotated.token.token_id && c.after?.revoked_at != null,
+        ),
+      ).toBe(true);
+
+      for (const change of tokenUpserts) {
+        expect(change.after?.token_hash).toBeTruthy();
+        expect(change.after).not.toHaveProperty("plaintext");
+        expect(change.after).not.toHaveProperty("scopes_json");
+      }
+
+      const serialized = JSON.stringify(rows);
+      expect(serialized).not.toContain(created.initial_token!.plaintext);
+      expect(serialized).not.toContain(rotated.token.plaintext);
+    });
+  });
 });

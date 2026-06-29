@@ -68,6 +68,24 @@ SELECT status, COUNT(*) FROM archive_outbox GROUP BY status;
 SELECT COUNT(*) FROM archive_outbox WHERE status='pending';
 ```
 
+## BotRegistry archive (slash catalog)
+
+Spec §0.1 and plan `2026-06-28-lilium-chat-archive-backend.md` §6.4.
+
+**PG migration:** `scripts/archive-local/migrations/006_slash_catalog_archive.sql` drops Phase-7 bot install/event tables, adds `chat.bot_command_names`, stateful session tables, and extends `chat.bot_tokens` (`name`, `expires_at`, `last_used_at`).
+
+**Producer routes** on singleton `BotRegistry` (`source_key=registry`):
+
+| Route | Normalized tables |
+| --- | --- |
+| `commands-sync` | `chat_bot_commands`, `chat_bot_command_aliases`, `chat_bot_command_names` |
+| `seed-official-bot` | `chat_bot_apps`, `chat_bot_tokens` (hash only), catalog rows |
+| `bots-create` | `chat_bot_apps`, optional `chat_bot_tokens` |
+| `bots-token-create` | `chat_bot_tokens` |
+| `bots-token-revoke` | `chat_bot_tokens` (`revoked_at`) |
+
+Plaintext `lcbot_*` tokens must never appear in `archive_outbox.payload_json`.
+
 ## What is not archived
 
 Runtime/projection state per spec §3.6: `projection_outbox`, `idempotency_keys`,
@@ -106,7 +124,7 @@ DATABASE_URL=postgres://... npm run archive:backfill
 The script will:
 
 1. Rename `chat.events` → `chat.events_raw` when the raw schema is detected
-2. Apply migrations `001`–`005` (normalized tables + `chat_archive_records` / watermarks)
+2. Apply migrations `001`–`006` (normalized tables + `chat_archive_records` / watermarks; `006` = slash-catalog bot table realignment)
 3. For each legacy raw row: `INSERT` into `chat_archive_records`, mark `chat.archive_backfill_applied`
 4. Drain per-source watermarks into normalized tables (same path as queue consumer)
 5. Final sweep loops until `chat_archive_records` has no pending rows

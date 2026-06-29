@@ -559,14 +559,19 @@ inside it (§0.3).
 
 ### 6.4 BotRegistry (`sourceKind="bot_registry"`, `sourceKey="registry"`)
 
-| Route (file:line) | Changes |
-|---|---|
-| commands-sync `bot-registry.ts:123` (txn at `:241`) | chat_bot_apps:upsert if app changed; chat_bot_commands:upsert (all current commands in request); chat_bot_command_aliases:replace_scope{bot_command_id} per command in request; chat_bot_event_capabilities:replace_scope{bot_id} or upsert each. Disabled/deleted-by-sync → final row with `enabled=false`/`deleted_at`. |
-| seed-official-bot `bot-registry.ts:493` (writes at `:551–694`, **bare auto-commit**) | chat_bot_apps:upsert; chat_bot_tokens:upsert(**token_hash only** — never plaintext); chat_bot_commands:upsert; chat_bot_command_aliases:replace_scope{bot_command_id}; chat_bot_event_capabilities:upsert/replace_scope{bot_id}. **Wrap the write block in `transactionSync`** (§0.3 refactor) so the archive row is co-atomic. |
-| other bot app/token create/update/revoke paths | chat_bot_apps:upsert / chat_bot_tokens:upsert(token_hash). **Flag:** enumerate any beyond seed-official-bot during implementation; the exploration found only token-verify (read-only) + seed-official-bot + commands-sync as write paths. |
+Slash-catalog alignment: see spec §0.1 (`006_slash_catalog_archive.sql`, `chat_bot_command_names`, removed `chat_bot_event_capabilities`).
 
-`commands-sync` already uses `transactionSync` → append inside it directly.
-`BotRegistry` is the only DO where the `seed-official-bot` refactor is required.
+| Route (file) | Changes |
+|---|---|
+| commands-sync | `chat_bot_commands` upsert; `chat_bot_command_aliases` + `chat_bot_command_names` replace_scope `{bot_command_id}` per command in request |
+| seed-official-bot | `chat_bot_apps` upsert; `chat_bot_tokens` upsert (**token_hash only**); catalog rows as commands-sync. Wrapped in `transactionSync` + `appendBotRegistryArchive` |
+| `/internal/bots-create` | `chat_bot_apps` upsert; optional `chat_bot_tokens` upsert when `issue_initial_token` |
+| `/internal/bots-token-create` | `chat_bot_tokens` upsert |
+| `/internal/bots-token-revoke` | `chat_bot_tokens` upsert with `revoked_at` (first revoke only) |
+
+Test: `test/routes/bots.test.ts` — `bot create, token create, and revoke append archive_outbox`.
+
+`commands-sync` and all token paths append inside `transactionSync`, then `scheduleArchiveAlarm()`.
 
 ---
 
