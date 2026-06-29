@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { BOT_GATEWAY_API_VERSION } from "../../src/chat/bot-gateway-protocol";
+import { PLATFORM_HELP_BOT_COMMAND_ID } from "../../src/chat/platform-commands";
 import { createOwnedTestChannel, getNamedDo } from "../helpers";
 import { nextAck, nextMessage, upgradeUserConnection } from "../ws-helpers";
 
@@ -192,6 +193,67 @@ describe("command.invoke", () => {
       };
       expect(storedInvocation.bot_command_id).toBe(botCommandId);
       expect(storedInvocation.invoked_name).toBe("ask");
+    });
+
+    ws.close();
+  });
+
+  it("platform /help bot message replies to the invocation message", async () => {
+    const userId = `help-user-${crypto.randomUUID()}`;
+    const channelId = crypto.randomUUID();
+
+    await createOwnedTestChannel(
+      env as unknown as Pick<import("../../src/env").Env, "CHAT_CHANNEL">,
+      userId,
+      { channelId, title: "Help Channel" },
+    );
+
+    const { ws } = await upgradeUserConnection(userId);
+    ws.send(JSON.stringify({
+      frame_type: "command",
+      command: "command.invoke",
+      command_id: `help-${crypto.randomUUID()}`,
+      channel_id: channelId,
+      payload: {
+        bot_command_id: PLATFORM_HELP_BOT_COMMAND_ID,
+        invoked_name: "help",
+        command_manifest_version: 0,
+        options: {},
+      },
+    }));
+
+    const ack = JSON.parse(await nextAck(ws)) as {
+      frame_type: string;
+      command: string;
+      status: string;
+      payload?: {
+        message?: {
+          reply_to?: string | null;
+          reply_snapshot?: { message_id?: string; text_preview?: string } | null;
+        };
+        invocation_message?: { message_id?: string; text?: string };
+      };
+    };
+    expect(ack.frame_type).toBe("command_ack");
+    expect(ack.command).toBe("command.invoke");
+    expect(ack.status).toBe("committed");
+    expect(ack.payload?.invocation_message?.text).toBe("/help");
+    expect(ack.payload?.message?.reply_to).toBe(ack.payload?.invocation_message?.message_id);
+    expect(ack.payload?.message?.reply_snapshot?.message_id).toBe(
+      ack.payload?.invocation_message?.message_id,
+    );
+    expect(ack.payload?.message?.reply_snapshot?.text_preview).toBe("/help");
+
+    await withChannel(channelId, (ctx) => {
+      const botMessage = ctx.storage.sql
+        .exec(
+          "SELECT reply_to, reply_snapshot_json FROM messages WHERE channel_id=? AND sender_bot_id IS NOT NULL",
+          channelId,
+        )
+        .toArray()[0] as { reply_to: string; reply_snapshot_json: string } | undefined;
+      expect(botMessage?.reply_to).toBe(ack.payload?.invocation_message?.message_id);
+      const snapshot = JSON.parse(botMessage?.reply_snapshot_json ?? "{}") as { text_preview?: string };
+      expect(snapshot.text_preview).toBe("/help");
     });
 
     ws.close();

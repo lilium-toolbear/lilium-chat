@@ -105,6 +105,7 @@ import {
   STATEFUL_BOT_DELIVERY_KINDS,
 } from "../chat/stateful-bot-delivery";
 import { invokedNameMatchesSnapshot } from "../chat/slash-token";
+import { buildReplySnapshot } from "../chat/reply-snapshot";
 import { insertUserCommandInvocationMessage, type InvocationMessageHost } from "./chat-channel/invocation-message";
 
 interface OutboxRow {
@@ -1551,13 +1552,17 @@ export class ChatChannel extends DurableObject<Env> {
       const messageId = uuidv7(input.nowMs + 1);
       const invocationId = uuidv7(input.nowMs + 2);
       const eventId = this.nextEventId(input.nowMs + 3);
+      const replyToMessageId = invocationMessage.invocationMessageId;
+      const replySnapshotJson = JSON.stringify(
+        buildReplySnapshot(invocationMessage.invocationMessageRow, senderSummary.display_name),
+      );
 
       this.ctx.storage.sql.exec(
         `INSERT INTO messages (
            message_id, command_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
            sender_bot_id, sender_bot_display_name, sender_bot_avatar_url, type, format, status, text,
-           reply_to, stream_state, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'bot', NULL, ?, ?, ?, 'text', 'markdown', 'normal', ?, NULL, 'none', ?, ?)`,
+           reply_to, reply_snapshot_json, stream_state, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'bot', NULL, ?, ?, ?, 'text', 'markdown', 'normal', ?, ?, ?, 'none', ?, ?)`,
         messageId,
         input.operationId,
         `bot:${PLATFORM_BOT_ID}`,
@@ -1566,6 +1571,8 @@ export class ChatChannel extends DurableObject<Env> {
         PLATFORM_BOT_DISPLAY_NAME,
         PLATFORM_BOT_AVATAR_URL,
         helpText,
+        replyToMessageId,
+        replySnapshotJson,
         input.now,
         input.now,
       );
@@ -1604,8 +1611,8 @@ export class ChatChannel extends DurableObject<Env> {
         format: "markdown",
         status: "normal",
         text: helpText,
-        reply_to: null,
-        reply_snapshot_json: null,
+        reply_to: replyToMessageId,
+        reply_snapshot_json: replySnapshotJson,
         stream_state: "none",
         created_at: input.now,
         updated_at: input.now,
@@ -1615,7 +1622,7 @@ export class ChatChannel extends DurableObject<Env> {
         recalled_at: null,
       };
 
-      const liveMessage = projectMessageForBrowser(messageRow, {});
+      const liveMessage = projectMessageForBrowser(messageRow, { replyTargetStatus: "normal" });
       const liveEventFrame = buildEventFrame({
         event_id: eventId,
         type: "message.created",

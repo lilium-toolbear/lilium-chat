@@ -41,6 +41,7 @@ export interface InsertUserCommandInvocationMessageInput {
 export interface InsertUserCommandInvocationMessageResult {
   invocationMessageId: string;
   invocationEventId: string;
+  invocationMessageRow: MessageRow;
   liveMessage: WireChatMessage;
 }
 
@@ -146,5 +147,10 @@ export function insertUserCommandInvocationMessage(
     input.now,
   );
 
-  return { invocationMessageId: messageId, invocationEventId: eventId, liveMessage };
+  return {
+    invocationMessageId: messageId,
+    invocationEventId: eventId,
+    invocationMessageRow: messageRow,
+    liveMessage,
+  };
 }
