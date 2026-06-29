@@ -28,7 +28,12 @@ Bot installation UI 与 per-channel slash 冲突模型移除。频道管理员�
 | GET | `/api/chat/channels/{channel_id}/stateful-session` | Active session summary or null |
 | POST | `/api/chat/channels/{channel_id}/stateful-session/stop` | Admin stop active session |
 
-**Deferred v1.1:** `PATCH /api/chat/bots/{bot_id}` (profile update)
+| PATCH | `/api/chat/bots/{bot_id}` | Update bot profile (owner; `official` requires admin JWT) |
+| GET | `/api/chat/admin/bots` | Global bot list (admin JWT `admin: true`) |
+| GET | `/api/chat/admin/bots/{bot_id}` | Bot detail (admin) |
+| PATCH | `/api/chat/admin/bots/{bot_id}` | Update any bot including `visibility: official` (admin) |
+| GET | `/api/chat/admin/bots/{bot_id}/tokens` | List token metadata (admin) |
+| DELETE | `/api/chat/admin/bots/{bot_id}/tokens/{token_id}` | Revoke token (admin) |
 
 ## Changed Browser routes
 
@@ -80,10 +85,22 @@ Extended response includes:
 
 ### `PUT /api/chat/bot/commands` (catalog sync)
 
+- Add `help_text` per command (used by platform `/help <command>`)
 - Add `execution.mode`: `"stateless" | "stateful"`
 - Add `execution.stateful` config when mode is stateful (mutex, TTL, listen_capability)
 - Remove `event_capabilities`, `default_enabled_on_install`
 - Global slash namespace: `bot_command_names` in BotRegistry; sync conflict → `409 COMMAND_NAME_CONFLICT` with `conflict` object
+- `visibility: "official"` bots: active catalog commands auto-allowed in all non-DM channels unless `blocked` binding; `status: "allowed"` on official command → `409 OFFICIAL_COMMAND_AUTO_ALLOWED`
+
+### Platform `/help` (v2.16)
+
+- Well-known `bot_command_id`: `00000000-0000-7000-8000-000000000700`
+- Always appended to channel manifest; invoke writes bot message synchronously (no Bot Gateway delivery)
+- Platform bot identity: `bot_id` `00000000-0000-7000-8000-000000000600`, `display_name` `system`, fixed avatar URL (see main contract §9.2)
+
+### JWT `admin` claim (v2.16)
+
+ToolBear browser JWT may include `admin: true` for ToolBear admins. Required for `/api/chat/admin/bots*` and for setting `visibility: "official"` on create/patch.
 
 ## Events
 
@@ -132,7 +149,8 @@ Reconnect resume: `BotConnection` reads bot-scoped `active_stateful_session_refs
 
 | Code | HTTP | Retryable |
 |---|---|---|
-| `COMMAND_NOT_ALLOWED` | 403 | no |
+| `ADMIN_ACCESS_REQUIRED` | 403 | no |
+| `OFFICIAL_COMMAND_AUTO_ALLOWED` | 409 | no |
 | `COMMAND_PERMISSION_DENIED` | 403 | no |
 | `COMMAND_OPTIONS_INVALID` | 422 | no |
 | `COMMAND_MANIFEST_VERSION_STALE` | 409 | no |
