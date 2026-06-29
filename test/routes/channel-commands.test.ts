@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
+import { PLATFORM_HELP_BOT_COMMAND_ID } from "../../src/chat/platform-commands";
 import { createTestDmChannel, getNamedDo, makeJwt, TEST_SECRET } from "../helpers";
 
 const SELF = (await import("../../src/index")).default as {
@@ -168,9 +169,10 @@ describe("channel command bindings", () => {
       items: Array<{ bot_command_id: string; name: string }>;
     };
     expect(manifest.version).toBe(1);
-    expect(manifest.items).toHaveLength(1);
-    expect(manifest.items[0]?.bot_command_id).toBe(botCommandId);
-    expect(manifest.items[0]?.name).toBe("ask");
+    const boundItems = manifest.items.filter((item) => item.bot_command_id !== PLATFORM_HELP_BOT_COMMAND_ID);
+    expect(boundItems).toHaveLength(1);
+    expect(boundItems[0]?.bot_command_id).toBe(botCommandId);
+    expect(boundItems[0]?.name).toBe("ask");
 
     await withChannel(channelId, (ctx) => {
       const binding = ctx.storage.sql
