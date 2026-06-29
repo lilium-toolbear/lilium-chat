@@ -1341,6 +1341,11 @@ export class ChatChannel extends DurableObject<Env> {
           channel_id: channelId, bot_id: binding.bot_id, bot_command_id: botCommandId,
           binding_changes: { enabled: { before: beforeStatus, after: afterStatus } },
           actor_kind: "user", actor_id: userId,
+          // TODO(Task 9): replace with real manifest delta from command-manifest builders
+          command_manifest_delta: {
+            op: enabled ? "upsert" : "remove",
+            manifest_version: 0,
+          },
         }),
         mv, now, actorMap,
       );

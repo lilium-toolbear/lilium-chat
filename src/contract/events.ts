@@ -1,6 +1,7 @@
 /** Copied from toolbear_ui/frontend/src/types/chatEvents.ts — keep in sync manually until shared package. */
 
 import type { ChannelDetail, ChannelMember, DissolvedChannelProjection } from "./channel";
+import type { CommandManifestDelta } from "./bot-api";
 import type { ChannelRole, ChannelVisibility } from "./primitives";
 import type { ChatMessage, WireChatMessage } from "./message";
 import type { ChatId, IsoDateTimeString, UserSummary } from "./primitives";
@@ -27,6 +28,9 @@ export type ChatEventType =
   | "command.invoked"
   | "command.completed"
   | "command.failed"
+  | "stateful_session.started"
+  | "stateful_session.updated"
+  | "stateful_session.closed"
   | "interaction.created"
   | "interaction.completed"
   | "interaction.failed";
@@ -53,6 +57,9 @@ export const CHAT_EVENT_TYPES = [
   "command.invoked",
   "command.completed",
   "command.failed",
+  "stateful_session.started",
+  "stateful_session.updated",
+  "stateful_session.closed",
   "interaction.created",
   "interaction.completed",
   "interaction.failed",
@@ -69,6 +76,9 @@ export const DOMAIN_TIMELINE_EVENT_TYPES = [
   "bot.installed",
   "bot.updated",
   "command.binding_updated",
+  "stateful_session.started",
+  "stateful_session.updated",
+  "stateful_session.closed",
 ] as const satisfies readonly ChatEventType[];
 
 export type DomainTimelineEventType = (typeof DOMAIN_TIMELINE_EVENT_TYPES)[number];
@@ -102,6 +112,9 @@ export const REPLAY_MANAGEMENT_EVENT_TYPES: ReadonlySet<string> = new Set([
   "bot.installed",
   "bot.updated",
   "command.binding_updated",
+  "stateful_session.started",
+  "stateful_session.updated",
+  "stateful_session.closed",
 ]);
 
 export function isDomainTimelineEventType(type: string): type is DomainTimelineEventType {
@@ -235,6 +248,34 @@ export interface CommandBindingUpdatedEventPayload {
   bot_command_id: ChatId;
   binding_changes: Record<string, FieldChange<unknown>>;
   actor?: ResolvedEventActor;
+  command_manifest_delta: CommandManifestDelta;
+}
+
+export interface StatefulSessionSummary {
+  session_id: string;
+  bot_command_id: string;
+  command_name: string;
+  status: string;
+  started_by: UserSummary;
+  started_at: IsoDateTimeString;
+  expires_at: IsoDateTimeString;
+}
+
+export interface StatefulSessionStartedPayload {
+  session: StatefulSessionSummary;
+}
+
+export interface StatefulSessionUpdatedPayload {
+  session: StatefulSessionSummary;
+}
+
+export interface StatefulSessionClosedPayload {
+  session_id: string;
+  bot_command_id: string;
+  command_name: string;
+  status: string;
+  reason: string;
+  closed_at: IsoDateTimeString;
 }
 
 export interface CommandInvokedEventPayload {
@@ -294,6 +335,9 @@ export interface DomainTimelineEventPayloadByType {
   "bot.installed": BotInstalledEventPayload;
   "bot.updated": BotUpdatedEventPayload;
   "command.binding_updated": CommandBindingUpdatedEventPayload;
+  "stateful_session.started": StatefulSessionStartedPayload;
+  "stateful_session.updated": StatefulSessionUpdatedPayload;
+  "stateful_session.closed": StatefulSessionClosedPayload;
 }
 
 export type DomainTimelineEventPayload<T extends DomainTimelineEventType = DomainTimelineEventType> =
@@ -321,6 +365,9 @@ export interface ChatEventPayloadByType {
   "command.invoked": CommandInvokedEventPayload;
   "command.completed": CommandCompletedEventPayload;
   "command.failed": CommandFailedEventPayload;
+  "stateful_session.started": StatefulSessionStartedPayload;
+  "stateful_session.updated": StatefulSessionUpdatedPayload;
+  "stateful_session.closed": StatefulSessionClosedPayload;
   "interaction.created": InteractionCreatedEventPayload;
   "interaction.completed": InteractionCompletedEventPayload;
   "interaction.failed": InteractionFailedEventPayload;

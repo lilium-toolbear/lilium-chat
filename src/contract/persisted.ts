@@ -1,5 +1,6 @@
 import type { ChannelFieldChanges } from "./events";
 import type { MemberJoinSource, MemberLeaveSource } from "./events";
+import type { CommandManifestDelta } from "./bot-api";
 
 /** Actor references stored in SQLite events.payload_json (design §3.5). */
 export interface ActorPersistedFields {
@@ -70,6 +71,7 @@ export interface CommandBindingUpdatedPersistedPayload extends ActorPersistedFie
   bot_id: string;
   bot_command_id: string;
   binding_changes: Record<string, { before: unknown; after: unknown }>;
+  command_manifest_delta: CommandManifestDelta;
 }
 
 export interface PersistedMessageSenderRef {

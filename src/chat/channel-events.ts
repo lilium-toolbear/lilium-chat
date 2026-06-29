@@ -11,6 +11,7 @@ import type {
   MemberRoleUpdatedPersistedPayload,
   ReadStateUpdatedPersistedPayload,
 } from "../contract/persisted";
+import type { CommandManifestDelta } from "../contract/bot-api";
 import type { ManagementWirePayload } from "../contract/wire-frames";
 import { fallbackUserDisplayName, type UserSummary } from "../contract/primitives";
 
@@ -164,6 +165,7 @@ export function buildCommandBindingUpdatedPayload(raw: {
   binding_changes: Record<string, { before: unknown; after: unknown }>;
   actor_kind: string;
   actor_id: string;
+  command_manifest_delta: CommandManifestDelta;
 }): CommandBindingUpdatedPersistedPayload {
   return {
     channel_id: raw.channel_id,
@@ -172,6 +174,7 @@ export function buildCommandBindingUpdatedPayload(raw: {
     binding_changes: raw.binding_changes,
     actor_kind: raw.actor_kind,
     actor_id: raw.actor_id,
+    command_manifest_delta: raw.command_manifest_delta,
   };
 }
 

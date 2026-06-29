@@ -67,13 +67,15 @@ describe("persisted payloads store actor refs, not UserSummary", () => {
     expect((p as any).changes).toEqual({ status: { before: "active", after: "removed" } });
   });
 
-  it("command.binding_updated carries binding_changes", () => {
+  it("command.binding_updated carries binding_changes and manifest delta", () => {
     const p = buildCommandBindingUpdatedPayload({
       channel_id: "c1", bot_id: "b1", bot_command_id: "cmd1",
       binding_changes: { enabled: { before: "disabled", after: "enabled" } },
       actor_kind: "user", actor_id: "u1",
+      command_manifest_delta: { op: "remove", manifest_version: 1 },
     });
     expect((p as any).binding_changes).toEqual({ enabled: { before: "disabled", after: "enabled" } });
+    expect(p.command_manifest_delta).toEqual({ op: "remove", manifest_version: 1 });
   });
 });
 
