@@ -1,19 +1,21 @@
-# Lilium Chat — Local PG Archive (Backend Runbook)
+# Lilium Chat — PG Archive (Backend Runbook)
 
 Phase A producer path: source DOs write `archive_outbox` in the same SQLite
 transaction as business rows, then flush to Cloudflare Queue via per-DO alarms.
 
-Phase B (local daemon + PG replay) is required for full feature acceptance. See
-`docs/superpowers/specs/2026-06-28-lilium-chat-local-pg-archive-cf-queue.md`.
+Phase B consumer: a dedicated Cloudflare Worker pulls from the Queue and writes
+normalized `chat.events` rows into PostgreSQL via Hyperdrive.
 
 ## Wrangler config split
 
 | Component | Where configured |
 |-----------|------------------|
 | Queue producer (`CHAT_ARCHIVE_QUEUE`) | `wrangler.jsonc` / `wrangler.test.jsonc` → `queues.producers` |
-| HTTP pull consumer | **Not** in wrangler config — operator CLI/dashboard only |
+| Queue consumer (Worker push) | `wrangler.archive.jsonc` → `queues.consumers` |
 
-Do not add `queues.consumers` or legacy `type: "http_pull"` to wrangler JSONC.
+Do **not** add `queues.consumers` to `wrangler.jsonc` (main chat Worker stays
+producer-only). Do **not** run an HTTP pull consumer on the same queue while the
+Worker consumer is attached.
 
 ## Operator queue setup
 
@@ -24,15 +26,28 @@ npx wrangler queues create lilium-chat-archive \
 # If queue already exists:
 npx wrangler queues update lilium-chat-archive \
   --message-retention-period-secs 1209600
-
-npx wrangler queues consumer http add lilium-chat-archive \
-  --batch-size 100 \
-  --message-retries 100 \
-  --visibility-timeout-secs 600
 ```
 
-`1209600` = 14 days (max retention). Configure `--message-retries 100` to
-maximize retry window before permanent deletion at `max_retries`.
+`1209600` = 14 days (max retention). Consumer retry policy is configured in
+`wrangler.archive.jsonc` (`max_retries: 100`).
+
+### Migrate off HTTP pull (if previously enabled)
+
+```bash
+npx wrangler queues consumer http remove lilium-chat-archive
+```
+
+### Deploy archive consumer Worker
+
+```bash
+# once: apply PG schema (operator machine with DATABASE_URL)
+DATABASE_URL=postgres://... npm run archive:migrate
+
+# deploy consumer Worker (Hyperdrive binding in wrangler.archive.jsonc)
+npm run archive:deploy
+```
+
+Worker entry: `src/archive-consumer/index.ts`. Config: `wrangler.archive.jsonc`.
 
 ## Plan B retention semantics
 
@@ -40,10 +55,9 @@ maximize retry window before permanent deletion at `max_retries`.
 - `archive_outbox.queued` — Queue durably accepted; audit only, **no** source requeue
 - `archive_outbox.failed` — producer-side deterministic failure (e.g. validation)
 
-Queue retention covers daemon **full stop**. The daemon **must not pull** when
-local PG is unhealthy — otherwise `max_retries` burns before retention (spec §8.5).
-
-Daemon pull body field: `visibility_timeout` (milliseconds), not `visibility_timeout_ms`.
+Queue retention covers consumer **full stop**. The consumer **must retry the
+batch without ack** when Hyperdrive/PG is unhealthy — otherwise `max_retries`
+burns before retention.
 
 ## Inspect source lag
 
@@ -66,20 +80,46 @@ Source DO business txn
   → archive_outbox (same txn)
 Source DO alarm
   → flushArchiveOutboxToQueue → CHAT_ARCHIVE_QUEUE
-Local daemon (Phase B)
-  → HTTP pull → chat.events (raw JSONB) → ack
+lilium-chat-archive-consumer Worker
+  → queue batch handler → chat.events (upsert) via LILIUM_DB Hyperdrive → ack
 ```
 
-## Minimal raw daemon (chat.events)
+## PG schema
 
-Stores each pulled Queue message body as-is in `chat.events` (schema `chat`).
+Normalized `chat.events` table (idempotent upsert on `event_id`):
 
 ```bash
-# once: create table
 DATABASE_URL=postgres://... npm run archive:migrate
-
-# run (requires CF queue HTTP pull consumer + env below)
-CF_ACCOUNT_ID=... CF_QUEUE_ID=... CF_QUEUES_TOKEN=... DATABASE_URL=... npm run archive:daemon
 ```
 
-Script: `scripts/archive-local/daemon.mjs`. Migration: `scripts/archive-local/migrations/001_chat_events_raw.sql`.
+Migration: `scripts/archive-local/migrations/001_chat_events.sql`.
+
+## Backfill legacy raw events
+
+If the old HTTP-pull daemon stored full `ArchiveRecord` JSON in `chat.events(payload)`
+(raw schema: `id`, `payload`, `received_at`), run backfill after migrate:
+
+```bash
+DATABASE_URL=postgres://... npm run archive:backfill
+```
+
+The script will:
+
+1. Rename `chat.events` → `chat.events_raw` when the raw schema is detected
+2. Apply structured migrations (`001` + `002`)
+3. Replay pending raw rows into normalized tables (`chat.messages`, `chat.events`, …)
+4. Track progress in `chat.archive_backfill_applied`
+
+Replay order is per `(source_kind, source_key, source_seq)` so child `replace_scope`
+rows apply after their parent upserts within the same archive record.
+
+Dry run:
+
+```bash
+BACKFILL_DRY_RUN=1 DATABASE_URL=postgres://... npm run archive:backfill
+```
+
+## Legacy local HTTP-pull daemon (deprecated)
+
+`scripts/archive-local/daemon.mjs` and `npm run archive:daemon` remain for
+emergency local replay only. Production path is the archive consumer Worker.

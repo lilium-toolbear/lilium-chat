@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lilium-chat-archive-consumer",
+  "main": "src/archive-consumer/index.ts",
+  "compatibility_date": "2026-06-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "upload_source_maps": true,
+
+  "hyperdrive": [
+    {
+      "binding": "LILIUM_DB",
+      "id": "c55ab0187c3c4edabc08de4d4b210732"
+    }
+  ],
+
+  "queues": {
+    "consumers": [
+      {
+        "queue": "lilium-chat-archive",
+        "max_batch_size": 100,
+        "max_batch_timeout": 30,
+        "max_retries": 100
+      }
+    ]
+  },
+
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "destinations": ["lilium-chat-logs"]
+    }
+  }
+}

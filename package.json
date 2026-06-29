@@ -13,7 +13,10 @@
     "typecheck": "tsc --noEmit",
     "cf-typegen": "wrangler types",
     "archive:daemon": "node ./scripts/archive-local/daemon.mjs",
-    "archive:migrate": "node ./scripts/archive-local/migrate.mjs"
+    "archive:migrate": "node ./scripts/archive-local/migrate.mjs",
+    "archive:backfill": "tsx scripts/archive-local/backfill-raw.ts",
+    "archive:deploy": "wrangler deploy -c wrangler.archive.jsonc",
+    "cf-typegen:archive": "wrangler types -c wrangler.archive.jsonc"
   },
   "dependencies": {
     "aws4fetch": "^1.0.20",
@@ -26,6 +29,7 @@
     "@sentry/cli": "^3.4.2",
     "@types/node": "^26.0.0",
     "typescript": "^5.9.0",
+    "tsx": "^4.19.0",
     "vitest": "^4.1.0",
     "wrangler": "^4.103.0"
   }

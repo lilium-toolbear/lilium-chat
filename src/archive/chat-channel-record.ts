@@ -272,10 +272,12 @@ export function replaceScopeMentionsChange(
   sql: SqlStorage,
   messageId: string,
   rowVersion: string,
-): ArchiveChange {
+  opts?: { omitWhenEmpty?: boolean },
+): ArchiveChange | null {
   const rows = sql
     .exec("SELECT message_id, user_id, start, end_ FROM mentions WHERE message_id=?", messageId)
     .toArray() as Array<Record<string, unknown>>;
+  if (opts?.omitWhenEmpty && rows.length === 0) return null;
   return archiveReplaceScope(
     chatChannelTable("mentions"),
     { message_id: messageId },
@@ -288,13 +290,15 @@ export function replaceScopeMessageAttachmentsChange(
   sql: SqlStorage,
   messageId: string,
   rowVersion: string,
-): ArchiveChange {
+  opts?: { omitWhenEmpty?: boolean },
+): ArchiveChange | null {
   const rows = sql
     .exec(
       "SELECT message_id, attachment_id FROM message_attachments WHERE message_id=?",
       messageId,
     )
     .toArray() as Array<Record<string, unknown>>;
+  if (opts?.omitWhenEmpty && rows.length === 0) return null;
   return archiveReplaceScope(
     chatChannelTable("message_attachments"),
     { message_id: messageId },
@@ -307,7 +311,8 @@ export function replaceScopeMessageStickersChange(
   sql: SqlStorage,
   messageId: string,
   rowVersion: string,
-): ArchiveChange {
+  opts?: { omitWhenEmpty?: boolean },
+): ArchiveChange | null {
   const rows = sql
     .exec(
       `SELECT message_id, sticker_id, attachment_id, url, mime_type, width, height, size_bytes, blurhash
@@ -315,6 +320,7 @@ export function replaceScopeMessageStickersChange(
       messageId,
     )
     .toArray() as Array<Record<string, unknown>>;
+  if (opts?.omitWhenEmpty && rows.length === 0) return null;
   return archiveReplaceScope(
     chatChannelTable("message_stickers"),
     { message_id: messageId },

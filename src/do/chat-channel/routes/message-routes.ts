@@ -397,10 +397,10 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
         const rv = rvEvent(eventId);
         return collectDefinedChanges([
           upsertMessageChange(host.ctx.storage.sql, messageId, channelId, rv),
-          replaceScopeMentionsChange(host.ctx.storage.sql, messageId, rv),
+          replaceScopeMentionsChange(host.ctx.storage.sql, messageId, rv, { omitWhenEmpty: true }),
           ...upsertAttachmentsForMessageChanges(host.ctx.storage.sql, messageId, rv),
-          replaceScopeMessageAttachmentsChange(host.ctx.storage.sql, messageId, rv),
-          replaceScopeMessageStickersChange(host.ctx.storage.sql, messageId, rv),
+          replaceScopeMessageAttachmentsChange(host.ctx.storage.sql, messageId, rv, { omitWhenEmpty: true }),
+          replaceScopeMessageStickersChange(host.ctx.storage.sql, messageId, rv, { omitWhenEmpty: true }),
           upsertEventChange(host.ctx.storage.sql, eventId),
         ]);
       });

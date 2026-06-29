@@ -1,5 +1,5 @@
 import pg from "pg";
-import type { ChatEventRow } from "./apply-events.js";
+import type { ChatEventRow } from "../../src/archive/apply-events.js";
 
 const UPSERT_EVENT_SQL = `
 INSERT INTO chat.events (
