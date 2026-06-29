@@ -42,8 +42,8 @@ export interface StatefulSessionInputStored {
   message: WireChatMessage;
 }
 
-export interface ParsedSessionStarted {
-  type: "session.started";
+export interface ParsedSessionStartAck {
+  type: "session.start_ack";
   api_version: string;
   session_id: string;
 }
@@ -76,16 +76,16 @@ export function buildSessionInput(input: Omit<SessionInputFrame, "type" | "api_v
   return { type: "session.input", api_version: BOT_GATEWAY_API_VERSION, ...input };
 }
 
-export function parseSessionStarted(raw: string): ParsedSessionStarted {
+export function parseSessionStartAck(raw: string): ParsedSessionStartAck {
   const obj = asObject(raw);
-  if (obj.type !== "session.started" || obj.api_version !== BOT_GATEWAY_API_VERSION) {
-    throw new Error("not session.started");
+  if (obj.type !== "session.start_ack" || obj.api_version !== BOT_GATEWAY_API_VERSION) {
+    throw new Error("not session.start_ack");
   }
   if (typeof obj.session_id !== "string" || obj.session_id.length === 0) {
     throw new Error("invalid session_id");
   }
   return {
-    type: "session.started",
+    type: "session.start_ack",
     api_version: obj.api_version,
     session_id: obj.session_id,
   };

@@ -241,9 +241,9 @@ Bot process (v4.3)
   ├─ outbound WS /api/chat/bot/ws (bot token) → BotConnection DO(bot_id)
   │    Chat pushes delivery frames → Bot; Bot returns delivery_result → Chat applies effects → delivery_ack
   │
-  └─ outbound HTTP management/active-send (bot token, no inbound HTTP endpoint required)
-       ├─ PUT  /api/chat/bot/commands           → BotRegistry singleton
-       └─ POST /api/chat/bot/channels/{id}/messages → ChatChannel DO
+  └─ outbound HTTP catalog sync (bot token, no inbound HTTP endpoint required)
+       └─ PUT  /api/chat/bot/commands           → BotRegistry singleton
+  （Bot 消息 mutation 只经 WS delivery_result / session.effects，无 HTTP 发消息路由 — contract v2.17）
 
 Durable Objects
   ├─ ChatChannel      by channel_id  —— realtime write owner; bot install/invocation/effect source
@@ -294,7 +294,7 @@ External:
 | WS command `interaction.submit` (v4.3) | UserConnection DO → ChatChannel DO → bot_delivery_outbox → BotConnection DO → Bot WS |
 | message.created passive listener (v4.3) | ChatChannel message commit → bot_delivery_outbox(kind=message_event) for enabled subscriptions → BotConnection DO → Bot WS |
 | `PUT /api/chat/bot/commands` (v4.3) | Worker 验 bot token → BotRegistry singleton |
-| `POST /api/chat/bot/channels/{channel_id}/messages` (v4.3) | Worker 验 bot token → ChatChannel DO |
+| Bot WS `delivery_result` / `session.effects` message mutation (v4.3) | BotConnection DO → ChatChannel `/internal/bot-delivery-result` |
 | `PATCH .../bot-installations/{bot_id}/event-subscriptions/message.created` (v4.3) | Browser admin → ChatChannel DO |
 
 Browser-facing message writes and read-state writes are WebSocket commands. Public HTTP endpoints must not mutate message timeline state or read-state. Internal DO-to-DO `fetch()` endpoints may still exist for implementation, but they are not Browser API.
@@ -1628,14 +1628,14 @@ GitHub Actions：`typecheck` + `test`，scripts 跟 game-worker 一致。
 
 ### 阶段 7：Bot slash command 与 rich interaction（contract 12.8, v2.10）
 
-交付：BotRegistry（singleton）全局身份 + token_hash + GLOBAL command catalog + aliases + event capabilities；BotConnection DO + Bot Gateway WS RPC（runtime transport，非 HTTP callback）；channel installation/binding + `command.invoke` + `interaction.submit` + 异步 `bot_delivery_outbox` delivery + effects + streaming + passive `message_event` 订阅 + bot 直接发消息。完整任务拆分见 `docs/superpowers/plans/2026-06-26-lilium-chat-phase-7.md`。
+交付：BotRegistry（singleton）全局身份 + token_hash + GLOBAL command catalog + aliases + event capabilities；BotConnection DO + Bot Gateway WS RPC（runtime transport，非 HTTP callback）；channel installation/binding + `command.invoke` + `interaction.submit` + 异步 `bot_delivery_outbox` delivery + effects + streaming + passive `message_event` 订阅。Bot 消息 mutation 只经 WS effects（contract v2.17 移除 `POST /bot/channels/{id}/messages`）。完整任务拆分见 `docs/superpowers/plans/2026-06-26-lilium-chat-phase-7.md`。
 
 - 7a：BotRegistry（singleton）+ token 认证 + `PUT /bot/commands` catalog sync + channel installation/binding/commands 查询 + 官方 bot seed。`botRegistryStub(env)` 统一 helper；`idx_bot_tokens_hash UNIQUE`。
 - 7b：Bot Gateway WS（`GET /api/chat/bot/ws` → `BotConnection DO(bot_id)`）+ hello/ready/ping/pong + delivery 队列（`bot_deliveries`，at-least-once，`delivery_id` 去重）+ `delivery_result` → ChatChannel `/internal/bot-delivery-result` + `delivery_ack`（applied/failed）+ reconnect/redelivery。BotConnection 单 active connection/bot_id。
 - 7c：`command.invoke` + invocation 状态 + `bot_delivery_outbox(kind=command_invocation)` + 异步 delivery（不在请求路径同步等 bot）+ effects 校验/应用（`bot_effects_applied` PK=`(channel_id, bot_id, client_effect_id)`）+ stream effects。command.invoke correctness = 当前 BotRegistry catalog（drift 刷新 binding snapshot）；bot offline precheck → `BOT_OFFLINE`。
 - 7d：`interaction.submit` + interaction 状态 + `bot_delivery_outbox(kind=message_interaction)` + delivery + effects；component ownership/disabled/custom_id 校验；`interaction.completed`。
 - 7e：passive `message_event` 订阅（BotRegistry `bot_event_capabilities` + ChatChannel `channel_bot_event_subscriptions` + `PATCH .../event-subscriptions/message.created`）；message send 事务内写 `bot_delivery_outbox(kind=message_event)`；loop prevention；bot 离线 drop/expire。observer/responder only，无 consume/stop-propagation。
-- 7f：bot 直接发消息 `POST /bot/channels/{channel_id}/messages`（bot token，可带 components，已安装+scope 校验）。
+- 7f：**已取消** — `POST /bot/channels/{channel_id}/messages`（contract v2.17 移除；消息 mutation 只经 Bot Gateway WS effects）。
 - 7g (future, non-goal for 7a–7f)：完整旧 external_commands stateful_ws session 语义（session.start/started/update/input/timer/closed、effect 序列 + ack、resume active sessions、room mutex/exclusive game session）。basic Bot Gateway WS RPC 不含 stateful session；如需另起 phase。
 
 验收：contract 12.8 + §14 v2.10 addendum 不变量。

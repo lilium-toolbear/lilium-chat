@@ -6,6 +6,10 @@
 
 本 addendum 描述 Slash Command 产品模型对 Browser/Bot API 的变更。与 base contract 冲突处以本文件 + spec 为准。
 
+## Removed Bot HTTP routes
+
+- `POST /api/chat/bot/channels/{channel_id}/messages` — Bot 消息 mutation 只走 Bot Gateway WS（`delivery_result.effects` / `session.effects`），不提供 HTTP 发消息端点。
+
 ## Removed Browser routes (non-goals)
 
 - `POST /api/chat/channels/{channel_id}/bot-installations`
@@ -130,7 +134,7 @@ Persisted event storage includes `command_manifest_delta` for timeline replay.
 
 ### Added channel events
 
-- `stateful_session.started` — payload `{ session: StatefulSessionSummary }` (emit only after bot `session.started`, status `active`)
+- `stateful_session.started` — payload `{ session: StatefulSessionSummary }` (emit only after bot `session.start_ack`, status `active`)
 - `stateful_session.updated` — payload `{ session: StatefulSessionSummary }`
 - `stateful_session.closed` — payload `{ session_id, bot_command_id, command_name, status, reason, closed_at }`
 
@@ -141,7 +145,7 @@ Bot ↔ `BotConnection` WebSocket frames:
 | Direction | Frame |
 |---|---|
 | Server → Bot | `session.start`, `session.input`, `session.closed` |
-| Bot → Server | `session.started`, `session.input_ack`, `session.effects`, `session.effects_ack`, `session.close` |
+| Bot → Server | `session.start_ack`, `session.input_ack`, `session.effects`, `session.effects_ack`, `session.close` |
 
 Reconnect resume: `BotConnection` reads bot-scoped `active_stateful_session_refs`, then fetches unacked inputs per channel from `ChatChannel`.
 
@@ -169,4 +173,4 @@ Reconnect resume: `BotConnection` reads bot-scoped `active_stateful_session_refs
 
 ## Stateful `command.invoke` success ack
 
-Stateful invoke success ack differs from stateless: it returns `channel_id`, `invocation_id`, and `session_id` only — **no `event_id`**. The `stateful_session.started` channel event (with its own `event_id`) is emitted only after the bot sends `session.started`.
+Stateful invoke success ack differs from stateless: it returns `channel_id`, `invocation_id`, and `session_id` only — **no `event_id`**. The `stateful_session.started` channel event (with its own `event_id`) is emitted only after the bot sends `session.start_ack`.

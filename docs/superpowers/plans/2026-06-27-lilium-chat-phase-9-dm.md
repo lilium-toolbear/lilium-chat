@@ -642,7 +642,7 @@ git commit -m "test(dm): message lifecycle on kind=dm channels"
 - Frontend DM UI (`dzmm_archive` Phase DM-3).
 - `source_channel_id`, privacy settings, blacklist, message request, DM rate limits (Phase DM-4).
 - Bot install/invoke on DM beyond rejection gates (v1 bots do not enter DM).
-- `POST /api/chat/bot/channels/{id}/messages` route — **not registered in `index.ts` today**; Phase 9 does **not** add this route. When a future phase registers it, it must gate DM with `409 UNSUPPORTED_CHANNEL_KIND`. Acceptance checklist uses conditional wording (see below).
+- Bot HTTP 发消息路由（contract v2.17 已移除；DM 上 Bot 消息 mutation 经 WS effects，须返回 `UNSUPPORTED_CHANNEL_KIND`）。
 - Merging addendum into main contract v2.13 (docs-only; can land separately).
 - Hyperdrive live integration tests (use `clientFactory` injection in unit tests).
 
@@ -667,7 +667,7 @@ git commit -m "test(dm): message lifecycle on kind=dm channels"
 [ ] PATCH/dissolve/join/invites/members on DM → 409 UNSUPPORTED_CHANNEL_KIND
 [ ] GET .../commands on DM -> { items: [] }
 [ ] WS command.invoke / interaction.submit on DM -> UNSUPPORTED_CHANNEL_KIND
-[ ] POST /bot/channels/{dm_id}/messages — route not in Phase 9 scope; if registered in a future phase, must return 409 UNSUPPORTED_CHANNEL_KIND on DM
+[ ] POST /bot/channels/{dm_id}/messages — **N/A**（contract v2.17 无此路由）；Bot WS effects on DM → `UNSUPPORTED_CHANNEL_KIND`
 [ ] DM 中不能 admin delete 对方消息
 [ ] POST /dms 响应含完整 ChannelSummary 列表字段
 [ ] ChannelSummary title/avatar/dm_peer 为 viewer-specific 投影

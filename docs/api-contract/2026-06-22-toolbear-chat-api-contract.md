@@ -101,7 +101,7 @@ ToolBear 前端只调用 `/api/chat/*` Browser API。该路径由 Cloudflare Wor
 | WS | `session.heartbeat` | 刷新 live session fanout lease (v2.11 delta) | §5.12 |
 | GET | `/api/chat/bot/ws` | Bot Gateway WebSocket RPC（bot token，outbound WS）(v2.10 delta) | §9.7 |
 | PUT | `/api/chat/bot/commands` | Bot 注册全局 slash command catalog（bot token）(v2.10 delta) | §9.3 |
-| POST | `/api/chat/bot/channels/{channel_id}/messages` | Bot 直接发消息（bot token）(v2.10 delta) | §9.8 |
+| WS (Bot Gateway) | `delivery_result` / `session.effects` | Bot 消息 mutation（send / update / stream / components）(v2.10 delta) | §9.7 |
 | PATCH | `/api/chat/channels/{channel_id}/commands/{bot_command_id}` | allow/block 频道 command binding（Browser admin） | §9.3 / addendum |
 | GET | `/api/chat/channels/{channel_id}/commands` | 频道 command manifest | §9.4 |
 | GET | `/api/chat/commands/directory` | 全局 command 目录搜索 | addendum |
@@ -1934,7 +1934,8 @@ Bot API 与 Browser API 分离：
 - Browser API 使用 ToolBear browser JWT，走 Browser WS `/api/chat/ws` → `UserConnection DO(user_id)`。
 - Bot API 使用 bot token。
 - Bot runtime delivery 走 **Bot Gateway WebSocket RPC**：bot 主动 outbound 连 `/api/chat/bot/ws`（bot token 鉴权）→ `BotConnection DO(bot_id)`，Chat 向 bot 推 `delivery` 帧（`command_invocation` / `message_interaction` / `message_event`），bot 回 `delivery_result`（含 effects），Chat 回 `delivery_ack`（v2.10 delta）。
-- Bot 管理/主动发送仍走 outbound HTTP：`PUT /api/chat/bot/commands`、`POST /api/chat/bot/channels/{channel_id}/messages`。这些是 bot → Chat 的 HTTP，**不要求 bot 暴露 HTTP endpoint**。
+- Bot catalog 同步走 outbound HTTP：`PUT /api/chat/bot/commands`（bot → Chat 的 HTTP，**不要求 bot 暴露 HTTP endpoint**）。
+- Bot **消息 mutation**（发消息、改消息、流式、components）**只**走 Bot Gateway WS 的 `delivery_result.effects` / `session.effects`；**无** Bot HTTP 发消息端点（v2.17 delta：移除 `POST /api/chat/bot/channels/{channel_id}/messages`）。
 - HTTP callback（Chat → bot HTTP `POST <bot_callback_url>` + HMAC 签名）降级为 **future transport**，Phase 7 不实现（v2.10 delta）。
 - 官方 bot 和第三方 bot 走同一套 token、installation、command、effect 机制。
 
@@ -1955,7 +1956,7 @@ Bot token scope：
 - `chat:members:read`
 - `chat:runtime:connect` — 连接 Bot Gateway WS（`GET /api/chat/bot/ws`），接收 runtime delivery（v2.10 delta）
 
-`GET /api/chat/bot/ws` 必须有 `chat:runtime:connect` scope（v2.10 delta）。`PUT /api/chat/bot/commands` 需 `chat:commands:manage`；`POST /api/chat/bot/channels/{channel_id}/messages` 需 `chat:messages:write`。
+`GET /api/chat/bot/ws` 必须有 `chat:runtime:connect` scope（v2.10 delta）。`PUT /api/chat/bot/commands` 需 `chat:commands:manage`。`chat:messages:write` 用于 Bot Gateway WS 上 `delivery_result` / `session.effects` 中的发消息类 effect（v2.17 delta：不再绑定任何 Bot HTTP 发消息路由）。
 
 ### 9.2 Bot actor
 
@@ -2573,39 +2574,16 @@ Chat 按 `(channel_id, bot_id, client_effect_id)` 对 effects 做幂等。`appen
 
 Chat Worker 校验 effects 后写入后端内的消息、审计记录和事件流。ToolBear Python 后端不执行 bot effects。
 
-### 9.8 Bot 直接发消息
+### 9.8 Bot 消息 mutation（仅 WebSocket）
 
-```http
-POST /api/chat/bot/channels/{channel_id}/messages
-Authorization: Bearer <bot_token>
-Idempotency-Key: client-key-bot-message
-```
+Bot 对频道消息的创建与修改（`send_message`、`update_message`、`disable_components`、`start_stream` / `append_stream` / `finalize_stream`）**只**通过 Bot Gateway WebSocket 提交：
 
-请求：
+- stateless / interaction / passive event 响应：`delivery_result.effects`
+- stateful 会话内：`session.effects`
 
-```json
-{
-  "type": "text",
-  "text": "system notice",
-  "reply_to_message_id": null,
-  "attachment_ids": [],
-  "components": []
-}
-```
+**不提供** `POST /api/chat/bot/channels/{channel_id}/messages` 或任何其它 Bot HTTP 消息 mutation 端点（v2.17 delta：自 v2.10 草案中移除）。
 
-响应：
-
-```json
-{
-  "message": {},
-  "event": {
-    "event_id": "01J...",
-    "type": "message.created"
-  }
-}
-```
-
-Bot 只能向已安装且 scope 允许的频道发消息。Bot 直接发消息可以携带 components。
+Bot 消息须满足与 §9.7.3 相同的 effect 校验：目标频道为已 allow 的 `kind=channel` 群聊、scope 含 `chat:messages:write`、components 规则同 Browser 可见消息投影。
 
 ### 9.9 Passive message_event 订阅
 
@@ -3084,7 +3062,7 @@ SeaweedFS presign + finalize + 图片消息。
 7. 两套 status 分开：outbox `pending | delivered | failed | dead_letter`；invocation/interaction lifecycle `pending | dispatched | completed | failed | expired`。
 8. bot offline policy：`command_invocation` / `message_interaction` precheck 时 bot 离线 → `BOT_OFFLINE`；已 commit 后断连 → 短 TTL 标 failed；`message_event` 离线 drop/expire，无用户可见错误，Phase 7 不批量重放历史 passive event。
 9. passive `message_event` listener observer/responder only：无 consume / stop-propagation 语义；loop prevention 默认排除 bot 自己的消息与该 bot 自己生成的消息。
-10. Bot 管理/主动发送（`PUT /bot/commands`、`POST /bot/channels/{channel_id}/messages`）是 bot → Chat 的 outbound HTTP，不要求 bot 暴露 HTTP endpoint。
+10. Bot catalog 同步（`PUT /bot/commands`）是 bot → Chat 的 outbound HTTP，不要求 bot 暴露 HTTP endpoint。Bot 消息 mutation **只**走 Bot Gateway WS effects，无 Bot HTTP 发消息路由（v2.17 delta）。
 
 ## 15. v2.11 addendum 实现不变量（Phase 8 Live Fanout）
 

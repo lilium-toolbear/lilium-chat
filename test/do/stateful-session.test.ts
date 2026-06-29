@@ -313,7 +313,7 @@ describe("stateful command sessions", () => {
     ws.close();
   });
 
-  it("does not emit stateful_session.started until bot sends session.started", async () => {
+  it("does not emit stateful_session.started until bot sends session.start_ack", async () => {
     const userId = `stateful-user-${crypto.randomUUID()}`;
     const channelId = crypto.randomUUID();
     const botId = `stateful-bot-${crypto.randomUUID()}`;
@@ -348,7 +348,7 @@ describe("stateful command sessions", () => {
     });
 
     botGateway.ws.send(JSON.stringify({
-      type: "session.started",
+      type: "session.start_ack",
       api_version: BOT_GATEWAY_API_VERSION,
       session_id: sessionId,
     }));
@@ -467,7 +467,7 @@ describe("stateful command sessions", () => {
     await sessionStartPromise;
 
     firstGateway.ws.send(JSON.stringify({
-      type: "session.started",
+      type: "session.start_ack",
       api_version: BOT_GATEWAY_API_VERSION,
       session_id: sessionId,
     }));

@@ -87,7 +87,7 @@ ChatChannel alarm flushes bot_delivery_outbox (earliest-wins, retry/backoff/dead
 
 (Phase 0–6 + E + v4.0 constraints carry forward. Load-bearing for this plan:)
 
-- **Bot API ≠ Browser API 认证路径，且 Bot WS ≠ Browser WS。** Browser API 用 ToolBear browser JWT（`verifyBrowserJwt`，已在 `src/auth/jwt.ts`）走 `/api/chat/ws` → `UserConnection DO(user_id)`。Bot API 用 `Authorization: Bearer <bot_token>`；bot runtime 走 `/api/chat/bot/ws`（bot token 鉴权）→ `BotConnection DO(bot_id)`。两条 WS 物理分离，bot 不复用 Browser WS。HTTP `PUT /api/chat/bot/commands` / `POST /api/chat/bot/channels/{id}/messages` 是 bot → Chat 的 outbound HTTP（bot token 鉴权），**不要求 bot 暴露 HTTP endpoint**。`/api/chat/channels/{id}/bot-installations` 与 `.../event-subscriptions/...` 是 Browser API（channel admin 操作），走 `getIdentity`。各路径不混用。
+- **Bot API ≠ Browser API 认证路径，且 Bot WS ≠ Browser WS。** Browser API 用 ToolBear browser JWT（`verifyBrowserJwt`，已在 `src/auth/jwt.ts`）走 `/api/chat/ws` → `UserConnection DO(user_id)`。Bot API 用 `Authorization: Bearer <bot_token>`；bot runtime 走 `/api/chat/bot/ws`（bot token 鉴权）→ `BotConnection DO(bot_id)`。两条 WS 物理分离，bot 不复用 Browser WS。HTTP `PUT /api/chat/bot/commands` 是 bot → Chat 的 outbound catalog sync（bot token 鉴权），**不要求 bot 暴露 HTTP endpoint**；Bot 消息 mutation 只经 WS effects（contract v2.17 移除 `POST .../messages`）。`/api/chat/channels/{id}/bot-installations` 与 `.../event-subscriptions/...` 是 Browser API（channel admin 操作），走 `getIdentity`。各路径不混用。
 - **Bot runtime transport = Bot Gateway WS RPC（非 HTTP callback）。** contract §9.7 v2.10：Chat 不再 `POST <bot_callback_url>` + HMAC 签名；改为 bot 主动连 `/api/chat/bot/ws`，Chat 推 `delivery`，bot 回 `delivery_result`，Chat 回 `delivery_ack`。HTTP callback（HMAC 签名）列为 future transport，**Phase 7 不实现**，不留 `callback-sign.ts` / `bot-callback.ts` / `callback_secret` 列。三类 runtime delivery（`command_invocation` / `message_interaction` / `message_event`）都走 Bot Gateway WS。
 - **BotConnection DO 是新增 DO 类，需 wrangler binding。** `wrangler.jsonc` + `wrangler.test.jsonc` 加 `{ "name": "BOT_CONNECTION", "class_name": "BotConnection" }` 绑定 + `migrations[].new_sqlite_classes` 加 `"BotConnection"`（两个 config 同步，见 CLAUDE.md toolchain gotchas）。**加 binding 后必须 `npm run cf-typegen`** 再 typecheck，否则 `worker-configuration.d.ts` 漂移。`src/do/bot-connection.ts` 实现该 DO（hibernation + delivery 队列 + `/internal/enqueue-delivery` + `webSocketMessage` delivery_result 解析 + reconnect redelivery）。helper `botConnectionStub(env, botId) = env.BOT_CONNECTION.get(env.BOT_CONNECTION.idFromName(botId))`。
 - **BotRegistry singleton。** `botRegistryStub(env) = env.BOT_REGISTRY.get(env.BOT_REGISTRY.idFromName("registry"))`，全文件统一，不散写 name。token 原文→hash 不可反查 `bot_id`，singleton 内 `SELECT ... WHERE token_hash=?` 靠 `idx_bot_tokens_hash` UNIQUE 索引。`/internal/bot-get?bot_id=` 是 singleton 内按 bot_id 查 row，不是路由到 by-bot_id DO。
@@ -118,7 +118,7 @@ ChatChannel alarm flushes bot_delivery_outbox (earliest-wins, retry/backoff/dead
 - `src/chat/bot-delivery.ts` — `buildCommandInvocationDeliveryPayload(...)` + `buildMessageInteractionDeliveryPayload(...)` + `buildMessageEventDeliveryPayload(...)`（pure；产出 contract §9.7 delivery `request_json`，含 `invoked_name`）。原 `bot-callback.ts` 重命名而来。
 - `src/chat/bot-effects.ts` — `validateEffects(effects, ctx)` + `applyEffect(...)` 调度（pure 校验；写入仍由 ChatChannel DO 事务承担）。`EffectType` 联合类型。
 - `src/routes/bot-ws.ts` — `GET /api/chat/bot/ws` WS upgrade：验 bot token → route 到 `BotConnection DO(bot_id)` → `acceptWebSocket` with subprotocol `lilium.chat.bot.v1`。
-- `src/routes/bot.ts` — bot-token HTTP routes：`PUT /api/chat/bot/commands`（catalog sync）、`POST /api/chat/bot/channels/:channel_id/messages`（bot 直接发消息）。
+- `src/routes/bot.ts` — bot-token HTTP routes：`PUT /api/chat/bot/commands`（catalog sync）。消息 mutation 经 Bot Gateway WS effects，无 HTTP 发消息路由（v2.17）。
 - `src/routes/bot-installations.ts` — Browser API routes：`GET/POST /api/chat/channels/:channel_id/bot-installations`、`PATCH .../bot-installations/:bot_id`、`PATCH .../commands/:bot_command_id`、`GET .../commands`（channel command 查询，prefix suggest）、`PATCH .../bot-installations/:bot_id/event-subscriptions/message.created`（7e passive 订阅）。
 - `src/do/bot-connection.ts` — `BotConnection` DO：hibernation（`ctx.acceptWebSocket`）、`/internal/enqueue-delivery`、`webSocketMessage`（hello/delivery_result/ping 解析）、`webSocketClose`/`webSocketError`（断线 tracking）、alarm（redelivery pending/sent + expire）、`bot_connection_state` + `bot_deliveries` schema migration、`/internal/connection-state`（online 查询，供 ChatChannel offline precheck）。
 - `src/do/migrations/bot-connection.ts` — `BotConnection` baseline schema + migration runner（`bot_connection_state` + `bot_deliveries` + `idx_bot_deliveries_due`）。`BOT_CONNECTION_BASELINE_SCHEMA` + `migrateBotConnectionSchema`。
@@ -547,9 +547,13 @@ CREATE INDEX idx_channel_bot_event_subscriptions_enabled
 
 ---
 
-## Section 7f — Bot 直接发消息
+## Section 7f — Bot HTTP 发消息（已取消）
 
-### Task 7f-bot-message: Bot 直接发消息 `POST /api/chat/bot/channels/:channel_id/messages`
+> **Contract v2.17：** Bot 消息 mutation 只经 Bot Gateway WS `delivery_result` / `session.effects`。不实现 `POST /api/chat/bot/channels/:channel_id/messages` 或 `/internal/bot-message-send`。
+
+~~### Task 7f-bot-message~~（以下任务作废，保留作历史记录）
+
+### Task 7f-bot-message: ~~Bot 直接发消息 `POST /api/chat/bot/channels/:channel_id/messages`~~
 **Files:** `src/routes/bot.ts`, `src/do/chat-channel.ts` (`/internal/bot-message-send`), `test/routes/bot-message-send.test.ts`
 - [ ] **Step 1:** `POST /api/chat/bot/channels/:channel_id/messages`：`getBotIdentity`（scope `chat:messages:write`）+ `Idempotency-Key` → body `{ type, text, reply_to_message_id, attachment_ids, components }` → ChatChannel `/internal/bot-message-send`。
 - [ ] **Step 2:** ChatChannel `/internal/bot-message-send`：校验 bot installed in channel（`bot_installations` status=active，bot summary 从 `bot_installations` snapshot 取）+ scope；校验 `components`（`validateComponents`）；resolve bot-owned attachments；insert `messages(sender_kind=bot, sender_bot_id, sender_bot_display_name, sender_bot_avatar_url, components_json)` + emit `message.created`（payload.message via `projectMessageForBrowser`，bot summary 来自 snapshot）+ fanout；idempotency via `idempotency_keys(operation=bot.message.send, principal_kind='bot', operation_id=Idempotency-Key)`。返回 contract §9.8 `{ message, event:{event_id, type:"message.created"} }`。
@@ -597,8 +601,7 @@ CREATE INDEX idx_channel_bot_event_subscriptions_enabled
 - [ ] `GET /api/chat/bot/ws`（bot token，outbound WS，subprotocol `lilium.chat.bot.v1`）→ `BotConnection DO(bot_id)`；hello/ready → delivery → delivery_result → delivery_ack 帧协议；bot 不复用 Browser WS。
 - [ ] WS `command.invoke` committed_ack `{channel_id, invocation_id, event_id}` + `command.invoked`(pending) → 异步 `bot_delivery_outbox` → `BotConnection` delivery → `delivery_result` → effects 应用 → `command.completed`；`command_id` durable 幂等；correctness source = 当前 BotRegistry catalog（drift 时刷新 binding snapshot）；bot offline precheck → `BOT_OFFLINE`。
 - [ ] WS `interaction.submit` committed_ack `{channel_id, interaction_id, event_id}` + `interaction.created` → 异步 delivery → `interaction.completed`；component ownership/disabled/custom_id 校验；bot offline precheck → `BOT_OFFLINE`。
-- [ ] Bot effects：send_message / update_message / disable_components / start_stream / append_stream / finalize_stream，按 `(channel_id, bot_id, client_effect_id)` 幂等（跨 delivery retry 去重），bot 只能改自己的消息，stream 不变量；同 `client_effect_id` 异 body → `BOT_EFFECT_CONFLICT`；非法 → `BOT_EFFECT_INVALID`（delivery_ack failed）。
-- [ ] `POST /api/chat/bot/channels/:id/messages`（bot token，可带 components）。
+- [ ] Bot effects：send_message / update_message / disable_components / start_stream / append_stream / finalize_stream，按 `(channel_id, bot_id, client_effect_id)` 幂等（跨 delivery retry 去重），bot 只能改自己的消息，stream 不变量；同 `client_effect_id` 异 body → `BOT_EFFECT_CONFLICT`；非法 → `BOT_EFFECT_INVALID`（delivery_ack failed）。**唯一** Bot 消息 mutation 路径（无 HTTP 发消息路由，contract v2.17）。
 - [ ] Passive `message_event` 订阅（§9.9）：`PATCH .../event-subscriptions/message.created`；message send 事务内为 enabled 且 filter 匹配的订阅写 `bot_delivery_outbox(kind=message_event)`；loop prevention（排除 bot 自己 / 自己生成的消息）；observer/responder only，无 consume/stop-propagation；bot 离线 drop/expire。
 - [ ] `projectMessageForBrowser` 携带 components + bot actor `{kind:"bot", bot:{bot_id, display_name, avatar_url}}`（来源 `messages.sender_bot_*` snapshot 列，全路径同形）；deleted/recalled bot 消息安全投影（content 清空，bot summary 可留）。
 - [ ] `bot_delivery_outbox`（原 `bot_callback_outbox` 重命名，`kind ∈ {command_invocation, message_interaction, message_event}`，`event_id` 列）+ `bot_effects_applied`（PK=`channel_id+bot_id+client_effect_id`，`outbox_id` debug 列）+ `channel_bot_event_subscriptions` + BotConnection `bot_connection_state`/`bot_deliveries`。

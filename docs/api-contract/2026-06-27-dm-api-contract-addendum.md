@@ -246,10 +246,16 @@ POST   /api/chat/channels/{channel_id}/bot-installations
 PATCH  /api/chat/channels/{channel_id}/bot-installations/{bot_id}
 PATCH  /api/chat/channels/{channel_id}/commands/{bot_command_id}
 PATCH  .../bot-installations/{bot_id}/event-subscriptions/message.created
-POST   /api/chat/bot/channels/{channel_id}/messages
 ```
 
-Bot / slash（v1 不进 DM）：
+Bot Gateway WS（v1 不进 DM）：
+
+```text
+delivery_result / session.effects（发消息类 effect）
+     -> delivery_ack.failed { code: "UNSUPPORTED_CHANNEL_KIND", retryable: false }
+```
+
+Slash / interaction（v1 不进 DM）：
 
 ```text
 GET  /api/chat/channels/{channel_id}/commands

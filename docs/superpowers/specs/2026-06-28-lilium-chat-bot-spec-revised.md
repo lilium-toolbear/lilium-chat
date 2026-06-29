@@ -1312,7 +1312,7 @@ Bot replies:
 
 ```json
 {
-  "type": "session.started",
+  "type": "session.start_ack",
   "api_version": "lilium.chat.bot.v1",
   "session_id": "00000000-0000-7000-8000-000000000901"
 }
@@ -1636,7 +1636,7 @@ Browser WS command.invoke
   → return committed ack with session_id
 ```
 
-When Bot sends `session.started`:
+When Bot sends `session.start_ack`:
 
 ```text
 BotConnection

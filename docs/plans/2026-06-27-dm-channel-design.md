@@ -229,7 +229,13 @@ POST   /api/chat/channels/{dm_id}/bot-installations
 PATCH  /api/chat/channels/{dm_id}/bot-installations/{bot_id}
 PATCH  /api/chat/channels/{dm_id}/commands/{bot_command_id}
 PATCH  .../bot-installations/{bot_id}/event-subscriptions/message.created
-POST   /api/chat/bot/channels/{dm_id}/messages
+```
+
+Bot Gateway WS effects on DM（v1 不进 DM）：
+
+```text
+delivery_result / session.effects
+     -> UNSUPPORTED_CHANNEL_KIND
 ```
 
 Bot / slash（v1 不进 DM，即使残留 binding 也须收口）：
@@ -338,7 +344,7 @@ UserDirectory flush → notify UserConnection /internal/live-memberships-changed
 [ ] PATCH/dissolve/join/invites/members on DM → 409 UNSUPPORTED_CHANNEL_KIND
 [ ] GET .../commands on DM -> { items: [] }
 [ ] WS command.invoke / interaction.submit on DM -> UNSUPPORTED_CHANNEL_KIND
-[ ] POST /bot/channels/{dm_id}/messages -> 409 UNSUPPORTED_CHANNEL_KIND
+[ ] Bot Gateway delivery_result / session.effects on DM -> UNSUPPORTED_CHANNEL_KIND
 [ ] DM 中不能 admin delete 对方消息
 [ ] POST /dms 响应含完整 ChannelSummary 列表字段
 [ ] ChannelSummary title/avatar/dm_peer 为 viewer-specific 投影

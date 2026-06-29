@@ -25,7 +25,7 @@ import {
 import {
   parseSessionClose,
   parseSessionInputAck,
-  parseSessionStarted,
+  parseSessionStartAck,
   type SessionInputFrame,
 } from "../chat/bot-gateway-session";
 
@@ -577,8 +577,8 @@ export class BotConnection extends DurableObject<Env> {
         return;
       }
 
-      if (frame.type === "session.started") {
-        const parsed = parseSessionStarted(message);
+      if (frame.type === "session.start_ack") {
+        const parsed = parseSessionStartAck(message);
         this.touchConnected(attachment.bot_id, attachment.session_id);
         const ref = this.ctx.storage.sql
           .exec(
