@@ -259,6 +259,87 @@ describe("command.invoke", () => {
     ws.close();
   });
 
+  it("includes reply_to context in bot delivery when invoke carries reply_to_message_id", async () => {
+    const userId = `invoke-reply-user-${crypto.randomUUID()}`;
+    const channelId = crypto.randomUUID();
+    const botId = `invoke-reply-bot-${crypto.randomUUID()}`;
+    const botCommandId = `invoke-reply-cmd-${crypto.randomUUID()}`;
+
+    await createOwnedTestChannel(
+      env as unknown as Pick<import("../../src/env").Env, "CHAT_CHANNEL">,
+      userId,
+      { channelId, title: "Invoke Reply Channel" },
+    );
+    await seedAllowedCommandBinding({
+      channelId,
+      userId,
+      botId,
+      botCommandId,
+      manifestVersion: 1,
+    });
+    const botGateway = await openBotGateway(botId);
+    openedBotSockets.push(botGateway.ws);
+
+    const { ws } = await upgradeUserConnection(userId);
+    const sendCommandId = `send-${crypto.randomUUID()}`;
+    ws.send(JSON.stringify({
+      frame_type: "command",
+      command: "message.send",
+      command_id: sendCommandId,
+      channel_id: channelId,
+      payload: {
+        type: "text",
+        text: "hello",
+        reply_to_message_id: null,
+        attachment_ids: [],
+        mentions: [],
+      },
+    }));
+    const sendAck = JSON.parse(await nextAck(ws)) as {
+      payload?: { message?: { message_id?: string } };
+    };
+    const targetMessageId = sendAck.payload?.message?.message_id;
+    expect(targetMessageId).toBeTruthy();
+
+    ws.send(JSON.stringify({
+      frame_type: "command",
+      command: "command.invoke",
+      command_id: `invoke-reply-${crypto.randomUUID()}`,
+      channel_id: channelId,
+      payload: {
+        bot_command_id: botCommandId,
+        invoked_name: "ask",
+        command_manifest_version: 1,
+        reply_to_message_id: targetMessageId,
+        options: {
+          prompt: { type: "string", value: "follow up" },
+        },
+      },
+    }));
+    const ack = JSON.parse(await nextAck(ws)) as {
+      status: string;
+      payload?: { invocation_id?: string };
+    };
+    expect(ack.status).toBe("committed");
+
+    await withChannel(channelId, (ctx) => {
+      const outbox = ctx.storage.sql
+        .exec(
+          "SELECT request_json FROM bot_delivery_outbox WHERE channel_id=? ORDER BY outbox_id DESC LIMIT 1",
+          channelId,
+        )
+        .toArray()[0] as { request_json: string } | undefined;
+      const request = JSON.parse(outbox?.request_json ?? "{}") as {
+        reply_to?: { message_id?: string; text?: string; sender?: { kind?: string } };
+      };
+      expect(request.reply_to?.message_id).toBe(targetMessageId);
+      expect(request.reply_to?.text).toBe("hello");
+      expect(request.reply_to?.sender?.kind).toBe("user");
+    });
+
+    ws.close();
+  });
+
   it("returns BOT_OFFLINE when bot is disconnected", async () => {
     const userId = `invoke-user-${crypto.randomUUID()}`;
     const channelId = crypto.randomUUID();

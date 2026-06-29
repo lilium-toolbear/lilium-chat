@@ -2,6 +2,7 @@ import type { Env } from "../../env";
 import type { UserSummary } from "../../contract/primitives";
 import type { ManagementPersistedEventType, ManagementPersistedPayload } from "../../contract/persisted";
 import { HTTP_STATUS_BY_CODE } from "../../errors";
+import type { CommandInvocationReplyContext } from "../../contract/message";
 import { buildSessionStart, buildSessionClosed, type StatefulSessionInputStored } from "../../chat/bot-gateway-session";
 import type { CommandBindingSnapshot } from "../../contract/bot-api";
 import type { WireChatMessage } from "../../contract/message";
@@ -162,6 +163,7 @@ export async function handleStatefulCommandInvoke(
     requestHash: string;
     idemExpiresAt: string;
     actor: UserSummary;
+    reply_to: CommandInvocationReplyContext | null;
   },
 ): Promise<Response> {
   const statefulConfig = parseStatefulConfigFromSnapshot(input.snapshot.execution);
@@ -196,6 +198,7 @@ export async function handleStatefulCommandInvoke(
     },
     invoker: input.actor,
     options: input.options,
+    ...(input.reply_to ? { reply_to: input.reply_to } : {}),
     listen_rules: listenRules,
     input_seq_start: 1,
     expires_at: expiresAt,

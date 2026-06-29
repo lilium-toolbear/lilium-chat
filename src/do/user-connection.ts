@@ -378,6 +378,7 @@ export class UserConnection extends DurableObject<Env> {
           invoked_name: parsed.command.invoked_name,
           command_manifest_version: parsed.command.command_manifest_version,
           options: parsed.command.options,
+          reply_to_message_id: parsed.command.reply_to_message_id,
         }),
       }));
       if (!invokeRes.ok) {

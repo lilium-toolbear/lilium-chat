@@ -30,7 +30,7 @@ import type {
 } from "../contract/persisted";
 import { buildReplayEventsResponse } from "../chat/replay-projection";
 import type { ChatEventPayloadByType } from "../contract/events";
-import type { MessageImageAttachment, WireChatMessage } from "../contract/message";
+import type { CommandInvocationReplyContext, MessageImageAttachment, WireChatMessage } from "../contract/message";
 import { idempotencyExpiresAt } from "../contract/idempotency";
 import type { MessageMutationAckPayload, MessageMutationIdempotencyEnvelope } from "../contract/idempotency";
 import type { ChannelMetaProjection, ChannelUpdatePresentFields, MemberProjection } from "../contract/channel-api";
@@ -106,6 +106,7 @@ import {
 } from "../chat/stateful-bot-delivery";
 import { invokedNameMatchesSnapshot } from "../chat/slash-token";
 import { buildReplySnapshot } from "../chat/reply-snapshot";
+import { projectCommandInvokeReplyContext } from "../chat/command-invoke-reply";
 import { insertUserCommandInvocationMessage, type InvocationMessageHost } from "./chat-channel/invocation-message";
 
 interface OutboxRow {
@@ -332,6 +333,42 @@ export class ChatChannel extends DurableObject<Env> {
       m.set(id, { user_id: id, display_name: v.display_name ?? `user-${id.slice(0, 8)}`, avatar_url: v.avatar_url });
     }
     return m;
+  }
+
+  private async resolveCommandInvokeReplyContext(
+    channelId: string,
+    replyToMessageId: string | null,
+  ): Promise<
+    | { ok: true; reply_to: CommandInvocationReplyContext | null }
+    | { ok: false; code: string; message: string }
+  > {
+    if (!replyToMessageId) return { ok: true, reply_to: null };
+
+    const targetRow = this.ctx.storage.sql
+      .exec(
+        `SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id,
+                sender_bot_display_name, sender_bot_avatar_url, type, format, status, text, reply_to,
+                reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at,
+                deleted_by, recalled_at
+         FROM messages WHERE message_id=? AND channel_id=?`,
+        replyToMessageId,
+        channelId,
+      )
+      .toArray()[0] as MessageRow | undefined;
+    if (!targetRow || (targetRow.status !== "normal" && targetRow.status !== "edited")) {
+      return { ok: false, code: "MESSAGE_NOT_FOUND", message: "reply target not found" };
+    }
+
+    let senderSummary: LiveUserSummary | null = null;
+    if (targetRow.sender_kind === "user" && targetRow.sender_user_id) {
+      const actorMap = await this.resolveActorMap([targetRow.sender_user_id]);
+      senderSummary = actorMap.get(targetRow.sender_user_id) ?? null;
+    }
+
+    return {
+      ok: true,
+      reply_to: projectCommandInvokeReplyContext(targetRow, senderSummary),
+    };
   }
 
   private assertNotDissolved(status: string): { code: string; message: string } | null {
@@ -1063,6 +1100,7 @@ export class ChatChannel extends DurableObject<Env> {
       invoked_name?: unknown;
       command_manifest_version?: unknown;
       options?: unknown;
+      reply_to_message_id?: unknown;
     } | null;
     if (
       !b ||
@@ -1082,6 +1120,10 @@ export class ChatChannel extends DurableObject<Env> {
     const invokedName = typeof b.invoked_name === "string" ? b.invoked_name : "";
     const commandManifestVersion = b.command_manifest_version;
     const options = b.options as Record<string, { type: string; value: unknown }>;
+    const replyToMessageId =
+      typeof b.reply_to_message_id === "string" && b.reply_to_message_id.length > 0
+        ? b.reply_to_message_id
+        : null;
     const now = this.nowIso();
     const nowMs = Date.parse(now);
     const idemExpiresAt = idempotencyExpiresAt(nowMs);
@@ -1091,6 +1133,7 @@ export class ChatChannel extends DurableObject<Env> {
       invoked_name: invokedName,
       command_manifest_version: commandManifestVersion,
       options,
+      reply_to_message_id: replyToMessageId,
     });
 
     const preCheck = this.ctx.storage.sql
@@ -1250,6 +1293,12 @@ export class ChatChannel extends DurableObject<Env> {
       avatar_url: null,
     };
 
+    const replyResolution = await this.resolveCommandInvokeReplyContext(channelId, replyToMessageId);
+    if (!replyResolution.ok) {
+      return this.botInstallError(replyResolution.code, replyResolution.message);
+    }
+    const invokeReplyTo = replyResolution.reply_to;
+
     if (snapshot.execution.mode === "stateful") {
       return handleStatefulCommandInvoke(this as unknown as StatefulSessionHost, {
         userId,
@@ -1264,6 +1313,7 @@ export class ChatChannel extends DurableObject<Env> {
         requestHash,
         idemExpiresAt,
         actor,
+        reply_to: invokeReplyTo,
       });
     }
 
@@ -1442,6 +1492,7 @@ export class ChatChannel extends DurableObject<Env> {
           },
           invoker: actor,
           options,
+          ...(invokeReplyTo ? { reply_to: invokeReplyTo } : {}),
         }),
         now,
         now,

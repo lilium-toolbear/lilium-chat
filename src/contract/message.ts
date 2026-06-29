@@ -27,11 +27,20 @@ export type MessageFormat = "plain" | "markdown";
 export type MessageLifecycleStatus = "normal" | "edited" | "deleted" | "recalled";
 export type MessageStreamState = "none" | "streaming" | "final";
 
+export interface ReplySnapshotMediaPreview {
+  kind: "image" | "sticker";
+  url: string;
+  blurhash: string | null;
+  width: number;
+  height: number;
+}
+
 export interface ReplySnapshot {
   message_id: ChatId;
   sender_display_name: string;
   text_preview: string;
   status: MessageLifecycleStatus;
+  media_preview?: ReplySnapshotMediaPreview | null;
 }
 
 export interface Attachment {
@@ -114,6 +123,15 @@ export interface CommandInvocationProjection {
   bot_command_id: ChatId;
   invoked_name: string;
   options: Record<string, { type: string; value: unknown }>;
+}
+
+/** Optional message the user was replying to when invoking a slash command. */
+export interface CommandInvocationReplyContext {
+  message_id: ChatId;
+  sender: WireMessageSender;
+  type: MessageType;
+  status: MessageLifecycleStatus;
+  text: string | null;
 }
 
 export interface ChatMessage {

@@ -1,5 +1,5 @@
 import { BOT_GATEWAY_API_VERSION } from "../contract/bot-gateway";
-import type { WireChatMessage } from "../contract/message";
+import type { CommandInvocationReplyContext, WireChatMessage } from "../contract/message";
 import { isRecord } from "../contract/utils";
 
 export interface SessionStartFrame {
@@ -16,6 +16,7 @@ export interface SessionStartFrame {
   };
   invoker: { user_id: string; display_name: string; avatar_url: string | null };
   options: Record<string, { type: string; value: unknown }>;
+  reply_to?: CommandInvocationReplyContext | null;
   listen_rules: {
     message_types: string[];
     include_bot_messages: boolean;

@@ -8,6 +8,7 @@ export interface ParsedCommandInvoke {
   invoked_name: string;
   command_manifest_version: number;
   options: Record<string, { type: string; value: unknown }>;
+  reply_to_message_id: string | null;
 }
 
 export type ParseCommandInvokeResult =
@@ -61,6 +62,13 @@ export function parseCommandInvokeCommand(frame: IncomingCommandFrame): ParseCom
   if (!isRecord(frame.payload.options)) {
     return fail("options must be an object");
   }
+
+  const replyToMessageIdRaw = frame.payload.reply_to_message_id;
+  const reply_to_message_id =
+    typeof replyToMessageIdRaw === "string" && replyToMessageIdRaw.length > 0
+      ? replyToMessageIdRaw
+      : null;
+
   const options: Record<string, { type: string; value: unknown }> = {};
   for (const [name, rawOption] of Object.entries(frame.payload.options)) {
     if (!isRecord(rawOption)) {
@@ -84,6 +92,7 @@ export function parseCommandInvokeCommand(frame: IncomingCommandFrame): ParseCom
       invoked_name: invokedName,
       command_manifest_version: commandManifestVersion,
       options,
+      reply_to_message_id,
     },
   };
 }
