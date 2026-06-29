@@ -142,5 +142,4 @@ columns/indexes via a new migration with an incremented
   history documenting why each platform-impossible pattern was rejected).
 - `docs/superpowers/plans/` — per-phase implementation plans.
 
-See `CLAUDE.md` for agent-oriented guidance (toolchain gotchas, invariants,
-and testing conventions in detail).
+See [`AGENTS.md`](AGENTS.md) for agent-oriented guidance (toolchain gotchas, DO topology, invariants, and testing conventions).

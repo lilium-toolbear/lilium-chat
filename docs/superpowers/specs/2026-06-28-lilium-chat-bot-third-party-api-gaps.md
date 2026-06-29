@@ -6,11 +6,11 @@
 
 > **2026-06-30 收口：** 本文是历史讨论稿和 gap tracker，**不再**作为实现计划或 contract 的规范来源。下一步实现应引用：
 >
-> - **Internal contract（normative wire shape）：** `docs/api-contract.md` **§16–§17**（v2.19 internal addendum）
+> - **Internal contract（normative wire shape）：** `docs/api-contract.md` **§9.13–§9.16**（Bot streaming）与 **§12.4**（实现不变量）
 > - **Backend spec（normative 实现不变量）：** `docs/superpowers/specs/2026-06-30-lilium-chat-bot-streaming-and-internal-api-spec.md`
 > - **Implementation plan：** `docs/superpowers/plans/2026-06-30-lilium-chat-bot-streaming-internal-api-implementation.md`
 >
-> 旧 standalone addendum 文件 `docs/api-contract/2026-06-30-bot-internal-api-contract-addendum.md` 已合并入主 contract §16，仅保留 redirect stub。
+> 旧 standalone addendum 文件 `docs/api-contract/2026-06-30-bot-internal-api-contract-addendum.md` 已合并入主 contract §9.13–§9.16 / §12.4，仅保留 redirect stub。
 >
 > 第三方公开 API 文档只描述已上线、可调用、经过验证的能力；不得从本文直接摘取“预留 scope / 尚未实现 / 内部路由 / Browser/Admin API / ToolBear Web route”等内容。
 >
@@ -65,7 +65,9 @@
 
 **上线后：** 在公开文档 §Effects 保留协议形状；不在公开文档写「缺口」表述。
 
-### 2.2 流式输出：双 WebSocket + 专用 DO（normative）
+### 2.2 流式输出：双 WebSocket + 专用 DO（historical decision, superseded by `docs/api-contract.md` §9.13–§9.16）
+
+> 以下内容为历史讨论摘要；**规范以主 contract §9.13–§9.16 与 backend spec 为准**。
 
 **架构结论（已与产品对齐）：**
 

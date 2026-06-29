@@ -17,8 +17,8 @@ Browser/Bot API 的 **唯一 source of truth** 是仓库根下的 [`docs/api-con
 1. **所有 API wire shape 变更**必须**只**修改 `docs/api-contract.md`，并在文内 **修订记录** 增加新版本条目（含日期与 delta 摘要）。
 2. **不要**为追平 spec 去改历史文档：`docs/api-contract/*` addendum、redirect stub、`docs/superpowers/plans/*`、gap tracker、已归档 spec/plan 等均保持原样，除非你在写新的讨论稿。
 3. 大型或跨阶段变更可先在 `docs/api-contract/` 写 dated addendum 讨论，**定稿后合并进** `docs/api-contract.md`；addendum 文件改为 redirect stub 或标注 superseded，**合并后不再维护 addendum 正文**。
-4. 实现计划与 backend spec 引用 `docs/api-contract.md`，不要以本目录 addendum 作为 normative source。
-5. 第三方公开 API 文档从已上线能力抽取；内部 addendum（如 §16）在 product 验证前不对第三方公开。
+4. 实现计划与 backend spec 引用 `docs/api-contract.md`，不要以本目录 addendum 作为 normative source。历史文档中的 §13–§17、§12-legacy 引用可跳转到文末 **tombstone** 章节再转到现行 normative 位置。
+5. 第三方公开 API 文档从已上线能力抽取；内部 Bot streaming 章节（§9.13–§9.16）在 product 验证前不对第三方公开。
 
 ## 当前文件
 
@@ -26,5 +26,5 @@ Browser/Bot API 的 **唯一 source of truth** 是仓库根下的 [`docs/api-con
 |---|---|
 | `2026-06-27-dm-api-contract-addendum.md` | 已合并进主 contract v2.13；保留为 patch trace |
 | `2026-06-28-bot-slash-command-contract-addendum.md` | 已合并进主 contract v2.16；保留为 patch trace |
-| `2026-06-30-bot-internal-api-contract-addendum.md` | 已合并进主 contract §16–§17 (v2.19)；redirect stub |
+| `2026-06-30-bot-internal-api-contract-addendum.md` | 已合并进主 contract §9.13–§9.16 / §12.4 (v2.19+)；redirect stub |
 | `2026-06-22-toolbear-chat-api-contract.md` | redirect stub → `docs/api-contract.md` |

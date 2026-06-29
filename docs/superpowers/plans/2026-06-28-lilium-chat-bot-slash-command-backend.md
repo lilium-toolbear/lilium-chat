@@ -20,7 +20,7 @@ Read before editing:
 
 - `docs/superpowers/specs/2026-06-28-lilium-chat-bot-spec-revised.md`
 - `docs/api-contract.md` (will be superseded in Task 1)
-- `CLAUDE.md` § DO topology, scheduler, migrations
+- `AGENTS.md` § DO topology, scheduler, migrations
 - `src/do/chat-channel.ts` (existing bot-install + binding handlers to remove)
 - `src/do/bot-registry.ts` (existing catalog sync to refactor)
 - `src/do/bot-connection.ts` (stateless delivery — extend for session frames)

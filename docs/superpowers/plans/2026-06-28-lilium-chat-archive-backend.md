@@ -600,7 +600,7 @@ Commit:
 
 ## 8. Tests (backend-relevant subset of spec §12)
 
-Run with the load-adjusted command from `CLAUDE.md`:
+Run with the load-adjusted command from `AGENTS.md`:
 `npx vitest run --no-file-parallelism --test-timeout=60000 --hook-timeout=60000`.
 
 ### 8.1 Unit tests — `test/archive/*.test.ts`
@@ -738,7 +738,7 @@ out-of-order safety, replay repair, and integration drain-to-PG.
 
 - **miniflare Queue producer**: confirm `wrangler.test.jsonc` `queues.producers`
   is accepted by `@cloudflare/vitest-pool-workers` at pool startup (like the
-  Hyperdrive placeholder caveat in `CLAUDE.md`). If miniflare rejects an
+  Hyperdrive placeholder caveat in `AGENTS.md`). If miniflare rejects an
   un-consumed producer, the fallback is to keep the binding in prod config only
   and inject a fake `CHAT_ARCHIVE_QUEUE` into the test env via
   `vitest.config.ts` `miniflare`/`bindings`. **Resolve at T3.**

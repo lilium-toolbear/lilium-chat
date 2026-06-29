@@ -2,18 +2,18 @@
 
 状态：内部实现前 spec patch  
 日期：2026-06-30  
-对应 contract：`docs/api-contract.md` **§16–§17**（v2.19 internal addendum）
+对应 contract：`docs/api-contract.md` **§9.13–§9.16**（Bot streaming wire shape）与 **§12.4**（实现不变量）
 基线：`docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` v4.4 + Bot Phase 7/Stateful addenda
 
 本 spec patch 把原讨论稿 `2026-06-28-lilium-chat-bot-third-party-api-gaps.md` 中可执行的架构决策收口为内部实现规范。第三方公开文档暂不更新；实现完成后再从生产可用能力整理外部说明。
 
-**Normative contract:** 主 contract `docs/api-contract.md` §16–§17。本文是后端实现视角的 spec patch，与 §16 wire shape 对齐。
+**Normative contract:** 主 contract `docs/api-contract.md` §9.13–§9.16（wire shape）与 §12.4（不变量）。本文是后端实现视角的 spec patch。
 
 ## 1. Authority And Supersession
 
 本文件覆盖以下旧设计点：
 
-- Base contract §9.7.3 中 `append_stream` / `finalize_stream` 作为主 Bot Gateway effects 的设计作废（见主 contract §16）。
+- Base contract §9.7.3 中 `append_stream` / `finalize_stream` 作为主 Bot Gateway effects 的设计作废（见主 contract §9.13–§9.16）。
 - Phase 7 plan 中“主 WS 上 append_stream UPDATE messages.text”的路径作废。
 - 流式进行中不写 `messages` / canonical `events`；只有 finalize 写 canonical message + event。
 - `message.stream_started` / `message.stream_delta` / `message.stream_abandoned` 是 live-only stream frames。
@@ -62,6 +62,9 @@ CREATE TABLE message_stream_registry (
   expires_at        TEXT NOT NULL,
   finalized_at      TEXT,
   abandoned_at      TEXT,
+  final_event_id    TEXT,
+  final_text_hash   TEXT,
+  finalized_response_json TEXT,
   PRIMARY KEY (channel_id, message_id)
 );
 CREATE INDEX idx_message_stream_registry_bot
@@ -86,9 +89,11 @@ CREATE INDEX idx_message_stream_registry_expiry
 
 A repeated identical `start_stream` effect returns the same registry entry and `ws_url`.
 
+On successful finalize, ChatChannel persists `final_event_id`, `final_text_hash`, and `finalized_response_json` on the registry row before marking `status=finalized`. Repeated finalize with the same final text hash returns the stored response; different hash returns `BOT_STREAM_CONFLICT`.
+
 ## 4. BotStreamConnection Schema
 
-`BotStreamConnection` owns in-progress stream text. It uses SQLite only for durable chunks and metadata; it must not write `ChatChannel` on every append.
+`BotStreamConnection` owns in-progress stream text. It uses SQLite for durable flushed text and metadata; it must not write `ChatChannel` on every append.
 
 ```sql
 CREATE TABLE stream_state (
@@ -97,7 +102,6 @@ CREATE TABLE stream_state (
   bot_id           TEXT NOT NULL,
   status           TEXT NOT NULL, -- streaming | finalizing | finalized | abandoned | expired
   ack_seq          INTEGER NOT NULL DEFAULT 0,
-  received_seq     INTEGER NOT NULL DEFAULT 0,
   flushed_text     TEXT NOT NULL DEFAULT '',
   pending_bytes    INTEGER NOT NULL DEFAULT 0,
   expires_at       TEXT NOT NULL,
@@ -105,20 +109,9 @@ CREATE TABLE stream_state (
   updated_at       TEXT NOT NULL,
   PRIMARY KEY (channel_id, message_id)
 );
-
-CREATE TABLE stream_append_hashes (
-  channel_id    TEXT NOT NULL,
-  message_id    TEXT NOT NULL,
-  seq           INTEGER NOT NULL,
-  delta_hash    TEXT NOT NULL,
-  created_at    TEXT NOT NULL,
-  PRIMARY KEY (channel_id, message_id, seq)
-);
-CREATE INDEX idx_stream_append_hashes_cleanup
-  ON stream_append_hashes(channel_id, message_id, seq);
 ```
 
-`stream_append_hashes` is a bounded conflict guard for recent/unflushed appends. It may be pruned for `seq <= ack_seq - STREAM_SEQ_HASH_RETENTION_WINDOW`; duplicates below `ack_seq` are no-ops.
+**No `stream_append_hashes` table.** Unacked duplicate detection lives only in the active WS attachment in-memory map. After disconnect or DO rehydrate, `received_seq` resets to `ack_seq` and the map is cleared; the bot must resend from `ack_seq + 1`.
 
 WebSocket attachment shape:
 
@@ -130,6 +123,8 @@ interface BotStreamConnectionAttachment {
   pending_text: string;
   pending_start_seq: number | null;
   pending_end_seq: number;
+  received_seq: number;
+  recent_unacked_hashes: Map<number, string>; // seq -> delta_hash, in-memory only
   fanout_pending_text: string;
   fanout_due_at_ms: number;
   expires_at: string;
@@ -145,7 +140,6 @@ export const STREAM_FANOUT_INTERVAL_MS = 100;
 export const STREAM_FANOUT_MAX_PENDING_BYTES = 4_096;
 export const STREAM_ACK_FLUSH_INTERVAL_MS = 250;
 export const STREAM_DEFAULT_TTL_SECONDS = 300;
-export const STREAM_SEQ_HASH_RETENTION_WINDOW = 128;
 ```
 
 `STREAM_ACK_FLUSH_INTERVAL_MS` is the maximum time the server should hold accepted but unacknowledged append data before flushing it to durable state and advancing `ack_seq`.
@@ -206,27 +200,34 @@ Append hot path:
 ```text
 append(seq, delta)
   -> validate status=streaming and not expired
-  -> validate seq relative to received_seq / ack_seq
-  -> record recent seq hash
-  -> pending_text += delta
+  -> validate seq relative to received_seq / ack_seq (gap uses received_seq + 1)
+  -> if unacked duplicate (seq <= received_seq && seq > ack_seq): check attachment recent_unacked_hashes
+  -> pending_text += delta; received_seq = seq
+  -> record hash in attachment recent_unacked_hashes (in-memory only)
   -> fanout_pending_text += delta
-  -> maybe fanout live stream_delta
+  -> maybe fanout live stream_delta via ChannelFanout /internal/deliver-stream-frame
   -> maybe flush pending_text to SQLite
-  -> only after durable flush, advance ack_seq and send append_ack
+  -> only after durable flush, advance ack_seq, prune attachment hashes for seq <= ack_seq, send append_ack
 ```
 
 Durability rule:
 
 `append_ack.ack_seq` must never advance beyond text that is durably included in `stream_state.flushed_text`.
 
-This means the implementation may accept and live-fanout data before acking it, but the bot must keep unacked deltas in its retry buffer. If the stream disconnects before an ack, the bot resends from `ready.ack_seq + 1`.
+This means the implementation may accept and live-fanout data before acking it, but the bot must keep unacked deltas in its retry buffer. On the same active connection, bot may send `seq=1,2,3` while `ack_seq=0`; gap detection uses `received_seq`, not `ack_seq`. If the stream disconnects before an ack, the bot resends from `ready.ack_seq + 1` after reconnect.
 
 Sequence rules:
 
-- `seq <= ack_seq`: no-op; respond with current `append_ack` eventually.
-- `seq == received_seq + 1`: accept into pending buffer.
-- `seq <= received_seq` but `seq > ack_seq`: check recent hash. Same hash is no-op; different hash returns `BOT_STREAM_CONFLICT`.
+- `seq <= ack_seq`: durable no-op; server may immediately send `append_ack { ack_seq }`.
+- `seq == received_seq + 1`: accept into pending buffer; update `received_seq`.
+- `seq <= received_seq` but `seq > ack_seq`: unacked duplicate on active connection; same hash in `recent_unacked_hashes` is no-op; different hash returns `BOT_STREAM_CONFLICT`.
 - `seq > received_seq + 1`: return `BOT_STREAM_SEQUENCE_GAP`.
+
+On WS disconnect or DO rehydrate:
+
+- reset attachment `received_seq` to SQLite `ack_seq`;
+- clear `recent_unacked_hashes` and in-memory `pending_text`;
+- `ready` exposes only `ack_seq`; bot resumes from `ack_seq + 1`.
 
 Flush triggers:
 
@@ -242,16 +243,49 @@ Flush operation:
 UPDATE stream_state
 SET flushed_text = flushed_text || pending_text,
     ack_seq = pending_end_seq,
-    received_seq = pending_end_seq,
     pending_bytes = 0,
     updated_at = now
 ```
 
-After flush, clear `pending_text` from attachment and send `append_ack { ack_seq }`.
+After flush, clear `pending_text` from attachment, prune `recent_unacked_hashes` for `seq <= ack_seq`, and send `append_ack { ack_seq }`.
 
 ## 9. Live Stream Fanout
 
-`BotStreamConnection` sends stream live frames to `ChannelFanout` or directly to `UserConnection` through the established live delivery helper. These frames are not `ChatChannel.events` rows.
+`BotStreamConnection` sends live-only stream frames through a dedicated internal path. These frames are not `ChatChannel.events` rows.
+
+Internal endpoint:
+
+```text
+POST ChannelFanout /internal/deliver-stream-frame
+```
+
+Request body:
+
+```json
+{
+  "channel_id": "...",
+  "frame": {
+    "frame_type": "stream_event",
+    "api_version": "lilium.chat.stream.v1",
+    "type": "message.stream_delta",
+    "channel_id": "...",
+    "message_id": "...",
+    "stream_seq": 42,
+    "delta": "hello"
+  }
+}
+```
+
+Rules:
+
+- no `event_id` required;
+- do not write `ChatChannel.events`;
+- do not advance Browser HTTP/WS per-channel event cursors;
+- `ChannelFanout` forwards best-effort to online `UserConnection`s with active leases;
+- `UserConnection` re-checks membership + lease, then sends `frame_type="stream_event"` unchanged to the browser;
+- **do not** reuse canonical `ChannelFanout /deliver`.
+
+`message.stream_started` is emitted once by `ChatChannel` on `start_stream`. `message.stream_delta` and `message.stream_abandoned` are emitted by `BotStreamConnection` via the path above.
 
 Live frame types:
 
@@ -284,9 +318,16 @@ BotStreamConnection finalize(final_seq, components?, attachment_ids?)
   -> close stream WS
 ```
 
-`ChatChannel /internal/stream-finalize` validates:
+`ChatChannel /internal/stream-finalize` behavior:
 
-- registry exists and status is `streaming`;
+- `status=streaming`: execute canonical transaction; persist `final_event_id`, `final_text_hash`, `finalized_response_json`, `finalized_at`; mark registry `finalized`.
+- `status=finalized` and same `bot_id` + same `final_text_hash`: return stored `finalized_response_json` (same `{ message_id, event_id }`).
+- `status=finalized` and different `final_text_hash`: return `BOT_STREAM_CONFLICT`.
+- `status=expired` / `abandoned`: return `BOT_STREAM_EXPIRED` or `BOT_STREAM_NOT_FOUND`.
+
+Initial call validates:
+
+- registry exists;
 - `bot_id` owns the stream;
 - channel is still writable;
 - referenced attachments are finalized and owned by same bot/channel if attachment support is enabled;
@@ -339,22 +380,24 @@ Rules:
 - Different body returns `BOT_EFFECT_CONFLICT`.
 - `start_stream` response JSON includes `message_id`, `ws_url`, and `expires_at`.
 
-Stream WS append idempotency is seq-based inside `BotStreamConnection`:
+Stream WS append idempotency is seq-based inside `BotStreamConnection` on the active connection:
 
 ```text
-(channel_id, message_id, seq, delta_hash)
+(channel_id, message_id, seq, delta_hash) // hash map in WS attachment only until ack_seq catches up
 ```
 
 Rules:
 
-- `seq <= ack_seq` is no-op.
-- unacked duplicate seq with same hash is no-op.
-- unacked duplicate seq with different hash is `BOT_STREAM_CONFLICT`.
-- seq gap is `BOT_STREAM_SEQUENCE_GAP`.
+- `seq <= ack_seq`: durable no-op.
+- unacked duplicate seq with same hash on active connection: no-op.
+- unacked duplicate seq with different hash on active connection: `BOT_STREAM_CONFLICT`.
+- seq gap (`seq > received_seq + 1`): `BOT_STREAM_SEQUENCE_GAP`.
+- after disconnect/rehydrate: only `ack_seq` is trusted; bot resends from `ack_seq + 1`.
 
 Finalize is idempotent after canonical commit:
 
-- repeated `finalize` after `finalized` returns `finalized_ack` with same `{ message_id, event_id }` if the same final stream state was already committed;
+- repeated `finalize` after `finalized` returns stored `finalized_response_json` with same `{ message_id, event_id }` when `final_text_hash` matches;
+- repeated `finalize` with different final text hash returns `BOT_STREAM_CONFLICT`;
 - finalize after `abandoned`/`expired` returns `BOT_STREAM_EXPIRED` or `BOT_STREAM_NOT_FOUND`.
 
 ## 13. Read Scopes And Attachments
@@ -384,7 +427,7 @@ It must not create Bot Gateway deliveries and must not appear in third-party Bot
 
 ## 15. Implementation plan reference
 
-具体 task 拆分、文件列表、测试要求见 **`docs/superpowers/plans/2026-06-30-lilium-chat-bot-streaming-internal-api-implementation.md`**。Plan 以本文 + 主 contract §16–§17 为 authority，**不**以 gap tracker 为 authority。
+具体 task 拆分、文件列表、测试要求见 **`docs/superpowers/plans/2026-06-30-lilium-chat-bot-streaming-internal-api-implementation.md`**。Plan 以本文 + 主 contract §9.13–§9.16 / §12.4 为 authority，**不**以 gap tracker 为 authority。
 
 ## 16. Required Tests
 

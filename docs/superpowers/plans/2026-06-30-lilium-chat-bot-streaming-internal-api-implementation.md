@@ -2,11 +2,11 @@
 
 > **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans task-by-task. Checkboxes track progress.
 
-**Goal:** Implement Bot effect application pipeline, dual-WebSocket streaming (`start_stream` on main Gateway + append/finalize on Stream WS), live stream frames, and canonical `message.stream_finalized` — per internal contract §16–§17 and backend spec.
+**Goal:** Implement Bot effect application pipeline, dual-WebSocket streaming (`start_stream` on main Gateway + append/finalize on Stream WS), live stream frames, and canonical `message.stream_finalized` — per contract §9.13–§9.16 / §12.4 and backend spec.
 
 **Authority (normative, in order):**
 
-1. `docs/api-contract.md` §16–§17 (v2.19 internal addendum)
+1. `docs/api-contract.md` §9.13–§9.16（Bot streaming wire shape）与 §12.4（实现不变量）
 2. `docs/superpowers/specs/2026-06-30-lilium-chat-bot-streaming-and-internal-api-spec.md`
 3. `docs/superpowers/specs/2026-06-22-lilium-chat-backend-design.md` v4.4 + existing Phase 7 slash addenda
 
@@ -33,7 +33,7 @@
 
 ## Task 1: Contract types, error codes, protocol frames
 
-**目标：** 让 TypeScript 类型、错误码、Bot Gateway / Stream WS 帧解析与 §16 wire shape 对齐。
+**目标：** 让 TypeScript 类型、错误码、Bot Gateway / Stream WS 帧解析与 §9.13–§9.16 wire shape 对齐。
 
 **可能修改的文件：**
 
@@ -49,7 +49,7 @@
 - Add `EffectResult` discriminated union with `start_stream` carrying `{ message_id, stream: { channel_id, message_id, ws_url, expires_at } }`.
 - Add `BotStreamFrame` types: `hello`, `ready`, `append`, `append_ack`, `finalize`, `finalized_ack`, `stream_error`.
 - Add `StreamEventFrame` for Browser live delivery (`frame_type: "stream_event"`).
-- Register new error codes in `HTTP_STATUS_BY_CODE` and `RETRYABLE_CODES` per §16 / §11.
+- Register new error codes in `HTTP_STATUS_BY_CODE` and `RETRYABLE_CODES` per §9.13–§9.16 / §11.
 
 **不变量：**
 
@@ -74,7 +74,7 @@
 **可能修改的文件：**
 
 - `src/do/bot-stream-connection.ts`（新建）
-- `src/do/migrations/bot-stream-connection.ts`（新建）— `stream_state`, `stream_append_hashes`
+- `src/do/migrations/bot-stream-connection.ts`（新建）— `stream_state` only（无 `stream_append_hashes`）
 - `src/index.ts` — export DO class
 - `wrangler.jsonc`, `wrangler.test.jsonc` — `BOT_STREAM_CONNECTION` binding + `migrations[].new_sqlite_classes`
 - `npm run cf-typegen` → gitignored `worker-configuration.d.ts`
@@ -85,7 +85,7 @@
 - Baseline schema per backend spec §4; `BOT_STREAM_CONNECTION_CURRENT_SCHEMA_VERSION = 1`.
 - Constructor runs `migrateSqlite`; `/schema-version` probe.
 - `fetch` routes: WS upgrade (stub), internal debug routes behind test flags only.
-- WS attachment shape per spec §4 (`pending_text`, `fanout_pending_text`, etc.).
+- WS attachment shape per spec §4 (`pending_text`, `received_seq`, `recent_unacked_hashes`, `fanout_pending_text`, etc.).
 
 **不变量：**
 
@@ -117,8 +117,9 @@
 **实现要点：**
 
 - Registry PK `(channel_id, message_id)`; status enum `streaming | finalized | abandoned | expired`.
+- Finalize persistence fields: `final_event_id`, `final_text_hash`, `finalized_response_json`, `finalized_at`.
 - `stream-registry-check`: validate bot ownership, status, expiry.
-- `stream-finalize`: transactional insert `messages` + `events` (`message.stream_finalized`) + registry finalize; enqueue fanout outbox.
+- `stream-finalize`: transactional insert `messages` + `events` (`message.stream_finalized`) + registry finalize + persist finalize response; idempotent replay when `status=finalized` and same hash.
 - Extend `bot_effects_applied.response_json` shape for `start_stream` idempotency cache.
 
 **不变量：**
@@ -195,7 +196,7 @@
 - Generate `message_id` (uuidv7 monotonic within channel).
 - Set `expires_at = now + STREAM_DEFAULT_TTL_SECONDS`.
 - Emit `message.stream_started` as `frame_type=stream_event` (not channel event).
-- Build `ws_url` path per §16.5.1.
+- Build `ws_url` path per §9.15.1.
 
 **不变量：**
 
@@ -257,6 +258,7 @@
 **可能修改的文件：**
 
 - `src/do/bot-stream-connection.ts` — append handler, flush, fanout batching, alarm
+- `src/do/channel-fanout.ts` — `/internal/deliver-stream-frame`（live-only path）
 - `src/chat/stream-seq.ts`（新建）— seq validation, delta hash
 - `src/do/scheduler.ts` — register stream flush/expiry due tables if needed
 - `test/do/bot-stream-append.test.ts`
@@ -265,16 +267,17 @@
 
 - Constants from spec §5 (`STREAM_PENDING_FLUSH_THRESHOLD_BYTES`, etc.).
 - `append_ack` only after durable flush to `stream_state.flushed_text`.
-- Fanout batching: `STREAM_FANOUT_INTERVAL_MS`, `STREAM_FANOUT_MAX_PENDING_BYTES`.
-- `stream_append_hashes` conflict guard for unacked seq.
+- Fanout batching via `ChannelFanout /internal/deliver-stream-frame`（**不**走 canonical `/deliver`）。
+- Unacked duplicate hash map in WS attachment only（**不**持久化 SQLite）。
 - Alarm-driven flush + expiry cleanup.
 
 **不变量：**
 
 - `ack_seq` never exceeds durable flushed text coverage.
-- `seq <= ack_seq` → no-op (still eventually ack).
-- `seq > ack_seq + 1` → `BOT_STREAM_SEQUENCE_GAP` (retryable).
-- Duplicate unacked seq different hash → `BOT_STREAM_CONFLICT`.
+- Gap detection: `seq > received_seq + 1` → `BOT_STREAM_SEQUENCE_GAP`（**不是** `ack_seq + 1`）。
+- `seq <= ack_seq` → durable no-op (still eventually ack).
+- Unacked duplicate (same connection, `seq > ack_seq`): same hash no-op / different hash → `BOT_STREAM_CONFLICT`.
+- Reconnect/rehydrate: `received_seq` resets to `ack_seq`; bot resumes from `ack_seq + 1`.
 - Append hot path: no ChatChannel SQLite writes.
 
 **测试要求：**
@@ -308,7 +311,8 @@
 - `resolved_text = stream_state.flushed_text`.
 - Optional `components` / `attachment_ids` on finalize (validate if attachment task not done: reject unknown attachments).
 - Insert `messages.stream_state=final`; event type `message.stream_finalized` only — **no** `message.created`.
-- Idempotent finalize returns same `{ message_id, event_id }`.
+- Persist registry `final_event_id`, `final_text_hash`, `finalized_response_json` on first commit.
+- Idempotent finalize: `status=finalized` + same hash → return stored response; different hash → `BOT_STREAM_CONFLICT`.
 
 **不变量：**
 
@@ -360,7 +364,7 @@
 
 **回滚 / 兼容风险：**
 
-- Low — tightens stream lifecycle; bots must finalize before TTL (documented in §16).
+- Low — tightens stream lifecycle; bots must finalize before TTL (documented in §9.15).
 
 ---
 
@@ -441,9 +445,9 @@
 
 | Item | Reason |
 |---|---|
-| Machine Token `/api/chat/bots*` | §16.7 D2 — needs actor/audit model |
-| Bot read API | §16.8 D8 — needs read grant design |
-| Bot attachment upload | §16.9 — optional; channel-scoped v1 spec exists but not streaming blocker |
+| Machine Token `/api/chat/bots*` | §9.17 D2 — needs actor/audit model |
+| Bot read API | §9.17 D8 — needs read grant design |
+| Bot attachment upload | §9.17 — optional; channel-scoped v1 spec exists but not streaming blocker |
 | Public Bot developer docs | After deploy verification |
 | `docs/bot-developer-guide.md` major update | After public API extraction |
 
@@ -461,7 +465,7 @@ Manual review:
 
 - Markdown code fences balanced in all touched docs.
 - No third-party public API doc written as deliverable.
-- Gap tracker header points to §16 + backend spec + this plan.
+- Gap tracker header points to §9.13–§9.16 + §12.4 + backend spec + this plan.
 - Plan does not treat Machine Token / Bot read / Bot upload as current scope.
 
 ---
