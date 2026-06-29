@@ -115,6 +115,7 @@ async function ensureNormalizedSchema(client: pg.Client): Promise<void> {
     "003_channel_tables.sql",
     "004_remaining_tables.sql",
     "005_archive_infra.sql",
+    "006_slash_catalog_archive.sql",
   ]);
 }
 

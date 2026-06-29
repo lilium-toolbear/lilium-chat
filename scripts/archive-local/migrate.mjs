@@ -21,6 +21,7 @@ const migrations = [
   "003_channel_tables.sql",
   "004_remaining_tables.sql",
   "005_archive_infra.sql",
+  "006_slash_catalog_archive.sql",
 ];
 
 const client = new pg.Client({ connectionString: databaseUrl });
