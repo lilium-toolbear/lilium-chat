@@ -67,5 +67,6 @@ export function buildPlatformHelpText(
     }
     lines.push("");
   }
-  return lines.join("\n").trim();
+  const body = lines.join("\n").trim();
+  return body.length > 0 ? body : "当前频道没有可用命令。";
 }

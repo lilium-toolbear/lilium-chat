@@ -389,6 +389,8 @@ export class UserConnection extends DurableObject<Env> {
         channel_id: string;
         invocation_id: string;
         event_id: string;
+        message_id?: string;
+        message?: unknown;
         session_id?: string;
       };
       ws.send(JSON.stringify({

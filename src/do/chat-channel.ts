@@ -1508,7 +1508,7 @@ export class ChatChannel extends DurableObject<Env> {
            message_id, command_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
            sender_bot_id, sender_bot_display_name, sender_bot_avatar_url, type, format, status, text,
            reply_to, stream_state, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'bot', NULL, ?, ?, ?, 'text', 'plain', 'normal', ?, NULL, 'none', ?, ?)`,
+         ) VALUES (?, ?, ?, ?, 'bot', NULL, ?, ?, ?, 'text', 'markdown', 'normal', ?, NULL, 'none', ?, ?)`,
         messageId,
         input.operationId,
         `user:${input.userId}`,
@@ -1552,7 +1552,7 @@ export class ChatChannel extends DurableObject<Env> {
         sender_bot_display_name: PLATFORM_BOT_DISPLAY_NAME,
         sender_bot_avatar_url: PLATFORM_BOT_AVATAR_URL,
         type: "text",
-        format: "plain",
+        format: "markdown",
         status: "normal",
         text: helpText,
         reply_to: null,
@@ -1617,6 +1617,7 @@ export class ChatChannel extends DurableObject<Env> {
         invocation_id: invocationId,
         event_id: eventId,
         message_id: messageId,
+        message: liveMessage,
       };
       this.ctx.storage.sql.exec(
         "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, ?, ?, ?, ?, 'completed', ?, ?)",
