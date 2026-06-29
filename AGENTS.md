@@ -31,6 +31,21 @@ Vitest runs through `@cloudflare/vitest-pool-workers` with `wrangler.test.jsonc`
 
 `docs/api-contract/` is authoritative when code and docs disagree. Read `CLAUDE.md` before changing cross-DO consistency, idempotency, scheduling, migrations, WebSocket routing, or Worker bindings. Do not call `ctx.storage.setAlarm` directly; use the shared scheduler. Add SQLite changes through new migration versions, not baseline edits. Regenerate, never hand-edit, `worker-configuration.d.ts`.
 
+### DO SQLite migrations and PG archive parity (required)
+
+Any change to DO SQLite schema (`src/do/migrations/<do>.ts` — new table/column/index, renamed field, dropped column) **must** keep the local PG archive path in sync in the **same change set**. The archive consumer replays upserts using every key in the payload; a missing PG column fails replay.
+
+Checklist when DO schema changes:
+
+1. **Archive producer** — tables under `src/archive/payload.ts` `ARCHIVE_TABLE_WHITELIST` must emit the new/changed fields from the mutating DO (`appendArchiveRecordSync` / `archiveUpsert` / `archiveReplaceScope` in `src/do/*.ts` or `src/archive/`).
+2. **PG migration** — add `scripts/archive-local/migrations/00N_<topic>.sql` (append-only; do not edit migrations already applied in prod).
+3. **Migration runners** — register the new file in `scripts/archive-local/migrate.mjs` and `scripts/archive-local/backfill-raw.ts`.
+4. **Replay config** — update `src/archive-consumer/replay-tables.ts` when PK, `jsonColumns`, `scopeReplace`, or `softDeleteColumn` changes.
+5. **Drift tests** — `test/archive/drift.test.ts` must stay aligned with `ARCHIVE_TABLE_WHITELIST`.
+6. **Docs** — for non-trivial archive shape changes, update `docs/superpowers/specs/2026-06-28-lilium-chat-local-pg-archive-cf-queue.md` §0.1 and `docs/superpowers/runbooks/2026-06-28-lilium-chat-archive-backend.md`.
+
+Operator apply after merge: `DATABASE_URL=... npm run archive:migrate` on the archive PG host (see archive runbook).
+
 ## Commit & Pull Request Guidelines
 
 Recent commits use Conventional Commit prefixes, for example `feat(ws): ...`, `fix(do): ...`, and `test(dm): ...`. Keep commits scoped and describe behavior changes. Pull requests should include the problem, solution, verification commands, and any contract or migration impact.
