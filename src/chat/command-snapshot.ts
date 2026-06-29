@@ -18,6 +18,7 @@ export function isCommandBindingSnapshot(value: unknown): value is CommandBindin
     typeof obj.name === "string" &&
     Array.isArray(obj.aliases) &&
     typeof obj.description === "string" &&
+    (typeof obj.help_text === "string" || obj.help_text === undefined) &&
     !!obj.bot &&
     typeof obj.bot.bot_id === "string" &&
     typeof obj.bot.display_name === "string" &&
@@ -59,6 +60,7 @@ export function parseCommandBindingSnapshot(raw: string): ParsedCommandBindingSn
     typeof parsed.name !== "string" ||
     !Array.isArray(parsed.aliases) ||
     typeof parsed.description !== "string" ||
+    (parsed.help_text !== undefined && typeof parsed.help_text !== "string") ||
     !isRecord(parsed.bot) ||
     typeof parsed.bot.bot_id !== "string" ||
     typeof parsed.bot.display_name !== "string" ||
@@ -95,6 +97,7 @@ export function parseCommandBindingSnapshot(raw: string): ParsedCommandBindingSn
     name: parsed.name,
     aliases: parsed.aliases.filter((alias): alias is string => typeof alias === "string"),
     description: parsed.description,
+    help_text: typeof parsed.help_text === "string" ? parsed.help_text : "",
     bot: {
       bot_id: parsed.bot.bot_id,
       display_name: parsed.bot.display_name,

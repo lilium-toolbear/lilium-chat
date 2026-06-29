@@ -24,6 +24,7 @@ async function fetchCommandSnapshot(env: Env, botCommandId: string): Promise<{
   name: string;
   aliases: string[];
   description: string;
+  help_text?: string;
   bot: { bot_id: string; display_name: string; avatar_url: string | null };
   options: unknown[];
   default_member_permission: "member" | "admin" | "owner";
@@ -43,6 +44,7 @@ async function fetchCommandSnapshot(env: Env, botCommandId: string): Promise<{
     name?: unknown;
     aliases?: unknown;
     description?: unknown;
+    help_text?: unknown;
     bot?: { bot_id?: unknown; display_name?: unknown; avatar_url?: unknown };
     options?: unknown;
     default_member_permission?: unknown;
@@ -71,6 +73,7 @@ async function fetchCommandSnapshot(env: Env, botCommandId: string): Promise<{
     name: body.name,
     aliases: body.aliases.filter((alias): alias is string => typeof alias === "string"),
     description: body.description,
+    help_text: typeof body.help_text === "string" ? body.help_text : "",
     bot: {
       bot_id: body.bot.bot_id,
       display_name: body.bot.display_name,

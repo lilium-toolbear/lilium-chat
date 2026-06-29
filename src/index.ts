@@ -41,6 +41,13 @@ import {
   updateBotHandler,
 } from "./routes/bots";
 import {
+  getAdminBotHandler,
+  listAdminBotTokensHandler,
+  listAdminBotsHandler,
+  revokeAdminBotTokenHandler,
+  updateAdminBotHandler,
+} from "./routes/bots-admin";
+import {
   updateCommandBindingHandler,
   listChannelCommandsHandler,
 } from "./routes/channel-commands";
@@ -117,6 +124,11 @@ app.patch("/api/chat/bots/:bot_id", (c) => updateBotHandler(c));
 app.get("/api/chat/bots/:bot_id/tokens", (c) => listBotTokensHandler(c));
 app.post("/api/chat/bots/:bot_id/tokens", (c) => createBotTokenHandler(c));
 app.delete("/api/chat/bots/:bot_id/tokens/:token_id", (c) => revokeBotTokenHandler(c));
+app.get("/api/chat/admin/bots", (c) => listAdminBotsHandler(c));
+app.get("/api/chat/admin/bots/:bot_id", (c) => getAdminBotHandler(c));
+app.patch("/api/chat/admin/bots/:bot_id", (c) => updateAdminBotHandler(c));
+app.get("/api/chat/admin/bots/:bot_id/tokens", (c) => listAdminBotTokensHandler(c));
+app.delete("/api/chat/admin/bots/:bot_id/tokens/:token_id", (c) => revokeAdminBotTokenHandler(c));
 app.get("/api/chat/commands/directory", (c) => commandDirectoryHandler(c));
 app.patch("/api/chat/channels/:channel_id/commands/:bot_command_id", (c) => updateCommandBindingHandler(c));
 app.get("/api/chat/channels/:channel_id/commands", (c) => listChannelCommandsHandler(c));

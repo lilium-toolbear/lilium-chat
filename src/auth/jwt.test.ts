@@ -8,7 +8,14 @@ describe("verifyBrowserJwt", () => {
     const uid = "00000000-0000-7000-8000-000000000101";
     const token = await makeJwt({ sub: uid });
     const id = await verifyBrowserJwt(token, TEST_SECRET);
-    expect(id).toEqual({ user_id: uid });
+    expect(id).toEqual({ user_id: uid, is_admin: false });
+  });
+
+  it("accepts admin claim as is_admin true", async () => {
+    const uid = "00000000-0000-7000-8000-000000000103";
+    const token = await makeJwt({ sub: uid, admin: true });
+    const id = await verifyBrowserJwt(token, TEST_SECRET);
+    expect(id).toEqual({ user_id: uid, is_admin: true });
   });
 
   it("accepts self-session with explicit owner_user_id == sub and effective == sub", async () => {

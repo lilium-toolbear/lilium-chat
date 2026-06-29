@@ -18,6 +18,7 @@ describe("buildCommandBindingUpdatedPayload", () => {
           name: "ask",
           aliases: [],
           description: "Ask",
+          help_text: "",
           bot: { bot_id: "bot-1", display_name: "Bot", avatar_url: null },
           options: [],
           effective_member_permission: "member",

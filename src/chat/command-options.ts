@@ -35,6 +35,7 @@ export interface ValidatedCommand {
   name: string;
   aliases: string[];
   description: string;
+  help_text: string;
   options: CommandOption[];
   default_member_permission: "member" | "admin" | "owner";
   execution_mode: "stateless" | "stateful";
@@ -45,6 +46,7 @@ export interface CommandInput {
   name?: unknown;
   aliases?: unknown;
   description?: unknown;
+  help_text?: unknown;
   options?: unknown;
   default_member_permission?: unknown;
   execution?: unknown;
@@ -123,6 +125,11 @@ export function validateCommand(input: CommandInput): ValidateResult<ValidatedCo
   }
   if (typeof input.description !== "string") {
     return fail("command.description must be string");
+  }
+  let helpText = "";
+  if (input.help_text !== undefined && input.help_text !== null) {
+    if (typeof input.help_text !== "string") return fail("command.help_text must be string");
+    helpText = input.help_text;
   }
   const options: CommandOption[] = [];
   if (input.options !== undefined && input.options !== null) {
@@ -204,6 +211,7 @@ export function validateCommand(input: CommandInput): ValidateResult<ValidatedCo
     name: input.name,
     aliases,
     description: input.description,
+    help_text: helpText,
     options,
     default_member_permission: perm as "member" | "admin" | "owner",
     execution_mode: input.execution.mode,
@@ -230,6 +238,7 @@ export function canonicalCommandDefinition(cmd: ValidatedCommand): string {
   return JSON.stringify({
     options: optionsCanonical,
     description: cmd.description,
+    help_text: cmd.help_text,
     default_member_permission: cmd.default_member_permission,
     execution_mode: cmd.execution_mode,
     stateful_config: cmd.stateful_config,

@@ -1,5 +1,6 @@
 import {
   applyBaselineSchema,
+  columnExists,
   migrateSqlite,
   type BaselineDetector,
   type SqlMigration,
@@ -7,7 +8,7 @@ import {
 import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
 import { migrateBotRegistryToSlashCatalogV4 } from "./bot-registry-v4-up";
 
-export const BOT_REGISTRY_CURRENT_SCHEMA_VERSION = 4;
+export const BOT_REGISTRY_CURRENT_SCHEMA_VERSION = 5;
 
 export const BOT_REGISTRY_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS bot_apps (
@@ -97,6 +98,15 @@ export const botRegistryMigrations: SqlMigration[] = [
     name: "slash command catalog schema (additive upgrade from Phase 7)",
     up(ctx) {
       migrateBotRegistryToSlashCatalogV4(ctx);
+    },
+  },
+  {
+    version: 5,
+    name: "bot_commands.help_text for detailed slash command help",
+    up(ctx) {
+      if (!columnExists(ctx, "bot_commands", "help_text")) {
+        ctx.storage.sql.exec("ALTER TABLE bot_commands ADD COLUMN help_text TEXT NOT NULL DEFAULT ''");
+      }
     },
   },
 ];

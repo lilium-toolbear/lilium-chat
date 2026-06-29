@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { CommandManifestItem, CommandManifestResponse } from "../../src/contract/bot-api";
 import {
   applyCommandManifestDelta,
+  appendPlatformHelpItem,
   buildManifestRemoveDelta,
   buildManifestUpsertDelta,
   projectCommandManifest,
 } from "../../src/chat/command-manifest";
+import { PLATFORM_HELP_BOT_COMMAND_ID } from "../../src/chat/platform-commands";
 
 function makeItem(overrides: Partial<CommandManifestItem> = {}): CommandManifestItem {
   return {
@@ -13,6 +15,7 @@ function makeItem(overrides: Partial<CommandManifestItem> = {}): CommandManifest
     name: "zebra",
     aliases: [],
     description: "Z",
+    help_text: "",
     bot: { bot_id: "b1", display_name: "Bot", avatar_url: null },
     options: [],
     effective_member_permission: "member",
@@ -152,5 +155,12 @@ describe("applyCommandManifestDelta", () => {
     expect(result.applied).toBe(false);
     expect(result.requiresRefresh).toBe(true);
     expect(result.manifest).toBe(current);
+  });
+});
+
+describe("appendPlatformHelpItem", () => {
+  it("appends platform /help command to manifest", () => {
+    const manifest = appendPlatformHelpItem(projectCommandManifest(1, []));
+    expect(manifest.items.some((item) => item.bot_command_id === PLATFORM_HELP_BOT_COMMAND_ID)).toBe(true);
   });
 });

@@ -1,6 +1,11 @@
 import type { MessageRow } from "../contract/persisted";
 import type { Mention, MessageImageAttachment, WireChatMessage } from "../contract/message";
 import { fallbackUserDisplayName, type UserSummary } from "../contract/primitives";
+import {
+  PLATFORM_BOT_AVATAR_URL,
+  PLATFORM_BOT_DISPLAY_NAME,
+  PLATFORM_BOT_ID,
+} from "./platform-commands";
 
 export interface MessageMention {
   user_id: string;
@@ -48,6 +53,22 @@ export function projectMessageForBrowser(
       avatar_url: null,
     };
     sender = { kind: "user", user: u };
+  } else if (row.sender_kind === "bot" && row.sender_bot_id) {
+    const botId = row.sender_bot_id;
+    const displayName =
+      row.sender_bot_display_name ??
+      (botId === PLATFORM_BOT_ID ? PLATFORM_BOT_DISPLAY_NAME : botId);
+    const avatarUrl =
+      row.sender_bot_avatar_url ??
+      (botId === PLATFORM_BOT_ID ? PLATFORM_BOT_AVATAR_URL : null);
+    sender = {
+      kind: "bot",
+      bot: {
+        bot_id: botId,
+        display_name: displayName,
+        avatar_url: avatarUrl,
+      },
+    };
   } else if (row.sender_kind === "bot") {
     sender = { kind: "bot", bot_id: row.sender_bot_id };
   } else {

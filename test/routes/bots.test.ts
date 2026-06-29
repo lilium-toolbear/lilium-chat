@@ -42,6 +42,24 @@ async function browserReq(
 }
 
 describe("Browser Bot Developer API", () => {
+  it("rejects visibility official for non-admin on create", async () => {
+    const userId = `bot-owner-${crypto.randomUUID()}`;
+    const res = await browserReq(
+      userId,
+      "POST",
+      "/api/chat/bots",
+      {
+        display_name: "Official Attempt",
+        visibility: "official",
+        issue_initial_token: false,
+      },
+      `key-official-create-${crypto.randomUUID()}`,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("ADMIN_ACCESS_REQUIRED");
+  });
+
   it("POST /api/chat/bots creates bot and initial token", async () => {
     const userId = `bot-owner-${crypto.randomUUID()}`;
     const res = await browserReq(
