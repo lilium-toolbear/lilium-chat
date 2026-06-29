@@ -15,9 +15,9 @@
 
 - Base contract §9.7.3 中 `append_stream` / `finalize_stream` 作为主 Bot Gateway effects 的设计作废（见主 contract §9.13–§9.16）。
 - Phase 7 plan 中“主 WS 上 append_stream UPDATE messages.text”的路径作废。
-- 流式进行中不写 `messages` / canonical `events`；只有 finalize 写 canonical message + event。
-- `message.stream_started` / `message.stream_delta` / `message.stream_abandoned` 是 live-only stream frames。
-- `message.stream_finalized` 是 canonical channel event；streamed bot message 不再额外发 `message.created`。
+- 流式进行中不写 `messages` / canonical `events`；**finalize** 写 canonical final message + `message.stream_finalized`；**abandon 且非空 partial** 写 canonical abandoned message + `message.stream_abandoned`。
+- `message.stream_started` / `message.stream_delta` / `message.stream_abandon_cleanup` 是 live-only stream frames。
+- `message.stream_abandoned`（非空 partial）与 `message.stream_finalized` 是 canonical channel events；streamed bot message 不再额外发 `message.created`。
 
 实现计划以本 spec patch 和内部 contract addendum 为准。原 gap 文档只保留 tracking / discussion 用途。
 
@@ -26,7 +26,7 @@
 | DO | Owns | Does not own |
 |---|---|---|
 | `BotConnection(bot_id)` | Bot main Gateway WS, delivery queue, `delivery_result` framing, online state | Stream text buffer, stream append/finalize, ChatChannel canonical writes |
-| `ChatChannel(channel_id)` | Stream registry, effect idempotency, final canonical message/event write, channel permissions | Hot append buffer, per-delta stream fanout batching |
+| `ChatChannel(channel_id)` | Stream registry, effect idempotency, final/abandon canonical message/event write, channel permissions | Hot append buffer, per-delta stream fanout batching |
 | `BotStreamConnection(channel_id#message_id)` | One active stream WS, authoritative in-progress text buffer, append seq/ack, live stream delta batching | Bot runtime delivery queue, channel membership source-of-truth |
 | `ChannelFanout(channel_id)` | Best-effort delivery to Browser live sessions | Stream durability or history recovery |
 | `BotRegistry` | Bot identity, token hash, command catalog | Stream sessions or per-channel stream state |
@@ -66,6 +66,9 @@ CREATE TABLE message_stream_registry (
   final_text_hash   TEXT, -- diagnostic: hash(resolved_text)
   finalize_request_hash TEXT,
   finalized_response_json TEXT,
+  abandoned_event_id TEXT,
+  abandoned_text_hash TEXT,
+  abandoned_response_json TEXT,
   PRIMARY KEY (channel_id, message_id)
 );
 CREATE INDEX idx_message_stream_registry_bot
@@ -286,13 +289,18 @@ Rules:
 - `UserConnection` re-checks membership + lease, then sends `frame_type="stream_event"` unchanged to the browser;
 - **do not** reuse canonical `ChannelFanout /deliver`.
 
-`message.stream_started` is emitted once by `ChatChannel` on `start_stream`. `message.stream_delta` and `message.stream_abandoned` are emitted by `BotStreamConnection` via the path above.
+`message.stream_started` is emitted once by `ChatChannel` on `start_stream`. `message.stream_delta` and `message.stream_abandon_cleanup` are emitted by `BotStreamConnection` via the live-only path above.
 
 Live frame types:
 
 - `message.stream_started`
 - `message.stream_delta`
-- `message.stream_abandoned`
+- `message.stream_abandon_cleanup`
+
+Canonical stream end events (written to `ChatChannel.events`, HTTP-recoverable):
+
+- `message.stream_finalized`
+- `message.stream_abandoned` (non-empty partial only)
 
 Fanout batching:
 
@@ -356,8 +364,31 @@ No `message.created` event is emitted for the final streamed message.
 
 Expiry is driven by both `ChatChannel` and `BotStreamConnection` alarms:
 
-- `ChatChannel` owns registry expiry and can mark stale streams `expired`/`abandoned`.
-- `BotStreamConnection` owns buffer cleanup and live abandon fanout.
+- `ChatChannel` owns registry expiry, `/internal/stream-abandon`, and canonical abandoned message writes.
+- `BotStreamConnection` owns buffer cleanup, live abandon cleanup fanout, and calling ChatChannel abandon.
+
+```text
+BotStreamConnection / ChatChannel expiry
+  -> flush any pending accepted text if possible
+  -> resolved_partial = stream_state.flushed_text
+  -> if resolved_partial is empty:
+       emit live-only message.stream_abandon_cleanup via /internal/deliver-stream-frame
+       mark registry abandoned/expired
+       clear buffer
+       no canonical message
+     else:
+       call ChatChannel /internal/stream-abandon
+       ChatChannel transaction:
+         insert messages row using registry.message_id
+         text = resolved_partial
+         stream_state = abandoned
+         status = failed
+         insert message.stream_abandoned canonical event
+         mark registry abandoned
+         persist abandoned_event_id, abandoned_text_hash, abandoned_response_json
+         enqueue ChannelFanout canonical event (not live-only stream frame)
+       BotStreamConnection clears buffer
+```
 
 Policy:
 
@@ -365,11 +396,29 @@ Policy:
 - Bot main WS close does not immediately abandon.
 - Before `expires_at`, bot can reconnect and resume at `ready.ack_seq + 1`.
 - After `expires_at`, no finalize is accepted.
-- Expired streams are abandoned, not promoted.
-- Abandon sends live-only `message.stream_abandoned` so online clients remove provisional UI.
-- Offline clients simply never see the stream in history.
+- Empty durable buffer: live-only cleanup only; no history row.
+- Non-empty durable buffer: persist abandoned partial; online clients converge provisional UI to failed message; offline clients see partial via HTTP history/events.
 
-No partial text is written to `messages` unless the bot explicitly finalizes.
+### Abandoned message projection
+
+`projectMessageForBrowser` for abandoned streamed messages:
+
+- `type="text"` (or registry `message_json.type` if non-text metadata was started — v1 default `text`)
+- `stream_state="abandoned"`
+- `status="failed"`
+- `text=resolved_partial` (partial durable text)
+- `components=[]`, `attachments=[]` — abandoned partial does not carry finalize-only components/attachments unless explicitly submitted via finalize path
+- same sender bot snapshots as registry
+- `created_at = registry.created_at`
+
+No `message.created` event is emitted for abandoned streams.
+
+### Abandon idempotency
+
+- `status=abandoned` and same `abandoned_text_hash`: return stored `abandoned_response_json`.
+- repeated empty-stream cleanup: no-op.
+- `finalize` after persisted abandon: `BOT_STREAM_EXPIRED` or `BOT_STREAM_CONFLICT`; must not overwrite abandoned message.
+- `finalize` after empty abandon cleanup only: `BOT_STREAM_EXPIRED` or `BOT_STREAM_NOT_FOUND`.
 
 ## 12. Idempotency And Conflicts
 
@@ -404,7 +453,13 @@ Finalize is idempotent after canonical commit:
 - repeated `finalize` after `finalized` returns stored `finalized_response_json` with same `{ message_id, event_id }` when `finalize_request_hash` matches;
 - repeated `finalize` with different `finalize_request_hash` returns `BOT_STREAM_CONFLICT`;
 - `final_seq == received_seq` required while `status=streaming`; `final_seq > received_seq` → `BOT_STREAM_SEQUENCE_GAP`; `final_seq < received_seq` → `BOT_STREAM_CONFLICT` unless already finalized with matching hash;
-- finalize after `abandoned`/`expired` returns `BOT_STREAM_EXPIRED` or `BOT_STREAM_NOT_FOUND`.
+- finalize after `abandoned`/`expired` returns `BOT_STREAM_EXPIRED` or `BOT_STREAM_NOT_FOUND` / `BOT_STREAM_CONFLICT` (must not overwrite persisted abandon).
+
+Abandon is idempotent after canonical commit or empty cleanup:
+
+- repeated abandon with same non-empty `abandoned_text_hash` returns stored `abandoned_response_json`;
+- repeated empty-stream cleanup is no-op;
+- abandon after `finalized` returns `BOT_STREAM_CONFLICT`.
 
 ## 13. Read Scopes And Attachments
 
@@ -447,10 +502,13 @@ Focused tests must cover:
 - seq gap returns `BOT_STREAM_SEQUENCE_GAP`.
 - duplicate unacked seq different body returns `BOT_STREAM_CONFLICT`.
 - finalize writes exactly one canonical `message.stream_finalized` event and no `message.created` event.
-- history/events after finalize return final message projection; history during stream returns nothing.
-- disconnect before expiry allows reconnect; expiry abandons without partial message.
-- `message.stream_abandoned` is live-only and not returned by HTTP events.
-- `projectMessageForBrowser` is shared for final stream message, history, event replay, and live event.
+- history/events after finalize return final message projection; history during stream returns nothing until finalize or abandon-with-partial.
+- disconnect before expiry allows reconnect; expiry with empty buffer → live-only cleanup, no history row.
+- expiry with non-empty flushed partial → history contains abandoned/failed message; HTTP events include canonical `message.stream_abandoned`.
+- online client sees provisional stream then converges to abandoned/failed message (not disappearance).
+- repeated abandon is idempotent; finalize after persisted abandon is rejected.
+- `message.stream_abandon_cleanup` is live-only and not returned by HTTP events.
+- `projectMessageForBrowser` is shared for final stream message, abandoned stream message, history, event replay, and live canonical events.
 - `/permission` owner/admin succeeds, member fails, official command `on` returns `OFFICIAL_COMMAND_AUTO_ALLOWED`, DM unsupported.
 
 Run at minimum:

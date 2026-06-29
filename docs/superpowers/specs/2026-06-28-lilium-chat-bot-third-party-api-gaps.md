@@ -68,6 +68,8 @@
 ### 2.2 流式输出：双 WebSocket + 专用 DO（historical decision, superseded by `docs/api-contract.md` §9.13–§9.16）
 
 > 以下内容为历史讨论摘要；**规范以主 contract §9.13–§9.16 与 backend spec 为准**。
+>
+> **Current decision:** non-empty durable partial text is persisted as an abandoned/failed canonical message. This is not a successful finalize and must be visually distinct from normal bot replies. Empty durable buffer → live-only `message.stream_abandon_cleanup` only.
 
 **架构结论（已与产品对齐）：**
 
@@ -83,7 +85,7 @@
 | 结束方式 | 行为 |
 | --- | --- |
 | `finalize`（流 WS） | 一次 INSERT `messages` + `events`（`resolved_text` 来自 BotStreamConnection buffer）；fanout `message.stream_finalized`；DELETE registry + 关流 WS |
-| 中断（timeout、流 WS 断连、主 bot 断连、session.close 等） | **historical, rejected：** 旧讨论曾写「可选 promote `resolved_text`」。**当前 contract 固定 abandon，不 promote partial text**；DELETE registry + buffer |
+| 中断（timeout、流 WS 断连、主 bot 断连、session.close 等） | **historical, rejected：** 旧讨论/旧 contract 曾写「不 promote partial text」。**当前 contract：** 非空 `flushed_text` → canonical abandoned message + `message.stream_abandoned`；空 buffer → live-only `message.stream_abandon_cleanup` |
 
 **与旧 Phase 7 plan 的差异：** 主 WS 上 `append_stream` UPDATE `messages.text` **作废**；以本节为准。
 
@@ -183,13 +185,14 @@ interface BotStreamConnectionAttachment {
 }
 ```
 
-**`resolved_text`（finalize only；中断不 promote）**
+**`resolved_text`（finalize only）**
 
 ```text
+resolved_partial = stream_buffer.flushed_text  // abandon 前 flush pending
 resolved_text = stream_buffer.flushed_text + attachment.pending_text  // finalize 前 drain pending
 ```
 
-**historical, rejected：** 旧稿曾允许中断时 promote partial text。**当前 contract（§9.15.5 / §12.4）固定 abandon，不写入 canonical `messages`。**
+**historical, rejected：** 旧稿/旧 contract 曾写中断时不写入 canonical `messages`。**当前 contract（§9.15.5 / §12.4）：** 非空 durable partial 写入 abandoned/failed canonical message；空 buffer 仅 live cleanup。
 
 finalize 前 **drain** `fanout_pending_text`。Bot `finalize` **不得**依赖重传全文；平台以 `resolved_text` 写 canonical。
 
@@ -229,11 +232,13 @@ finalize @ 流 WS
 
 | 事件 | SQLite | 投递 |
 | --- | --- | --- |
-| `message.stream_started` | ChatChannel registry INSERT | 同步 ChannelFanout |
-| `message.stream_delta` | 无 canonical；BotStreamConnection 合并 | 限速同步 ChannelFanout |
+| `message.stream_started` | ChatChannel registry INSERT | 同步 ChannelFanout live-only |
+| `message.stream_delta` | 无 canonical；BotStreamConnection 合并 | 限速 live-only ChannelFanout |
+| `message.stream_abandon_cleanup` | 无 canonical | live-only ChannelFanout |
+| `message.stream_abandoned` | messages + events INSERT（非空 partial） | canonical ChannelFanout / HTTP events |
 | `message.stream_finalized` | messages + events INSERT | outbox 或同步 fanout |
 
-History / replay **不**含 streaming 中途正文；离线 reconnect 仅 finalize 后收敛。
+History / replay **不**含 streaming 中途 delta；离线 reconnect 在 finalize 或 abandon-with-partial 后收敛。
 
 **实现缺口（相对 §2.1）：** 新增 `BotStreamConnection` DO + binding + migration；`src/routes/bot-stream-ws.ts`；`streamDoName(channel_id, message_id)`；contract / 公开文档补充流 WS 路径与 `delivery_ack.stream`；主 WS effect 校验拒绝 append/finalize。
 

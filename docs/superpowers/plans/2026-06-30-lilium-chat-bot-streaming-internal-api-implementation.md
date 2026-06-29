@@ -39,7 +39,7 @@
 
 - `src/contract/bot-gateway.ts` — `delivery_ack.effect_results`, reject `append_stream`/`finalize_stream` on main gateway parser
 - `src/contract/bot-stream.ts`（新建）— Stream WS frame types
-- `src/contract/events.ts` — `message.stream_abandoned`, live `stream_event` frame types
+- `src/contract/events.ts` — `message.stream_abandoned`, `message.stream_abandon_cleanup`, live `stream_event` frame types
 - `src/errors.ts` — `BOT_STREAM_*`, `BOT_SCOPE_DENIED`, `COMMAND_PERMISSION_DENIED`
 - `src/chat/bot-gateway-protocol.ts` — effect result builders/parsers
 - `test/errors.test.ts`, `test/chat/bot-gateway-protocol.test.ts`
@@ -105,7 +105,7 @@
 
 ## Task 3: `ChatChannel` stream registry + internal routes
 
-**目标：** `message_stream_registry` 表、`/internal/stream-registry-check`、`/internal/stream-finalize` 骨架。
+**目标：** `message_stream_registry` 表、`/internal/stream-registry-check`、`/internal/stream-finalize`、`/internal/stream-abandon` 骨架。
 
 **可能修改的文件：**
 
@@ -118,8 +118,10 @@
 
 - Registry PK `(channel_id, message_id)`; status enum `streaming | finalized | abandoned | expired`.
 - Finalize persistence fields: `final_event_id`, `final_text_hash` (diagnostic), `finalize_request_hash`, `finalized_response_json`, `finalized_at`.
+- Abandon persistence fields: `abandoned_event_id`, `abandoned_text_hash`, `abandoned_response_json`, `abandoned_at`.
 - `stream-registry-check`: validate bot ownership, status, expiry.
 - `stream-finalize`: transactional insert `messages` + `events` (`message.stream_finalized`) + registry finalize + persist finalize response; idempotent replay when `status=finalized` and same `finalize_request_hash`.
+- `stream-abandon`: if non-empty partial, transactional insert `messages` (`stream_state=abandoned`, `status=failed`) + `message.stream_abandoned` event + registry abandon + persist abandon response; idempotent when `status=abandoned` and same `abandoned_text_hash`.
 - Extend `bot_effects_applied.response_json` shape for `start_stream` idempotency cache.
 
 **不变量：**
@@ -130,7 +132,7 @@
 
 **测试要求：**
 
-- Registry insert/check/finalize unit tests via DO fetch internal routes.
+- Registry insert/check/finalize/abandon unit tests via DO fetch internal routes.
 - Idempotent `start_stream` returns same `message_id` + `ws_url`.
 
 **回滚 / 兼容风险：**
@@ -343,36 +345,46 @@
 
 ## Task 9: Expiry, abandon, reconnect policy
 
-**目标：** Registry + stream DO expiry alarms；abandon 不发 partial message；live `message.stream_abandoned`.
+**目标：** Registry + stream DO expiry alarms；非空 durable partial 写入 canonical abandoned/failed message；空 buffer 仅 live `message.stream_abandon_cleanup`。
 
 **可能修改的文件：**
 
-- `src/do/chat-channel.ts` — registry expiry alarm, mark `expired`/`abandoned`
-- `src/do/bot-stream-connection.ts` — buffer cleanup, abandon fanout
+- `src/do/chat-channel.ts` — registry expiry alarm, `/internal/stream-abandon`, mark `expired`/`abandoned`
+- `src/do/bot-stream-connection.ts` — buffer cleanup, empty-stream cleanup fanout, abandon orchestration
+- `src/chat/message-projection.ts` — abandoned partial projection (`stream_state=abandoned`, `status=failed`)
 - `test/do/bot-stream-expiry.test.ts`
 
 **实现要点：**
 
 - Both ChatChannel and BotStreamConnection participate in expiry (spec §11).
 - WS disconnect alone does not abandon — wait until `expires_at`.
+- Before abandon: flush pending accepted text if possible; `resolved_partial = stream_state.flushed_text`.
 - After expiry: reject append/finalize with `BOT_STREAM_EXPIRED`.
-- Emit live-only `message.stream_abandoned`; delete registry + buffer.
+- Empty `resolved_partial`: emit live-only `message.stream_abandon_cleanup` via `/internal/deliver-stream-frame`; mark registry abandoned; clear buffer; no canonical message.
+- Non-empty `resolved_partial`: call `/internal/stream-abandon`; canonical `message.stream_abandoned` + fanout; persist `abandoned_*` registry fields.
 - Reconnect before expiry: resume at `ready.ack_seq + 1`.
 
 **不变量：**
 
-- No partial text promoted on abandon/expiry.
-- Offline clients never see abandoned streams in HTTP history.
+- Abandoned partial is not a successful finalize; `status=failed`, `stream_state=abandoned`.
+- No `message.created` for abandoned streams.
+- Finalize after persisted abandon rejected; must not overwrite partial message.
+- Empty-stream repeated cleanup is no-op; non-empty repeated abandon idempotent via `abandoned_text_hash`.
 
 **测试要求：**
 
 - Disconnect + reconnect before expiry → resume works.
-- Expiry without finalize → abandon frame, no history row.
-- Finalize after expiry → `BOT_STREAM_EXPIRED`.
+- Expiry with empty buffer → live-only cleanup frame, no history row.
+- Expiry with flushed partial text → history contains abandoned/failed message.
+- Online client: provisional stream converges to abandoned/failed message (not disappearance).
+- HTTP events include canonical `message.stream_abandoned` for non-empty partial.
+- No `message.created` for abandoned stream.
+- Finalize after persisted abandon → rejected; partial message unchanged.
+- Repeated abandon idempotent.
 
 **回滚 / 兼容风险：**
 
-- Low — tightens stream lifecycle; bots must finalize before TTL (documented in §9.15).
+- Medium — changes Browser timeline semantics for expired streams with partial output; frontend must handle `message.stream_abandoned` canonical event and failed styling.
 
 ---
 
