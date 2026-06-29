@@ -1,13 +1,20 @@
-# Lilium Chat Bot 第三方公开 API — 实现缺口
+# Lilium Chat Bot API Gaps — Discussion Tracker
 
-**Status:** Tracking  
+**Status:** Discussion / Tracking（**非** implementation source of truth）
 **Audience:** `lilium-chat` + `toolbear_ui` 实现与评审  
-**Public doc:** `dzmm_archive/lilium-openapi/docs/lilium-chat-bot-api-design.md`（仅收录已上线能力；缺口只记本文）
+**Public doc:** 暂不更新；第三方公开说明等实现完成并部署验证后再统一整理
 
-公开接入规范与本文分工：
+> **2026-06-30 收口：** 本文是历史讨论稿和 gap tracker，**不再**作为实现计划或 contract 的规范来源。下一步实现应引用：
+>
+> - **Internal contract（normative wire shape）：** `docs/api-contract/2026-06-22-toolbear-chat-api-contract.md` **§16–§17**（v2.19 internal addendum）
+> - **Backend spec（normative 实现不变量）：** `docs/superpowers/specs/2026-06-30-lilium-chat-bot-streaming-and-internal-api-spec.md`
+> - **Implementation plan：** `docs/superpowers/plans/2026-06-30-lilium-chat-bot-streaming-internal-api-implementation.md`
+>
+> 旧 standalone addendum 文件 `docs/api-contract/2026-06-30-bot-internal-api-contract-addendum.md` 已合并入主 contract §16，仅保留 redirect stub。
+>
+> 第三方公开 API 文档只描述已上线、可调用、经过验证的能力；不得从本文直接摘取“预留 scope / 尚未实现 / 内部路由 / Browser/Admin API / ToolBear Web route”等内容。
 
-- 公开文档描述第三方**现在就能调用**的 API 与协议字段。
-- 本文记录**尚未上线**的公开 API 能力、**后端/前端实现缺口**、scope 占位、以及公开文档刻意不写的设计方向。
+本文保留用于追踪历史讨论项、实现缺口、以及公开文档刻意不写的设计方向。
 
 ---
 
