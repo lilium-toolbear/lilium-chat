@@ -6,6 +6,7 @@ import {
   type UserSummary as LiveUserSummary,
 } from "../../../chat/event-broadcast";
 import { projectMessageForBrowser, type MessageStickerSnapshot } from "../../../chat/message-projection";
+import { buildReplySnapshot, replyTargetSenderDisplayName } from "../../../chat/reply-snapshot";
 import { projectAttachmentForBrowser, type AttachmentRow as ChatAttachmentRow } from "../../../chat/attachment-projection";
 import type { MessageRow } from "../../../contract/persisted";
 import type { MessageImageAttachment } from "../../../contract/message";
@@ -72,6 +73,40 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
       );
     }
 
+    let replySnapshotJson: string | null = null;
+    if (b.reply_to) {
+      const targetRow = host.ctx.storage.sql
+        .exec(
+          `SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id,
+                  sender_bot_display_name, sender_bot_avatar_url, type, format, status, text, reply_to,
+                  reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at,
+                  deleted_by, recalled_at
+           FROM messages WHERE message_id=? AND channel_id=?`,
+          b.reply_to,
+          channelId,
+        )
+        .toArray()[0] as MessageRow | undefined;
+      if (!targetRow || (targetRow.status !== "normal" && targetRow.status !== "edited")) {
+        return Response.json(
+          { error: { code: "MESSAGE_NOT_FOUND", message: "reply target not found", retryable: false } },
+          { status: 404 },
+        );
+      }
+      let targetSenderDisplayName = replyTargetSenderDisplayName(targetRow);
+      if (targetRow.sender_kind === "user" && targetRow.sender_user_id) {
+        try {
+          const raw = await resolveUserSummaries([targetRow.sender_user_id], host.env);
+          const normalized = raw.get(targetRow.sender_user_id);
+          if (normalized?.display_name) {
+            targetSenderDisplayName = normalized.display_name;
+          }
+        } catch {
+          // fallback handled by replyTargetSenderDisplayName
+        }
+      }
+      replySnapshotJson = JSON.stringify(buildReplySnapshot(targetRow, targetSenderDisplayName));
+    }
+
     const requestHash = JSON.stringify({
       type: b.type,
       text: b.text,
@@ -96,7 +131,7 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
       status: "normal",
       text: b.text,
       reply_to: b.reply_to,
-      reply_snapshot_json: null,
+      reply_snapshot_json: replySnapshotJson,
       stream_state: "none",
       created_at: now,
       updated_at: now,
@@ -299,8 +334,8 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
       host.ctx.storage.sql.exec(
         `INSERT INTO messages (
             message_id, command_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
-            sender_bot_id, type, format, status, text, reply_to, stream_state, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, 'user', ?, NULL, ?, 'plain', 'normal', ?, ?, 'none', ?, ?)`,
+            sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'user', ?, NULL, ?, 'plain', 'normal', ?, ?, ?, 'none', ?, ?)`,
         messageId,
         b.command_id,
         b.dedupe_principal_key,
@@ -309,6 +344,7 @@ export async function dispatchMessageRoutes(host: ChatChannelHost, request: Requ
         b.type,
         b.text,
         b.reply_to,
+        replySnapshotJson,
         now,
         now,
       );

@@ -1,5 +1,6 @@
 import { buildEventFrame, type UserSummary as LiveUserSummary } from "./event-broadcast";
 import { projectMessageForBrowser, type MessageStickerSnapshot } from "./message-projection";
+import { buildReplyTargetStatusLookup } from "./reply-snapshot";
 import { projectAttachmentForBrowser, type AttachmentRow as ChatAttachmentRow } from "./attachment-projection";
 import { resolveActorWithMap } from "./channel-events";
 import type { Env } from "../env";
@@ -110,12 +111,16 @@ function projectReplayMessagePayload(
       messageRow.message_id,
     )
     .toArray()[0] as unknown as MessageStickerSnapshot | undefined;
+  const replyTargetStatus = messageRow.reply_to
+    ? buildReplyTargetStatusLookup(sql, [messageRow.reply_to]).get(messageRow.reply_to)
+    : undefined;
   return {
     message: projectMessageForBrowser(messageRow, {
       senderSummary,
       mentions: replayMentions,
       attachments: replayAttachments,
       sticker: replayStickerRow ?? null,
+      replyTargetStatus,
     }),
   };
 }

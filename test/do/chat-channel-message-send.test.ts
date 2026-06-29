@@ -254,4 +254,77 @@ describe("ChatChannel /internal/message-send", () => {
     expect(r2.message).not.toBeNull();
     expect(r2.message!.message_id).toBe(r1.message.message_id);
   });
+
+  it("persists reply_to and reply_snapshot when replying to a visible message", async () => {
+    const { stub, channelId } = await setupChannelAndJoin("u-ms-reply");
+    const original = (await (
+      await stub.fetch(
+        new Request("https://x/internal/message-send", {
+          method: "POST",
+          headers: { "X-Verified-User-Id": "u-ms-reply", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            command_id: "cm-reply-target",
+            dedupe_principal_key: "user:u-ms-reply",
+            type: "text",
+            text: "original message",
+            reply_to: null,
+            mentions: [],
+            channel_id: channelId,
+          }),
+        }),
+      )
+    ).json()) as { message: { message_id: string } };
+
+    const reply = (await (
+      await stub.fetch(
+        new Request("https://x/internal/message-send", {
+          method: "POST",
+          headers: { "X-Verified-User-Id": "u-ms-reply", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            command_id: "cm-reply-send",
+            dedupe_principal_key: "user:u-ms-reply",
+            type: "text",
+            text: "my reply",
+            reply_to: original.message.message_id,
+            mentions: [],
+            channel_id: channelId,
+          }),
+        }),
+      )
+    ).json()) as {
+      message: {
+        reply_to: string | null;
+        reply_snapshot: { message_id: string; text_preview: string; status: string } | null;
+      };
+    };
+
+    expect(reply.message.reply_to).toBe(original.message.message_id);
+    expect(reply.message.reply_snapshot).toMatchObject({
+      message_id: original.message.message_id,
+      text_preview: "original message",
+      status: "normal",
+    });
+  });
+
+  it("rejects reply_to when target message is missing", async () => {
+    const { stub, channelId } = await setupChannelAndJoin("u-ms-reply-miss");
+    const res = await stub.fetch(
+      new Request("https://x/internal/message-send", {
+        method: "POST",
+        headers: { "X-Verified-User-Id": "u-ms-reply-miss", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          command_id: "cm-reply-miss",
+          dedupe_principal_key: "user:u-ms-reply-miss",
+          type: "text",
+          text: "orphan reply",
+          reply_to: "00000000-0000-7000-8000-000000009999",
+          mentions: [],
+          channel_id: channelId,
+        }),
+      }),
+    );
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("MESSAGE_NOT_FOUND");
+  });
 });

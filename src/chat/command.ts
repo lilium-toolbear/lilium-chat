@@ -77,9 +77,10 @@ export function parseMessageSendCommand(frame: IncomingCommandFrame, senderUserI
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "sticker message text must be empty", retryable: false } };
   }
   const reply_to_message_id = p.reply_to_message_id;
-  if (typeof reply_to_message_id === "string" && reply_to_message_id.length > 0) {
-    return { ok: false, error: { code: "INVALID_MESSAGE", message: "reply_to_message_id not supported", retryable: false } };
-  }
+  const reply_to =
+    typeof reply_to_message_id === "string" && reply_to_message_id.length > 0
+      ? reply_to_message_id
+      : null;
   const attachment_ids = Array.isArray(p.attachment_ids) ? p.attachment_ids.filter((a): a is string => typeof a === "string") : [];
   const sticker_id = typeof p.sticker_id === "string" ? p.sticker_id : "";
   if (type === "image") {
@@ -108,7 +109,7 @@ export function parseMessageSendCommand(frame: IncomingCommandFrame, senderUserI
       command_id,
       type,
       text,
-      reply_to: null,
+      reply_to,
       attachment_ids,
       sticker_id: sticker_id || null,
       mentions,

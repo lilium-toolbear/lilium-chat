@@ -104,13 +104,13 @@ describe("parseMessageSendCommand", () => {
     if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
   });
 
-  it("rejects reply_to_message_id (reply snapshot is Phase 4)", () => {
+  it("parses reply_to_message_id into reply_to", () => {
     const r = parseMessageSendCommand(
       { frame_type: "command", command: "message.send", command_id: "cmd-1", channel_id: "ch-1", payload: { type: "text", text: "hi", reply_to_message_id: "m-1" } },
       "u-1",
     );
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error.code).toBe("INVALID_MESSAGE");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.command.reply_to).toBe("m-1");
   });
 
   it("rejects non-empty attachment_ids (text-only)", () => {
