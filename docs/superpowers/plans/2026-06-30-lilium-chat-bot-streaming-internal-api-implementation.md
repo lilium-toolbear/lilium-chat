@@ -117,9 +117,9 @@
 **实现要点：**
 
 - Registry PK `(channel_id, message_id)`; status enum `streaming | finalized | abandoned | expired`.
-- Finalize persistence fields: `final_event_id`, `final_text_hash`, `finalized_response_json`, `finalized_at`.
+- Finalize persistence fields: `final_event_id`, `final_text_hash` (diagnostic), `finalize_request_hash`, `finalized_response_json`, `finalized_at`.
 - `stream-registry-check`: validate bot ownership, status, expiry.
-- `stream-finalize`: transactional insert `messages` + `events` (`message.stream_finalized`) + registry finalize + persist finalize response; idempotent replay when `status=finalized` and same hash.
+- `stream-finalize`: transactional insert `messages` + `events` (`message.stream_finalized`) + registry finalize + persist finalize response; idempotent replay when `status=finalized` and same `finalize_request_hash`.
 - Extend `bot_effects_applied.response_json` shape for `start_stream` idempotency cache.
 
 **不变量：**
@@ -308,15 +308,19 @@
 **实现要点：**
 
 - Drain pending fanout before finalize transaction.
+- Flush pending accepted text so `ack_seq == received_seq` before finalize.
+- `final_seq == received_seq` required; `final_seq > received_seq` → `BOT_STREAM_SEQUENCE_GAP`; `final_seq < received_seq` → `BOT_STREAM_CONFLICT` unless already finalized with matching hash.
 - `resolved_text = stream_state.flushed_text`.
+- `finalize_request_hash = hash({ final_seq, resolved_text, components, attachment_ids })`.
 - Optional `components` / `attachment_ids` on finalize (validate if attachment task not done: reject unknown attachments).
 - Insert `messages.stream_state=final`; event type `message.stream_finalized` only — **no** `message.created`.
-- Persist registry `final_event_id`, `final_text_hash`, `finalized_response_json` on first commit.
-- Idempotent finalize: `status=finalized` + same hash → return stored response; different hash → `BOT_STREAM_CONFLICT`.
+- Persist registry `final_event_id`, `final_text_hash` (diagnostic), `finalize_request_hash`, `finalized_response_json` on first commit.
+- Idempotent finalize: `status=finalized` + same `finalize_request_hash` → return stored response; different hash → `BOT_STREAM_CONFLICT`.
 
 **不变量：**
 
 - Exactly one canonical event per finalized stream.
+- `final_seq == received_seq` at finalize time (after flush); no finalize with missing deltas.
 - `projectMessageForBrowser` shared for history, HTTP events, live event, and finalize ack projection.
 - HTTP `GET .../messages` and `GET .../events` return final message after finalize only.
 
@@ -325,7 +329,11 @@
 - Finalize → one `message.stream_finalized` in events; assert no `message.created`.
 - History after finalize contains full text.
 - Replay projection matches live event payload.
-- Repeated finalize → same ack (idempotent).
+- `final_seq == received_seq` → success.
+- `final_seq > received_seq` → `BOT_STREAM_SEQUENCE_GAP`.
+- `final_seq < received_seq` → `BOT_STREAM_CONFLICT` (unless idempotent replay with same `finalize_request_hash`).
+- Repeated finalize with same `finalize_request_hash` → same ack (idempotent).
+- Repeated finalize with same `final_text_hash` but different `components` / `attachment_ids` → `BOT_STREAM_CONFLICT`.
 
 **回滚 / 兼容 risk：**
 

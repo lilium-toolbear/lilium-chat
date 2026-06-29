@@ -83,11 +83,11 @@
 | 结束方式 | 行为 |
 | --- | --- |
 | `finalize`（流 WS） | 一次 INSERT `messages` + `events`（`resolved_text` 来自 BotStreamConnection buffer）；fanout `message.stream_finalized`；DELETE registry + 关流 WS |
-| 中断（timeout、流 WS 断连、主 bot 断连、session.close 等） | 可选 promote `resolved_text`；否则 abandon；DELETE registry + buffer |
+| 中断（timeout、流 WS 断连、主 bot 断连、session.close 等） | **historical, rejected：** 旧讨论曾写「可选 promote `resolved_text`」。**当前 contract 固定 abandon，不 promote partial text**；DELETE registry + buffer |
 
 **与旧 Phase 7 plan 的差异：** 主 WS 上 `append_stream` UPDATE `messages.text` **作废**；以本节为准。
 
-#### 2.2.1 协议与路由（normative）
+#### 2.2.1 协议与路由（historical sketch, non-normative）
 
 **`start_stream`（主 WS）**
 
@@ -183,11 +183,13 @@ interface BotStreamConnectionAttachment {
 }
 ```
 
-**`resolved_text`（finalize / 中断 promote）**
+**`resolved_text`（finalize only；中断不 promote）**
 
 ```text
-resolved_text = stream_buffer.flushed_text + attachment.pending_text
+resolved_text = stream_buffer.flushed_text + attachment.pending_text  // finalize 前 drain pending
 ```
+
+**historical, rejected：** 旧稿曾允许中断时 promote partial text。**当前 contract（§9.15.5 / §12.4）固定 abandon，不写入 canonical `messages`。**
 
 finalize 前 **drain** `fanout_pending_text`。Bot `finalize` **不得**依赖重传全文；平台以 `resolved_text` 写 canonical。
 
@@ -216,7 +218,7 @@ finalize @ 流 WS
   → DELETE stream_buffer; 关 WS; finalized_ack
 ```
 
-#### 2.2.3 并发与异步（normative）
+#### 2.2.3 并发与异步（historical sketch, non-normative）
 
 - 主 Bot Gateway 仍为 **异步** at-least-once delivery；与流 WS **解耦**。
 - **N 条并发 stream = N 条流 WS + N 个 `BotStreamConnection` DO**；`BotConnection` **无** stream buffer。

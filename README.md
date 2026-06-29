@@ -86,18 +86,20 @@ A thin Hono Worker authenticates JWTs and proxies to Durable Objects by name.
 WebSocket upgrades verify the JWT, extract `user_id`, and forward it to a
 `UserConnection` DO named by `user_id`.
 
-Eight Durable Object classes (all SQLite-backed):
+Ten production Durable Object classes (all SQLite-backed), plus **`SchedulerProbe`** in the test worker only. Full topology table, naming rules, and invariants: [`AGENTS.md`](AGENTS.md).
 
-| DO | Named by | Role |
+| DO | Named by | Role (summary) |
 |---|---|---|
-| `ChatChannel` | `channel_id` | Auth source-of-truth. Owns members, messages, event log, audit logs, attachments, outbox. |
-| `UserDirectory` | `user_id` | Repairable projection of memberships (`my_channels`), read-state floor, personal stickers, attachment ownership. |
-| `UserConnection` | `user_id` | WebSocket hibernation + per-channel cursors; routes WS commands to `ChatChannel`. |
-| `ChannelFanout` | `channel_id` | Holds online sessions per channel; delivers events to online connections. |
-| `ChannelDirectory` | `shared` | Public channel directory read model. |
-| `InviteDirectory` | `shared` | invite-code → channel_id global index. |
-| `BotRegistry` | `shared` | Global bot identity + token hash store. |
-| `SchedulerProbe` | — | Test-only (declared in `wrangler.test.jsonc`). |
+| `ChatChannel` | `channel_id` | Auth source-of-truth: messages, members, events, outbox |
+| `UserDirectory` | `user_id` | Repairable membership projection, stickers, attachments |
+| `UserConnection` | `user_id` | Browser WS hibernation; routes WS commands to `ChatChannel` |
+| `ChannelFanout` | `channel_id` | Online sessions; best-effort live delivery |
+| `ChannelDirectory` | `shared` | Public channel directory |
+| `InviteDirectory` | `shared` | invite-code → channel_id index |
+| `BotRegistry` | singleton | Bot identity + token hashes |
+| `BotConnection` | `bot_id` | Bot Gateway WS, delivery queue |
+| `BotStreamConnection` | `` `${channel_id}#${message_id}` `` | Stream WS buffer, seq/ack, live stream fanout |
+| `DMDirectory` | `shared` | DM pair → channel_id index |
 
 ### Key design invariants
 

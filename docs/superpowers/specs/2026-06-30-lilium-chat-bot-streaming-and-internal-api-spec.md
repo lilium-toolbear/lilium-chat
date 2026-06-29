@@ -63,7 +63,8 @@ CREATE TABLE message_stream_registry (
   finalized_at      TEXT,
   abandoned_at      TEXT,
   final_event_id    TEXT,
-  final_text_hash   TEXT,
+  final_text_hash   TEXT, -- diagnostic: hash(resolved_text)
+  finalize_request_hash TEXT,
   finalized_response_json TEXT,
   PRIMARY KEY (channel_id, message_id)
 );
@@ -89,7 +90,7 @@ CREATE INDEX idx_message_stream_registry_expiry
 
 A repeated identical `start_stream` effect returns the same registry entry and `ws_url`.
 
-On successful finalize, ChatChannel persists `final_event_id`, `final_text_hash`, and `finalized_response_json` on the registry row before marking `status=finalized`. Repeated finalize with the same final text hash returns the stored response; different hash returns `BOT_STREAM_CONFLICT`.
+On successful finalize, ChatChannel persists `final_event_id`, `final_text_hash` (diagnostic), `finalize_request_hash`, and `finalized_response_json` on the registry row before marking `status=finalized`. Repeated finalize with the same `finalize_request_hash` returns the stored response; different hash returns `BOT_STREAM_CONFLICT`. `final_text_hash` alone is **not** sufficient for idempotency when `components` or `attachment_ids` differ.
 
 ## 4. BotStreamConnection Schema
 
@@ -306,10 +307,12 @@ Browser clients must treat stream frames as provisional. They do not update chan
 
 ```text
 BotStreamConnection finalize(final_seq, components?, attachment_ids?)
-  -> validate final_seq <= received_seq or accept any prior pending frames in order
-  -> flush pending_text, advancing ack_seq
+  -> validate final_seq == received_seq (final_seq > received_seq -> BOT_STREAM_SEQUENCE_GAP;
+     final_seq < received_seq -> BOT_STREAM_CONFLICT unless already finalized with matching hash)
+  -> flush pending_text so ack_seq == received_seq
   -> drain live fanout
   -> resolved_text = stream_state.flushed_text
+  -> finalize_request_hash = hash({ final_seq, resolved_text, components, attachment_ids })
   -> call ChatChannel /internal/stream-finalize
   -> ChatChannel transaction inserts final messages row + message.stream_finalized event
   -> ChatChannel deletes/marks registry finalized
@@ -318,11 +321,13 @@ BotStreamConnection finalize(final_seq, components?, attachment_ids?)
   -> close stream WS
 ```
 
+`finalize_request_hash` is computed from canonical JSON of `{ final_seq, resolved_text, components, attachment_ids }` (stable field ordering / null omission rules). `final_text_hash = hash(resolved_text)` is stored for diagnostics only.
+
 `ChatChannel /internal/stream-finalize` behavior:
 
-- `status=streaming`: execute canonical transaction; persist `final_event_id`, `final_text_hash`, `finalized_response_json`, `finalized_at`; mark registry `finalized`.
-- `status=finalized` and same `bot_id` + same `final_text_hash`: return stored `finalized_response_json` (same `{ message_id, event_id }`).
-- `status=finalized` and different `final_text_hash`: return `BOT_STREAM_CONFLICT`.
+- `status=streaming`: execute canonical transaction; persist `final_event_id`, `final_text_hash`, `finalize_request_hash`, `finalized_response_json`, `finalized_at`; mark registry `finalized`.
+- `status=finalized` and same `bot_id` + same `finalize_request_hash`: return stored `finalized_response_json` (same `{ message_id, event_id }`).
+- `status=finalized` and different `finalize_request_hash`: return `BOT_STREAM_CONFLICT`.
 - `status=expired` / `abandoned`: return `BOT_STREAM_EXPIRED` or `BOT_STREAM_NOT_FOUND`.
 
 Initial call validates:
@@ -396,8 +401,9 @@ Rules:
 
 Finalize is idempotent after canonical commit:
 
-- repeated `finalize` after `finalized` returns stored `finalized_response_json` with same `{ message_id, event_id }` when `final_text_hash` matches;
-- repeated `finalize` with different final text hash returns `BOT_STREAM_CONFLICT`;
+- repeated `finalize` after `finalized` returns stored `finalized_response_json` with same `{ message_id, event_id }` when `finalize_request_hash` matches;
+- repeated `finalize` with different `finalize_request_hash` returns `BOT_STREAM_CONFLICT`;
+- `final_seq == received_seq` required while `status=streaming`; `final_seq > received_seq` → `BOT_STREAM_SEQUENCE_GAP`; `final_seq < received_seq` → `BOT_STREAM_CONFLICT` unless already finalized with matching hash;
 - finalize after `abandoned`/`expired` returns `BOT_STREAM_EXPIRED` or `BOT_STREAM_NOT_FOUND`.
 
 ## 13. Read Scopes And Attachments
