@@ -147,5 +147,6 @@ export { InviteDirectory } from "./do/invite-directory";
 export { BotRegistry } from "./do/bot-registry";
 export { ChannelFanout } from "./do/channel-fanout";
 export { BotConnection } from "./do/bot-connection";
+export { BotStreamConnection } from "./do/bot-stream-connection";
 export { DMDirectory } from "./do/dm-directory";
 export { SchedulerProbe } from "./do/scheduler-probe";

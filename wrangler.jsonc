@@ -29,6 +29,7 @@
       { "name": "BOT_REGISTRY", "class_name": "BotRegistry" },
       { "name": "CHANNEL_FANOUT", "class_name": "ChannelFanout" },
       { "name": "BOT_CONNECTION", "class_name": "BotConnection" },
+      { "name": "BOT_STREAM_CONNECTION", "class_name": "BotStreamConnection" },
       { "name": "DM_DIRECTORY", "class_name": "DMDirectory" }
     ]
   },
@@ -59,6 +60,10 @@
     {
       "tag": "v3",
       "new_sqlite_classes": ["DMDirectory"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["BotStreamConnection"]
     }
   ],
 
