@@ -49,15 +49,28 @@ export async function dispatchBotRoutes(host: ChatChannelHost, request: Request,
       channel_id?: unknown;
       session_id?: unknown;
       reason?: unknown;
+      operation_id?: unknown;
     } | null;
     if (!body || typeof body.channel_id !== "string" || typeof body.session_id !== "string") {
       return new Response("invalid payload", { status: 400 });
     }
+    const operationId = typeof body.operation_id === "string" && body.operation_id.length > 0
+      ? body.operation_id
+      : "";
+    if (!operationId) return new Response("missing operation_id", { status: 400 });
+    const reason = typeof body.reason === "string" ? body.reason : "admin_stop";
+    const requestHash = JSON.stringify({
+      channel_id: body.channel_id,
+      session_id: body.session_id,
+      reason,
+    });
     return handleStatefulSessionStop(statefulHost, {
       userId,
       channelId: body.channel_id,
       sessionId: body.session_id,
-      reason: typeof body.reason === "string" ? body.reason : "admin_stop",
+      reason,
+      operationId,
+      requestHash,
     });
   }
 

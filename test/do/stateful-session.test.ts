@@ -110,6 +110,32 @@ async function openBotGateway(botId: string): Promise<{ ws: WebSocket; stub: Dur
   return { ws, stub, waitForType };
 }
 
+async function stopStatefulSession(input: {
+  userId: string;
+  channelId: string;
+  sessionId: string;
+  operationId: string;
+  reason?: string;
+}): Promise<{ ok?: boolean; session_id?: string; error?: { code?: string } }> {
+  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as DurableObjectNamespace, input.channelId);
+  const res = await stub.fetch(
+    new Request("https://x/internal/stateful-session-stop", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Verified-User-Id": input.userId,
+      },
+      body: JSON.stringify({
+        channel_id: input.channelId,
+        session_id: input.sessionId,
+        reason: input.reason ?? "admin_stop",
+        operation_id: input.operationId,
+      }),
+    }),
+  );
+  return (await res.json()) as { ok?: boolean; session_id?: string; error?: { code?: string } };
+}
+
 async function invokeStatefulCommand(input: {
   userId: string;
   channelId: string;
@@ -377,6 +403,46 @@ describe("stateful command sessions", () => {
       frame_type: "command_error",
       error: { code: "COMMAND_OPTIONS_INVALID" },
     });
+    ws.close();
+  });
+
+  it("stop is idempotent for the same operation_id after session closes", async () => {
+    const userId = `stateful-user-${crypto.randomUUID()}`;
+    const channelId = crypto.randomUUID();
+    const botId = `stateful-bot-${crypto.randomUUID()}`;
+    const botCommandId = `stateful-cmd-${crypto.randomUUID()}`;
+    const operationId = `stop-${crypto.randomUUID()}`;
+
+    await createOwnedTestChannel(
+      env as unknown as Pick<import("../../src/env").Env, "CHAT_CHANNEL">,
+      userId,
+      { channelId, title: "Stateful Stop Idempotency" },
+    );
+    await seedStatefulBinding({ channelId, userId, botId, botCommandId, manifestVersion: 1 });
+    const botGateway = await openBotGateway(botId);
+    openedBotSockets.push(botGateway.ws);
+
+    const { ws, ack } = await invokeStatefulCommand({ userId, channelId, botCommandId });
+    const sessionId = ack.payload?.session_id as string;
+    expect(sessionId).toBeTruthy();
+
+    const firstStop = await stopStatefulSession({
+      userId,
+      channelId,
+      sessionId,
+      operationId,
+    });
+    expect(firstStop).toMatchObject({ ok: true, session_id: sessionId });
+
+    const retryStop = await stopStatefulSession({
+      userId,
+      channelId,
+      sessionId,
+      operationId,
+    });
+    expect(retryStop).toMatchObject({ ok: true, session_id: sessionId });
+    expect(retryStop.error?.code).toBeUndefined();
+
     ws.close();
   });
 

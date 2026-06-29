@@ -19,6 +19,7 @@ import {
 } from "../../chat/stateful-bot-delivery";
 import { uuidv7 } from "../../ids/uuidv7";
 import { SESSION_START_TIMEOUT_MS } from "../../chat/stateful-session";
+import { idempotencyExpiresAt } from "../../contract/idempotency";
 
 export interface StatefulSessionHost {
   readonly ctx: DurableObjectState;
@@ -710,36 +711,103 @@ export async function handleStatefulSessionStop(
     channelId: string;
     sessionId: string;
     reason: string;
+    operationId: string;
+    requestHash: string;
   },
 ): Promise<Response> {
-  const row = host.ctx.storage.sql
-    .exec(
-      "SELECT session_id, channel_id, started_by_user_id, status FROM stateful_command_sessions WHERE session_id=? AND channel_id=?",
-      input.sessionId,
-      input.channelId,
-    )
-    .toArray()[0] as {
-      session_id: string;
-      channel_id: string;
-      started_by_user_id: string;
-      status: string;
-    } | undefined;
-  if (!row) {
-    return errorResponse("STATEFUL_SESSION_NOT_FOUND", "session not found", undefined, 404);
-  }
-  if (!["starting", "active", "suspended", "closing"].includes(row.status)) {
-    return errorResponse("STATEFUL_SESSION_NOT_ACTIVE", "session is not active");
-  }
+  const operation = "stateful_session.stop";
+  const now = host.nowIso();
+  const idemExpiresAt = idempotencyExpiresAt(Date.parse(now));
 
-  const callerRole = host.activeRole(input.channelId, input.userId);
-  const isStarter = row.started_by_user_id === input.userId;
-  const isAdmin = callerRole === "owner" || callerRole === "admin";
-  if (!isStarter && !isAdmin) {
-    return errorResponse("FORBIDDEN", "not allowed to stop this session", undefined, 403);
+  const preCheck = host.ctx.storage.sql
+    .exec(
+      "SELECT response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation=? AND operation_id=? AND request_hash=? AND response_json IS NOT NULL AND response_json != ''",
+      input.userId,
+      operation,
+      input.operationId,
+      input.requestHash,
+    )
+    .toArray()[0] as { response_json: string } | undefined;
+  if (preCheck) return host.cachedResponse(preCheck.response_json);
+
+  const txResult = host.ctx.storage.transactionSync(() => {
+    const idem = host.ctx.storage.sql
+      .exec(
+        "SELECT request_hash, response_json FROM idempotency_keys WHERE principal_kind='user' AND principal_id=? AND operation=? AND operation_id=?",
+        input.userId,
+        operation,
+        input.operationId,
+      )
+      .toArray()[0] as { request_hash: string; response_json: string | null } | undefined;
+    if (idem) {
+      if (idem.request_hash !== input.requestHash) return { kind: "conflict" as const };
+      return { kind: "cached" as const, responseJson: idem.response_json ?? "{}" };
+    }
+
+    const row = host.ctx.storage.sql
+      .exec(
+        "SELECT session_id, channel_id, started_by_user_id, status FROM stateful_command_sessions WHERE session_id=? AND channel_id=?",
+        input.sessionId,
+        input.channelId,
+      )
+      .toArray()[0] as {
+        session_id: string;
+        channel_id: string;
+        started_by_user_id: string;
+        status: string;
+      } | undefined;
+    if (!row) {
+      return {
+        kind: "error" as const,
+        j: JSON.stringify({ error: { code: "STATEFUL_SESSION_NOT_FOUND", message: "session not found" } }),
+      };
+    }
+    if (!["starting", "active", "suspended", "closing"].includes(row.status)) {
+      return {
+        kind: "error" as const,
+        j: JSON.stringify({ error: { code: "STATEFUL_SESSION_NOT_ACTIVE", message: "session is not active" } }),
+      };
+    }
+
+    const callerRole = host.activeRole(input.channelId, input.userId);
+    const isStarter = row.started_by_user_id === input.userId;
+    const isAdmin = callerRole === "owner" || callerRole === "admin";
+    if (!isStarter && !isAdmin) {
+      return {
+        kind: "error" as const,
+        j: JSON.stringify({ error: { code: "FORBIDDEN", message: "not allowed to stop this session" } }),
+      };
+    }
+
+    return { kind: "close" as const };
+  });
+
+  if (txResult.kind === "conflict") {
+    return Response.json(
+      { error: { code: "IDEMPOTENCY_CONFLICT", message: "operation_id reused with different body", retryable: false } },
+      { status: 409 },
+    );
   }
+  if (txResult.kind === "cached") return host.cachedResponse(txResult.responseJson);
+  if (txResult.kind === "error") return host.cachedResponse(txResult.j);
 
   await closeStatefulSession(host, input.sessionId, input.reason);
-  return Response.json({ ok: true, session_id: input.sessionId });
+
+  const responseBody = { ok: true, session_id: input.sessionId };
+  host.ctx.storage.transactionSync(() => {
+    host.ctx.storage.sql.exec(
+      "INSERT INTO idempotency_keys (principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at) VALUES ('user', ?, ?, ?, ?, ?, 'completed', ?, ?)",
+      input.userId,
+      operation,
+      input.operationId,
+      input.requestHash,
+      JSON.stringify(responseBody),
+      now,
+      idemExpiresAt,
+    );
+  });
+
+  return Response.json(responseBody);
 }
 
 export async function flushStatefulSessionTimeouts(host: StatefulSessionHost, nowIso: string): Promise<void> {

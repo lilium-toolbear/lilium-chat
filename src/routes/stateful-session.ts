@@ -51,6 +51,7 @@ export async function stopStatefulSessionHandler(c: Context<{ Bindings: Env; Var
         channel_id: channelId,
         session_id: body.session_id,
         reason: typeof body.reason === "string" ? body.reason : "admin_stop",
+        operation_id: idempotencyKey,
       }),
     }),
   );

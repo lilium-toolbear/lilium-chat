@@ -1,12 +1,11 @@
 import {
   applyBaselineSchema,
-  indexExists,
   migrateSqlite,
-  tableExists,
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
 import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
+import { migrateBotRegistryToSlashCatalogV4 } from "./bot-registry-v4-up";
 
 export const BOT_REGISTRY_CURRENT_SCHEMA_VERSION = 4;
 
@@ -95,28 +94,9 @@ export const botRegistryMigrations: SqlMigration[] = [
   },
   {
     version: 4,
-    name: "defensive reset for slash command baseline schema",
+    name: "slash command catalog schema (additive upgrade from Phase 7)",
     up(ctx) {
-      for (const tableName of [
-        "bot_command_names",
-        "bot_event_capabilities",
-        "bot_command_aliases",
-        "bot_commands",
-        "bot_idempotency_keys",
-        "bot_tokens",
-        "bot_apps",
-      ]) {
-        if (tableExists(ctx, tableName)) {
-          ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${tableName}`);
-        }
-      }
-      for (const indexName of ["idx_bot_commands_bot", "idx_bot_tokens_bot", "idx_bot_tokens_hash", "idx_bot_idem_expires"]) {
-        if (indexExists(ctx, indexName)) {
-          ctx.storage.sql.exec(`DROP INDEX IF EXISTS ${indexName}`);
-        }
-      }
-      applyBaselineSchema(ctx, BOT_REGISTRY_BASELINE_SCHEMA);
-      applyArchiveOutboxMigration(ctx);
+      migrateBotRegistryToSlashCatalogV4(ctx);
     },
   },
 ];
