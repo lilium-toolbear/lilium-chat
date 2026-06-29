@@ -83,6 +83,11 @@ function leaseNeedsRefresh(
   return false;
 }
 
+function sessionSeenNeedsRefresh(lastSeenAt: string, nowMs: number): boolean {
+  const lastSeenMs = Date.parse(lastSeenAt);
+  return !Number.isFinite(lastSeenMs) || nowMs - lastSeenMs >= HEARTBEAT_INTERVAL_MS;
+}
+
 function responseError(code: string, message: string, retryable = false): SendError {
   return { code, message, retryable };
 }
@@ -504,10 +509,10 @@ export class UserConnection extends DurableObject<Env> {
     return null;
   }
 
-  private getSessionRow(sessionId: string): { status: string; user_id: string } | null {
+  private getSessionRow(sessionId: string): { status: string; user_id: string; last_seen_at: string } | null {
     const row = this.ctx.storage.sql
-      .exec("SELECT status, user_id FROM live_sessions WHERE session_id=?", sessionId)
-      .toArray()[0] as { status: string; user_id: string } | undefined;
+      .exec("SELECT status, user_id, last_seen_at FROM live_sessions WHERE session_id=?", sessionId)
+      .toArray()[0] as { status: string; user_id: string; last_seen_at: string } | undefined;
     return row ?? null;
   }
 
@@ -765,13 +770,13 @@ export class UserConnection extends DurableObject<Env> {
       return;
     }
 
-    const ts = nowIso();
-
-    this.ctx.storage.sql.exec(
-      "UPDATE live_sessions SET last_seen_at=? WHERE session_id=?",
-      ts,
-      attachment.session_id,
-    );
+    if (sessionSeenNeedsRefresh(session.last_seen_at, Date.now())) {
+      this.ctx.storage.sql.exec(
+        "UPDATE live_sessions SET last_seen_at=? WHERE session_id=?",
+        nowIso(),
+        attachment.session_id,
+      );
+    }
 
     let sync: LeaseSyncResult;
     try {

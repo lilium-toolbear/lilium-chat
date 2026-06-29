@@ -432,7 +432,7 @@ describe("UserConnection session.heartbeat membership", () => {
     const { channelId } = await joinTestChannel(userId);
     const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
 
-    const { ws } = await upgradeUserConnection(userId);
+    const { ws, stub, sessionId } = await upgradeUserConnection(userId);
     await liveStartAndAck(ws, "cmd-hb-skip-live-start");
 
     const beforeDump = (await (await fanout.fetch(new Request("https://x/dump", {
@@ -441,14 +441,62 @@ describe("UserConnection session.heartbeat membership", () => {
     expect(beforeDump.leases.length).toBeGreaterThan(0);
     const updatedAtBefore = beforeDump.leases[0]?.updated_at ?? "";
 
+    const freshLastSeenAt = new Date(Date.now() + 60_000).toISOString();
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+      state.storage.sql.exec(
+        "UPDATE live_sessions SET last_seen_at=? WHERE session_id=?",
+        freshLastSeenAt,
+        sessionId,
+      );
+    });
+
     sendHeartbeat(ws, "cmd-hb-skip");
     const hbRaw = await nextAck(ws);
     expect(JSON.parse(hbRaw).frame_type).toBe("command_ack");
+
+    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+      const row = state.storage.sql
+        .exec("SELECT last_seen_at FROM live_sessions WHERE session_id=?", sessionId)
+        .toArray()[0] as { last_seen_at: string } | undefined;
+      expect(row?.last_seen_at).toBe(freshLastSeenAt);
+    });
 
     const afterDump = (await (await fanout.fetch(new Request("https://x/dump", {
       headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
     }))).json()) as { leases: Array<{ updated_at: string }> };
     expect(afterDump.leases[0]?.updated_at).toBe(updatedAtBefore);
+    ws.close();
+  });
+
+  it("refreshes live session last_seen_at after heartbeat interval", async () => {
+    const userId = "u-heartbeat-refresh-session";
+    await joinTestChannel(userId);
+
+    const { ws, stub, sessionId } = await upgradeUserConnection(userId);
+    await liveStartAndAck(ws, "cmd-hb-refresh-live-start");
+
+    const staleLastSeenAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+      state.storage.sql.exec(
+        "UPDATE live_sessions SET last_seen_at=? WHERE session_id=?",
+        staleLastSeenAt,
+        sessionId,
+      );
+    });
+
+    sendHeartbeat(ws, "cmd-hb-refresh");
+    const hbRaw = await nextAck(ws);
+    expect(JSON.parse(hbRaw).frame_type).toBe("command_ack");
+
+    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+      const row = state.storage.sql
+        .exec("SELECT last_seen_at FROM live_sessions WHERE session_id=?", sessionId)
+        .toArray()[0] as { last_seen_at: string } | undefined;
+      expect(row?.last_seen_at).not.toBe(staleLastSeenAt);
+    });
+
     ws.close();
   });
 
