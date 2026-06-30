@@ -499,3 +499,10 @@ Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6 → Task 7 → Tas
 ```
 
 Tasks 1–3 can partially parallelize after Task 1 types land. Task 4 blocks Task 5. Tasks 6–9 are sequential on stream path.
+
+**Frontend parallel track（`dzmm_archive` repo，不在本 repo 存放前端计划正文）：**
+
+- Impl plan: `dzmm_archive/docs/superpowers/plans/2026-06-30-toolbear-bot-streaming-rich-ui-frontend-implementation.md`
+- Parity audit: `dzmm_archive/docs/superpowers/plans/2026-06-30-toolbear-frontend-bot-streaming-changes.md`
+
+Joint E2E gate: backend Tasks 4+5+7+8+9 + frontend FE-6+FE-12+FE-15.
