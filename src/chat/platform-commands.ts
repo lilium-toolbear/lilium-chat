@@ -21,6 +21,19 @@ export function formatPlatformCommandChipMarkdown(commandName: string): string {
   return `[\`/${commandName}\`](${PLATFORM_COMMAND_CHIP_LINK_PREFIX}${commandName})`;
 }
 
+export function officialBotIdsFromCatalog(
+  catalog: readonly { bot: { bot_id: string } }[],
+): Set<string> {
+  const ids = new Set<string>([PLATFORM_BOT_ID]);
+  for (const item of catalog) ids.add(item.bot.bot_id);
+  return ids;
+}
+
+export function isOfficialBotId(botId: string, officialBotIds?: ReadonlySet<string>): boolean {
+  if (botId === PLATFORM_BOT_ID) return true;
+  return officialBotIds?.has(botId) ?? false;
+}
+
 export function platformBotSummary(): CommandManifestBotSummary {
   return {
     bot_id: PLATFORM_BOT_ID,

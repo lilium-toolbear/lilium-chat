@@ -23,7 +23,7 @@ export type UnresolvedBotSender = {
 export type WireMessageSender = MessageSender | UnresolvedBotSender | { kind: string };
 
 export type MessageType = "text" | "image" | "sticker" | "system";
-export type MessageFormat = "plain" | "markdown";
+export type MessageFormat = "plain" | "markdown" | "unsafe-markdown";
 export type MessageLifecycleStatus = "normal" | "edited" | "deleted" | "recalled" | "failed";
 export type MessageStreamState = "none" | "streaming" | "final" | "abandoned";
 

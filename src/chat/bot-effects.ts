@@ -2,6 +2,7 @@ import type { BotEffectWire, EffectResult } from "../contract/bot-gateway";
 import type { StartStreamEffectResponse } from "./stream-registry";
 import type { MessageRow } from "../contract/persisted";
 import type { WireChatMessage } from "../contract/message";
+import { isAllowedBotMessageFormat } from "./bot-message-format";
 import { isRecord } from "../contract/utils";
 
 export type NonStreamBotEffectType = "send_message" | "update_message" | "disable_components";
@@ -77,8 +78,10 @@ function parseStartStreamMessageBody(raw: unknown): BotEffectMessageBody {
   if (type !== "text") {
     throw new BotEffectValidationError("only text messages are supported");
   }
-  if (typeof format !== "string" || (format !== "plain" && format !== "markdown")) {
-    throw new BotEffectValidationError("start_stream.message.format must be plain or markdown");
+  if (typeof format !== "string" || !isAllowedBotMessageFormat(format)) {
+    throw new BotEffectValidationError(
+      "start_stream.message.format must be plain, markdown, or unsafe-markdown",
+    );
   }
   const replyTo = raw.reply_to_message_id;
   const replyToMessageId =
@@ -116,8 +119,10 @@ function parseMessageBody(raw: unknown): BotEffectMessageBody {
   if (type !== "text") {
     throw new BotEffectValidationError("only text messages are supported");
   }
-  if (typeof format !== "string" || (format !== "plain" && format !== "markdown")) {
-    throw new BotEffectValidationError("send_message.message.format must be plain or markdown");
+  if (typeof format !== "string" || !isAllowedBotMessageFormat(format)) {
+    throw new BotEffectValidationError(
+      "send_message.message.format must be plain, markdown, or unsafe-markdown",
+    );
   }
   if (typeof text !== "string") {
     throw new BotEffectValidationError("send_message.message.text required");

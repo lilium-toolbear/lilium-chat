@@ -22,7 +22,7 @@ async function withRegistry(
 
 const seededBots = new Set<string>();
 
-async function seedBot(botId: string): Promise<void> {
+async function seedBot(botId: string, visibility: "private" | "official" = "private"): Promise<void> {
   await withRegistry((ctx) => {
     ctx.storage.sql.exec(
       `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, description, visibility, status, created_at, updated_at)
@@ -32,7 +32,7 @@ async function seedBot(botId: string): Promise<void> {
       "Delivery Bot",
       null,
       null,
-      "private",
+      visibility,
       "active",
       "2026-06-30T00:00:00.000Z",
       "2026-06-30T00:00:00.000Z",
@@ -211,6 +211,120 @@ describe("BotConnection delivery_result routing", () => {
     const ack = JSON.parse(await nextMessageOfType(ws, "delivery_ack")) as ReturnType<typeof buildDeliveryAck>;
     expect(ack.status).toBe("failed");
     expect(ack.error?.code).toBe("BOT_EFFECT_INVALID");
+    ws.close();
+  });
+
+  it("rejects unsafe-markdown format for non-official bots", async () => {
+    const botId = `bot-conn-unsafe-${crypto.randomUUID()}`;
+    await seedBot(botId);
+    const channelId = crypto.randomUUID();
+    await createTestChannel(env, { channelId, ownerId: "owner-1" });
+    const { ws, stub } = await openConnection(botId);
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        api_version: BOT_GATEWAY_API_VERSION,
+        last_received_delivery_id: null,
+      }),
+    );
+    await nextMessageOfType(ws, "ready");
+
+    const enq = await stub.fetch(
+      new Request("https://x/internal/enqueue-delivery", {
+        method: "POST",
+        headers: {
+          "X-Verified-Bot-Id": botId,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(
+          enqueuePayload({ outbox_id: `out-${crypto.randomUUID()}`, channel_id: channelId }),
+        ),
+      }),
+    );
+    expect(enq.status).toBe(200);
+    const deliveryFrame = JSON.parse(await nextMessageOfType(ws, "delivery")) as { delivery_id: string };
+    ws.send(
+      JSON.stringify({
+        type: "delivery_result",
+        api_version: BOT_GATEWAY_API_VERSION,
+        delivery_id: deliveryFrame.delivery_id,
+        status: "ok",
+        effects: [
+          {
+            type: "send_message",
+            client_effect_id: `eff-${crypto.randomUUID()}`,
+            message: {
+              type: "text",
+              format: "unsafe-markdown",
+              text: "external [link](https://example.com)",
+              reply_to_message_id: null,
+              attachment_ids: [],
+              components: [],
+            },
+          },
+        ],
+      }),
+    );
+    const ack = JSON.parse(await nextMessageOfType(ws, "delivery_ack")) as ReturnType<typeof buildDeliveryAck>;
+    expect(ack.status).toBe("failed");
+    expect(ack.error?.code).toBe("BOT_EFFECT_INVALID");
+    expect(ack.error?.message).toContain("unsafe-markdown");
+    ws.close();
+  });
+
+  it("allows unsafe-markdown format for official bots", async () => {
+    const botId = `bot-conn-official-${crypto.randomUUID()}`;
+    await seedBot(botId, "official");
+    const channelId = crypto.randomUUID();
+    await createTestChannel(env, { channelId, ownerId: "owner-1" });
+    const { ws, stub } = await openConnection(botId);
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        api_version: BOT_GATEWAY_API_VERSION,
+        last_received_delivery_id: null,
+      }),
+    );
+    await nextMessageOfType(ws, "ready");
+
+    const enq = await stub.fetch(
+      new Request("https://x/internal/enqueue-delivery", {
+        method: "POST",
+        headers: {
+          "X-Verified-Bot-Id": botId,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(
+          enqueuePayload({ outbox_id: `out-${crypto.randomUUID()}`, channel_id: channelId }),
+        ),
+      }),
+    );
+    expect(enq.status).toBe(200);
+    const deliveryFrame = JSON.parse(await nextMessageOfType(ws, "delivery")) as { delivery_id: string };
+    ws.send(
+      JSON.stringify({
+        type: "delivery_result",
+        api_version: BOT_GATEWAY_API_VERSION,
+        delivery_id: deliveryFrame.delivery_id,
+        status: "ok",
+        effects: [
+          {
+            type: "send_message",
+            client_effect_id: `eff-${crypto.randomUUID()}`,
+            message: {
+              type: "text",
+              format: "unsafe-markdown",
+              text: "official link",
+              reply_to_message_id: null,
+              attachment_ids: [],
+              components: [],
+            },
+          },
+        ],
+      }),
+    );
+    const ack = JSON.parse(await nextMessageOfType(ws, "delivery_ack")) as ReturnType<typeof buildDeliveryAck>;
+    expect(ack.status).toBe("applied");
     ws.close();
   });
 });

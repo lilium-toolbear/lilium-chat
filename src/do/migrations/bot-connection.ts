@@ -7,7 +7,7 @@ import {
   type SqlMigration,
 } from "../sql-migrations";
 
-export const BOT_CONNECTION_CURRENT_SCHEMA_VERSION = 2026062901;
+export const BOT_CONNECTION_CURRENT_SCHEMA_VERSION = 2026063002;
 
 // Phase 7 Bot Gateway WS RPC: BotConnection DO (by bot_id) holds the bot
 // runtime WebSocket hibernation state + the delivery queue. Delivery is
@@ -26,7 +26,8 @@ export const BOT_CONNECTION_BASELINE_SCHEMA: string[] = [
     connected_at    TEXT,
     disconnected_at TEXT,
     last_seen_at    TEXT,
-    expires_at      TEXT
+    expires_at      TEXT,
+    is_official     INTEGER NOT NULL DEFAULT 0
   )`,
   `CREATE TABLE IF NOT EXISTS bot_deliveries (
     delivery_id      TEXT PRIMARY KEY,
@@ -78,7 +79,7 @@ export const botConnectionMigrations: SqlMigration[] = [
     },
   },
   {
-    version: BOT_CONNECTION_CURRENT_SCHEMA_VERSION,
+    version: 2026062901,
     name: "add active stateful session refs for reconnect resume",
     up(ctx) {
       if (!tableExists(ctx, "active_stateful_session_refs")) {
@@ -91,6 +92,17 @@ export const botConnectionMigrations: SqlMigration[] = [
         )`);
         ctx.storage.sql.exec(
           "CREATE INDEX IF NOT EXISTS idx_active_stateful_session_refs_bot_status ON active_stateful_session_refs(bot_id, status, updated_at)",
+        );
+      }
+    },
+  },
+  {
+    version: BOT_CONNECTION_CURRENT_SCHEMA_VERSION,
+    name: "cache bot is_official on connection state",
+    up(ctx) {
+      if (!columnExists(ctx, "bot_connection_state", "is_official")) {
+        ctx.storage.sql.exec(
+          "ALTER TABLE bot_connection_state ADD COLUMN is_official INTEGER NOT NULL DEFAULT 0",
         );
       }
     },

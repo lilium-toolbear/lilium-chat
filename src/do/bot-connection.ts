@@ -14,6 +14,7 @@ import {
   type ParsedDeliveryResult,
   validateMainGatewayEffects,
 } from "../chat/bot-gateway-protocol";
+import { effectUsesUnsafeMarkdown } from "../chat/bot-message-format";
 import type { EffectResult } from "../contract/bot-gateway";
 import { uuidv7 } from "../ids/uuidv7";
 import { handleSchemaVersionRequest } from "./sql-migrations";
@@ -64,6 +65,7 @@ interface BotConnectionStateRow {
   status: string;
   session_id: string | null;
   expires_at: string | null;
+  is_official: number;
 }
 
 const MAX_BOT_DELIVERY_ATTEMPTS = 3;
@@ -533,22 +535,25 @@ export class BotConnection extends DurableObject<Env> {
         const nowMs = Date.now();
         const expiresAt = this.leaseExpiresAt(nowMs);
         const sessionId = uuidv7();
+        const isOfficial = await this.fetchBotIsOfficial(attachment.bot_id);
         this.ctx.storage.sql.exec(
           `INSERT INTO bot_connection_state (
-             bot_id, session_id, status, connected_at, disconnected_at, last_seen_at, expires_at
-           ) VALUES (?, ?, 'connected', ?, NULL, ?, ?)
+             bot_id, session_id, status, connected_at, disconnected_at, last_seen_at, expires_at, is_official
+           ) VALUES (?, ?, 'connected', ?, NULL, ?, ?, ?)
            ON CONFLICT(bot_id) DO UPDATE SET
              session_id = excluded.session_id,
              status = 'connected',
              connected_at = excluded.connected_at,
              disconnected_at = NULL,
              last_seen_at = excluded.last_seen_at,
-             expires_at = excluded.expires_at`,
+             expires_at = excluded.expires_at,
+             is_official = excluded.is_official`,
           attachment.bot_id,
           sessionId,
           now,
           now,
           expiresAt,
+          isOfficial ? 1 : 0,
         );
         ws.serializeAttachment({
           bot_id: attachment.bot_id,
@@ -723,9 +728,24 @@ export class BotConnection extends DurableObject<Env> {
     let validatedEffects;
     try {
       validatedEffects = validateMainGatewayEffects(parsed.effects);
+      const connectionState = this.ctx.storage.sql
+        .exec("SELECT is_official FROM bot_connection_state WHERE bot_id=?", row.bot_id)
+        .toArray()[0] as { is_official: number } | undefined;
+      const isOfficial = connectionState?.is_official === 1;
+      for (const effect of validatedEffects) {
+        if (effectUsesUnsafeMarkdown(effect) && !isOfficial) {
+          throw new MainGatewayEffectValidationError(
+            "unsafe-markdown format is only allowed for official bots",
+          );
+        }
+      }
     } catch (err) {
       const message =
-        err instanceof MainGatewayEffectValidationError ? err.message : "invalid effects";
+        err instanceof MainGatewayEffectValidationError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "invalid effects";
       this.ctx.storage.sql.exec(
         "UPDATE bot_deliveries SET status='failed', updated_at=?, next_attempt_at=? WHERE delivery_id=? AND status IN ('pending', 'sent')",
         now,
@@ -797,6 +817,15 @@ export class BotConnection extends DurableObject<Env> {
         }),
       ),
     );
+  }
+
+  private async fetchBotIsOfficial(botId: string): Promise<boolean> {
+    const res = await this.env.BOT_REGISTRY.getByName("registry").fetch(
+      new Request(`https://x/internal/bot-get?bot_id=${encodeURIComponent(botId)}`),
+    );
+    if (!res.ok) return false;
+    const body = (await res.json()) as { is_official?: unknown };
+    return body.is_official === true;
   }
 
   touchConnected(botId: string, sessionId?: string): void {

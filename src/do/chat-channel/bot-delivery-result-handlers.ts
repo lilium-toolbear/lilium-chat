@@ -13,6 +13,7 @@ import {
   type ParsedNonStreamEffect,
 } from "../../chat/bot-effects";
 import { projectMessageForBrowser } from "../../chat/message-projection";
+import { isOfficialBotId } from "../../chat/platform-commands";
 import { buildStreamStartedFrame, deliverLiveStreamFrame } from "../../chat/stream-live-delivery";
 import { botDedupePrincipalKey } from "../../chat/stream-registry";
 import type { StartStreamEffectResponse } from "../../chat/stream-registry";
@@ -80,6 +81,7 @@ interface BotDeliveryResultBody {
 interface BotSummary {
   display_name: string;
   avatar_url: string | null;
+  is_official: boolean;
 }
 
 function loadMessageRow(
@@ -106,10 +108,15 @@ async function fetchBotSummary(env: Env, botId: string): Promise<BotSummary | nu
     new Request(`https://x/internal/bot-get?bot_id=${encodeURIComponent(botId)}`),
   );
   if (!res.ok) return null;
-  const body = (await res.json()) as { display_name?: unknown; avatar_url?: unknown };
+  const body = (await res.json()) as {
+    display_name?: unknown;
+    avatar_url?: unknown;
+    is_official?: unknown;
+  };
   return {
     display_name: typeof body.display_name === "string" ? body.display_name : botId,
     avatar_url: typeof body.avatar_url === "string" ? body.avatar_url : null,
+    is_official: body.is_official === true,
   };
 }
 
@@ -126,7 +133,9 @@ function insertBotLifecycleEvent(
     membershipVersion: number;
   },
 ): void {
-  const liveMessage = projectMessageForBrowser(input.messageRow, { components: input.components });
+  const liveMessage = projectMessageForBrowser(input.messageRow, {
+    components: input.components,
+  });
   const liveEventFrame = buildEventFrame({
     event_id: input.eventId,
     type: input.eventType,
@@ -580,7 +589,7 @@ export async function handleBotDeliveryResult(
   let botSummary: BotSummary | null = null;
   if (parsedEffects.some((effect) => effect.type === "send_message" || effect.type === "start_stream")) {
     botSummary = await fetchBotSummary(env, botId);
-    if (!botSummary) {
+    if (!botSummary && !isOfficialBotId(botId)) {
       maybeFinalizeInteractionDelivery(host, interactionDeliveryContext, {
         channelId,
         botId,

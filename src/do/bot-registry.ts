@@ -376,11 +376,19 @@ export class BotRegistry extends DurableObject<Env> {
     if (!botId) return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot_id required" } }, { status: 404 });
     const row = this.ctx.storage.sql
       .exec(
-        `SELECT bot_id, display_name, avatar_url, status
+        `SELECT bot_id, display_name, avatar_url, status, visibility
          FROM bot_apps WHERE bot_id = ?`,
         botId,
       )
-      .toArray()[0] as { bot_id: string; display_name: string; avatar_url: string | null; status: string } | undefined;
+      .toArray()[0] as
+      | {
+          bot_id: string;
+          display_name: string;
+          avatar_url: string | null;
+          status: string;
+          visibility: string;
+        }
+      | undefined;
     if (!row) {
       return Response.json({ error: { code: "BOT_NOT_FOUND", message: "bot not found" } }, { status: 404 });
     }
@@ -389,6 +397,8 @@ export class BotRegistry extends DurableObject<Env> {
       display_name: row.display_name,
       avatar_url: row.avatar_url,
       status: row.status,
+      visibility: row.visibility,
+      is_official: row.visibility === "official",
     });
   }
 
