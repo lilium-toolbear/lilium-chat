@@ -238,6 +238,7 @@ async function triggerStreamAlarm(channelId: string, messageId: string): Promise
   const { runInDurableObject } = await import("cloudflare:test");
   await runInDurableObject(stub, async (instance: unknown, state: any) => {
     const ago = Date.now() - 10_000;
+    const now = Date.now();
     for (const ws of state.getWebSockets()) {
       const att = ws.deserializeAttachment() as Record<string, unknown> | null;
       if (!att) continue;
@@ -249,6 +250,17 @@ async function triggerStreamAlarm(channelId: string, messageId: string): Promise
     }
     state.storage.sql.exec("UPDATE stream_due_jobs SET due_at_ms=? WHERE status='pending'", ago);
     await (instance as { alarm: () => Promise<void> }).alarm();
+    // Restore flush/fanout clocks so a later append on the same socket does not
+    // immediately re-flush because last_flush_at_ms was left in the past.
+    for (const ws of state.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Record<string, unknown> | null;
+      if (!att) continue;
+      ws.serializeAttachment({
+        ...att,
+        last_flush_at_ms: now,
+        fanout_due_at_ms: 0,
+      });
+    }
   });
 }
 
@@ -371,6 +383,14 @@ describe("BotStreamConnection append", () => {
 
     ws1.send(JSON.stringify(buildBotStreamAppend({ seq: 2, delta: "!" })));
     await yieldToStreamDo();
+    const preReconnect = (await (
+      await streamStub(channelId, messageId).fetch(
+        new Request("https://x/dump", { headers: { "X-Test-Only": "1" } }),
+      )
+    ).json()) as { stream_state: Array<{ flushed_text: string; ack_seq: number }> };
+    expect(preReconnect.stream_state[0]?.flushed_text).toBe("hello");
+    expect(Number(preReconnect.stream_state[0]?.ack_seq)).toBe(1);
+
     await new Promise<void>((resolve) => {
       ws1.addEventListener("close", () => resolve(), { once: true });
       ws1.close();

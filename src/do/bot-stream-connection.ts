@@ -693,21 +693,39 @@ export class BotStreamConnection extends DurableObject<Env> {
     if (!attachment.pending_text) return attachment;
 
     const now = nowIso();
-    this.ctx.storage.sql.exec(
-      `UPDATE stream_state SET
-        flushed_text = flushed_text || ?,
-        ack_seq = ?,
-        pending_bytes = 0,
-        updated_at = ?
-      WHERE channel_id = ? AND message_id = ?`,
-      attachment.pending_text,
-      attachment.pending_end_seq,
-      now,
-      attachment.channel_id,
-      attachment.message_id,
-    );
+    const endSeq = attachment.pending_end_seq;
+    const pendingText = attachment.pending_text;
+    const flushed = this.ctx.storage.sql
+      .exec(
+        `UPDATE stream_state SET
+          flushed_text = flushed_text || ?,
+          ack_seq = ?,
+          pending_bytes = 0,
+          updated_at = ?
+        WHERE channel_id = ? AND message_id = ? AND ack_seq < ?`,
+        pendingText,
+        endSeq,
+        now,
+        attachment.channel_id,
+        attachment.message_id,
+        endSeq,
+      )
+      .rowsWritten;
+    if (flushed === 0) {
+      const row = this.loadStreamState(attachment.channel_id, attachment.message_id);
+      const ackSeq = row ? Number(row.ack_seq) : endSeq;
+      this.sendAppendAck(ws, ackSeq);
+      return {
+        ...attachment,
+        pending_text: "",
+        pending_start_seq: null,
+        pending_end_seq: ackSeq,
+        recent_unacked_hashes: {},
+        last_flush_at_ms: Date.now(),
+      };
+    }
 
-    const ackSeq = attachment.pending_end_seq;
+    const ackSeq = endSeq;
     const prunedHashes: Record<string, string> = {};
     for (const [seqKey, hash] of Object.entries(attachment.recent_unacked_hashes)) {
       if (Number(seqKey) > ackSeq) prunedHashes[seqKey] = hash;
