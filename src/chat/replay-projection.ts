@@ -351,7 +351,7 @@ export async function buildReplayEventsPage(opts: {
     | { channel_id: string; visibility: string }
     | undefined;
   if (meta === undefined) {
-    return { events: [], latest_event_id: null, next_cursor: null };
+    throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
   }
 
   const member = userId

@@ -63,6 +63,14 @@ describe("GET /api/chat/channels/{channel_id}/events", () => {
     expect(body.latest_event_id).toBe(send.event_id);
   });
 
+  it("returns 404 CHANNEL_NOT_FOUND for a random channel_id", async () => {
+    const userId = "u-ch-ev-missing-1";
+    const res = await authedChannelEventsReq(userId, "0199eeee-0000-7000-8000-000000000001");
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("CHANNEL_NOT_FOUND");
+  });
+
   it("returns 403 for non-member on a private channel", async () => {
     const ownerId = "u-ch-ev-owner-2";
     const strangerId = "u-ch-ev-stranger-2";
