@@ -4,9 +4,11 @@
 **Audience:** `lilium-chat` + `toolbear_ui` 实现与评审  
 **Public doc:** 暂不更新；第三方公开说明等实现完成并部署验证后再统一整理
 
+> **2026-07-01 api-gap-closure（Tasks 1–7 + Task 8 docs）：** §2（Bot 回复 / effect 管线 / 流式）、§4（Bot 图片附件 + `attachment_ids`）**已关闭**；实现细节以 `docs/api-contract.md` §6.1b、§6.6、§9.13–§9.17、§12.4 为准。§3 及下列 deferred / WNI 项见 **§9 Defer ledger** 与 contract §9.17.2。
+>
 > **2026-06-30 收口：** 本文是历史讨论稿和 gap tracker，**不再**作为实现计划或 contract 的规范来源。下一步实现应引用：
 >
-> - **Internal contract（normative wire shape）：** `docs/api-contract.md` **§9.13–§9.16**（Bot streaming）与 **§12.4**（实现不变量）
+> - **Internal contract（normative wire shape）：** `docs/api-contract.md` **§9.13–§9.17**（Bot streaming + upload + defer ledger）与 **§12.4**（实现不变量）
 > - **Backend spec（normative 实现不变量）：** `docs/superpowers/specs/2026-06-30-lilium-chat-bot-streaming-and-internal-api-spec.md`
 > - **Implementation plan：** `docs/superpowers/plans/2026-06-30-lilium-chat-bot-streaming-internal-api-implementation.md`
 >
@@ -53,15 +55,13 @@
 
 ## 2. Bot 回复消息（effect 应用管线 + 流式 + 前端）
 
+**Status: Done (2026-07 api-gap-closure)** — effect 应用、双 WS 流式、Browser stream frames、Rich UI components v2、`attachment_ids`（非 stream）、stateful `session.input` fan-in 均已实现。Normative：`docs/api-contract.md` §9.7、§9.13–§9.16、§3.8、§12.4。
+
 ### 2.1 后端 effect 应用
 
 **目标：** Bot 经 Bot Gateway WS 提交 `delivery_result.effects` / `session.effects` 后，Chat 写入频道消息（`send_message`、`update_message`、stream、components 等）。
 
-**当前状态：**
-
-- `src/do/bot-connection.ts` 对 `delivery_result` 返回 `BOT_EFFECT_INVALID`（`delivery_result not implemented yet`）
-- `session.effects` 同属未完成的 effect 应用路径
-- 频道 WS 事件 `message.stream_started` / `message.stream_delta` / `message.stream_finalized` 仅在 `src/contract/events.ts` 有类型定义，**无** emit 实现
+**当前状态（2026-07）：** **Done。** `BotConnection` / `ChatChannel` effect 管线已实现；stream 走 `BotStreamConnection` + §9.15 Stream WS。
 
 **上线后：** 在公开文档 §Effects 保留协议形状；不在公开文档写「缺口」表述。
 
@@ -244,6 +244,8 @@ History / replay **不**含 streaming 中途 delta；离线 reconnect 在 finali
 
 ### 2.3 ToolBear 前端消费侧（`toolbear_ui/frontend`）
 
+**Status: Done (backend)** — 后端 stream / effect 事件已 emit；前端对齐项见 contract §9.16。下列历史缺口表保留供归档，**不再**表示 open gap。
+
 前端**不**实现 Bot Gateway；只消费 Browser WS 频道事件。与 §2.1 后端 effect 管线配合后方能端到端。
 
 **已有（无需重做）：**
@@ -275,6 +277,8 @@ History / replay **不**含 streaming 中途 delta；离线 reconnect 在 finali
 
 ## 3. Chat Bot Token read scope（无公开端点）
 
+**Status: Deferred** — scope 可签发，无 Bot Token HTTP/WS read endpoint；见 **Defer ledger** 与 contract §9.17.2。
+
 下列 scope 已在 token 模型与 contract 中定义，**尚无**对应 Bot Token HTTP/WS 只读 API：
 
 | Scope | 预期用途（待设计公开端点） |
@@ -283,7 +287,7 @@ History / replay **不**含 streaming 中途 delta；离线 reconnect 在 finali
 | `chat:channels:read` | Bot 查询频道元数据 |
 | `chat:members:read` | Bot 查询频道成员列表 |
 
-**当前状态：** Token 可签发这些 scope，但签发后无 API 可调用。Bot 仅能通过 `delivery` / `message_event` 被动接收上下文。
+**当前状态：** Token 可签发这些 scope，但签发后无 API 可调用。Bot 仅能通过 `delivery` / stateful `session.input` 被动接收上下文（passive `message_event` delivery **Deferred**，见 Defer ledger）。
 
 **上线后：** 为每个 scope 定义公开路径与认证后写入公开文档 §Scopes。
 
@@ -291,21 +295,17 @@ History / replay **不**含 streaming 中途 delta；离线 reconnect 在 finali
 
 ## 4. Bot 图片附件
 
-**目标：** Bot 在 `send_message` / `start_stream` / `update_message` effects 中引用 `attachment_ids`（`type: "image"`）。
+**Status: Done (2026-07 api-gap-closure)** — channel-scoped presign/finalize + 非 stream effect `attachment_ids` 已实现。Normative：`docs/api-contract.md` §9.17.1。
 
-**阻塞：**
+**目标：** Bot 在 `send_message` / `update_message` effects 中引用 `attachment_ids`（`type: "image"`）。
 
-1. Effect 应用管线（§2.1）未完成。
-2. 无 Bot Token 附件上传公开 API（presign + finalize）。
-3. 附件归属模型仅 `owner_user_id`（`UserDirectory.pending_attachments`），无 `owner_bot_id`。
-4. Bot 不能复用用户 `attachment_id`（归属校验拒绝）。
+**实现路径（已定稿）：**
 
-**设计方向（未承诺路径）：**
-
-- `POST /api/chat/bot/uploads/images/presign`
-- `POST /api/chat/bot/uploads/images/{attachment_id}/finalize`
-- Scope：`chat:messages:write` 或独立 `chat:attachments:write`
+- `POST /api/chat/bot/channels/{channel_id}/uploads/images/presign`
+- `POST /api/chat/bot/channels/{channel_id}/uploads/images/{attachment_id}/finalize`
+- Scope：`chat:messages:write`
 - 消息 mutation 仍只经 WS effects；上传 HTTP 仅产生可引用的 `attachment_id`
+- Stream 路径（`start_stream`、Stream WS `finalize`）仍禁止 `attachment_ids`
 
 `type: "sticker"` + `sticker_id` 为用户个人表情库能力，不纳入 Bot 第三方公开面。
 
@@ -395,6 +395,26 @@ History / replay **不**含 streaming 中途 delta；离线 reconnect 在 finali
 **Phase 7 plan 对齐：** `docs/superpowers/plans/2026-06-26-lilium-chat-phase-7.md` Task 7c-components / 7d 实现时以 contract v2.18 为准（非旧 `{button, select}` 范围）。
 
 **刻意不在 v1：** `modal` / `form` 容器 / 多字段一次性 submit object — 需另开 contract 修订。
+
+---
+
+---
+
+## 9. Defer ledger（2026-07-01）
+
+Explicit non-goals and deferred capabilities after api-gap-closure (Tasks 1–7). Normative copy also in `docs/api-contract.md` §9.17.2.
+
+| Capability | Status | Rationale |
+|---|---|---|
+| Machine Token on `/api/chat/bots*` | Deferred | Owner API stays Browser JWT (§9.17) |
+| Bot read APIs (`chat:*:read` scopes) | Deferred | No product consumer yet |
+| HTTP callback transport | **Will not implement** | WS delivery is the only bot transport |
+| Signed attachment URL / read proxy | **Will not implement** | Public-read SeaweedFS URLs accepted risk |
+| Admin audit API (deleted/recalled 原文) | Deferred | Ops uses PG archive / lilium-ng message store |
+| Passive `message_event` delivery | Deferred | Stateful uses `session.input`; passive subscription API exists but delivery kind unused |
+| `last_message_preview` text | Deferred | §5.6 already documents `null` |
+
+**Admin audit rationale:** Deleted/recalled messages keep content in PostgreSQL via archive ingestion (`ChatChannel` archive outbox → PG). Ops/debug queries run against archive DB, not a separate Chat Worker admin API.
 
 ---
 
