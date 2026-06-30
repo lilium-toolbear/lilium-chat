@@ -34,6 +34,9 @@ export async function dispatchBotRoutes(host: ChatChannelHost, request: Request,
   if (url.pathname === "/internal/command-invoke") {
     return host.handleCommandInvoke(request);
   }
+  if (url.pathname === "/internal/interaction-submit") {
+    return host.handleInteractionSubmit(request);
+  }
 
   const statefulHost = asStatefulHost(host);
 

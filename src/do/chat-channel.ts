@@ -117,6 +117,7 @@ import { invokedNameMatchesSnapshot } from "../chat/slash-token";
 import { buildReplySnapshot, loadReplySnapshotMedia, replyTargetSenderDisplayName } from "../chat/reply-snapshot";
 import { projectCommandInvokeReplyContext } from "../chat/command-invoke-reply";
 import { insertUserCommandInvocationMessage, type InvocationMessageHost } from "./chat-channel/invocation-message";
+import { handleInteractionSubmitRequest } from "./chat-channel/interaction-submit-handlers";
 
 interface OutboxRow {
   outbox_id: string;
@@ -1618,6 +1619,11 @@ export class ChatChannel extends DurableObject<Env> {
     if (txResult.kind === "error") return this.cachedResponse(txResult.j);
     await this.scheduleArchiveAlarm(now);
     return Response.json(JSON.parse(txResult.responseJson));
+  }
+
+  /** POST /internal/interaction-submit — validate submit, enforce policy, enqueue bot delivery. */
+  handleInteractionSubmit(request: Request): Promise<Response> {
+    return handleInteractionSubmitRequest(this as unknown as ChatChannelHost, request);
   }
 
   private async handlePlatformHelpInvoke(input: {

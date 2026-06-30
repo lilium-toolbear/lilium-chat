@@ -5,6 +5,7 @@ import { migrateUserConnectionSchema } from "./migrations/user-connection";
 import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame, type UserEventFrame } from "../ws/frames";
 import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditCommand, parseMessageRecallCommand, parseMessageSendCommand } from "../chat/command";
 import { parseCommandInvokeCommand } from "../chat/command-invoke";
+import { parseInteractionSubmitCommand } from "../chat/interaction-submit";
 import type { MessageMutationAckPayload, MessageMutationInternalRequest } from "../contract/idempotency";
 import { requireTestOnly } from "./do-errors";
 
@@ -418,7 +419,10 @@ export class UserConnection extends DurableObject<Env> {
 
     if (frame.command === "interaction.submit") {
       const channelId = frame.channel_id ?? "";
-      if (!channelId) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "missing channel_id")); return; }
+      if (!channelId) {
+        sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "missing channel_id"));
+        return;
+      }
       const chStub = this.env.CHAT_CHANNEL.getByName(channelId);
       const summaryRes = await chStub.fetch(new Request("https://x/internal/summary", {
         headers: { "X-Verified-User-Id": attachment.user_id },
@@ -430,7 +434,50 @@ export class UserConnection extends DurableObject<Env> {
           return;
         }
       }
-      sendCommandError(ws, frame.command_id, responseError("INVALID_MESSAGE", "unsupported command"));
+
+      const parsed = parseInteractionSubmitCommand(frame);
+      if (!parsed.ok) {
+        sendCommandError(ws, frame.command_id, parsed.error);
+        return;
+      }
+
+      const isMember = await this.ensureActiveMember(attachment.user_id, parsed.command.channel_id);
+      if (!isMember) {
+        sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found or not a member"));
+        return;
+      }
+      const submitRes = await chStub.fetch(new Request("https://x/internal/interaction-submit", {
+        method: "POST",
+        headers: {
+          "X-Verified-User-Id": attachment.user_id,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          operation_id: parsed.command.command_id,
+          channel_id: parsed.command.channel_id,
+          message_id: parsed.command.message_id,
+          component_id: parsed.command.component_id,
+          custom_id: parsed.command.custom_id,
+          value: parsed.command.value,
+        }),
+      }));
+      if (!submitRes.ok) {
+        const body = await submitRes.json().catch(() => null);
+        sendCommandError(ws, frame.command_id, normalizeEventError(body));
+        return;
+      }
+      const out = await submitRes.json() as {
+        channel_id: string;
+        interaction_id: string;
+        event_id: string;
+      };
+      ws.send(JSON.stringify({
+        frame_type: "command_ack",
+        command: "interaction.submit",
+        command_id: frame.command_id,
+        status: "committed",
+        payload: out,
+      }));
       return;
     }
 

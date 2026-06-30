@@ -455,6 +455,13 @@ export const chatChannelMigrations: SqlMigration[] = [
       if (tableExists(ctx, "interactions") && !columnExists(ctx, "interactions", "error_code")) {
         ctx.storage.sql.exec("ALTER TABLE interactions ADD COLUMN error_code TEXT");
       }
+      if (!indexExists(ctx, "uniq_interaction_per_user_once")) {
+        ctx.storage.sql.exec(
+          `CREATE UNIQUE INDEX uniq_interaction_per_user_once
+           ON interactions(message_id, component_id, actor_user_id)
+           WHERE status IN ('pending', 'completed')`,
+        );
+      }
 
       if (!tableExists(ctx, "bot_delivery_outbox")) {
         ctx.storage.sql.exec(`CREATE TABLE bot_delivery_outbox (
