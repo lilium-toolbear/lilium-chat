@@ -893,14 +893,24 @@ export class ChatChannel extends DurableObject<Env> {
         await this.bumpBotDeliveryRetry(row.outbox_id, nowIso, "missing target id");
         continue;
       }
+      const target = this.env.BOT_CONNECTION.getByName(row.bot_id);
       try {
-        const res = await this.env.BOT_CONNECTION.getByName(row.bot_id).enqueueDelivery(row.bot_id, {
-          outbox_id: row.outbox_id,
-          channel_id: row.channel_id,
-          kind: row.kind,
-          target_id: targetId,
-          request_json: row.request_json,
-        });
+        const res = await target.fetch(
+          new Request("https://x/internal/enqueue-delivery", {
+            method: "POST",
+            headers: {
+              "X-Verified-Bot-Id": row.bot_id,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              outbox_id: row.outbox_id,
+              channel_id: row.channel_id,
+              kind: row.kind,
+              target_id: targetId,
+              request_json: row.request_json,
+            }),
+          }),
+        );
         if (!res.ok) {
           const text = await res.text();
           await this.bumpBotDeliveryRetry(row.outbox_id, nowIso, `${res.status}: ${text}`);
@@ -926,14 +936,11 @@ export class ChatChannel extends DurableObject<Env> {
 
     const target = this.env.INVITE_DIRECTORY.getByName("shared");
     try {
-      const payload = JSON.parse(row.payload_json) as {
-        invite_code?: string;
-        channel_id?: string;
-        status?: string;
-        expires_at?: string;
-        revoked_at?: string | null;
-      };
-      const res = await target.upsertInvite(payload);
+      const res = await target.fetch(new Request("https://x/upsert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: row.payload_json,
+      }));
       if (!res.ok) return false;
       this.ctx.storage.sql.exec(
         "UPDATE projection_outbox SET status='delivered', updated_at=?, last_error=NULL WHERE outbox_id=?",
@@ -1057,8 +1064,10 @@ export class ChatChannel extends DurableObject<Env> {
   }
 
   private async fetchOfficialCatalog(): Promise<OfficialCommandCatalogItem[]> {
-    const res = await this.env.BOT_REGISTRY.getByName("registry").officialCommands();
-    if (!res || !res.ok) return [];
+    const res = await this.env.BOT_REGISTRY.getByName("registry").fetch(
+      new Request("https://x/internal/official-commands"),
+    );
+    if (!res.ok) return [];
     const body = (await res.json()) as { items?: OfficialCommandCatalogItem[] };
     return Array.isArray(body.items) ? body.items : [];
   }
@@ -1333,7 +1342,12 @@ export class ChatChannel extends DurableObject<Env> {
       );
     }
 
-    const connectionState = await this.env.BOT_CONNECTION.getByName(bindingBotId).getConnectionState();
+    const connectionRes = await this.env.BOT_CONNECTION.getByName(bindingBotId).fetch(
+      new Request("https://x/internal/connection-state"),
+    );
+    const connectionState = connectionRes.ok
+      ? (await connectionRes.json()) as { status?: string }
+      : { status: "disconnected" };
     if (connectionState.status !== "connected") {
       return Response.json(
         {
@@ -2591,14 +2605,17 @@ export class ChatChannel extends DurableObject<Env> {
   private async flushProjectionOutboxRows(rows: OutboxRow[], nowIso: string): Promise<void> {
     for (const r of rows) {
       if (r.target_kind === "user_directory") {
+        const req = new Request("https://x/internal/upsert-channel", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Verified-User-Id": r.target_key,
+          },
+          body: r.payload_json,
+        });
+        const target = this.env.USER_DIRECTORY.getByName(r.target_key);
         try {
-          const payload = JSON.parse(r.payload_json) as {
-            action: "join" | "leave" | "dissolve";
-            channel_id: string;
-            kind: string;
-            membership_version: number;
-          };
-          const res = await this.env.USER_DIRECTORY.getByName(r.target_key).upsertChannelProjection(r.target_key, payload);
+          const res = await target.fetch(req);
           if (!res.ok) {
             const text = await res.text();
             await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
@@ -2631,14 +2648,13 @@ export class ChatChannel extends DurableObject<Env> {
       if (r.target_kind === "invite_directory") {
         const target = this.env.INVITE_DIRECTORY.getByName("shared");
         try {
-          const payload = JSON.parse(r.payload_json) as {
-            invite_code?: string;
-            channel_id?: string;
-            status?: string;
-            expires_at?: string;
-            revoked_at?: string | null;
-          };
-          const res = await target.upsertInvite(payload);
+          const res = await target.fetch(new Request("https://x/upsert", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: r.payload_json,
+          }));
           if (!res.ok) {
             const text = await res.text();
             await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);
@@ -2659,19 +2675,11 @@ export class ChatChannel extends DurableObject<Env> {
       if (r.target_kind === "channel_directory") {
         const target = this.env.CHANNEL_DIRECTORY.getByName("shared");
         try {
-          const payload = JSON.parse(r.payload_json) as {
-            action: "upsert" | "delete";
-            channel_id: string;
-            fields?: {
-              title?: string;
-              avatar_url?: string | null;
-              member_count?: number;
-              last_message_at?: string | null;
-              status?: string;
-            };
-            fields_present?: string[];
-          };
-          const res = await target.applyProjection(payload);
+          const res = await target.fetch(new Request("https://x/internal/apply-projection", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: r.payload_json,
+          }));
           if (!res.ok) {
             const text = await res.text();
             await this.bumpOutboxRetry(r.outbox_id, nowIso, `${res.status}: ${text}`);

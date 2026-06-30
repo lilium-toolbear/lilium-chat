@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { getNamedDo } from "../helpers";
+import { nextAck } from "../ws-helpers";
 
 async function setupChannelAndJoin(userId: string, channelId: string) {
   const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
@@ -52,7 +53,7 @@ describe("UserConnection channel.mark_read", () => {
       frame_type: "command", command: "channel.mark_read", command_id: "cmd-mr-1", channel_id: cid,
       payload: { last_read_event_id: "01J00000000000000000000000" },
     }));
-    const ackRaw = await nextMessage(ws);
+    const ackRaw = await nextAck(ws);
     const ack = JSON.parse(ackRaw);
     expect(ack.frame_type).toBe("command_ack");
     expect(ack.command_id).toBe("cmd-mr-1");
@@ -77,7 +78,7 @@ describe("UserConnection channel.mark_read", () => {
       payload: { last_read_event_id: "01J00000000000000000000010" },
     }));
     // drain wsA's ack
-    await nextMessage(wsA);
+    await nextAck(wsA);
     // wsB: receive either the read_state_updated frame (first message might be replay events; poll)
     let got = "";
     try { got = await nextMessage(wsB, 3000); } catch { got = ""; }
@@ -95,9 +96,9 @@ describe("UserConnection channel.mark_read", () => {
     await setupChannelAndJoin(userId, cid);
     const { ws } = await upgrade(userId);
     ws.send(JSON.stringify({ frame_type: "command", command: "channel.mark_read", command_id: "cmd-mr-3a", channel_id: cid, payload: { last_read_event_id: "01Jzzzzzzzzzzzzzzzzzzzzzz" } }));
-    await nextMessage(ws);
+    await nextAck(ws);
     ws.send(JSON.stringify({ frame_type: "command", command: "channel.mark_read", command_id: "cmd-mr-3b", channel_id: cid, payload: { last_read_event_id: "01Jaaaaaaaaaaaaaaaaaaaaaaa" } }));
-    const ackRaw2 = await nextMessage(ws);
+    const ackRaw2 = await nextAck(ws);
     const ack2 = JSON.parse(ackRaw2);
     expect(ack2.payload.last_read_event_id).toBe("01Jzzzzzzzzzzzzzzzzzzzzzz");
     ws.close();

@@ -197,6 +197,13 @@ export class BotStreamConnection extends DurableObject<Env> {
     const attachment = this.attachmentFromState(row, botId);
     this.scheduleStreamExpiry(row.expires_at);
     await scheduleNextAlarm(this.ctx, this.streamDueTables());
+    for (const existing of this.ctx.getWebSockets()) {
+      try {
+        existing.close(1000, "stream reconnect");
+      } catch {
+        // socket may already be closed
+      }
+    }
     const pair = new WebSocketPair();
     const [client, server] = pair as unknown as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server, [botStreamDoName(channelId, messageId)]);

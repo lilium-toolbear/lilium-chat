@@ -370,7 +370,11 @@ describe("BotStreamConnection append", () => {
     expect(ack1.ack_seq).toBe(1);
 
     ws1.send(JSON.stringify(buildBotStreamAppend({ seq: 2, delta: "!" })));
-    ws1.close();
+    await yieldToStreamDo();
+    await new Promise<void>((resolve) => {
+      ws1.addEventListener("close", () => resolve(), { once: true });
+      ws1.close();
+    });
 
     const { ws: ws2, ready } = await openStreamWs({ botId, channelId, messageId, expiresAt });
     expect(ready.ack_seq).toBe(1);
