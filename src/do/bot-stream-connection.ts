@@ -4,12 +4,16 @@ import { BOT_STREAM_API_VERSION } from "../contract/bot-stream";
 import {
   buildBotStreamAppendAck,
   buildBotStreamError,
+  buildBotStreamFinalizedAck,
   buildBotStreamPong,
   buildBotStreamReady,
   parseBotStreamAppend,
+  parseBotStreamFinalize,
   parseBotStreamHello,
   parseBotStreamPing,
 } from "../chat/bot-stream-protocol";
+import { callChatChannelStreamFinalize, parseStreamFinalizeResponse } from "../chat/stream-finalize-client";
+import { computeFinalizeRequestHash } from "../chat/stream-registry";
 import {
   STREAM_ACK_FLUSH_INTERVAL_MS,
   STREAM_FANOUT_INTERVAL_MS,
@@ -159,7 +163,7 @@ export class BotStreamConnection extends DurableObject<Env> {
     const row = this.ensureStreamState(channelId, messageId, botId, expiresAtHeader);
     if (!row) return new Response("stream not found", { status: 404 });
     if (row.bot_id !== botId) return new Response("forbidden", { status: 403 });
-    if (row.status !== "streaming") {
+    if (row.status !== "streaming" && row.status !== "finalized") {
       return new Response("stream not active", { status: 409 });
     }
 
@@ -206,6 +210,11 @@ export class BotStreamConnection extends DurableObject<Env> {
       if (frame.type === "append") {
         const append = parseBotStreamAppend(message);
         await this.handleAppend(ws, attachment, append.seq, append.delta);
+        return;
+      }
+      if (frame.type === "finalize") {
+        const finalize = parseBotStreamFinalize(message);
+        await this.handleFinalize(ws, attachment, finalize);
         return;
       }
     } catch {
@@ -256,6 +265,181 @@ export class BotStreamConnection extends DurableObject<Env> {
         },
       },
     ];
+  }
+
+  private async handleFinalize(
+    ws: WebSocket,
+    attachment: BotStreamConnectionAttachment,
+    finalize: {
+      final_seq: number;
+      components?: unknown[];
+      attachment_ids?: string[];
+    },
+  ): Promise<void> {
+    const row = this.loadStreamState(attachment.channel_id, attachment.message_id);
+    if (!row) {
+      this.sendStreamError(ws, "BOT_STREAM_NOT_FOUND", "stream not active", false);
+      return;
+    }
+    if (row.status === "finalized") {
+      await this.replayFinalize(ws, attachment, finalize);
+      return;
+    }
+    if (row.status !== "streaming") {
+      this.sendStreamError(ws, "BOT_STREAM_NOT_FOUND", "stream not active", false);
+      return;
+    }
+    if (row.expires_at <= nowIso()) {
+      this.sendStreamError(ws, "BOT_STREAM_EXPIRED", "stream expired", false);
+      return;
+    }
+
+    if (finalize.final_seq > attachment.received_seq) {
+      this.sendStreamError(ws, "BOT_STREAM_SEQUENCE_GAP", "finalize sequence gap", true);
+      return;
+    }
+    if (finalize.final_seq < attachment.received_seq) {
+      this.sendStreamError(ws, "BOT_STREAM_CONFLICT", "finalize sequence behind received", false);
+      return;
+    }
+
+    const attachmentIds = Array.isArray(finalize.attachment_ids)
+      ? finalize.attachment_ids.filter((id): id is string => typeof id === "string")
+      : [];
+    if (attachmentIds.length > 0) {
+      this.sendStreamError(ws, "BOT_EFFECT_INVALID", "attachment_ids not supported yet", false);
+      return;
+    }
+
+    let next = attachment;
+    if (next.fanout_pending_text) {
+      next = await this.fanoutPending(next);
+    }
+    while (next.pending_text) {
+      next = await this.flushPending(ws, next);
+    }
+    ws.serializeAttachment(next);
+
+    const freshRow = this.loadStreamState(attachment.channel_id, attachment.message_id);
+    if (!freshRow || freshRow.status !== "streaming") {
+      this.sendStreamError(ws, "BOT_STREAM_NOT_FOUND", "stream not active", false);
+      return;
+    }
+
+    const ackSeq = Number(freshRow.ack_seq);
+    if (ackSeq !== next.received_seq || finalize.final_seq !== next.received_seq) {
+      this.sendStreamError(ws, "BOT_STREAM_CONFLICT", "finalize before flush complete", false);
+      return;
+    }
+
+    const resolvedText = freshRow.flushed_text;
+    const components = Array.isArray(finalize.components) ? finalize.components : [];
+    const finalizeRequestHash = await computeFinalizeRequestHash({
+      final_seq: finalize.final_seq,
+      resolved_text: resolvedText,
+      components,
+      attachment_ids: attachmentIds,
+    });
+
+    const res = await callChatChannelStreamFinalize(this.env, {
+      channel_id: attachment.channel_id,
+      message_id: attachment.message_id,
+      bot_id: attachment.bot_id,
+      resolved_text: resolvedText,
+      finalize_request_hash: finalizeRequestHash,
+      final_seq: finalize.final_seq,
+      components,
+      attachment_ids: attachmentIds,
+    });
+    const parsed = await parseStreamFinalizeResponse(res);
+    if (!parsed.ok) {
+      this.sendStreamError(ws, parsed.code, parsed.message, parsed.retryable);
+      return;
+    }
+
+    this.markStreamFinalized(attachment.channel_id, attachment.message_id);
+    this.clearStreamDueJob("flush");
+    this.clearStreamDueJob("fanout");
+    ws.send(
+      JSON.stringify(
+        buildBotStreamFinalizedAck({
+          message_id: parsed.body.message_id,
+          event_id: parsed.body.event_id,
+        }),
+      ),
+    );
+    try {
+      ws.close(1000, "stream finalized");
+    } catch {
+      // socket may already be closed
+    }
+  }
+
+  private async replayFinalize(
+    ws: WebSocket,
+    attachment: BotStreamConnectionAttachment,
+    finalize: {
+      final_seq: number;
+      components?: unknown[];
+      attachment_ids?: string[];
+    },
+  ): Promise<void> {
+    const row = this.loadStreamState(attachment.channel_id, attachment.message_id);
+    if (!row) {
+      this.sendStreamError(ws, "BOT_STREAM_NOT_FOUND", "stream not active", false);
+      return;
+    }
+
+    const attachmentIds = Array.isArray(finalize.attachment_ids)
+      ? finalize.attachment_ids.filter((id): id is string => typeof id === "string")
+      : [];
+    const components = Array.isArray(finalize.components) ? finalize.components : [];
+    const resolvedText = row.flushed_text;
+    const finalizeRequestHash = await computeFinalizeRequestHash({
+      final_seq: finalize.final_seq,
+      resolved_text: resolvedText,
+      components,
+      attachment_ids: attachmentIds,
+    });
+
+    const res = await callChatChannelStreamFinalize(this.env, {
+      channel_id: attachment.channel_id,
+      message_id: attachment.message_id,
+      bot_id: attachment.bot_id,
+      resolved_text: resolvedText,
+      finalize_request_hash: finalizeRequestHash,
+      final_seq: finalize.final_seq,
+      components,
+      attachment_ids: attachmentIds,
+    });
+    const parsed = await parseStreamFinalizeResponse(res);
+    if (!parsed.ok) {
+      this.sendStreamError(ws, parsed.code, parsed.message, parsed.retryable);
+      return;
+    }
+
+    ws.send(
+      JSON.stringify(
+        buildBotStreamFinalizedAck({
+          message_id: parsed.body.message_id,
+          event_id: parsed.body.event_id,
+        }),
+      ),
+    );
+    try {
+      ws.close(1000, "stream finalized");
+    } catch {
+      // socket may already be closed
+    }
+  }
+
+  private markStreamFinalized(channelId: string, messageId: string): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE stream_state SET status='finalized', updated_at=? WHERE channel_id=? AND message_id=?",
+      nowIso(),
+      channelId,
+      messageId,
+    );
   }
 
   private async handleAppend(

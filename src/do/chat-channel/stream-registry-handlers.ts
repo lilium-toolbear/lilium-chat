@@ -420,6 +420,9 @@ export async function handleStreamFinalize(host: ChatChannelHost, body: {
   const attachmentIds = Array.isArray(body.attachment_ids)
     ? body.attachment_ids.filter((id): id is string => typeof id === "string")
     : [];
+  if (attachmentIds.length > 0) {
+    return doErrorResponse("BOT_EFFECT_INVALID", "attachment_ids not supported yet", { httpStatus: 422 });
+  }
 
   const expectedHash = await computeFinalizeRequestHash({
     final_seq: body.final_seq,

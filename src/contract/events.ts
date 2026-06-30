@@ -88,6 +88,8 @@ export type DomainTimelineEventType = (typeof DOMAIN_TIMELINE_EVENT_TYPES)[numbe
 /** Event types returned by channel timeline history HTTP (`GET .../messages`, bootstrap). */
 export const TIMELINE_HISTORY_EVENT_TYPES: ReadonlySet<string> = new Set([
   "message.created",
+  "message.stream_finalized",
+  "message.stream_abandoned",
   ...DOMAIN_TIMELINE_EVENT_TYPES,
 ]);
 
@@ -173,7 +175,7 @@ export interface MessageStreamDeltaPayload {
 
 export interface MessageStreamFinalizedPayload {
   channel_id?: ChatId;
-  message_id?: ChatId;
+  event_id?: ChatId;
   message?: WireChatMessage;
 }
 

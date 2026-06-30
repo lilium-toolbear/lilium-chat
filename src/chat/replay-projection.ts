@@ -1,4 +1,5 @@
 import { buildEventFrame, type UserSummary as LiveUserSummary } from "./event-broadcast";
+import { parseStoredComponents } from "./bot-effects";
 import { projectMessageForBrowser, type MessageStickerSnapshot } from "./message-projection";
 import { buildReplyTargetStatusLookup } from "./reply-snapshot";
 import { projectAttachmentForBrowser, type AttachmentRow as ChatAttachmentRow } from "./attachment-projection";
@@ -76,10 +77,14 @@ function projectReplayMessagePayload(
   }
   const messageRow = sql
     .exec(
-      "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at, invocation_json FROM messages WHERE message_id=?",
+      `SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id,
+              sender_bot_display_name, sender_bot_avatar_url, type, format, status, text,
+              reply_to, reply_snapshot_json, components_json, stream_state, created_at, updated_at,
+              edited_at, deleted_at, deleted_by, recalled_at, invocation_json
+       FROM messages WHERE message_id=?`,
       messageId,
     )
-    .toArray()[0] as MessageRow | undefined;
+    .toArray()[0] as (MessageRow & { components_json?: string | null }) | undefined;
   if (!messageRow) {
     return persistedPayload;
   }
@@ -120,6 +125,7 @@ function projectReplayMessagePayload(
       mentions: replayMentions,
       attachments: replayAttachments,
       sticker: replayStickerRow ?? null,
+      components: parseStoredComponents(messageRow.components_json ?? "[]"),
       replyTargetStatus,
     }),
   };
