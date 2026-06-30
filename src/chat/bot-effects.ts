@@ -122,6 +122,9 @@ function parseStartStreamMessageBody(raw: unknown): BotEffectMessageBody {
   const attachmentIds = Array.isArray(raw.attachment_ids)
     ? raw.attachment_ids.filter((id): id is string => typeof id === "string")
     : [];
+  if (attachmentIds.length > 0) {
+    throw new BotEffectValidationError("attachment_ids not supported for start_stream");
+  }
   const components = wrapComponentValidation(() => {
     const parsed = Array.isArray(raw.components) ? raw.components : [];
     rejectNonEmptyStreamComponents(parsed);
@@ -147,8 +150,8 @@ function parseMessageBody(raw: unknown): BotEffectMessageBody {
   if (typeof type !== "string" || type.length === 0) {
     throw new BotEffectValidationError("send_message.message.type required");
   }
-  if (type !== "text") {
-    throw new BotEffectValidationError("only text messages are supported");
+  if (type !== "text" && type !== "image") {
+    throw new BotEffectValidationError("only text and image messages are supported");
   }
   if (typeof format !== "string" || !isAllowedBotMessageFormat(format)) {
     throw new BotEffectValidationError(
@@ -170,8 +173,11 @@ function parseMessageBody(raw: unknown): BotEffectMessageBody {
   const attachmentIds = Array.isArray(raw.attachment_ids)
     ? raw.attachment_ids.filter((id): id is string => typeof id === "string")
     : [];
-  if (attachmentIds.length > 0) {
-    throw new BotEffectValidationError("attachment_ids are not supported yet");
+  if (type === "text" && attachmentIds.length > 0) {
+    throw new BotEffectValidationError("attachment_ids not allowed for text messages");
+  }
+  if (type === "image" && attachmentIds.length === 0) {
+    throw new BotEffectValidationError("image message requires attachment_ids");
   }
   const components = wrapComponentValidation(() =>
     validateComponents(Array.isArray(raw.components) ? raw.components : []),
@@ -241,14 +247,14 @@ export function parseNonStreamEffect(raw: BotEffectWire): ParsedNonStreamEffect 
       if (!Array.isArray(messageRaw.attachment_ids)) {
         throw new BotEffectValidationError("update_message.message.attachment_ids must be an array");
       }
-      const attachmentIds = messageRaw.attachment_ids.filter((id): id is string => typeof id === "string");
-      if (attachmentIds.length > 0) {
-        throw new BotEffectValidationError("attachment_ids are not supported yet");
-      }
-      message.attachment_ids = attachmentIds;
+      message.attachment_ids = messageRaw.attachment_ids.filter((id): id is string => typeof id === "string");
     }
-    if (message.text === undefined && message.components === undefined) {
-      throw new BotEffectValidationError("update_message requires text and/or components");
+    if (
+      message.text === undefined &&
+      message.components === undefined &&
+      message.attachment_ids === undefined
+    ) {
+      throw new BotEffectValidationError("update_message requires text, components, and/or attachment_ids");
     }
     return { type, client_effect_id: clientEffectId, message_id: messageId, message };
   }
@@ -306,6 +312,9 @@ export function validateEffectsForApply(
       }
       assertBotOwnsMessage(row, ctx.botId);
       if (row.status === "deleted" || row.status === "recalled") {
+        throw new BotEffectValidationError("message is not mutable");
+      }
+      if (row.stream_state !== "none") {
         throw new BotEffectValidationError("message is not mutable");
       }
       if (effect.type === "disable_components") {

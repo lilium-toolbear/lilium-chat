@@ -36,11 +36,20 @@ import {
 import {
   appendChatChannelArchive,
   collectDefinedChanges,
+  replaceScopeMessageAttachmentsChange,
   rvEvent,
+  upsertAttachmentsForMessageChanges,
   upsertEventChange,
   upsertMessageChange,
 } from "../../../archive/chat-channel-record";
 import type { ChatChannelHandlerRef } from "../handler-ref";
+import {
+  linkBotMessageAttachments,
+  loadMessageAttachmentProjections,
+  replaceBotMessageAttachments,
+  resolveBotAttachmentIds,
+} from "./bot-attachment-resolve";
+import type { MessageImageAttachment } from "../../../contract/message";
 
 interface BotSummary {
   display_name: string;
@@ -147,11 +156,13 @@ function insertBotLifecycleEvent(
     occurredAt: string;
     messageRow: MessageRow;
     components: WireChatMessage["components"];
+    attachments: MessageImageAttachment[];
     membershipVersion: number;
   },
 ): void {
   const liveMessage = projectMessageForBrowser(input.messageRow, {
     components: input.components,
+    attachments: input.attachments,
   });
   const liveEventFrame = buildEventFrame({
     event_id: input.eventId,
@@ -218,6 +229,15 @@ function applySendMessageEffect(
   const messageId = uuidv7(input.nowMs);
   const eventId = channel.nextEventId(input.nowMs + 1);
   const componentsJson = JSON.stringify(input.effect.message.components);
+  const sql = channel.ctx.storage.sql;
+  const attachmentProjections =
+    input.effect.message.type === "image"
+      ? resolveBotAttachmentIds(sql, {
+          botId: input.botId,
+          channelId: input.channelId,
+          attachmentIds: input.effect.message.attachment_ids,
+        })
+      : [];
   channel.ctx.storage.sql.exec(
     `INSERT INTO messages (
        message_id, command_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
@@ -239,6 +259,9 @@ function applySendMessageEffect(
     input.now,
     input.now,
   );
+  if (input.effect.message.type === "image") {
+    linkBotMessageAttachments(sql, messageId, input.effect.message.attachment_ids);
+  }
 
   const messageRow: MessageRow = {
     message_id: messageId,
@@ -272,6 +295,7 @@ function applySendMessageEffect(
     occurredAt: input.now,
     messageRow,
     components: input.effect.message.components as WireChatMessage["components"],
+    attachments: attachmentProjections,
     membershipVersion: input.membershipVersion,
   });
 
@@ -291,12 +315,15 @@ function applySendMessageEffect(
     input.outboxId,
   );
 
-  appendChatChannelArchive(channel.ctx, input.channelId, input.now, [eventId], () =>
-    collectDefinedChanges([
-      upsertMessageChange(channel.ctx.storage.sql, messageId, input.channelId, rvEvent(eventId)),
+  appendChatChannelArchive(channel.ctx, input.channelId, input.now, [eventId], (sourceSeq) => {
+    const rv = rvEvent(eventId);
+    return collectDefinedChanges([
+      upsertMessageChange(channel.ctx.storage.sql, messageId, input.channelId, rv),
+      replaceScopeMessageAttachmentsChange(channel.ctx.storage.sql, messageId, rv, { omitWhenEmpty: true }),
+      ...upsertAttachmentsForMessageChanges(channel.ctx.storage.sql, messageId, rv),
       upsertEventChange(channel.ctx.storage.sql, eventId),
-    ]),
-  );
+    ]);
+  });
 
   return {
     message_id: messageId,
@@ -324,6 +351,7 @@ function applyUpdateMessageEffect(
     existing: BotEffectMessageContextRow;
   },
 ): { message_id: string; event_id: string; effectResult: EffectResult } {
+  const sql = channel.ctx.storage.sql;
   const nextText = input.effect.message.text ?? input.existing.text ?? "";
   const nextComponentsJson =
     input.effect.message.components !== undefined
@@ -334,12 +362,31 @@ function applyUpdateMessageEffect(
       ? "edited"
       : input.existing.status;
   const editedAt = input.effect.message.text !== undefined ? input.now : input.existing.edited_at;
+  let nextType = input.existing.type;
+  let attachmentProjections: MessageImageAttachment[];
+  if (input.effect.message.attachment_ids !== undefined) {
+    if (input.effect.message.attachment_ids.length > 0) {
+      attachmentProjections = resolveBotAttachmentIds(sql, {
+        botId: input.botId,
+        channelId: input.channelId,
+        attachmentIds: input.effect.message.attachment_ids,
+      });
+      nextType = "image";
+    } else {
+      attachmentProjections = [];
+      nextType = "text";
+    }
+    replaceBotMessageAttachments(sql, input.effect.message_id, input.effect.message.attachment_ids);
+  } else {
+    attachmentProjections = loadMessageAttachmentProjections(sql, input.effect.message_id);
+  }
 
   channel.ctx.storage.sql.exec(
     `UPDATE messages
-     SET text=?, components_json=?, status=?, updated_at=?, edited_at=?
+     SET text=?, type=?, components_json=?, status=?, updated_at=?, edited_at=?
      WHERE message_id=? AND channel_id=?`,
     nextText,
+    nextType,
     nextComponentsJson,
     nextStatus,
     input.now,
@@ -350,6 +397,7 @@ function applyUpdateMessageEffect(
 
   const messageRow: MessageRow = {
     ...input.existing,
+    type: nextType,
     text: nextText,
     status: nextStatus,
     updated_at: input.now,
@@ -364,6 +412,7 @@ function applyUpdateMessageEffect(
     occurredAt: input.now,
     messageRow,
     components: parseStoredComponents(nextComponentsJson),
+    attachments: attachmentProjections,
     membershipVersion: input.membershipVersion,
   });
 
@@ -383,12 +432,21 @@ function applyUpdateMessageEffect(
     input.outboxId,
   );
 
-  appendChatChannelArchive(channel.ctx, input.channelId, input.now, [eventId], () =>
-    collectDefinedChanges([
-      upsertMessageChange(channel.ctx.storage.sql, input.effect.message_id, input.channelId, rvEvent(eventId)),
+  appendChatChannelArchive(channel.ctx, input.channelId, input.now, [eventId], () => {
+    const rv = rvEvent(eventId);
+    return collectDefinedChanges([
+      upsertMessageChange(channel.ctx.storage.sql, input.effect.message_id, input.channelId, rv),
+      ...(input.effect.message.attachment_ids !== undefined
+        ? [
+            replaceScopeMessageAttachmentsChange(channel.ctx.storage.sql, input.effect.message_id, rv, {
+              omitWhenEmpty: true,
+            }),
+            ...upsertAttachmentsForMessageChanges(channel.ctx.storage.sql, input.effect.message_id, rv),
+          ]
+        : []),
       upsertEventChange(channel.ctx.storage.sql, eventId),
-    ]),
-  );
+    ]);
+  });
 
   return {
     message_id: input.effect.message_id,
@@ -434,6 +492,10 @@ function applyDisableComponentsEffect(
     updated_at: input.now,
   };
   const eventId = channel.nextEventId(input.nowMs);
+  const attachmentProjections = loadMessageAttachmentProjections(
+    channel.ctx.storage.sql,
+    input.effect.message_id,
+  );
   insertBotLifecycleEvent(channel, {
     eventId,
     eventType: "message.updated",
@@ -442,6 +504,7 @@ function applyDisableComponentsEffect(
     occurredAt: input.now,
     messageRow,
     components: parseStoredComponents(nextComponentsJson),
+    attachments: attachmentProjections,
     membershipVersion: input.membershipVersion,
   });
 

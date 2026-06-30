@@ -178,4 +178,86 @@ describe("bot-effects validation", () => {
       ),
     ).toThrow(/UUIDv7/);
   });
+
+  it("parses send_message type=image with attachment_ids", () => {
+    const parsed = parseNonStreamEffect({
+      type: "send_message",
+      client_effect_id: "eff-img",
+      message: {
+        type: "image",
+        format: "plain",
+        text: "",
+        reply_to_message_id: null,
+        attachment_ids: ["att-1"],
+        components: [],
+      },
+    });
+    expect(parsed.type).toBe("send_message");
+    if (parsed.type !== "send_message") return;
+    expect(parsed.message.type).toBe("image");
+    expect(parsed.message.attachment_ids).toEqual(["att-1"]);
+  });
+
+  it("rejects text send_message with attachment_ids", () => {
+    expect(() =>
+      parseNonStreamEffect({
+        type: "send_message",
+        client_effect_id: "eff-text-att",
+        message: {
+          type: "text",
+          format: "plain",
+          text: "hi",
+          reply_to_message_id: null,
+          attachment_ids: ["att-1"],
+          components: [],
+        },
+      }),
+    ).toThrow(/not allowed for text/);
+  });
+
+  it("rejects image send_message without attachment_ids", () => {
+    expect(() =>
+      parseNonStreamEffect({
+        type: "send_message",
+        client_effect_id: "eff-img-empty",
+        message: {
+          type: "image",
+          format: "plain",
+          text: "",
+          reply_to_message_id: null,
+          attachment_ids: [],
+          components: [],
+        },
+      }),
+    ).toThrow(/requires attachment_ids/);
+  });
+
+  it("parses update_message with attachment_ids only", () => {
+    const parsed = parseNonStreamEffect({
+      type: "update_message",
+      client_effect_id: "eff-upd-att",
+      message_id: "msg-1",
+      message: { attachment_ids: ["att-2"] },
+    });
+    expect(parsed.type).toBe("update_message");
+    if (parsed.type !== "update_message") return;
+    expect(parsed.message.attachment_ids).toEqual(["att-2"]);
+  });
+
+  it("rejects start_stream with attachment_ids", () => {
+    expect(() =>
+      parseBotEffect({
+        type: "start_stream",
+        client_effect_id: "eff-stream-att",
+        message: {
+          type: "text",
+          format: "plain",
+          text: "",
+          reply_to_message_id: null,
+          attachment_ids: ["att-1"],
+          components: [],
+        },
+      }),
+    ).toThrow(/not supported for start_stream/);
+  });
 });
