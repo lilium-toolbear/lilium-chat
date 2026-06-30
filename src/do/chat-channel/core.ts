@@ -24,7 +24,6 @@ import type {
   AddMemberRpcInput,
   BotDeliveryResultInput,
   BotDeliveryResultResponse,
-  BotSessionAckResponse,
   ChannelMetaProjection,
   CommandBindingUpdateRpcInput,
   CommandBindingUpdateResponse,

@@ -1,7 +1,6 @@
 import type { EffectResult } from "./bot-gateway";
 
 export interface StreamRegistryCheckResponse {
-  ok: true;
   channel_id: string;
   message_id: string;
   bot_id: string;

@@ -16,7 +16,6 @@ export interface GetStatefulSessionResponse {
 }
 
 export interface StopStatefulSessionResponse {
-  ok: true;
   session_id: string;
 }
 
@@ -38,8 +37,4 @@ export interface StatefulSessionInputItem {
 export interface StatefulSessionInputsResponse {
   session: StatefulSessionRefSummary;
   inputs: StatefulSessionInputItem[];
-}
-
-export interface BotSessionAckResponse {
-  ok: true;
 }

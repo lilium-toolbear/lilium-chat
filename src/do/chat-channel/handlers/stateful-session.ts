@@ -876,7 +876,7 @@ export function StatefulSessionMixin<T extends Constructor<ChatChannelCore>>(Bas
 
       await closeStatefulSession(asHandlerRef(this), input.session_id, input.reason);
 
-      const responseBody: StopStatefulSessionResponse = { ok: true, session_id: input.session_id };
+      const responseBody: StopStatefulSessionResponse = { session_id: input.session_id };
       this.ctx.storage.transactionSync(() => {
         writeUserCompletedIdempotency(this.ctx.storage.sql, {
           userId: input.user_id,

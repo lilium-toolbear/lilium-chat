@@ -430,7 +430,7 @@ describe("stateful command sessions", () => {
       sessionId,
       operationId,
     });
-    expect(firstStop).toMatchObject({ ok: true, session_id: sessionId });
+    expect(firstStop).toMatchObject({ session_id: sessionId });
 
     const retryStop = await stopStatefulSession({
       userId,
@@ -438,7 +438,7 @@ describe("stateful command sessions", () => {
       sessionId,
       operationId,
     });
-    expect(retryStop).toMatchObject({ ok: true, session_id: sessionId });
+    expect(retryStop).toMatchObject({ session_id: sessionId });
     expect(retryStop.error?.code).toBeUndefined();
 
     ws.close();

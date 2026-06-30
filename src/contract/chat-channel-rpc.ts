@@ -31,7 +31,6 @@ export type {
 } from "./bot-api";
 
 export type {
-  BotSessionAckResponse,
   GetStatefulSessionResponse,
   StatefulSessionInputsResponse,
   StopStatefulSessionResponse,
