@@ -2,6 +2,7 @@ import type { Env } from "../env";
 import {
   TIMELINE_HISTORY_EVENT_TYPES,
 } from "../contract/events";
+import { ApiError } from "../errors";
 import type { EventFrame } from "../contract/wire-frames";
 import {
   collectReplayUserIds,
@@ -55,7 +56,7 @@ export async function buildTimelineHistoryPage(opts: {
   before?: string | null;
   after?: string | null;
   limit: number;
-}): Promise<TimelineHistoryPage | { forbidden: true } | { notFound: true }> {
+}): Promise<TimelineHistoryPage> {
   const { sql, env, userId, limit } = opts;
   const before = opts.before && opts.before !== "" ? opts.before : null;
   const after = opts.after && opts.after !== "" ? opts.after : null;
@@ -63,7 +64,9 @@ export async function buildTimelineHistoryPage(opts: {
   const meta = sql.exec("SELECT channel_id, visibility FROM channel_meta LIMIT 1").toArray()[0] as
     | { channel_id: string; visibility: string }
     | undefined;
-  if (meta === undefined) return { notFound: true };
+  if (meta === undefined) {
+    throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  }
 
   const member = userId
     ? (sql.exec(
@@ -73,7 +76,7 @@ export async function buildTimelineHistoryPage(opts: {
       ).toArray()[0] as { x: number } | undefined)
     : undefined;
   if (!member && meta.visibility === "private") {
-    return { forbidden: true };
+    throw new ApiError("FORBIDDEN", "not a member");
   }
 
   const { clause, types } = timelineTypePlaceholders();
@@ -116,18 +119,4 @@ export async function buildTimelineHistoryPage(opts: {
   const items = await projectTimelineRows({ sql, env, channelId: meta.channel_id, rows: slice });
   const next_cursor = hasMore && slice.length > 0 ? String(slice[0]!.event_id ?? "") : null;
   return { items, next_cursor: next_cursor || null };
-}
-
-export async function buildTimelineHistoryResponse(opts: {
-  sql: SyncSql;
-  env: Env;
-  userId: string;
-  before?: string | null;
-  after?: string | null;
-  limit: number;
-}): Promise<Response> {
-  const result = await buildTimelineHistoryPage(opts);
-  if ("forbidden" in result) return new Response("forbidden", { status: 403 });
-  if ("notFound" in result) return new Response("channel not created", { status: 409 });
-  return Response.json({ items: result.items, next_cursor: result.next_cursor });
 }

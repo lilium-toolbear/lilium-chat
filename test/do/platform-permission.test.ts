@@ -4,7 +4,9 @@ import {
   PLATFORM_HELP_BOT_COMMAND_ID,
   PLATFORM_PERMISSION_BOT_COMMAND_ID,
 } from "../../src/chat/platform-commands";
-import { createOwnedTestChannel, getNamedDo } from "../helpers";
+import { createOwnedTestChannel, addTestMember, getNamedDo } from "../helpers";
+import type { CommandManifestResponse } from "../../src/contract/bot-api";
+import type { ChatChannel } from "../../src/do/chat-channel";
 import { nextAck, upgradeUserConnection } from "../ws-helpers";
 
 async function withChannel(
@@ -65,23 +67,13 @@ async function addChannelMember(
   memberUserId: string,
   role: "member" | "admin",
 ): Promise<void> {
-  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as DurableObjectNamespace, channelId);
-  const res = await stub.fetch(
-    new Request("https://x/internal/members-add", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Verified-User-Id": actorUserId,
-      },
-      body: JSON.stringify({
-        idempotency_key: `add-${memberUserId}-${crypto.randomUUID()}`,
-        channel_id: channelId,
-        user_id: memberUserId,
-        role,
-      }),
-    }),
-  );
-  expect(res.status).toBe(200);
+  const stub = getNamedDo<ChatChannel>(env.CHAT_CHANNEL as unknown as DurableObjectNamespace<ChatChannel>, channelId);
+  await addTestMember(stub, {
+    actorUserId,
+    targetUserId: memberUserId,
+    channelId,
+    role,
+  });
 }
 
 async function invokePermission(
@@ -244,24 +236,12 @@ describe("platform /permission", () => {
     );
     await addChannelMember(channelId, ownerId, memberId, "member");
 
-    const channelStub = getNamedDo(env.CHAT_CHANNEL as unknown as DurableObjectNamespace, channelId);
-    const ownerRes = await channelStub.fetch(
-      new Request(`https://x/internal/channel-commands?channel_id=${encodeURIComponent(channelId)}`, {
-        headers: { "X-Verified-User-Id": ownerId },
-      }),
-    );
-    expect(ownerRes.status).toBe(200);
-    const ownerManifest = (await ownerRes.json()) as { items: Array<{ bot_command_id: string }> };
+    const channelStub = getNamedDo<ChatChannel>(env.CHAT_CHANNEL as unknown as DurableObjectNamespace<ChatChannel>, channelId);
+    const ownerManifest = await channelStub.getChannelCommands(ownerId, channelId) as CommandManifestResponse;
     expect(ownerManifest.items.some((item) => item.bot_command_id === PLATFORM_PERMISSION_BOT_COMMAND_ID)).toBe(true);
     expect(ownerManifest.items.some((item) => item.bot_command_id === PLATFORM_HELP_BOT_COMMAND_ID)).toBe(true);
 
-    const memberRes = await channelStub.fetch(
-      new Request(`https://x/internal/channel-commands?channel_id=${encodeURIComponent(channelId)}`, {
-        headers: { "X-Verified-User-Id": memberId },
-      }),
-    );
-    expect(memberRes.status).toBe(200);
-    const memberManifest = (await memberRes.json()) as { items: Array<{ bot_command_id: string }> };
+    const memberManifest = await channelStub.getChannelCommands(memberId, channelId) as CommandManifestResponse;
     expect(memberManifest.items.some((item) => item.bot_command_id === PLATFORM_PERMISSION_BOT_COMMAND_ID)).toBe(false);
     expect(memberManifest.items.some((item) => item.bot_command_id === PLATFORM_HELP_BOT_COMMAND_ID)).toBe(true);
   });

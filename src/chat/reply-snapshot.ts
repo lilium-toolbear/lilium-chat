@@ -3,6 +3,7 @@ import type {
   ReplySnapshot,
   ReplySnapshotMediaPreview,
 } from "../contract/message";
+import { logSwallowedError } from "../errors";
 import type { MessageRow } from "../contract/persisted";
 import { fallbackUserDisplayName } from "../contract/primitives";
 import {
@@ -123,7 +124,8 @@ export function parseStoredReplySnapshot(raw: string | null): ReplySnapshot | nu
   if (!raw) return null;
   try {
     return JSON.parse(raw) as ReplySnapshot;
-  } catch {
+  } catch (err) {
+    logSwallowedError("reply_snapshot_json_invalid", err);
     return null;
   }
 }

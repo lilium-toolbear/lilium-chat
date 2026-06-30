@@ -137,7 +137,7 @@ app.get("/api/chat/channels/:channel_id/commands", (c) => listChannelCommandsHan
 app.get("/api/chat/channels/:channel_id/stateful-session", (c) => getStatefulSessionHandler(c));
 app.post("/api/chat/channels/:channel_id/stateful-session/stop", (c) => stopStatefulSessionHandler(c));
 app.all("/api/chat/*", (c) => {
-  throw new ApiError("CHANNEL_NOT_FOUND", "route not found", { httpStatus: 404 });
+  throw new ApiError("NOT_FOUND", "route not found", { httpStatus: 404 });
 });
 
 export default app;

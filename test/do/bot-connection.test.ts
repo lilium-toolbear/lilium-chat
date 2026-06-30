@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { BOT_GATEWAY_API_VERSION, buildDeliveryAck } from "../../src/chat/bot-gateway-protocol";
-import { getNamedDo } from "../helpers";
+import { getNamedDo, readDoSchemaVersion } from "../helpers";
+import type { BotConnection } from "../../src/do/bot-connection";
 
-function botConnectionStub(botId: string): DurableObjectStub {
-  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace, botId);
+function botConnectionStub(botId: string): DurableObjectStub<BotConnection> {
+  return getNamedDo<BotConnection>(env.BOT_CONNECTION, botId);
 }
 
-async function openConnection(botId: string): Promise<{ ws: WebSocket; stub: DurableObjectStub }> {
+async function openConnection(botId: string): Promise<{ ws: WebSocket; stub: DurableObjectStub<BotConnection> }> {
   const stub = botConnectionStub(botId);
   const res = await stub.fetch(new Request("https://x/bot", {
     headers: {
@@ -64,17 +65,15 @@ async function withBotConnection(
 }
 
 async function waitForConnectionState(
-  stub: DurableObjectStub,
+  stub: DurableObjectStub<BotConnection>,
   expected: string,
 ): Promise<{ status: string; session_id: string | null }> {
   for (let i = 0; i < 20; i += 1) {
-    const res = await stub.fetch(new Request("https://x/internal/connection-state"));
-    const state = (await res.json()) as { status: string; session_id: string | null };
+    const state = await stub.getConnectionState();
     if (state.status === expected) return state;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  const finalRes = await stub.fetch(new Request("https://x/internal/connection-state"));
-  return (await finalRes.json()) as { status: string; session_id: string | null };
+  return stub.getConnectionState();
 }
 
 describe("BotConnection DO (7b-connection)", () => {
@@ -94,8 +93,7 @@ describe("BotConnection DO (7b-connection)", () => {
     expect(frame.bot_id).toBe(botId);
     expect(frame.session_id).toBeTruthy();
 
-    const stateRes = await stub.fetch(new Request("https://x/internal/connection-state"));
-    const state = (await stateRes.json()) as { status: string; session_id: string | null };
+    const state = await stub.getConnectionState();
     expect(state.status).toBe("connected");
     expect(state.session_id).toBe(frame.session_id);
     ws.close();
@@ -137,11 +135,10 @@ describe("BotConnection DO (7b-connection)", () => {
     expect(state.status).toBe("disconnected");
   });
 
-  it("returns disconnected for /internal/connection-state when offline", async () => {
+  it("returns disconnected for getConnectionState when offline", async () => {
     const botId = `bot-state-${crypto.randomUUID()}`;
     const { ws, stub } = await openConnection(botId);
-    const initial = await stub.fetch(new Request("https://x/internal/connection-state"));
-    const initialState = (await initial.json()) as { status: string; session_id: string | null };
+    const initialState = await stub.getConnectionState();
     expect(initialState.status).toBe("disconnected");
 
     ws.send(
@@ -156,8 +153,7 @@ describe("BotConnection DO (7b-connection)", () => {
       type: string;
     };
     expect(ready.type).toBe("ready");
-    const connected = await stub.fetch(new Request("https://x/internal/connection-state"));
-    const connectedState = (await connected.json()) as { status: string; session_id: string | null };
+    const connectedState = await stub.getConnectionState();
     expect(connectedState.status).toBe("connected");
     expect(connectedState.session_id).toBeTruthy();
     ws.close();
@@ -168,7 +164,7 @@ describe("BotConnection DO (7b-connection)", () => {
     const stub = botConnectionStub(botId);
     const now = new Date().toISOString();
     const future = new Date(Date.now() + 60000).toISOString();
-    await stub.fetch(new Request("https://x/ping"));
+    await readDoSchemaVersion(stub);
     await withBotConnection(stub, (ctx) => {
       ctx.storage.sql.exec(
         `INSERT INTO bot_connection_state (
@@ -182,8 +178,7 @@ describe("BotConnection DO (7b-connection)", () => {
       );
     });
 
-    const res = await stub.fetch(new Request("https://x/internal/connection-state"));
-    const state = (await res.json()) as { status: string; session_id: string | null };
+    const state = await stub.getConnectionState();
     expect(state.status).toBe("disconnected");
     expect(state.session_id).toBeNull();
 
@@ -196,7 +191,7 @@ describe("BotConnection DO (7b-connection)", () => {
     });
   });
 
-  it("closes expired connected state on /internal/connection-state", async () => {
+  it("closes expired connected state on getConnectionState", async () => {
     const botId = `bot-expired-state-${crypto.randomUUID()}`;
     const { ws, stub } = await openConnection(botId);
     ws.send(JSON.stringify({
@@ -213,8 +208,7 @@ describe("BotConnection DO (7b-connection)", () => {
       );
     });
 
-    const res = await stub.fetch(new Request("https://x/internal/connection-state"));
-    const state = (await res.json()) as { status: string; session_id: string | null };
+    const state = await stub.getConnectionState();
     expect(state.status).toBe("disconnected");
     expect(state.session_id).toBeNull();
     ws.close();

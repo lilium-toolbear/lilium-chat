@@ -12,6 +12,7 @@ import { buildReplyTargetStatusLookup } from "./reply-snapshot";
 import { projectAttachmentForBrowser, type AttachmentRow as ChatAttachmentRow } from "./attachment-projection";
 import { resolveActorWithMap } from "./channel-events";
 import type { Env } from "../env";
+import { ApiError, logSwallowedError } from "../errors";
 import {
   isChatEventType,
   REPLAY_BOT_LIFECYCLE_EVENT_TYPES,
@@ -196,8 +197,11 @@ export function collectReplayUserIds(sql: SyncSql, parsedRows: ReplayEventRow[])
         if (messageId) {
           userIdsToResolve.push(...extractMessageSenderUserId(sql, messageId));
         }
-      } catch {
-        // ignore malformed payload
+      } catch (err) {
+        logSwallowedError("replay_collect_user_ids_malformed_payload", err, {
+          event_type: r.event_type,
+          event_id: r.event_id,
+        });
       }
       continue;
     }
@@ -207,8 +211,11 @@ export function collectReplayUserIds(sql: SyncSql, parsedRows: ReplayEventRow[])
         if (typeof p.actor_user_id === "string" && p.actor_user_id) {
           userIdsToResolve.push(p.actor_user_id);
         }
-      } catch {
-        // ignore malformed payload
+      } catch (err) {
+        logSwallowedError("replay_collect_user_ids_malformed_payload", err, {
+          event_type: r.event_type,
+          event_id: r.event_id,
+        });
       }
       continue;
     }
@@ -225,8 +232,11 @@ export function collectReplayUserIds(sql: SyncSql, parsedRows: ReplayEventRow[])
         if (typeof p.target_user_id === "string" && p.target_user_id) userIdsToResolve.push(p.target_user_id);
         if (typeof p.user_id === "string" && p.user_id) userIdsToResolve.push(p.user_id);
         if (typeof p.inviter_user_id === "string" && p.inviter_user_id) userIdsToResolve.push(p.inviter_user_id);
-      } catch {
-        // ignore malformed payload
+      } catch (err) {
+        logSwallowedError("replay_collect_user_ids_malformed_payload", err, {
+          event_type: r.event_type,
+          event_id: r.event_id,
+        });
       }
     }
   }
@@ -256,7 +266,11 @@ export function projectParsedEventRows(opts: {
     let persistedPayload: MessagePersistedPayload | ManagementPersistedPayload | unknown = {};
     try {
       persistedPayload = JSON.parse(r.payload_json) as MessagePersistedPayload | ManagementPersistedPayload;
-    } catch {
+    } catch (err) {
+      logSwallowedError("replay_event_payload_parse_failed", err, {
+        event_type: r.event_type,
+        event_id: r.event_id,
+      });
       persistedPayload = {};
     }
 
@@ -281,7 +295,11 @@ export function projectParsedEventRows(opts: {
         } else {
           wirePayload = projected;
         }
-      } catch {
+      } catch (err) {
+        logSwallowedError("replay_message_projection_failed", err, {
+          event_type: r.event_type,
+          event_id: r.event_id,
+        });
         continue;
       }
     } else if (botLifecycleTypes.has(r.event_type)) {
@@ -308,17 +326,17 @@ export function projectParsedEventRows(opts: {
   return out;
 }
 
-export async function buildReplayEventsResponse(opts: {
+export async function buildReplayEventsPage(opts: {
   sql: SyncSql;
   env: Env;
   userId: string;
   after: string;
-}): Promise<Response> {
+}): Promise<{ events: ReplayEnvelope[] }> {
   const { sql, env, userId, after } = opts;
   const meta = sql.exec("SELECT channel_id, visibility FROM channel_meta LIMIT 1").toArray()[0] as
     | { channel_id: string; visibility: string }
     | undefined;
-  if (meta === undefined) return Response.json({ events: [] });
+  if (meta === undefined) return { events: [] };
 
   const member = userId
     ? (sql.exec(
@@ -328,7 +346,7 @@ export async function buildReplayEventsResponse(opts: {
       ).toArray()[0] as { x: number } | undefined)
     : undefined;
   if (!member && meta.visibility === "private") {
-    return new Response("forbidden", { status: 403 });
+    throw new ApiError("FORBIDDEN", "not a member");
   }
 
   const rows = sql
@@ -354,5 +372,5 @@ export async function buildReplayEventsResponse(opts: {
     event_json: JSON.stringify(frame),
   }));
 
-  return Response.json({ events: out });
+  return { events: out };
 }

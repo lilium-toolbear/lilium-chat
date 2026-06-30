@@ -1,9 +1,11 @@
 import type { Context } from "hono";
 import type { Env } from "../env";
-import { ApiError } from "../errors";
+import { ApiError, apiErrorFromRemote } from "../errors";
 import type { OpenDmApiResponse } from "../contract/channel-api";
 import { inflateChannelSummaryForViewer } from "../chat/channel-summary";
 import { getIdentity } from "./channel-mutations";
+import type { UserDirectory } from "../do/user-directory";
+import type { ChatChannel } from "../do/chat-channel";
 
 type OpenDmInternalResponse =
   | { kind: "cached"; response: OpenDmApiResponse }
@@ -18,47 +20,25 @@ export async function openDmHandler(c: Context<{ Bindings: Env; Variables: { req
   if (!body?.recipient_user_id) throw new ApiError("INVALID_DM_TARGET", "recipient_user_id required");
   if (body.recipient_user_id === userId) throw new ApiError("INVALID_DM_TARGET", "cannot open DM with yourself");
 
-  const dirStub = env.USER_DIRECTORY.getByName(userId);
-  const res = await dirStub.fetch(new Request("https://x/internal/open-dm", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ idempotency_key: idempotencyKey, recipient_user_id: body.recipient_user_id }),
-  }));
-
-  if (res.status === 404) {
-    const e = await res.json().catch(() => ({})) as { error?: { message?: string } };
-    throw new ApiError("DM_TARGET_NOT_FOUND", e.error?.message ?? "recipient user not found");
-  }
-  if (res.status === 409) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError(e.error?.code ?? "IDEMPOTENCY_CONFLICT", e.error?.message ?? "idempotency conflict");
-  }
-  if (res.status === 422) {
-    const e = await res.json().catch(() => ({})) as { error?: { message?: string } };
-    throw new ApiError("INVALID_DM_TARGET", e.error?.message ?? "invalid dm target");
-  }
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "dm open failed");
-
-  const internal = await res.json() as OpenDmInternalResponse;
+  const dirStub = env.USER_DIRECTORY.getByName(userId) as DurableObjectStub<UserDirectory>;
+  const internal = await dirStub.openDm(userId, { idempotency_key: idempotencyKey, recipient_user_id: body.recipient_user_id })
+    .catch((err) => {
+      throw apiErrorFromRemote(err) ?? err;
+    }) as OpenDmInternalResponse;
   if (internal.kind === "cached") {
     return c.json(internal.response, 200, { "X-Request-Id": c.get("requestId") });
   }
 
   const channelId = internal.channel_id;
-  const chStub = env.CHAT_CHANNEL.getByName(channelId);
-  const summaryRes = await chStub.fetch(new Request("https://x/internal/summary", {
-    headers: { "X-Verified-User-Id": userId },
-  }));
-  if (!summaryRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "failed to load dm summary");
-
-  const summary = await summaryRes.json() as Parameters<typeof inflateChannelSummaryForViewer>[0]["summary"];
+  const chStub = env.CHAT_CHANNEL.getByName(channelId) as DurableObjectStub<ChatChannel>;
+  const summary = await chStub.getSummary(userId).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  });
 
   let myChannelRow: { last_read_event_id: string | null } | null = null;
-  const myChannelsRes = await dirStub.fetch(new Request("https://x/my-channels", {
-    headers: { "X-Verified-User-Id": userId },
-  }));
-  if (myChannelsRes.ok) {
-    const items = ((await myChannelsRes.json()) as { items: Array<{ channel_id: string; last_read_event_id: string | null }> }).items;
+  const myChannels = await dirStub.listMyChannels(userId).catch(() => null);
+  if (myChannels) {
+    const items = myChannels.items;
     const row = items.find((it) => it.channel_id === channelId);
     if (row) myChannelRow = { last_read_event_id: row.last_read_event_id };
   }
@@ -75,15 +55,10 @@ export async function openDmHandler(c: Context<{ Bindings: Env; Variables: { req
     membership: { role: internal.role, joined_at: internal.joined_at },
   };
 
-  const completeRes = await dirStub.fetch(new Request("https://x/internal/open-dm-complete", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      idempotency_key: idempotencyKey,
-      response_json: JSON.stringify(response),
-    }),
-  }));
-  if (!completeRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "dm open completion failed");
+  await dirStub.completeOpenDm(userId, {
+    idempotency_key: idempotencyKey,
+    response_json: JSON.stringify(response),
+  });
 
   return c.json(response, 200, { "X-Request-Id": c.get("requestId") });
 }

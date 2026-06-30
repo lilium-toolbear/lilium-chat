@@ -1,18 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { BOT_GATEWAY_API_VERSION } from "../../src/chat/bot-gateway-protocol";
-import { createTestChannel, getNamedDo } from "../helpers";
+import { createTestChannel, getNamedDo, readDoSchemaVersion } from "../helpers";
+import type { BotConnection } from "../../src/do/bot-connection";
 
-function botConnectionStub(botId: string): DurableObjectStub {
-  return getNamedDo(
-    env.BOT_CONNECTION as unknown as DurableObjectNamespace,
-    botId,
-  );
+function botConnectionStub(botId: string): DurableObjectStub<BotConnection> {
+  return getNamedDo<BotConnection>(env.BOT_CONNECTION, botId);
 }
 
 async function openConnection(
   botId: string,
-): Promise<{ ws: WebSocket; stub: DurableObjectStub }> {
+): Promise<{ ws: WebSocket; stub: DurableObjectStub<BotConnection> }> {
   const stub = botConnectionStub(botId);
   const res = await stub.fetch(
     new Request("https://x/bot", {
@@ -89,7 +87,7 @@ function enqueuePayload(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     outbox_id: `outbox-${crypto.randomUUID()}`,
     channel_id: channelId,
-    kind: "command_invocation",
+    kind: "command_invocation" as const,
     target_id: targetId,
     request_json: JSON.stringify({
       channel_id: channelId,
@@ -101,24 +99,22 @@ function enqueuePayload(overrides: Partial<Record<string, unknown>> = {}) {
   };
 }
 
+async function enqueueDelivery(
+  stub: DurableObjectStub<BotConnection>,
+  botId: string,
+  payload: ReturnType<typeof enqueuePayload>,
+) {
+  return stub.enqueueDelivery(botId, payload);
+}
+
 describe("BotConnection DO delivery queue (7b)", () => {
-  it("persists a pending delivery row on /internal/enqueue-delivery", async () => {
+  it("persists a pending delivery row through enqueueDelivery RPC", async () => {
     const botId = `bot-delivery-persist-${crypto.randomUUID()}`;
     const stub = botConnectionStub(botId);
     const payload = enqueuePayload();
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(res.status).toBe(200);
-    const out = (await res.json()) as { delivery_id: string; status: string };
+    const res = await enqueueDelivery(stub, botId, payload);
+    const out = { delivery_id: res.delivery_id, status: res.status };
     expect(out.delivery_id).toBeTruthy();
 
     const { runInDurableObject } = await import("cloudflare:test");
@@ -174,18 +170,8 @@ describe("BotConnection DO delivery queue (7b)", () => {
     await nextMessageOfType(ws, "ready");
 
     const payload = enqueuePayload();
-    const enq = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(enq.status).toBe(200);
-
+    const enq = await enqueueDelivery(stub, botId, payload);
+    
     const deliveryFrame = JSON.parse(
       await nextMessageOfType(ws, "delivery"),
     ) as {
@@ -252,18 +238,8 @@ describe("BotConnection DO delivery queue (7b)", () => {
     await nextMessageOfType(ws, "ready");
 
     const payload = enqueuePayload();
-    const enq = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(enq.status).toBe(200);
-
+    const enq = await enqueueDelivery(stub, botId, payload);
+    
     const deliveryFrame = JSON.parse(
       await nextMessageOfType(ws, "delivery"),
     ) as { delivery_id: string };
@@ -339,18 +315,8 @@ describe("BotConnection DO delivery queue (7b)", () => {
       }),
     });
     const oldSocketIdle = noMessageOfType(first.ws, "delivery", 2000);
-    const enq = await first.stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(enq.status).toBe(200);
-
+    const enq = await enqueueDelivery(first.stub, botId, payload);
+    
     const deliveryFrame = JSON.parse(
       await nextMessageOfType(second.ws, "delivery"),
     ) as { invocation_id?: string };
@@ -365,18 +331,8 @@ describe("BotConnection DO delivery queue (7b)", () => {
     const stub = botConnectionStub(botId);
     const payload = enqueuePayload({ outbox_id: "outbox-disconnected" });
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(res.status).toBe(200);
-
+    const res = await enqueueDelivery(stub, botId, payload);
+    
     const { runInDurableObject } = await import("cloudflare:test");
     await runInDurableObject(stub, async (instance: unknown) => {
       const sql = (
@@ -409,31 +365,9 @@ describe("BotConnection DO delivery queue (7b)", () => {
     const stub = botConnectionStub(botId);
     const payload = enqueuePayload({ outbox_id: `outbox-dedupe-${crypto.randomUUID()}` });
 
-    const first = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    const second = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(first.status).toBe(200);
-    expect(second.status).toBe(200);
-    const firstBody = (await first.json()) as { delivery_id: string };
-    const secondBody = (await second.json()) as { delivery_id: string };
-    expect(secondBody.delivery_id).toBe(firstBody.delivery_id);
+    const first = await enqueueDelivery(stub, botId, payload);
+    const second = await enqueueDelivery(stub, botId, payload);
+    expect(second.delivery_id).toBe(first.delivery_id);
 
     const { runInDurableObject } = await import("cloudflare:test");
     await runInDurableObject(stub, async (instance: unknown) => {
@@ -466,7 +400,7 @@ describe("BotConnection DO delivery queue (7b)", () => {
     const botId = `bot-delivery-stale-online-${crypto.randomUUID()}`;
     const stub = botConnectionStub(botId);
     const now = new Date().toISOString();
-    await stub.fetch(new Request("https://x/ping"));
+    await readDoSchemaVersion(stub);
     const { runInDurableObject } = await import("cloudflare:test");
     await runInDurableObject(stub, async (instance: unknown) => {
       const sql = (
@@ -491,18 +425,8 @@ describe("BotConnection DO delivery queue (7b)", () => {
     });
 
     const payload = enqueuePayload();
-    const res = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { status: string };
+    const res = await enqueueDelivery(stub, botId, payload);
+    const body = { status: res.status };
     expect(body.status).toBe("pending");
 
     await runInDurableObject(stub, async (instance: unknown) => {
@@ -561,33 +485,13 @@ describe("BotConnection DO delivery queue (7b)", () => {
         invoker: { user_id: "user-delivery" },
       }),
     });
-    const enqPending = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payloadPending),
-      }),
-    );
-    const enqSent = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payloadSent),
-      }),
-    );
-    expect(enqPending.status).toBe(200);
-    expect(enqSent.status).toBe(200);
-
+    const enqPending = await enqueueDelivery(stub, botId, payloadPending);
+    const enqSent = await enqueueDelivery(stub, botId, payloadSent);
+        
     const { runInDurableObject } = await import("cloudflare:test");
     const out = {
-      pending: (await enqPending.json()) as { delivery_id: string },
-      sent: (await enqSent.json()) as { delivery_id: string },
+      pending: { delivery_id: enqPending.delivery_id },
+      sent: { delivery_id: enqSent.delivery_id },
     };
     await runInDurableObject(stub, async (instance: unknown) => {
       const nowDue = String(Date.now() - 1000);
@@ -694,18 +598,8 @@ describe("BotConnection DO delivery queue (7b)", () => {
       outbox_id: "outbox-event-expired",
       target_id: "target-event",
     });
-    const enq = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(enq.status).toBe(200);
-    const out = (await enq.json()) as { delivery_id: string };
+    const enq = await enqueueDelivery(stub, botId, payload);
+    const out = { delivery_id: enq.delivery_id };
 
     await runInDurableObject(stub, async (instance: unknown) => {
       const sql = (
@@ -774,18 +668,8 @@ describe("BotConnection DO delivery queue (7b)", () => {
       outbox_id: "outbox-event-pending",
       target_id: "target-event-pending",
     });
-    const enq = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(enq.status).toBe(200);
-
+    const enq = await enqueueDelivery(stub, botId, payload);
+    
     for (let i = 0; i < 4; i += 1) {
       await runInDurableObject(stub, async (instance: unknown) => {
         const sql = (
@@ -848,18 +732,8 @@ describe("BotConnection DO delivery queue (7b)", () => {
       outbox_id: "outbox-command-retry",
       target_id: "target-retry",
     });
-    const enq = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(enq.status).toBe(200);
-    const out = (await enq.json()) as { delivery_id: string };
+    const enq = await enqueueDelivery(stub, botId, payload);
+    const out = { delivery_id: enq.delivery_id };
     const nowIso = new Date().toISOString();
 
     await runInDurableObject(stub, async (instance: unknown) => {

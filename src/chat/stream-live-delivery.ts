@@ -41,17 +41,8 @@ export async function deliverLiveStreamFrame(
   },
 ): Promise<void> {
   const fanout = env.CHANNEL_FANOUT.getByName(input.channel_id);
-  await fanout.fetch(
-    new Request("https://x/internal/deliver-stream-frame", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Channel-Id": input.channel_id,
-      },
-      body: JSON.stringify({
-        channel_id: input.channel_id,
-        frame: input.frame,
-      }),
-    }),
-  );
+  await fanout.fanoutDeliverStreamFrame({
+    channel_id: input.channel_id,
+    frame: input.frame,
+  });
 }

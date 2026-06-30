@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 
-import { setupOwnedChannelForUser } from "../helpers";
+import { mutateTestMessage, replayTestEvents, sendTestMessage, setupOwnedChannelForUser } from "../helpers";
 
 describe("replay filters message.created when message is deleted", () => {
   it("created event absent from replay after delete", async () => {
@@ -12,39 +12,19 @@ describe("replay filters message.created when message is deleted", () => {
     });
 
     const send = (await (
-      await stub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            command_id: "cm-replay-del",
-            dedupe_principal_key: `user:${userId}`,
-            type: "text",
-            text: "hi",
-            reply_to: null,
-            mentions: [],
-            channel_id: channelId,
-          }),
-        }),
-      )
+      await sendTestMessage(stub, { userId, channelId, commandId: "cm-replay-del", text: "hi" })
     ).json()) as { event_id: string; message: { message_id: string } };
 
-    const deleteRes = await stub.fetch(
-      new Request("https://x/internal/message-delete", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          operation_id: "op-replay-del",
-          message_id: send.message.message_id,
-          channel_id: channelId,
-        }),
-      }),
-    );
+    const deleteRes = await mutateTestMessage(stub, {
+      userId,
+      channelId,
+      messageId: send.message.message_id,
+      operation: "message.delete",
+      operationId: "op-replay-del",
+    });
     expect(deleteRes.status).toBe(200);
 
-    const replay = (await (
-      await stub.fetch(new Request(`https://x/internal/replay?after=`, { headers: { "X-Verified-User-Id": userId } }))
-    ).json()) as { events: Array<{ event_id: string; event_json: string }> };
+    const replay = await replayTestEvents(stub, userId);
 
     const created = replay.events.find((e) => e.event_id === send.event_id);
     expect(created).toBeUndefined();

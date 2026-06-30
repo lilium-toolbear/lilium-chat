@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { getNamedDo, makeJwt, TEST_SECRET } from "../helpers";
+import type { ChatChannel } from "../../src/do/chat-channel";
 
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
@@ -24,18 +25,14 @@ async function authedReq(
 }
 
 async function listMembers(channelId: string, viewerUserId: string): Promise<Array<{ user_id: string; role: string }>> {
-  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
-  const res = await stub.fetch(new Request("https://x/internal/members-list", { headers: { "X-Verified-User-Id": viewerUserId } }));
-  expect(res.status).toBe(200);
-  const body = (await res.json()) as { items: Array<{ user_id: string; role: string }> };
+  const stub = getNamedDo<ChatChannel>(env.CHAT_CHANNEL, channelId);
+  const body = await stub.listMembers(viewerUserId, "");
   return body.items;
 }
 
 async function readReplay(channelId: string, viewerUserId: string): Promise<Array<{ type: string; payload: Record<string, unknown> }>> {
-  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
-  const res = await stub.fetch(new Request("https://x/internal/replay?after=", { headers: { "X-Verified-User-Id": viewerUserId } }));
-  expect(res.status).toBe(200);
-  const replay = (await res.json()) as { events: Array<{ event_json: string }> };
+  const stub = getNamedDo<ChatChannel>(env.CHAT_CHANNEL, channelId);
+  const replay = await stub.replayEvents(viewerUserId, "");
   return replay.events.map((evt) => JSON.parse(evt.event_json) as { type: string; payload: Record<string, unknown> });
 }
 

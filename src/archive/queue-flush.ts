@@ -1,5 +1,6 @@
-import { isoDueTable, type DueTable } from "../do/scheduler";
-import { computeRetryBackoffMs } from "../do/retry-backoff";
+import { isoDueTable, type DueTable } from "../do/shared/scheduler";
+import { logSwallowedError } from "../errors";
+import { computeRetryBackoffMs } from "../do/shared/retry-backoff";
 import {
   ARCHIVE_BATCH_TARGET_BYTES,
   canonicalStringify,
@@ -115,7 +116,8 @@ export async function flushArchiveOutboxToQueue(
     let parsed: unknown;
     try {
       parsed = JSON.parse(row.payload_json);
-    } catch {
+    } catch (err) {
+      logSwallowedError("archive_outbox_invalid_json", err, { archive_id: row.archive_id });
       sql.exec(
         `UPDATE archive_outbox SET status='failed', last_error=?, updated_at=? WHERE archive_id=?`,
         "invalid JSON",

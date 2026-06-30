@@ -1,6 +1,6 @@
 import type { Context } from "hono";
 import type { Env } from "../env";
-import { ApiError } from "../errors";
+import { ApiError, apiErrorFromRemote, logSwallowedError } from "../errors";
 import { verifyBrowserJwt } from "../auth/jwt";
 import type { EventFrame } from "../ws/frames";
 
@@ -13,7 +13,8 @@ function decodeCursors(param: string | null): Record<string, string> {
   try {
     const normalized = `${param.replace(/-/g, "+").replace(/_/g, "/")}${"=".repeat((4 - (param.length % 4)) % 4)}`;
     return JSON.parse(atob(normalized)) as Record<string, string>;
-  } catch {
+  } catch (err) {
+    logSwallowedError("events_cursor_decode_failed", err);
     return {};
   }
 }
@@ -35,24 +36,25 @@ export async function eventsHandler(c: Context<{ Bindings: Env; Variables: { req
   } else {
     const cursors = decodeCursors(cursorsParam);
     const dirStub = c.env.USER_DIRECTORY.getByName(userId);
-    const dirRes = await dirStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
-    const myChannels = dirRes.ok ? ((await dirRes.json()) as { items: Array<{ channel_id: string }> }).items : [];
+    const myChannels = (await dirStub.listMyChannels(userId).catch(() => ({ items: [] as Array<{ channel_id: string }> }))).items;
     targets = myChannels.map((mc) => ({ channel_id: mc.channel_id, after: cursors[mc.channel_id] ?? "" }));
   }
 
   const replays = await Promise.all(
     targets.map(async (target): Promise<{ channel_id: string; items: EventFrame[]; last_event_id: string | null } | null> => {
       const stub = c.env.CHAT_CHANNEL.getByName(target.channel_id);
-      const replayRes = await stub.fetch(new Request(`https://x/internal/replay?after=${encodeURIComponent(target.after)}`, {
-        headers: { "X-Verified-User-Id": userId },
-      }));
-      if (!replayRes.ok) return null;
-      const replay = (await replayRes.json()) as ReplayResponse;
+      const replay = await stub.replayEvents(userId, target.after).catch((err) => {
+        const apiErr = apiErrorFromRemote(err);
+        if (apiErr?.code === "FORBIDDEN") return null;
+        throw apiErr ?? err;
+      }) as ReplayResponse | null;
+      if (!replay) return null;
       const items = replay.events
         .map((it) => {
           try {
             return JSON.parse(it.event_json) as EventFrame;
-          } catch {
+          } catch (err) {
+            logSwallowedError("events_replay_event_json_invalid", err, { channel_id: target.channel_id });
             return null;
           }
         })

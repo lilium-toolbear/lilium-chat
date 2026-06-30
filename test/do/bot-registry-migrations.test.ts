@@ -1,17 +1,17 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { getNamedDo, readDoSchemaVersion } from "../helpers";
 import {
   indexExists,
   migrateSqlite,
   tableExists,
-} from "../../src/do/sql-migrations";
+} from "../../src/do/shared/sql-migrations";
 import {
   BOT_REGISTRY_CURRENT_SCHEMA_VERSION,
   botRegistryBaseline,
   botRegistryMigrations,
   migrateBotRegistrySchema,
-} from "../../src/do/migrations/bot-registry";
+} from "../../src/do/bot-registry/migrations";
 
 function registryStub() {
   return getNamedDo(env.BOT_REGISTRY as unknown as DurableObjectNamespace, "registry");
@@ -29,11 +29,7 @@ async function withDoState(
 }
 
 async function schemaVersion(stub: DurableObjectStub): Promise<number> {
-  const res = await stub.fetch(
-    new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
-  );
-  const body = (await res.json()) as { current_version: number };
-  return body.current_version;
+  return (await readDoSchemaVersion(stub)).current_version;
 }
 
 function expectSlashCatalogBaseline(ctx: DurableObjectState): void {
@@ -51,7 +47,7 @@ function expectSlashCatalogBaseline(ctx: DurableObjectState): void {
 describe("BotRegistry v4 migrations (slash command baseline)", () => {
   it("fresh install reaches slash catalog schema", async () => {
     const stub = registryStub();
-    await stub.fetch(new Request("https://x/ping"));
+    await schemaVersion(stub);
     await withDoState(stub, (ctx) => {
       expectSlashCatalogBaseline(ctx);
       expect(tableExists(ctx, "archive_outbox")).toBe(true);
@@ -62,7 +58,7 @@ describe("BotRegistry v4 migrations (slash command baseline)", () => {
 
   it("fresh baseline includes bot_command_names and excludes bot_event_capabilities", async () => {
     const stub = registryStub();
-    await stub.fetch(new Request("https://x/ping"));
+    await schemaVersion(stub);
     await withDoState(stub, (ctx) => {
       expect(tableExists(ctx, "bot_command_names")).toBe(true);
       expect(tableExists(ctx, "bot_event_capabilities")).toBe(false);
@@ -196,7 +192,7 @@ describe("BotRegistry v4 migrations (slash command baseline)", () => {
 
   it("migration is idempotent (re-run is noop)", async () => {
     const stub = registryStub();
-    await stub.fetch(new Request("https://x/ping"));
+    await schemaVersion(stub);
 
     let extraRuns = 0;
     const extra = {
@@ -222,7 +218,7 @@ describe("BotRegistry v4 migrations (slash command baseline)", () => {
 
   it("idx_bot_tokens_hash is unique", async () => {
     const stub = registryStub();
-    await stub.fetch(new Request("https://x/ping"));
+    await schemaVersion(stub);
     await withDoState(stub, (ctx) => {
       const rows = ctx.storage.sql
         .exec("PRAGMA index_list(bot_tokens)")

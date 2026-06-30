@@ -141,20 +141,14 @@ describe("interaction delivery completion", () => {
     const interactionId = submitPayload.interaction_id!;
     const outboxId = `bot_delivery:${channelId}:${interactionId}`;
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/bot-delivery-result", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          delivery_id: `del-${interactionId}`,
-          outbox_id: outboxId,
-          bot_id: botId,
-          channel_id: channelId,
-          effects: [],
-        }),
-      }),
-    );
-    expect(res.status).toBe(200);
+    const result = await stub.botDeliveryResult({
+      delivery_id: `del-${interactionId}`,
+      outbox_id: outboxId,
+      bot_id: botId,
+      channel_id: channelId,
+      effects: [],
+    });
+    expect(result.status).toBe("applied");
 
     await withChannel(channelId, (ctx) => {
       const interaction = ctx.storage.sql
@@ -194,20 +188,14 @@ describe("interaction delivery completion", () => {
     const interactionId = submitPayload.interaction_id!;
     const outboxId = `bot_delivery:${channelId}:${interactionId}`;
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/bot-delivery-result", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          delivery_id: `del-fail-${interactionId}`,
-          outbox_id: outboxId,
-          bot_id: botId,
-          channel_id: channelId,
-          effects: [{ type: "append_stream", client_effect_id: "bad", seq: 1, delta: "x" }],
-        }),
-      }),
-    );
-    expect(res.status).toBe(422);
+    const result = await stub.botDeliveryResult({
+      delivery_id: `del-fail-${interactionId}`,
+      outbox_id: outboxId,
+      bot_id: botId,
+      channel_id: channelId,
+      effects: [{ type: "append_stream", client_effect_id: "bad", seq: 1, delta: "x" }],
+    });
+    expect(result.status).toBe("failed");
 
     await withChannel(channelId, (ctx) => {
       const interaction = ctx.storage.sql

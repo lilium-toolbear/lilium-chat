@@ -1,0 +1,1 @@
+export { DMDirectory } from "./object";

@@ -1,14 +1,14 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
-import { applyBaselineSchema, columnExists, migrateSqlite, tableExists } from "../../src/do/sql-migrations";
+import { getNamedDo, readDoSchemaVersion } from "../helpers";
+import { applyBaselineSchema, columnExists, migrateSqlite, tableExists } from "../../src/do/shared/sql-migrations";
 import {
   CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
   CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA,
   chatChannelBaseline,
   chatChannelMigrations,
   migrateChatChannelSchema,
-} from "../../src/do/migrations/chat-channel";
+} from "../../src/do/chat-channel/data/migrations";
 
 function chatStub(channelId: string) {
   return getNamedDo(env.CHAT_CHANNEL as unknown as DurableObjectNamespace, channelId);
@@ -82,24 +82,14 @@ describe("ChatChannel migrations", () => {
       expect(attachment?.blurhash).toBeNull();
     });
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
-    );
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { current_version: number };
+    const body = await readDoSchemaVersion(stub);
     expect(body.current_version).toBe(CHAT_CHANNEL_CURRENT_SCHEMA_VERSION);
-  });
-
-  it("rejects schema-version without X-Test-Only", async () => {
-    const stub = chatStub(`schema-version-guard-${crypto.randomUUID()}`);
-    const res = await stub.fetch(new Request("https://x/internal/schema-version"));
-    expect(res.status).toBe(403);
   });
 
   it("does not reapply completed migrations", async () => {
     const channelId = `migrate-noop-${crypto.randomUUID()}`;
     const stub = chatStub(channelId);
-    await stub.fetch(new Request("https://x/ping"));
+    await readDoSchemaVersion(stub);
 
     let migrationRuns = 0;
     const extraMigration = {
@@ -178,11 +168,7 @@ describe("ChatChannel migrations", () => {
       expect(meta?.title).toBe("Pre-Phase-E");
     });
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
-    );
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { current_version: number };
+    const body = await readDoSchemaVersion(stub);
     expect(body.current_version).toBe(CHAT_CHANNEL_CURRENT_SCHEMA_VERSION);
   });
 });

@@ -1,34 +1,27 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { computeFinalizeRequestHash } from "../../src/chat/stream-registry";
-import { createTestChannel, getNamedDo } from "../helpers";
+import { createTestChannel } from "../helpers";
+import type { ChatChannel } from "../../src/do/chat-channel";
 
 const BOT_ID = "bot-stream-history-1";
 
 async function registerAndFinalize(
-  stub: DurableObjectStub,
+  stub: DurableObjectStub<ChatChannel>,
   channelId: string,
   resolvedText: string,
   components: unknown[] = [],
 ) {
   const clientEffectId = `eff-${crypto.randomUUID()}`;
-  const registerRes = await stub.fetch(
-    new Request("https://x/internal/stream-registry-register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channel_id: channelId,
-        bot_id: BOT_ID,
-        client_effect_id: clientEffectId,
-        request_hash: JSON.stringify({ format: "plain" }),
-        sender_bot_display_name: "Stream Bot",
-        sender_bot_avatar_url: null,
-        message: { type: "text", format: "plain" },
-      }),
-    }),
-  );
-  expect(registerRes.status).toBe(200);
-  const registerBody = (await registerRes.json()) as { message_id: string };
+  const registerBody = await stub.streamRegistryRegister({
+    channel_id: channelId,
+    bot_id: BOT_ID,
+    client_effect_id: clientEffectId,
+    request_hash: JSON.stringify({ format: "plain" }),
+    sender_bot_display_name: "Stream Bot",
+    sender_bot_avatar_url: null,
+    message: { type: "text", format: "plain" },
+  });
   const messageId = registerBody.message_id;
   const finalSeq = 1;
   const finalizeRequestHash = await computeFinalizeRequestHash({
@@ -38,24 +31,16 @@ async function registerAndFinalize(
     attachment_ids: [],
   });
 
-  const finalizeRes = await stub.fetch(
-    new Request("https://x/internal/stream-finalize", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channel_id: channelId,
-        message_id: messageId,
-        bot_id: BOT_ID,
-        resolved_text: resolvedText,
-        finalize_request_hash: finalizeRequestHash,
-        final_seq: finalSeq,
-        components,
-        attachment_ids: [],
-      }),
-    }),
-  );
-  expect(finalizeRes.status).toBe(200);
-  const finalizeBody = (await finalizeRes.json()) as { message_id: string; event_id: string };
+  const finalizeBody = await stub.streamFinalize({
+    channel_id: channelId,
+    message_id: messageId,
+    bot_id: BOT_ID,
+    resolved_text: resolvedText,
+    finalize_request_hash: finalizeRequestHash,
+    final_seq: finalSeq,
+    components,
+    attachment_ids: [],
+  });
   return { messageId, eventId: finalizeBody.event_id };
 }
 
@@ -67,16 +52,11 @@ describe("stream finalize history and replay projection", () => {
     const resolvedText = "canonical final body";
     const { messageId, eventId } = await registerAndFinalize(stub, channelId, resolvedText);
 
-    const historyRes = await stub.fetch(
-      new Request("https://x/internal/messages", {
-        headers: { "X-Verified-User-Id": ownerId },
-      }),
+    const history = await stub.getMessages(ownerId, { before: null, after: null, limit: 50 });
+    const finalized = history.items.find(
+      (item): item is typeof item & { type: "message.stream_finalized"; payload: { message?: { text?: string | null; message_id?: string } } } =>
+        item.event_id === eventId && item.type === "message.stream_finalized",
     );
-    expect(historyRes.status).toBe(200);
-    const history = (await historyRes.json()) as {
-      items: Array<{ type: string; event_id: string; payload: { message?: { text?: string | null; message_id?: string } } }>;
-    };
-    const finalized = history.items.find((item) => item.event_id === eventId);
     expect(finalized?.type).toBe("message.stream_finalized");
     expect(finalized?.payload.message?.message_id).toBe(messageId);
     expect(finalized?.payload.message?.text).toBe(resolvedText);
@@ -120,13 +100,7 @@ describe("stream finalize history and replay projection", () => {
     expect(liveFrame.type).toBe("message.stream_finalized");
     expect(liveFrame.event_id).toBe(eventId);
 
-    const replayRes = await stub.fetch(
-      new Request("https://x/internal/replay?after=", {
-        headers: { "X-Verified-User-Id": ownerId },
-      }),
-    );
-    expect(replayRes.status).toBe(200);
-    const replay = (await replayRes.json()) as { events: Array<{ event_id: string; event_json: string }> };
+    const replay = await stub.replayEvents(ownerId, "");
     const replayRow = replay.events.find((row) => row.event_id === eventId);
     expect(replayRow).toBeTruthy();
     const replayFrame = JSON.parse(replayRow!.event_json) as {
@@ -134,10 +108,12 @@ describe("stream finalize history and replay projection", () => {
       payload: { message?: { text?: string | null; components?: unknown[] } };
     };
     expect(replayFrame.type).toBe("message.stream_finalized");
-    expect(replayFrame.payload.message?.text).toBe(resolvedText);
-    expect(replayFrame.payload.message?.components).toEqual(components);
-    expect(replayFrame.payload.message?.text).toBe(liveFrame.payload.message?.text);
-    expect(replayFrame.payload.message?.components).toEqual(liveFrame.payload.message?.components);
+    if (replayFrame.type === "message.stream_finalized" && liveFrame.type === "message.stream_finalized") {
+      expect(replayFrame.payload.message?.text).toBe(resolvedText);
+      expect(replayFrame.payload.message?.components).toEqual(components);
+      expect(replayFrame.payload.message?.text).toBe(liveFrame.payload.message?.text);
+      expect(replayFrame.payload.message?.components).toEqual(liveFrame.payload.message?.components);
+    }
   });
 
   it("does not include stream message in history before finalize", async () => {
@@ -145,33 +121,21 @@ describe("stream finalize history and replay projection", () => {
     const ownerId = `owner-${crypto.randomUUID()}`;
     const stub = await createTestChannel(env, { channelId, ownerId });
     const clientEffectId = `eff-${crypto.randomUUID()}`;
-    const registerRes = await stub.fetch(
-      new Request("https://x/internal/stream-registry-register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          channel_id: channelId,
-          bot_id: BOT_ID,
-          client_effect_id: clientEffectId,
-          request_hash: JSON.stringify({ format: "plain" }),
-          sender_bot_display_name: "Stream Bot",
-          sender_bot_avatar_url: null,
-          message: { type: "text", format: "plain" },
-        }),
-      }),
-    );
-    const registerBody = (await registerRes.json()) as { message_id: string };
+    const registerBody = await stub.streamRegistryRegister({
+      channel_id: channelId,
+      bot_id: BOT_ID,
+      client_effect_id: clientEffectId,
+      request_hash: JSON.stringify({ format: "plain" }),
+      sender_bot_display_name: "Stream Bot",
+      sender_bot_avatar_url: null,
+      message: { type: "text", format: "plain" },
+    });
     const messageId = registerBody.message_id;
 
-    const historyRes = await stub.fetch(
-      new Request("https://x/internal/messages", {
-        headers: { "X-Verified-User-Id": ownerId },
-      }),
+    const history = await stub.getMessages(ownerId, { before: null, after: null, limit: 50 });
+    const hasMessage = history.items.some(
+      (item) => "message" in item.payload && item.payload.message?.message_id === messageId,
     );
-    const history = (await historyRes.json()) as {
-      items: Array<{ payload: { message?: { message_id?: string } } }>;
-    };
-    const hasMessage = history.items.some((item) => item.payload.message?.message_id === messageId);
     expect(hasMessage).toBe(false);
 
     const messageCount = await runInDoCount(stub, "SELECT COUNT(*) AS c FROM messages WHERE message_id=?", messageId);

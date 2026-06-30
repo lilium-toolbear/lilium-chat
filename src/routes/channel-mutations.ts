@@ -1,16 +1,27 @@
 import type { Context } from "hono";
 import type {
+  AcceptInviteApiResponse,
+  AddMemberApiResponse,
   ChannelMetaProjection,
   CreateChannelApiResponse,
+  CreateInviteApiResponse,
   DissolveChannelApiResponse,
+  InvitePreviewApiResponse,
+  JoinChannelApiResponse,
+  ListMembersApiResponse,
+  MemberProjection,
+  RemoveMemberApiResponse,
+  TransferOwnerApiResponse,
+  UpdateChannelApiResponse,
+  UpdateMemberRoleApiResponse,
 } from "../contract/channel-api";
 import type { Env } from "../env";
-import { ApiError } from "../errors";
-import type { ChannelSummaryFromDo } from "../chat/channel-summary";
+import { ApiError, apiErrorFromRemote } from "../errors";
 import { compareMemberListRows, encodeMemberListCursor } from "../chat/member-list-order";
 import { fallbackUserDisplayName } from "../contract/primitives";
 import { resolveUserSummaries } from "../profile/resolve";
 import { getIdentity, requireIdempotencyKey } from "./auth";
+import { requireChannelIdParam, requireMemberUserIdParam } from "./path-params";
 
 export { getIdentity } from "./auth";
 
@@ -27,165 +38,101 @@ export async function createChannelHandler(c: Context<{ Bindings: Env; Variables
   }
 
   const dirStub = env.USER_DIRECTORY.getByName(userId);
-  const res = await dirStub.fetch(new Request("https://x/internal/channel-create-coordinate", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      idempotency_key: idempotencyKey,
-      title: body.title,
-      topic: body.topic ?? null,
-      avatar_attachment_id: body.avatar_attachment_id ?? null,
-      visibility: body.visibility ?? "private",
-      initial_members: body.initial_members ?? [],
-    }),
-  }));
-
-  if (res.status === 409) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError("IDEMPOTENCY_CONFLICT", e.error?.message ?? "idempotency conflict");
-  }
-  if (res.status === 422) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError("INVALID_MESSAGE", e.error?.message ?? "invalid channel");
-  }
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "channel create failed");
-
-  const out = await res.json() as CreateChannelApiResponse;
+  const out = await dirStub.channelCreateCoordinate(userId, {
+    idempotency_key: idempotencyKey,
+    title: body.title,
+    topic: body.topic ?? null,
+    avatar_attachment_id: body.avatar_attachment_id ?? null,
+    visibility: body.visibility ?? "private",
+    initial_members: body.initial_members ?? [],
+  }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as CreateChannelApiResponse;
   return c.json(out, 201, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function updateChannelHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
   const idempotencyKey = requireIdempotencyKey(c);
 
   const body = (await c.req.json().catch(() => ({}))) as {
     title?: string; topic?: string | null; avatar_attachment_id?: string | null; visibility?: string;
   };
   const stub = env.CHAT_CHANNEL.getByName(channelId);
-  const res = await stub.fetch(new Request("https://x/internal/update-channel", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      idempotency_key: idempotencyKey,
-      channel_id: channelId,
-      title: body.title, topic: body.topic, avatar_attachment_id: body.avatar_attachment_id, visibility: body.visibility,
-    }),
-  }));
-  if (res.status === 409) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    const code = e.error?.code ?? "IDEMPOTENCY_CONFLICT";
-    throw new ApiError(code, e.error?.message ?? "conflict");
-  }
-  if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to update channel");
-  if (res.status === 404) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  if (res.status === 415) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError(e.error?.code ?? "UNSUPPORTED_ATTACHMENT_TYPE", e.error?.message ?? "unsupported avatar attachment", { httpStatus: 415 });
-  }
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "channel update failed");
-  const out = await res.json() as { channel: ChannelMetaProjection };
+  const out = await stub.updateChannel({
+    user_id: userId,
+    idempotency_key: idempotencyKey,
+    channel_id: channelId,
+    title: body.title,
+    topic: body.topic,
+    avatar_attachment_id: body.avatar_attachment_id,
+    visibility: body.visibility,
+  }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as UpdateChannelApiResponse;
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function dissolveChannelHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
   const idempotencyKey = requireIdempotencyKey(c);
   const stub = env.CHAT_CHANNEL.getByName(channelId);
-  const res = await stub.fetch(new Request("https://x/internal/dissolve", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ idempotency_key: idempotencyKey, channel_id: channelId }),
-  }));
-  if (res.status === 409) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError(e.error?.code ?? "CHANNEL_DISSOLVED", e.error?.message ?? "conflict");
-  }
-  if (res.status === 403) throw new ApiError("FORBIDDEN", "only owner may dissolve");
-  if (res.status === 404) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "dissolve failed");
-  const out = await res.json() as DissolveChannelApiResponse;
+  const out = await stub.dissolveChannel({ user_id: userId, idempotency_key: idempotencyKey, channel_id: channelId }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as DissolveChannelApiResponse;
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function addMemberHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
   const idempotencyKey = requireIdempotencyKey(c);
   const body = (await c.req.json().catch(() => ({}))) as { user_id?: string; role?: string };
   const stub = env.CHAT_CHANNEL.getByName(channelId);
-  const res = await stub.fetch(new Request("https://x/internal/members-add", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ idempotency_key: idempotencyKey, channel_id: channelId, user_id: body.user_id ?? "", role: body.role ?? "member" }),
-  }));
-  if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to add members");
-  if (res.status === 404) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  if (res.status === 409) { const e = await res.json().catch(() => ({})) as { error?: { code?: string } }; throw new ApiError(e.error?.code ?? "CHANNEL_DISSOLVED", "conflict"); }
-  if (res.status === 422) throw new ApiError("INVALID_MESSAGE", "invalid member");
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "add member failed");
-  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+  const out = await stub.addMember({ user_id: userId, idempotency_key: idempotencyKey, channel_id: channelId, target_user_id: body.user_id ?? "", role: body.role ?? "member" }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as AddMemberApiResponse;
+  return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function updateMemberRoleHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  const memberUserId = c.req.param("user_id");
-  if (!channelId || !memberUserId) throw new ApiError("CHANNEL_NOT_FOUND", "channel or user not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
+  const memberUserId = requireMemberUserIdParam(c.req.param("user_id"));
   const idempotencyKey = requireIdempotencyKey(c);
   const body = (await c.req.json().catch(() => ({}))) as { role?: string };
   const stub = env.CHAT_CHANNEL.getByName(channelId);
-  const res = await stub.fetch(new Request("https://x/internal/members-update-role", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ idempotency_key: idempotencyKey, channel_id: channelId, user_id: memberUserId, role: body.role ?? "" }),
-  }));
-  if (res.status === 403) throw new ApiError("FORBIDDEN", "only owner may change roles");
-  if (res.status === 404) throw new ApiError("MEMBER_NOT_FOUND", "member not found");
-  if (res.status === 409) { const e = await res.json().catch(() => ({})) as { error?: { code?: string } }; throw new ApiError(e.error?.code ?? "CHANNEL_DISSOLVED", "conflict"); }
-  if (res.status === 422) throw new ApiError("INVALID_MESSAGE", "invalid role");
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "role update failed");
-  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+  const out = await stub.updateMemberRole({ user_id: userId, idempotency_key: idempotencyKey, channel_id: channelId, target_user_id: memberUserId, role: body.role ?? "" }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as UpdateMemberRoleApiResponse;
+  return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function removeMemberHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  const memberUserId = c.req.param("user_id");
-  if (!channelId || !memberUserId) throw new ApiError("CHANNEL_NOT_FOUND", "channel or user not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
+  const memberUserId = requireMemberUserIdParam(c.req.param("user_id"));
   const idempotencyKey = requireIdempotencyKey(c);
   const stub = env.CHAT_CHANNEL.getByName(channelId);
-  const res = await stub.fetch(new Request("https://x/internal/members-remove", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ idempotency_key: idempotencyKey, channel_id: channelId, user_id: memberUserId }),
-  }));
-  if (res.status === 403) throw new ApiError("FORBIDDEN", "only owner may remove others");
-  if (res.status === 404) throw new ApiError("MEMBER_NOT_FOUND", "member not found");
-  if (res.status === 409) { const e = await res.json().catch(() => ({})) as { error?: { code?: string } }; throw new ApiError(e.error?.code ?? "CHANNEL_DISSOLVED", "conflict"); }
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "remove member failed");
-  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+  const out = await stub.removeMember({ user_id: userId, idempotency_key: idempotencyKey, channel_id: channelId, target_user_id: memberUserId }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as RemoveMemberApiResponse;
+  return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function listMembersHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
   const url = new URL(c.req.url);
   const query = (url.searchParams.get("query") ?? "").toLowerCase();
   const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") ?? "50")));
   const cursor = url.searchParams.get("cursor") ?? "";
   const stub = env.CHAT_CHANNEL.getByName(channelId);
-  // Push cursor + a limit+1 fetch into the DO so it can signal hasMore without a 2nd round-trip.
-  const res = await stub.fetch(new Request(`https://x/internal/members-list?cursor=${encodeURIComponent(cursor)}`, { headers: { "X-Verified-User-Id": userId } }));
-  if (res.status === 403) throw new ApiError("FORBIDDEN", "not a member");
-  if (res.status === 404 || res.status === 409) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "member list failed");
-  const raw = (await res.json()) as { items: Array<{ user_id: string; role: string; joined_at: string }> };
+  const raw = await stub.listMembers(userId, cursor).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as ListMembersApiResponse;
 
   const map = await resolveUserSummaries(raw.items.map((m) => m.user_id), env);
   const resolved = raw.items.map((m) => {
@@ -220,15 +167,12 @@ export async function listMembersHandler(c: Context<{ Bindings: Env; Variables: 
 
 export async function getMemberHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  const targetUserId = c.req.param("user_id");
-  if (!channelId || !targetUserId) throw new ApiError("CHANNEL_NOT_FOUND", "channel or user not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
+  const targetUserId = requireMemberUserIdParam(c.req.param("user_id"));
   const stub = env.CHAT_CHANNEL.getByName(channelId);
-  const res = await stub.fetch(new Request(`https://x/internal/members-get?user_id=${encodeURIComponent(targetUserId)}`, { headers: { "X-Verified-User-Id": userId } }));
-  if (res.status === 403) throw new ApiError("FORBIDDEN", "not a member");
-  if (res.status === 404) throw new ApiError("MEMBER_NOT_FOUND", "member not found");
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "member get failed");
-  const raw = (await res.json()) as { user_id: string; role: string; joined_at: string; status: string };
+  const raw = await stub.getMember(userId, targetUserId).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as MemberProjection;
   const map = await resolveUserSummaries([targetUserId], env);
   const u = map.get(targetUserId) ?? { user_id: targetUserId, display_name: fallbackUserDisplayName(targetUserId), avatar_url: null };
   return c.json({ user: u, role: raw.role, joined_at: raw.joined_at, status: raw.status }, 200, { "X-Request-Id": c.get("requestId") });
@@ -236,61 +180,39 @@ export async function getMemberHandler(c: Context<{ Bindings: Env; Variables: { 
 
 export async function ownerTransferHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
   const idempotencyKey = requireIdempotencyKey(c);
   const body = (await c.req.json().catch(() => ({}))) as { target_user_id?: string; previous_owner_role?: string };
   const stub = env.CHAT_CHANNEL.getByName(channelId);
-  const res = await stub.fetch(new Request("https://x/internal/owner-transfer", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      operation_id: idempotencyKey,
-      channel_id: channelId,
-      target_user_id: body.target_user_id ?? "",
-      previous_owner_role: body.previous_owner_role ?? "",
-    }),
-  }));
-  if (!res.ok) {
-    const e = await res.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "owner transfer failed" } })) as {
-      error?: { code?: string; message?: string };
-    };
-    if (res.status === 409) {
-      throw new ApiError(e.error?.code ?? "IDEMPOTENCY_CONFLICT", e.error?.message ?? "idempotency conflict");
-    }
-    throw new ApiError(e.error?.code ?? "CHAT_WORKER_UNAVAILABLE", e.error?.message ?? "owner transfer failed");
-  }
-  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+  const out = await stub.transferOwner({
+    user_id: userId,
+    operation_id: idempotencyKey,
+    channel_id: channelId,
+    target_user_id: body.target_user_id ?? "",
+    previous_owner_role: body.previous_owner_role ?? "",
+  }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as TransferOwnerApiResponse;
+  return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function createInviteHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
   const idempotencyKey = requireIdempotencyKey(c);
 
   const body = (await c.req.json().catch(() => ({}))) as { expires_in_seconds?: number; max_uses?: number | null };
   const stub = env.CHAT_CHANNEL.getByName(channelId);
-  const res = await stub.fetch(new Request("https://x/internal/invites-create", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      operation_id: idempotencyKey,
-      channel_id: channelId,
-      expires_in_seconds: body.expires_in_seconds,
-      max_uses: body.max_uses,
-    }),
-  }));
+  const out = await stub.createInvite({
+    user_id: userId,
+    operation_id: idempotencyKey,
+    channel_id: channelId,
+    expires_in_seconds: body.expires_in_seconds,
+    max_uses: body.max_uses,
+  }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as CreateInviteApiResponse;
 
-  if (!res.ok) {
-    const e = await res.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "create invite failed" } })) as {
-      error?: { code?: string; message?: string };
-    };
-    const code = e.error?.code ?? "CHAT_WORKER_UNAVAILABLE";
-    throw new ApiError(code, e.error?.message ?? "create invite failed");
-  }
-
-  const out = await res.json() as { invite_code: string; expires_at: string; max_uses: number | null };
   const base = env.API_BASE_URL.replace(/\/$/, "");
   return c.json({
     invite_code: out.invite_code,
@@ -306,23 +228,8 @@ export async function previewInviteHandler(c: Context<{ Bindings: Env; Variables
   if (!inviteCode) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
 
   const dirStub = env.INVITE_DIRECTORY.getByName("shared");
-  const dirRes = await dirStub.fetch(new Request(`https://x/preview?code=${encodeURIComponent(inviteCode)}`));
-  if (dirRes.status === 404) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
-  if (!dirRes.ok) {
-    const e = await dirRes.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "invite index unavailable" } })) as {
-      error?: { code?: string; message?: string };
-    };
-    throw new ApiError(e.error?.code ?? "CHAT_WORKER_UNAVAILABLE", e.error?.message ?? "invite preview failed");
-  }
-
-  const row = await dirRes.json() as {
-    invite_code?: string;
-    channel_id?: string;
-    status?: string;
-    expires_at?: string;
-    revoked_at?: string | null;
-  };
-  if (row.invite_code !== inviteCode || row.channel_id === undefined || row.status !== "active") {
+  const row = await dirStub.previewInvite(inviteCode);
+  if (!row || row.invite_code !== inviteCode || row.status !== "active") {
     throw new ApiError("INVITE_NOT_FOUND", "invite not found");
   }
 
@@ -332,33 +239,11 @@ export async function previewInviteHandler(c: Context<{ Bindings: Env; Variables
   }
 
   const stub = env.CHAT_CHANNEL.getByName(row.channel_id);
-  const inviteRes = await stub.fetch(new Request(
-    `https://x/internal/invites-get?invite_code=${encodeURIComponent(row.invite_code)}&channel_id=${encodeURIComponent(row.channel_id)}`,
-    { headers: { "X-Verified-User-Id": userId } },
-  ));
-  if (inviteRes.status === 404) {
-    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "INVITE_NOT_FOUND", message: "invite not found" } })) as { error?: { code?: string; message?: string } };
-    const code = inviteErr.error?.code;
-    if (code === "ROUTE_INDEX_PENDING") throw new ApiError("ROUTE_INDEX_PENDING", inviteErr.error?.message ?? "invite index pending");
-    if (code === "INVITE_NOT_FOUND") throw new ApiError("INVITE_NOT_FOUND", inviteErr.error?.message ?? "invite not found");
-    throw new ApiError("INVITE_NOT_FOUND", "invite not found");
-  }
-  if (inviteRes.status === 409) {
-    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "ROUTE_INDEX_PENDING", message: "invite index pending" } })) as {
-      error?: { code?: string; message?: string };
-    };
-    const code = inviteErr.error?.code ?? "ROUTE_INDEX_PENDING";
-    if (code === "ROUTE_INDEX_PENDING") throw new ApiError("ROUTE_INDEX_PENDING", inviteErr.error?.message ?? "invite index pending");
-    throw new ApiError(code, inviteErr.error?.message ?? "preview failed");
-  }
-  if (!inviteRes.ok) {
-    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "invite preview failed" } })) as {
-      error?: { code?: string; message?: string };
-    };
-    throw new ApiError(inviteErr.error?.code ?? "CHAT_WORKER_UNAVAILABLE", inviteErr.error?.message ?? "invite preview failed");
-  }
+  const out = await stub.getInvite({ user_id: userId, invite_code: row.invite_code, channel_id: row.channel_id }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as InvitePreviewApiResponse;
 
-  return c.json(await inviteRes.json(), 200, { "X-Request-Id": c.get("requestId") });
+  return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function acceptInviteHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
@@ -368,51 +253,21 @@ export async function acceptInviteHandler(c: Context<{ Bindings: Env; Variables:
   const idempotencyKey = requireIdempotencyKey(c);
 
   const dirStub = env.INVITE_DIRECTORY.getByName("shared");
-  const dirRes = await dirStub.fetch(new Request(`https://x/preview?code=${encodeURIComponent(inviteCode)}`));
-  if (dirRes.status === 404) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
-  if (!dirRes.ok) {
-    const dirErr = await dirRes.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "invite directory unavailable" } })) as {
-      error?: { code?: string; message?: string };
-    };
-    throw new ApiError(dirErr.error?.code ?? "CHAT_WORKER_UNAVAILABLE", dirErr.error?.message ?? "invite directory unavailable");
-  }
-
-  const row = await dirRes.json() as { channel_id?: string; status?: string };
-  if (row.channel_id === undefined || row.status !== undefined && row.status !== "active") {
+  const row = await dirStub.previewInvite(inviteCode);
+  if (!row || row.status !== "active") {
     throw new ApiError("INVITE_NOT_FOUND", "invite not found");
   }
 
   const stub = env.CHAT_CHANNEL.getByName(row.channel_id);
-  const inviteRes = await stub.fetch(new Request("https://x/internal/invites-accept", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      operation_id: idempotencyKey,
-      channel_id: row.channel_id,
-      invite_code: inviteCode,
-    }),
-  }));
-
-  if (inviteRes.status === 409) {
-    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency conflict" } })) as {
-      error?: { code?: string; message?: string };
-    };
-    throw new ApiError(inviteErr.error?.code ?? "IDEMPOTENCY_CONFLICT", inviteErr.error?.message ?? "idempotency conflict");
-  }
-  if (inviteRes.status === 404) throw new ApiError("INVITE_NOT_FOUND", "invite not found");
-  if (inviteRes.status === 422) {
-    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "INVALID_MESSAGE", message: "invite accept failed" } })) as {
-      error?: { code?: string; message?: string };
-    };
-    throw new ApiError(inviteErr.error?.code ?? "INVALID_MESSAGE", inviteErr.error?.message ?? "invite accept failed");
-  }
-  if (!inviteRes.ok) {
-    const inviteErr = await inviteRes.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "invite accept failed" } })) as {
-      error?: { code?: string; message?: string };
-    };
-    throw new ApiError(inviteErr.error?.code ?? "CHAT_WORKER_UNAVAILABLE", inviteErr.error?.message ?? "invite accept failed");
-  }
-  return c.json(await inviteRes.json(), 200, { "X-Request-Id": c.get("requestId") });
+  const out = await stub.acceptInvite({
+    user_id: userId,
+    operation_id: idempotencyKey,
+    channel_id: row.channel_id,
+    invite_code: inviteCode,
+  }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as AcceptInviteApiResponse;
+  return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function listStickersHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
@@ -421,17 +276,10 @@ export async function listStickersHandler(c: Context<{ Bindings: Env; Variables:
   const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") ?? "50")));
   const cursor = url.searchParams.get("cursor") ?? "";
   const stub = env.USER_DIRECTORY.getByName(userId);
-  const query = cursor
-    ? `https://x/internal/sticker-list?limit=${limit}&cursor=${encodeURIComponent(cursor)}`
-    : `https://x/internal/sticker-list?limit=${limit}`;
-  const res = await stub.fetch(new Request(query, { headers: { "X-Verified-User-Id": userId } }));
-  if (!res.ok) {
-    const e = await res.json().catch(() => ({ error: { code: "CHAT_WORKER_UNAVAILABLE", message: "sticker list failed" } })) as {
-      error?: { code?: string; message?: string };
-    };
-    throw new ApiError(e.error?.code ?? "CHAT_WORKER_UNAVAILABLE", e.error?.message ?? "sticker list failed");
-  }
-  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+  const body = await stub.listStickers(userId, { limit, cursor: cursor || null }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  });
+  return c.json(body, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function saveStickerHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
@@ -442,30 +290,14 @@ export async function saveStickerHandler(c: Context<{ Bindings: Env; Variables: 
     throw new ApiError("INVALID_MESSAGE", "channel_id and attachment_id required");
   }
   const stub = env.USER_DIRECTORY.getByName(userId);
-  const res = await stub.fetch(new Request("https://x/internal/sticker-save", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      operation_id: idempotencyKey,
-      channel_id: body.channel_id,
-      attachment_id: body.attachment_id,
-    }),
-  }));
-  if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to save sticker");
-  if (res.status === 404) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError(e.error?.code ?? "STICKER_NOT_FOUND", e.error?.message ?? "sticker source not found");
-  }
-  if (res.status === 409) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError(e.error?.code ?? "IDEMPOTENCY_CONFLICT", e.error?.message ?? "idempotency conflict");
-  }
-  if (res.status === 422) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError(e.error?.code ?? "INVALID_MESSAGE", e.error?.message ?? "invalid sticker save");
-  }
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "sticker save failed");
-  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+  const bodyOut = await stub.saveSticker(userId, {
+    operation_id: idempotencyKey,
+    channel_id: body.channel_id,
+    attachment_id: body.attachment_id,
+  }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  });
+  return c.json(bodyOut, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function deleteStickerHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
@@ -474,57 +306,28 @@ export async function deleteStickerHandler(c: Context<{ Bindings: Env; Variables
   if (!stickerId) throw new ApiError("STICKER_NOT_FOUND", "sticker not found");
   const idempotencyKey = requireIdempotencyKey(c);
   const stub = env.USER_DIRECTORY.getByName(userId);
-  const res = await stub.fetch(new Request("https://x/internal/sticker-delete", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ sticker_id: stickerId, operation_id: idempotencyKey }),
-  }));
-  if (res.status === 403) throw new ApiError("FORBIDDEN", "not authorized to delete sticker");
-  if (res.status === 409) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError(e.error?.code ?? "IDEMPOTENCY_CONFLICT", e.error?.message ?? "sticker delete conflict");
-  }
-  if (res.status === 422) {
-    const e = await res.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError(e.error?.code ?? "INVALID_MESSAGE", e.error?.message ?? "invalid sticker delete");
-  }
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "sticker delete failed");
-  return c.json(await res.json(), 200, { "X-Request-Id": c.get("requestId") });
+  const body = await stub.deleteSticker(userId, { sticker_id: stickerId, operation_id: idempotencyKey }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  });
+  return c.json(body, 200, { "X-Request-Id": c.get("requestId") });
 }
 
 export async function joinChannelHandler(c: Context<{ Bindings: Env; Variables: { requestId: string } }>): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
   const idempotencyKey = requireIdempotencyKey(c);
 
   const stub = env.CHAT_CHANNEL.getByName(channelId);
 
-  const joinRes = await stub.fetch(new Request("https://x/internal/join", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId, operation_id: idempotencyKey }),
-  }));
-
-  if (joinRes.status === 403) {
-    const e = await joinRes.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    throw new ApiError("FORBIDDEN", e.error?.message ?? "channel is not publicly joinable");
-  }
-  if (joinRes.status === 409) {
-    const e = await joinRes.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-    const code = e.error?.code ?? "CHANNEL_DISSOLVED";
-    if (code === "IDEMPOTENCY_CONFLICT") throw new ApiError("IDEMPOTENCY_CONFLICT", e.error?.message ?? "idempotency conflict");
-    throw new ApiError(code, e.error?.message ?? "channel dissolved");
-  }
-  if (!joinRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "join failed");
-
-  const joinBody = (await joinRes.json()) as { channel_id: string; membership_version: number; joined_at: string; role: string };
+  const joinBody = await stub.joinChannel({ user_id: userId, operation_id: idempotencyKey }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  }) as JoinChannelApiResponse;
 
   // Re-inflate the ChannelDetail fresh (the cached idempotency result is the membership result; the
   // channel field is re-inflated per call and may differ in transient fields like title/avatar).
-  const summaryRes = await stub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
-  if (!summaryRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "channel summary failed");
-  const s = (await summaryRes.json()) as ChannelSummaryFromDo;
+  const s = await stub.getSummary(userId).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  });
 
   const channel = {
     channel_id: s.channel_id,
@@ -551,33 +354,32 @@ export async function listPublicDirectoryHandler(c: Context<{ Bindings: Env; Var
   const cursor = c.req.query("cursor") ?? null;
 
   const dirStub = env.CHANNEL_DIRECTORY.getByName("shared");
-  const listUrl = `https://x/internal/list?q=${encodeURIComponent(q)}&limit=${limit}` + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
-  const dirRes = await dirStub.fetch(new Request(listUrl));
-  if (!dirRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "directory list failed");
-  const dirBody = (await dirRes.json()) as { items: { channel_id: string; title: string; avatar_url: string | null; member_count: number; last_message_at: string | null; status: string }[]; next_cursor: string | null };
+  const dirBody = await dirStub.listPublicChannels({ q, limit, cursor });
 
   // Step 1: caller's active-membership set + last_read_event_id from UserDirectory/my-channels (one call).
   const udStub = env.USER_DIRECTORY.getByName(userId);
-  const udRes = await udStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
-  if (!udRes.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "my-channels failed");
-  const udBody = (await udRes.json()) as { items: { channel_id: string; last_read_event_id: string | null }[] };
+  const udBody = await udStub.listMyChannels(userId).catch(() => {
+    throw new ApiError("CHAT_WORKER_UNAVAILABLE", "my-channels failed");
+  });
   const activeChannelIds = new Set(udBody.items.map((i) => i.channel_id));
   const lastReadByChannel = new Map<string, string | null>();
   for (const i of udBody.items) lastReadByChannel.set(i.channel_id, i.last_read_event_id);
 
   // Step 2: for each directory row the caller is an active member of, fetch role from
-  // ChatChannel/internal/summary.my_role (NOT .role). Run concurrently.
+  // ChatChannel summary RPC my_role (NOT .role). Run concurrently.
   const joinedRows = dirBody.items.filter((i) => activeChannelIds.has(i.channel_id));
   const roleEntries = await Promise.all(
     joinedRows.map(async (row) => {
       try {
         const chStub = env.CHAT_CHANNEL.getByName(row.channel_id);
-        const sRes = await chStub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }));
-        if (!sRes.ok) return [row.channel_id, null] as const;
-        const s = (await sRes.json()) as { my_role?: string | null };
+        const s = await chStub.getSummary(userId);
         return [row.channel_id, s.my_role ?? null] as const;
-      } catch {
-        return [row.channel_id, null] as const;
+      } catch (err) {
+        const apiErr = apiErrorFromRemote(err);
+        if (apiErr?.code === "FORBIDDEN" || apiErr?.code === "CHANNEL_NOT_FOUND") {
+          return [row.channel_id, null] as const;
+        }
+        throw apiErr ?? err;
       }
     }),
   );

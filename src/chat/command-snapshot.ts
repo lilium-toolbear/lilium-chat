@@ -1,6 +1,7 @@
 import type { CommandBindingSnapshot, CommandBindingSnapshotExecution } from "../contract/bot-api";
 import { isRecord } from "../contract/utils";
 import type { CommandOption } from "./command-options";
+import { logSwallowedError } from "../errors";
 import { parseStatefulConfigFromSnapshot } from "./stateful-session";
 
 export type { CommandBindingSnapshot, CommandBindingSnapshotExecution };
@@ -36,7 +37,8 @@ export function parseCommandBindingSnapshot(raw: string): ParsedCommandBindingSn
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
+  } catch (err) {
+    logSwallowedError("command_binding_snapshot_json_invalid", err);
     return null;
   }
   if (!isRecord(parsed)) return null;

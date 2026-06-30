@@ -1,6 +1,7 @@
 import type { IncomingCommandFrame } from "../contract/commands";
 import type { Mention } from "../contract/message";
 import { isRecord } from "../contract/utils";
+import { parseChannelCommandFrame } from "./ws-command-frame";
 
 export interface ParsedMessageSend {
   command_id: string;
@@ -13,15 +14,18 @@ export interface ParsedMessageSend {
 }
 
 export interface ParsedMessageEdit {
+  channel_id: string;
   message_id: string;
   text: string;
 }
 
 export interface ParsedMessageRecall {
+  channel_id: string;
   message_id: string;
 }
 
 export interface ParsedMessageDelete {
+  channel_id: string;
   message_id: string;
   reason: string | null;
 }
@@ -51,20 +55,12 @@ function parseMentions(raw: unknown): Mention[] {
 }
 
 export function parseMessageSendCommand(frame: IncomingCommandFrame, senderUserId: string): ParseResult<ParsedMessageSend> {
-  if (frame.command !== "message.send") {
-    return { ok: false, error: { code: "INVALID_COMMAND", message: `unsupported command: ${frame.command}`, retryable: false } };
-  }
-  if (!frame.channel_id) {
-    return { ok: false, error: { code: "CHANNEL_NOT_FOUND", message: "missing channel_id", retryable: false } };
-  }
+  const scoped = parseChannelCommandFrame(frame, "message.send");
+  if (!scoped.ok) return scoped;
   if (!isRecord(frame.payload)) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "invalid payload", retryable: false } };
   }
   const p = frame.payload;
-  const command_id = typeof frame.command_id === "string" ? frame.command_id : "";
-  if (!command_id) {
-    return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
-  }
   const type = typeof p.type === "string" ? p.type : "text";
   if (type !== "text" && type !== "image" && type !== "sticker") {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: `unsupported type: ${type}`, retryable: false } };
@@ -106,7 +102,7 @@ export function parseMessageSendCommand(frame: IncomingCommandFrame, senderUserI
   return {
     ok: true,
     command: {
-      command_id,
+      command_id: scoped.frame.command_id,
       type,
       text,
       reply_to,
@@ -117,24 +113,9 @@ export function parseMessageSendCommand(frame: IncomingCommandFrame, senderUserI
   };
 }
 
-function requireCommandId(frame: IncomingCommandFrame): string | null {
-  return typeof frame.command_id === "string" && frame.command_id ? frame.command_id : null;
-}
-
-function requireChannelId(frame: IncomingCommandFrame): string | null {
-  return typeof frame.channel_id === "string" && frame.channel_id ? frame.channel_id : null;
-}
-
 export function parseMessageEditCommand(frame: IncomingCommandFrame): ParseResult<ParsedMessageEdit> {
-  if (frame.command !== "message.edit") {
-    return { ok: false, error: { code: "INVALID_COMMAND", message: `unsupported command: ${frame.command}`, retryable: false } };
-  }
-  if (!requireCommandId(frame)) {
-    return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
-  }
-  if (!requireChannelId(frame)) {
-    return { ok: false, error: { code: "CHANNEL_NOT_FOUND", message: "missing channel_id", retryable: false } };
-  }
+  const scoped = parseChannelCommandFrame(frame, "message.edit");
+  if (!scoped.ok) return scoped;
   if (!isRecord(frame.payload)) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "invalid payload", retryable: false } };
   }
@@ -146,19 +127,12 @@ export function parseMessageEditCommand(frame: IncomingCommandFrame): ParseResul
   if (text.trim() === "") {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "message text is empty", retryable: false } };
   }
-  return { ok: true, command: { message_id, text } };
+  return { ok: true, command: { channel_id: scoped.frame.channel_id, message_id, text } };
 }
 
 export function parseMessageRecallCommand(frame: IncomingCommandFrame): ParseResult<ParsedMessageRecall> {
-  if (frame.command !== "message.recall") {
-    return { ok: false, error: { code: "INVALID_COMMAND", message: `unsupported command: ${frame.command}`, retryable: false } };
-  }
-  if (!requireCommandId(frame)) {
-    return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
-  }
-  if (!requireChannelId(frame)) {
-    return { ok: false, error: { code: "CHANNEL_NOT_FOUND", message: "missing channel_id", retryable: false } };
-  }
+  const scoped = parseChannelCommandFrame(frame, "message.recall");
+  if (!scoped.ok) return scoped;
   if (!isRecord(frame.payload)) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "invalid payload", retryable: false } };
   }
@@ -166,19 +140,12 @@ export function parseMessageRecallCommand(frame: IncomingCommandFrame): ParseRes
   if (!message_id) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "message_id is required", retryable: false } };
   }
-  return { ok: true, command: { message_id } };
+  return { ok: true, command: { channel_id: scoped.frame.channel_id, message_id } };
 }
 
 export function parseMessageDeleteCommand(frame: IncomingCommandFrame): ParseResult<ParsedMessageDelete> {
-  if (frame.command !== "message.delete") {
-    return { ok: false, error: { code: "INVALID_COMMAND", message: `unsupported command: ${frame.command}`, retryable: false } };
-  }
-  if (!requireCommandId(frame)) {
-    return { ok: false, error: { code: "INVALID_MESSAGE", message: "command_id is required", retryable: false } };
-  }
-  if (!requireChannelId(frame)) {
-    return { ok: false, error: { code: "CHANNEL_NOT_FOUND", message: "missing channel_id", retryable: false } };
-  }
+  const scoped = parseChannelCommandFrame(frame, "message.delete");
+  if (!scoped.ok) return scoped;
   if (!isRecord(frame.payload)) {
     return { ok: false, error: { code: "INVALID_MESSAGE", message: "invalid payload", retryable: false } };
   }
@@ -188,5 +155,5 @@ export function parseMessageDeleteCommand(frame: IncomingCommandFrame): ParseRes
   }
   const reasonRaw = frame.payload.reason;
   const reason = typeof reasonRaw === "string" ? reasonRaw : null;
-  return { ok: true, command: { message_id, reason } };
+  return { ok: true, command: { channel_id: scoped.frame.channel_id, message_id, reason } };
 }

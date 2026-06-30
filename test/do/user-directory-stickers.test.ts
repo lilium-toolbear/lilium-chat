@@ -1,15 +1,28 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo, fakeS3PublicPath, createTestChannel, getTimelineMessageIdFromHistory, type TimelineHistoryItem } from "../helpers";
+import {
+  addTestMember,
+  createTestChannel,
+  fakeS3PublicPath,
+  getNamedDo,
+  getTimelineMessageIdFromHistory,
+  joinTestChannel,
+  mutateTestMessage,
+  readTestMessages,
+  sendTestMessage,
+  type TimelineHistoryItem,
+} from "../helpers";
 import { setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
+import type { ChatChannel } from "../../src/do/chat-channel";
+import type { UserDirectory } from "../../src/do/user-directory";
 
 function udStub(userId: string) {
-  return getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], userId);
+  return getNamedDo<UserDirectory>(env.USER_DIRECTORY, userId);
 }
 
 function chatStub(channelId: string) {
-  return getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
+  return getNamedDo<ChatChannel>(env.CHAT_CHANNEL, channelId);
 }
 
 async function insertSticker(stub: ReturnType<typeof udStub>, values: {
@@ -48,98 +61,63 @@ async function insertSticker(stub: ReturnType<typeof udStub>, values: {
 }
 
 async function createChannel(channelId: string, ownerId: string) {
-  const stub = chatStub(channelId);
-  const res = await stub.fetch(
-    new Request("https://x/internal/create-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channel_id: channelId,
-        creator_user_id: ownerId,
-        title: "Sticker source",
-        topic: null,
-        avatar_attachment_id: null,
-        visibility: "private",
-        initial_members: [],
-      }),
-    }),
-  );
-  expect(res.status).toBe(200);
+  const stub = await createTestChannel(env, { channelId, ownerId, title: "Sticker source", visibility: "private" });
+  await stub.getSummary(ownerId);
 }
 
 async function addMember(channelId: string, ownerId: string, memberId: string) {
-  const res = await chatStub(channelId).fetch(
-    new Request("https://x/internal/members-add", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: `idem-add-${channelId}-${memberId}`, channel_id: channelId, user_id: memberId, role: "member" }),
-    }),
-  );
-  expect(res.status).toBe(200);
+  await addTestMember(chatStub(channelId), {
+    actorUserId: ownerId,
+    targetUserId: memberId,
+    channelId,
+    idempotencyKey: `idem-add-${channelId}-${memberId}`,
+  });
 }
 
 async function presignAndFinalize(userId: string, fake: FakeS3): Promise<{ attachment_id: string; upload_url: string }> {
   const key = `idem-sticker-${userId}`;
-  const presignRes = await udStub(userId).fetch(
-    new Request("https://x/internal/attachment-presign", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": key, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filename: "img.png",
-        mime_type: "image/png",
-        size_bytes: 12345,
-        width: 128,
-        height: 128,
-        blurhash: "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
-      }),
-    }),
-  );
-  expect(presignRes.status).toBe(200);
-  const presignBody = (await presignRes.json()) as { attachment_id: string; upload_url: string };
+  const presignRes = await udStub(userId).presignUpload(userId, key, "attachment", {
+    filename: "img.png",
+    mime_type: "image/png",
+    size_bytes: 12345,
+    width: 128,
+    height: 128,
+    blurhash: "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
+  });
+  const presignBody = presignRes;
   fake.objects.set(fakeS3PublicPath(presignBody.attachment_id), { contentType: "image/png", contentLength: 12345 });
 
-  const finalizeRes = await udStub(userId).fetch(
-    new Request("https://x/internal/attachment-finalize", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": `${key}-fin`, "Content-Type": "application/json" },
-      body: JSON.stringify({ attachment_id: presignBody.attachment_id }),
-    }),
-  );
-  expect(finalizeRes.status).toBe(200);
+  const finalizeRes = await udStub(userId).finalizeUpload(userId, `${key}-fin`, { attachment_id: presignBody.attachment_id });
+  expect(finalizeRes.attachment.attachment_id).toBe(presignBody.attachment_id);
   return presignBody;
 }
 
 async function sendImageMessage(channelId: string, senderId: string, attachmentId: string) {
-  const res = await chatStub(channelId).fetch(
-    new Request("https://x/internal/message-send", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": senderId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command_id: `cmd-sticker-${senderId}`,
-        dedupe_principal_key: `user:${senderId}`,
-        type: "image",
-        text: "",
-        reply_to: null,
-        attachment_ids: [attachmentId],
-        mentions: [],
-        channel_id: channelId,
-      }),
-    }),
-  );
+  const res = await sendTestMessage(chatStub(channelId), {
+    userId: senderId,
+    channelId,
+    commandId: `cmd-sticker-${senderId}`,
+    type: "image",
+    attachmentIds: [attachmentId],
+  });
   expect(res.status).toBe(200);
 }
 
 async function saveSticker(userId: string, channelId: string, attachmentId: string, operationId: string) {
-  return udStub(userId).fetch(
-    new Request("https://x/internal/sticker-save", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({ operation_id: operationId, channel_id: channelId, attachment_id: attachmentId }),
-    }),
-  );
+  return udStub(userId).saveSticker(userId, { operation_id: operationId, channel_id: channelId, attachment_id: attachmentId });
 }
 
-describe("UserDirectory personal_stickers + /internal/sticker-resolve", () => {
+async function expectRemoteCode(fn: () => Promise<unknown>, code: string): Promise<void> {
+  try {
+    await fn();
+    throw new Error(`expected ${code}`);
+  } catch (err) {
+    expect((err as { remote?: unknown }).remote).toBe(true);
+    expect((err as { code?: unknown }).code).toBe(code);
+  }
+}
+
+describe("UserDirectory personal_stickers + resolveSticker RPC", () => {
   it("resolves an owned active sticker", async () => {
     const userId = "u-sticker-resolve-1";
     const stub = udStub(userId);
@@ -155,11 +133,7 @@ describe("UserDirectory personal_stickers + /internal/sticker-resolve", () => {
       created_at: "2026-01-01T00:00:00.000Z",
     });
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/sticker-resolve?sticker_id=s1", { headers: { "X-Verified-User-Id": userId } }),
-    );
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { sticker_id: string; attachment_id: string; url: string; width: number; height: number };
+    const body = await stub.resolveSticker(userId, "s1");
     expect(body.sticker_id).toBe("s1");
     expect(body.attachment_id).toBe("a1");
     expect(body.width).toBe(128);
@@ -180,12 +154,7 @@ describe("UserDirectory personal_stickers + /internal/sticker-resolve", () => {
       deleted_at: "2026-01-02T00:00:00.000Z",
     });
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/sticker-resolve?sticker_id=s2", { headers: { "X-Verified-User-Id": userId } }),
-    );
-    expect(res.status).toBe(404);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("STICKER_NOT_FOUND");
+    await expectRemoteCode(() => stub.resolveSticker(userId, "s2"), "STICKER_NOT_FOUND");
   });
 
   it("returns 404 for another user's sticker", async () => {
@@ -202,16 +171,11 @@ describe("UserDirectory personal_stickers + /internal/sticker-resolve", () => {
       created_at: "2026-01-01T00:00:00.000Z",
     });
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/sticker-resolve?sticker_id=s3", { headers: { "X-Verified-User-Id": otherId } }),
-    );
-    expect(res.status).toBe(404);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("STICKER_NOT_FOUND");
+    await expectRemoteCode(() => stub.resolveSticker(otherId, "s3"), "STICKER_NOT_FOUND");
   });
 });
 
-describe("UserDirectory /internal/sticker-save + /internal/sticker-list + /internal/sticker-delete", () => {
+describe("UserDirectory sticker save/list/delete RPC", () => {
   let fake: FakeS3;
   beforeEach(() => {
     fake = new FakeS3();
@@ -225,32 +189,21 @@ describe("UserDirectory /internal/sticker-save + /internal/sticker-list + /inter
     const { attachment_id } = await presignAndFinalize(userId, fake);
 
     const saveRes = await saveSticker(userId, channelId, attachment_id, `op-${userId}-save`);
-    expect(saveRes.status).toBe(200);
-    const saveBody = (await saveRes.json()) as { sticker: { sticker_id: string; attachment: { attachment_id: string; blurhash: string | null } } };
+    const saveBody = saveRes;
     expect(saveBody.sticker.attachment.attachment_id).toBe(attachment_id);
     expect(saveBody.sticker.attachment.blurhash).toBe("LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB");
 
-    const listRes = await udStub(userId).fetch(
-      new Request("https://x/internal/sticker-list?limit=10", { headers: { "X-Verified-User-Id": userId } }),
-    );
-    expect(listRes.status).toBe(200);
-    const listBody = (await listRes.json()) as { items: Array<{ sticker_id: string }>; next_cursor: string | null };
+    const listBody = await udStub(userId).listStickers(userId, { limit: 10, cursor: null });
     expect(listBody.items).toHaveLength(1);
     expect(listBody.items[0]!.sticker_id).toBe(saveBody.sticker.sticker_id);
 
-    const delRes = await udStub(userId).fetch(
-      new Request("https://x/internal/sticker-delete", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({ sticker_id: saveBody.sticker.sticker_id, operation_id: `op-del-${userId}` }),
-      }),
-    );
-    expect(delRes.status).toBe(200);
+    const delRes = await udStub(userId).deleteSticker(userId, {
+      sticker_id: saveBody.sticker.sticker_id,
+      operation_id: `op-del-${userId}`,
+    });
+    expect(delRes.deleted).toBe(true);
 
-    const listAfterRes = await udStub(userId).fetch(
-      new Request("https://x/internal/sticker-list?limit=10", { headers: { "X-Verified-User-Id": userId } }),
-    );
-    const listAfterBody = (await listAfterRes.json()) as { items: Array<unknown> };
+    const listAfterBody = await udStub(userId).listStickers(userId, { limit: 10, cursor: null });
     expect(listAfterBody.items).toHaveLength(0);
   });
 
@@ -262,13 +215,9 @@ describe("UserDirectory /internal/sticker-save + /internal/sticker-list + /inter
     const op = `op-${userId}-idem`;
 
     const r1 = await saveSticker(userId, channelId, attachment_id, op);
-    expect(r1.status).toBe(200);
-    const b1 = (await r1.json()) as { sticker: { sticker_id: string } };
 
     const r2 = await saveSticker(userId, channelId, attachment_id, op);
-    expect(r2.status).toBe(200);
-    const b2 = (await r2.json()) as { sticker: { sticker_id: string } };
-    expect(b2.sticker.sticker_id).toBe(b1.sticker.sticker_id);
+    expect(r2.sticker.sticker_id).toBe(r1.sticker.sticker_id);
   });
 
   it("saves a channel-visible attachment from another user's image message", async () => {
@@ -281,9 +230,7 @@ describe("UserDirectory /internal/sticker-save + /internal/sticker-list + /inter
     await sendImageMessage(channelId, ownerId, attachment_id);
 
     const saveRes = await saveSticker(memberId, channelId, attachment_id, `op-${memberId}-visible`);
-    expect(saveRes.status).toBe(200);
-    const saveBody = (await saveRes.json()) as { sticker: { attachment: { attachment_id: string } } };
-    expect(saveBody.sticker.attachment.attachment_id).toBe(attachment_id);
+    expect(saveRes.sticker.attachment.attachment_id).toBe(attachment_id);
   });
 
   it("saves a channel-visible attachment from another user's sticker message", async () => {
@@ -295,34 +242,20 @@ describe("UserDirectory /internal/sticker-save + /internal/sticker-list + /inter
     // Owner finalizes an image and saves it to their own sticker library, then sends a sticker message.
     const { attachment_id } = await presignAndFinalize(ownerId, fake);
     const saveRes = await saveSticker(ownerId, channelId, attachment_id, `op-${ownerId}-lib`);
-    expect(saveRes.status).toBe(200);
-    const saveBody = (await saveRes.json()) as { sticker: { sticker_id: string } };
-    const stickerId = saveBody.sticker.sticker_id;
+    const stickerId = saveRes.sticker.sticker_id;
 
-    const sendRes = await chatStub(channelId).fetch(
-      new Request("https://x/internal/message-send", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          command_id: `cmd-sticker-msg-${ownerId}`,
-          dedupe_principal_key: `user:${ownerId}`,
-          type: "sticker",
-          text: "",
-          reply_to: null,
-          sticker_id: stickerId,
-          attachment_ids: [],
-          mentions: [],
-          channel_id: channelId,
-        }),
-      }),
-    );
+    const sendRes = await sendTestMessage(chatStub(channelId), {
+      userId: ownerId,
+      channelId,
+      commandId: `cmd-sticker-msg-${ownerId}`,
+      type: "sticker",
+      stickerId,
+    });
     expect(sendRes.status).toBe(200);
 
     // Member saves the sticker from the owner's sticker message using its canonical attachment_id.
     const memberSaveRes = await saveSticker(memberId, channelId, attachment_id, `op-${memberId}-sticker-src`);
-    expect(memberSaveRes.status).toBe(200);
-    const memberSaveBody = (await memberSaveRes.json()) as { sticker: { attachment: { attachment_id: string } } };
-    expect(memberSaveBody.sticker.attachment.attachment_id).toBe(attachment_id);
+    expect(memberSaveRes.sticker.attachment.attachment_id).toBe(attachment_id);
   });
 
   it("saves a channel-visible attachment from a public channel using client channel_id", async () => {
@@ -335,35 +268,20 @@ describe("UserDirectory /internal/sticker-save + /internal/sticker-list + /inter
       title: "Sticker Channel",
       visibility: "public_listed",
     });
-    await channelStub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: memberId }),
-    }));
+    await joinTestChannel(channelStub, memberId);
 
     const { attachment_id } = await presignAndFinalize(ownerId, fake);
-    const sendRes = await channelStub.fetch(
-      new Request("https://x/internal/message-send", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          command_id: `cmd-sticker-system-${ownerId}`,
-          dedupe_principal_key: `user:${ownerId}`,
-          type: "image",
-          text: "",
-          reply_to: null,
-          attachment_ids: [attachment_id],
-          mentions: [],
-          channel_id: channelId,
-        }),
-      }),
-    );
+    const sendRes = await sendTestMessage(channelStub, {
+      userId: ownerId,
+      channelId,
+      commandId: `cmd-sticker-system-${ownerId}`,
+      type: "image",
+      attachmentIds: [attachment_id],
+    });
     expect(sendRes.status).toBe(200);
 
     const saveRes = await saveSticker(memberId, channelId, attachment_id, `op-${memberId}-system`);
-    expect(saveRes.status).toBe(200);
-    const saveBody = (await saveRes.json()) as { sticker: { attachment: { attachment_id: string } } };
-    expect(saveBody.sticker.attachment.attachment_id).toBe(attachment_id);
+    expect(saveRes.sticker.attachment.attachment_id).toBe(attachment_id);
   });
 
   it("rejects saving a recalled source message attachment via channel-visible path", async () => {
@@ -375,26 +293,22 @@ describe("UserDirectory /internal/sticker-save + /internal/sticker-list + /inter
     const { attachment_id } = await presignAndFinalize(ownerId, fake);
     await sendImageMessage(channelId, ownerId, attachment_id);
 
-    const historyRes = await chatStub(channelId).fetch(
-      new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": ownerId } }),
-    );
-    expect(historyRes.status).toBe(200);
-    const historyBody = (await historyRes.json()) as { items: TimelineHistoryItem[] };
+    const historyBody = await readTestMessages(chatStub(channelId), ownerId);
     const messageId = getTimelineMessageIdFromHistory(historyBody.items);
 
-    const recallRes = await chatStub(channelId).fetch(
-      new Request("https://x/internal/message-recall", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-        body: JSON.stringify({ operation_id: "op-recall", message_id: messageId, channel_id: channelId }),
-      }),
-    );
+    const recallRes = await mutateTestMessage(chatStub(channelId), {
+      userId: ownerId,
+      channelId,
+      messageId,
+      operation: "message.recall",
+      operationId: "op-recall",
+    });
     expect(recallRes.status).toBe(200);
 
-    const saveRes = await saveSticker(memberId, channelId, attachment_id, `op-${memberId}-recalled`);
-    expect(saveRes.status).toBe(422);
-    const saveBody = (await saveRes.json()) as { error: { code: string } };
-    expect(saveBody.error.code).toBe("INVALID_STICKER_SOURCE");
+    await expectRemoteCode(
+      () => saveSticker(memberId, channelId, attachment_id, `op-${memberId}-recalled`),
+      "INVALID_STICKER_SOURCE",
+    );
   });
 });
 
@@ -436,38 +350,38 @@ describe("UserDirectory sticker library limit + width/height validation + delete
 
     // A new, distinct finalized attachment → should hit the limit.
     const { attachment_id } = await presignAndFinalize(userId, fake);
-    const res = await saveSticker(userId, channelId, attachment_id, `op-${userId}-limit`);
-    expect(res.status).toBe(409);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("STICKER_LIBRARY_LIMIT_EXCEEDED");
+    await expectRemoteCode(
+      () => saveSticker(userId, channelId, attachment_id, `op-${userId}-limit`),
+      "STICKER_LIBRARY_LIMIT_EXCEEDED",
+    );
   });
 
   it("rejects presign with non-positive width", async () => {
     const userId = "u-sticker-width";
-    const res = await udStub(userId).fetch(
-      new Request("https://x/internal/attachment-presign", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Idempotency-Key": "op-width", "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: "img.png", mime_type: "image/png", size_bytes: 12345, width: 0, height: 128 }),
+    await expectRemoteCode(
+      () => udStub(userId).presignUpload(userId, "op-width", "attachment", {
+        filename: "img.png",
+        mime_type: "image/png",
+        size_bytes: 12345,
+        width: 0,
+        height: 128,
       }),
+      "INVALID_MESSAGE",
     );
-    expect(res.status).toBe(422);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("INVALID_MESSAGE");
   });
 
   it("rejects presign with negative height", async () => {
     const userId = "u-sticker-height";
-    const res = await udStub(userId).fetch(
-      new Request("https://x/internal/attachment-presign", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Idempotency-Key": "op-height", "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: "img.png", mime_type: "image/png", size_bytes: 12345, width: 128, height: -1 }),
+    await expectRemoteCode(
+      () => udStub(userId).presignUpload(userId, "op-height", "attachment", {
+        filename: "img.png",
+        mime_type: "image/png",
+        size_bytes: 12345,
+        width: 128,
+        height: -1,
       }),
+      "INVALID_MESSAGE",
     );
-    expect(res.status).toBe(422);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("INVALID_MESSAGE");
   });
 
   it("delete is idempotent: retry returns the same {sticker_id, deleted:true}", async () => {
@@ -476,32 +390,15 @@ describe("UserDirectory sticker library limit + width/height validation + delete
     await createChannel(channelId, userId);
     const { attachment_id } = await presignAndFinalize(userId, fake);
     const saveRes = await saveSticker(userId, channelId, attachment_id, `op-${userId}-save`);
-    const saveBody = (await saveRes.json()) as { sticker: { sticker_id: string } };
-    const stickerId = saveBody.sticker.sticker_id;
+    const stickerId = saveRes.sticker.sticker_id;
 
     const op = `op-${userId}-del`;
-    const r1 = await udStub(userId).fetch(
-      new Request("https://x/internal/sticker-delete", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({ sticker_id: stickerId, operation_id: op }),
-      }),
-    );
-    expect(r1.status).toBe(200);
-    const b1 = (await r1.json()) as { sticker_id: string; deleted: boolean };
-    expect(b1.sticker_id).toBe(stickerId);
-    expect(b1.deleted).toBe(true);
+    const r1 = await udStub(userId).deleteSticker(userId, { sticker_id: stickerId, operation_id: op });
+    expect(r1.sticker_id).toBe(stickerId);
+    expect(r1.deleted).toBe(true);
 
-    const r2 = await udStub(userId).fetch(
-      new Request("https://x/internal/sticker-delete", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({ sticker_id: stickerId, operation_id: op }),
-      }),
-    );
-    expect(r2.status).toBe(200);
-    const b2 = (await r2.json()) as { sticker_id: string; deleted: boolean };
-    expect(b2.sticker_id).toBe(stickerId);
-    expect(b2.deleted).toBe(true);
+    const r2 = await udStub(userId).deleteSticker(userId, { sticker_id: stickerId, operation_id: op });
+    expect(r2.sticker_id).toBe(stickerId);
+    expect(r2.deleted).toBe(true);
   });
 });

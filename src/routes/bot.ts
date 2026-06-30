@@ -1,7 +1,7 @@
 import type { Context } from "hono";
 import type { BotCommandsSyncResponse } from "../contract/bot-api";
 import type { Env } from "../env";
-import { ApiError } from "../errors";
+import { ApiError, apiErrorFromRemote } from "../errors";
 import { botRegistryStub, getBotIdentity } from "../auth/bot";
 
 /** PUT /api/chat/bot/commands — sync the bot's global command catalog. */
@@ -19,34 +19,23 @@ export async function putBotCommandsHandler(
     throw new ApiError("INVALID_COMMAND_OPTIONS", "commands array required");
   }
 
-  const res = await botRegistryStub(env).fetch(
-    new Request("https://x/internal/commands-sync", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        bot_id: botId,
-        idempotency_key: idempotencyKey,
-        commands: body.commands,
-      }),
-    }),
-  );
-
-  if (res.status === 422) {
-    const e = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
-    throw new ApiError("INVALID_COMMAND_OPTIONS", e.error?.message ?? "invalid commands");
-  }
-  if (res.status === 409) {
-    const e = (await res.json().catch(() => ({}))) as {
-      error?: { code?: string; message?: string; conflict?: unknown };
-    };
-    if (e.error?.code === "COMMAND_NAME_CONFLICT") {
+  try {
+    const out = await botRegistryStub(env).syncCommands({
+      bot_id: botId,
+      idempotency_key: idempotencyKey,
+      commands: body.commands,
+    });
+    return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
+  } catch (err) {
+    const apiErr = err instanceof ApiError ? err : apiErrorFromRemote(err);
+    if (apiErr?.code === "COMMAND_NAME_CONFLICT") {
       return c.json(
         {
           error: {
             code: "COMMAND_NAME_CONFLICT",
-            message: e.error.message ?? "command name conflict",
+            message: apiErr.message,
             retryable: false,
-            conflict: e.error.conflict ?? null,
+            conflict: (apiErr as ApiError & { conflict?: unknown }).conflict ?? null,
           },
           request_id: c.get("requestId"),
         },
@@ -54,10 +43,7 @@ export async function putBotCommandsHandler(
         { "X-Request-Id": c.get("requestId") },
       );
     }
-    throw new ApiError("IDEMPOTENCY_CONFLICT", "idempotency key reused with different body");
+    if (apiErr) throw apiErr;
+    throw err;
   }
-  if (!res.ok) throw new ApiError("CHAT_WORKER_UNAVAILABLE", "commands sync failed");
-
-  const out = (await res.json()) as BotCommandsSyncResponse;
-  return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { ApiError, errorResponse, HTTP_STATUS_BY_CODE } from "./errors";
+import { ApiError, apiErrorFromRemote, errorResponse, HTTP_STATUS_BY_CODE } from "./errors";
 
 describe("ApiError", () => {
   it("maps code to http status via HTTP_STATUS_BY_CODE", () => {
@@ -30,5 +30,33 @@ describe("ApiError", () => {
   it("CHAT_WORKER_UNAVAILABLE is retryable=true", () => {
     const e = new ApiError("CHAT_WORKER_UNAVAILABLE", "down");
     expect(e.retryable).toBe(true);
+  });
+
+  it("maps only remote user-code RPC errors back to ApiError", () => {
+    const err = apiErrorFromRemote({
+      remote: true,
+      code: "INVALID_COMMAND_OPTIONS",
+      message: "option.type invalid",
+      retryable: false,
+    });
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err?.code).toBe("INVALID_COMMAND_OPTIONS");
+    expect(err?.httpStatus).toBe(422);
+
+    expect(apiErrorFromRemote({ remote: false, retryable: true, message: "transport" })).toBeNull();
+    expect(apiErrorFromRemote({ remote: true, message: "missing code" })).toBeNull();
+
+    const withExtras = apiErrorFromRemote({
+      remote: true,
+      code: "STATEFUL_SESSION_BUSY",
+      message: "busy",
+      active_session: { session_id: "s1" },
+      conflict: { bot_id: "b1" },
+    });
+    expect(withExtras).toMatchObject({
+      code: "STATEFUL_SESSION_BUSY",
+      active_session: { session_id: "s1" },
+      conflict: { bot_id: "b1" },
+    });
   });
 });

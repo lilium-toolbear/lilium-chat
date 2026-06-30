@@ -1,5 +1,7 @@
 import type { IncomingCommandFrame } from "../contract/commands";
 import { isRecord } from "../contract/utils";
+import type { ParsedChannelCommandFrame } from "./ws-command-frame";
+import { parseChannelCommandFrame } from "./ws-command-frame";
 
 export interface ParsedCommandInvoke {
   channel_id: string;
@@ -22,19 +24,10 @@ function fail(message: string): ParseCommandInvokeResult {
   };
 }
 
-export function parseCommandInvokeCommand(frame: IncomingCommandFrame): ParseCommandInvokeResult {
-  if (frame.command !== "command.invoke") {
-    return fail(`unsupported command: ${frame.command}`);
-  }
-  if (typeof frame.command_id !== "string" || frame.command_id.length === 0) {
-    return fail("command_id is required");
-  }
-  if (typeof frame.channel_id !== "string" || frame.channel_id.length === 0) {
-    return {
-      ok: false,
-      error: { code: "CHANNEL_NOT_FOUND", message: "missing channel_id", retryable: false },
-    };
-  }
+export function parseCommandInvokePayload(
+  frame: IncomingCommandFrame,
+  channel: ParsedChannelCommandFrame,
+): ParseCommandInvokeResult {
   if (!isRecord(frame.payload)) {
     return fail("invalid payload");
   }
@@ -86,8 +79,8 @@ export function parseCommandInvokeCommand(frame: IncomingCommandFrame): ParseCom
   return {
     ok: true,
     command: {
-      channel_id: frame.channel_id,
-      command_id: frame.command_id,
+      channel_id: channel.channel_id,
+      command_id: channel.command_id,
       bot_command_id: botCommandId,
       invoked_name: invokedName,
       command_manifest_version: commandManifestVersion,
@@ -95,4 +88,10 @@ export function parseCommandInvokeCommand(frame: IncomingCommandFrame): ParseCom
       reply_to_message_id,
     },
   };
+}
+
+export function parseCommandInvokeCommand(frame: IncomingCommandFrame): ParseCommandInvokeResult {
+  const scoped = parseChannelCommandFrame(frame, "command.invoke");
+  if (!scoped.ok) return scoped;
+  return parseCommandInvokePayload(frame, scoped.frame);
 }

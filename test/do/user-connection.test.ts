@@ -10,7 +10,7 @@ async function joinTestChannel(userId: string): Promise<{ channelId: string }> {
 }
 
 describe("UserConnection DO", () => {
-  it("/deliver sends an event frame on the live socket and stores a probe", async () => {
+  it("deliver sends an event frame on the live socket and stores a probe", async () => {
     const userId = "u-uc-deliver";
     const { channelId } = await joinTestChannel(userId);
     const { ws, stub, sessionId } = await upgradeUserConnection(userId);
@@ -40,29 +40,24 @@ describe("UserConnection DO", () => {
       payload: {},
     });
     const receivedPromise = nextMessage(ws);
-    const deliverRes = await stub.fetch(new Request("https://x/deliver", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Channel-Id": channelId },
-      body: JSON.stringify({
-        lease_id: leaseId,
-        channel_id: channelId,
-        session_id: sessionId,
-        event_id: "e-d1",
-        event_json: eventJson,
-        membership_version_at_event: 0,
-      }),
-    }));
-    expect(deliverRes.status).toBe(200);
+    await stub.deliver({
+      lease_id: leaseId,
+      channel_id: channelId,
+      session_id: sessionId,
+      event_id: "e-d1",
+      event_json: eventJson,
+      membership_version_at_event: 0,
+    });
 
     const received = await receivedPromise;
     expect(JSON.parse(received).event_id).toBe("e-d1");
 
-    const probe = await (await stub.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1" } }))).json() as { event_json: string | null };
+    const probe = await stub.debugLastDeliver();
     expect(probe.event_json).toContain('"event_id":"e-d1"');
     ws.close();
   });
 
-  it("/deliver with a non-existent session_id does NOT deliver to another socket of the same user (fail-closed)", async () => {
+  it("deliver with a non-existent session_id does NOT deliver to another socket of the same user (fail-closed)", async () => {
     const userId = "u-uc-failclosed";
     const { channelId } = await joinTestChannel(userId);
     const { ws, stub } = await upgradeUserConnection(userId);
@@ -72,23 +67,17 @@ describe("UserConnection DO", () => {
       frame_type: "event", api_version: "lilium.chat.v2", event_id: "e-stale", type: "message.created",
       channel_id: channelId, occurred_at: "2026-06-23T00:00:00Z", payload: {},
     });
-    const deliverRes = await stub.fetch(new Request("https://x/deliver", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Channel-Id": channelId },
-      body: JSON.stringify({
-        session_id: "session-that-does-not-exist",
-        channel_id: channelId,
-        lease_id: "missing-lease",
-        event_json: eventJson,
-        membership_version_at_event: 0,
-      }),
-    }));
-    expect(deliverRes.status).toBe(200);
-    const body = (await deliverRes.json()) as { delivered: boolean; reason?: string };
+    const body = await stub.deliver({
+      session_id: "session-that-does-not-exist",
+      channel_id: channelId,
+      lease_id: "missing-lease",
+      event_json: eventJson,
+      membership_version_at_event: 0,
+    });
     expect(body.delivered).toBe(false);
     expect(body.reason).toBe("session_not_found");
 
-    const probe = await (await stub.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1" } }))).json() as { event_json: string | null };
+    const probe = await stub.debugLastDeliver();
     expect(probe.event_json ?? "").not.toContain('"e-stale"');
     ws.close();
   });

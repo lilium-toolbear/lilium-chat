@@ -3,13 +3,14 @@ import { env } from "cloudflare:workers";
 import { BOT_GATEWAY_API_VERSION } from "../../src/chat/bot-gateway-protocol";
 import { createOwnedTestChannel, getNamedDo } from "../helpers";
 import { nextAck, upgradeUserConnection } from "../ws-helpers";
+import type { ChatChannel } from "../../src/do/chat-channel";
 
 async function withChannel(
   channelId: string,
   fn: (ctx: DurableObjectState) => void | Promise<void>,
 ): Promise<void> {
   const { runInDurableObject } = await import("cloudflare:test");
-  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as DurableObjectNamespace, channelId);
+  const stub = getNamedDo<ChatChannel>(env.CHAT_CHANNEL, channelId);
   await runInDurableObject(stub, async (instance: unknown) => {
     const ctx = (instance as { ctx: DurableObjectState }).ctx;
     await fn(ctx);
@@ -117,23 +118,20 @@ async function stopStatefulSession(input: {
   operationId: string;
   reason?: string;
 }): Promise<{ ok?: boolean; session_id?: string; error?: { code?: string } }> {
-  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as DurableObjectNamespace, input.channelId);
-  const res = await stub.fetch(
-    new Request("https://x/internal/stateful-session-stop", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Verified-User-Id": input.userId,
-      },
-      body: JSON.stringify({
-        channel_id: input.channelId,
-        session_id: input.sessionId,
-        reason: input.reason ?? "admin_stop",
-        operation_id: input.operationId,
-      }),
-    }),
-  );
-  return (await res.json()) as { ok?: boolean; session_id?: string; error?: { code?: string } };
+  const stub = getNamedDo<ChatChannel>(env.CHAT_CHANNEL, input.channelId);
+  try {
+    return await stub.stopStatefulSession({
+      user_id: input.userId,
+      channel_id: input.channelId,
+      session_id: input.sessionId,
+      reason: input.reason ?? "admin_stop",
+      operation_id: input.operationId,
+    });
+  } catch (err) {
+    const apiErr = (await import("../../src/errors")).apiErrorFromRemote(err);
+    if (apiErr) return { error: { code: apiErr.code } };
+    throw err;
+  }
 }
 
 async function invokeStatefulCommand(input: {

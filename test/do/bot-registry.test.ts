@@ -11,9 +11,10 @@ import {
   verifyBotToken,
   type BotIdentity,
 } from "../../src/auth/bot";
+import type { BotRegistry } from "../../src/do/bot-registry";
 
 const REGISTRY = () =>
-  getNamedDo(env.BOT_REGISTRY as unknown as DurableObjectNamespace, "registry");
+  getNamedDo<BotRegistry>(env.BOT_REGISTRY as unknown as DurableObjectNamespace<BotRegistry>, "registry");
 
 async function withRegistry(
   fn: (ctx: DurableObjectState) => void | Promise<void>,
@@ -97,7 +98,7 @@ function botIdentityApp(requiredScope: string) {
   return app;
 }
 
-describe("BotRegistry token-verify + bot-get (7a-bot-identity)", () => {
+describe("BotRegistry token verification and bot profile RPC", () => {
   it("verifyBotToken resolves a valid active bot token to {bot_id, scopes}", async () => {
     const botId = `bot-ok-${crypto.randomUUID()}`;
     await seedBot({ botId, token: "secret-ok", scopes: ["chat:commands:manage", "chat:runtime:connect"] });
@@ -128,30 +129,26 @@ describe("BotRegistry token-verify + bot-get (7a-bot-identity)", () => {
     });
   });
 
-  it("/internal/bot-get returns the bot profile (no callback_secret/callback_url)", async () => {
+  it("getBot returns the bot profile (no callback_secret/callback_url)", async () => {
     const botId = `bot-get-${crypto.randomUUID()}`;
     await seedBot({ botId, token: "secret-get", displayName: "Profile Bot", avatarUrl: "https://example.test/a.png" });
-    const res = await REGISTRY().fetch(
-      new Request(`https://x/internal/bot-get?bot_id=${botId}`),
-    );
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as Record<string, unknown>;
-    expect(body.bot_id).toBe(botId);
-    expect(body.display_name).toBe("Profile Bot");
-    expect(body.avatar_url).toBe("https://example.test/a.png");
-    expect(body.status).toBe("active");
+    const body = await REGISTRY().getBot(botId);
+    expect(body.bot.bot_id).toBe(botId);
+    expect(body.bot.display_name).toBe("Profile Bot");
+    expect(body.bot.avatar_url).toBe("https://example.test/a.png");
+    expect(body.bot.status).toBe("active");
     // never leak callback config (HTTP callback is future transport)
-    expect(body.callback_secret).toBeUndefined();
-    expect(body.callback_url).toBeUndefined();
+    expect("callback_secret" in body.bot).toBe(false);
+    expect("callback_url" in body.bot).toBe(false);
   });
 
-  it("/internal/bot-get returns 404 BOT_NOT_FOUND for unknown bot_id", async () => {
-    const res = await REGISTRY().fetch(
-      new Request("https://x/internal/bot-get?bot_id=nope"),
-    );
-    expect(res.status).toBe(404);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("BOT_NOT_FOUND");
+  it("getBot throws remote BOT_NOT_FOUND for unknown bot_id", async () => {
+    try {
+      await REGISTRY().getBot("nope");
+      throw new Error("getBot should have failed");
+    } catch (err) {
+      expect(err).toMatchObject({ code: "BOT_NOT_FOUND", remote: true });
+    }
   });
 
   it("getBotIdentity returns bot_id when scope is present", async () => {
@@ -159,7 +156,7 @@ describe("BotRegistry token-verify + bot-get (7a-bot-identity)", () => {
     await seedBot({ botId, token: "secret-scope-ok", scopes: ["chat:commands:manage"] });
     const app = botIdentityApp("chat:commands:manage");
     const res = await app.fetch(
-      new Request("https://x/probe", {
+      new Request("https://chat.kuma.homes/probe", {
         method: "POST",
         headers: { Authorization: "Bearer secret-scope-ok", "Content-Type": "application/json" },
         body: "{}",
@@ -175,7 +172,7 @@ describe("BotRegistry token-verify + bot-get (7a-bot-identity)", () => {
     await seedBot({ botId, token: "secret-scope-missing", scopes: ["chat:messages:read"] });
     const app = botIdentityApp("chat:commands:manage");
     const res = await app.fetch(
-      new Request("https://x/probe", {
+      new Request("https://chat.kuma.homes/probe", {
         method: "POST",
         headers: { Authorization: "Bearer secret-scope-missing", "Content-Type": "application/json" },
         body: "{}",
@@ -190,7 +187,7 @@ describe("BotRegistry token-verify + bot-get (7a-bot-identity)", () => {
   it("getBotIdentity returns 401 without a bearer token", async () => {
     const app = botIdentityApp("chat:commands:manage");
     const res = await app.fetch(
-      new Request("https://x/probe", { method: "POST", body: "{}" }),
+      new Request("https://chat.kuma.homes/probe", { method: "POST", body: "{}" }),
       env,
     );
     expect(res.status).toBe(401);

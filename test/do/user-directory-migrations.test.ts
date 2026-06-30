@@ -1,12 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
-import { applyBaselineSchema, columnExists, tableExists } from "../../src/do/sql-migrations";
+import { getNamedDo, readDoSchemaVersion } from "../helpers";
+import { applyBaselineSchema, columnExists, tableExists } from "../../src/do/shared/sql-migrations";
 import {
   USER_DIRECTORY_CURRENT_SCHEMA_VERSION,
   USER_DIRECTORY_LEGACY_BASELINE_SCHEMA,
   migrateUserDirectorySchema,
-} from "../../src/do/migrations/user-directory";
+} from "../../src/do/user-directory/migrations";
 
 function udStub(userId: string) {
   return getNamedDo(env.USER_DIRECTORY as unknown as DurableObjectNamespace, userId);
@@ -63,11 +63,7 @@ describe("UserDirectory migrations", () => {
       expect(pending?.blurhash).toBeNull();
     });
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
-    );
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { current_version: number };
+    const body = await readDoSchemaVersion(stub);
     expect(body.current_version).toBe(USER_DIRECTORY_CURRENT_SCHEMA_VERSION);
   });
 
@@ -120,11 +116,7 @@ describe("UserDirectory migrations", () => {
       expect(myCh?.channel_id).toBe("ch-pre-phase-e");
     });
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
-    );
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { current_version: number };
+    const body = await readDoSchemaVersion(stub);
     expect(body.current_version).toBe(USER_DIRECTORY_CURRENT_SCHEMA_VERSION);
   });
 });

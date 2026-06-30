@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { getNamedDo, readDoSchemaVersion } from "../helpers";
 import {
   applyBaselineSchema,
   columnExists,
@@ -8,14 +8,14 @@ import {
   migrateSqlite,
   quoteIdent,
   tableExists,
-} from "../../src/do/sql-migrations";
+} from "../../src/do/shared/sql-migrations";
 import {
   CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
   CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA,
   chatChannelBaseline,
   chatChannelMigrations,
   migrateChatChannelSchema,
-} from "../../src/do/migrations/chat-channel";
+} from "../../src/do/chat-channel/data/migrations";
 
 function chatStub(channelId: string) {
   return getNamedDo(env.CHAT_CHANNEL as unknown as DurableObjectNamespace, channelId);
@@ -33,11 +33,7 @@ async function withDoState(
 }
 
 async function schemaVersion(stub: DurableObjectStub): Promise<number> {
-  const res = await stub.fetch(
-    new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
-  );
-  const body = (await res.json()) as { current_version: number };
-  return body.current_version;
+  return (await readDoSchemaVersion(stub)).current_version;
 }
 
 function expectPhase7Tables(ctx: DurableObjectState): void {
@@ -81,7 +77,7 @@ function stampSchemaVersion(ctx: DurableObjectState, version: number, name = "le
 describe("ChatChannel v2 migrations (Task 7 baseline reset)", () => {
   it("fresh install uses reset baseline schema", async () => {
     const stub = chatStub(`fresh-v2-${crypto.randomUUID()}`);
-    await stub.fetch(new Request("https://x/ping"));
+    await schemaVersion(stub);
 
     await withDoState(stub, (ctx) => {
       expectPhase7Tables(ctx);
@@ -135,7 +131,7 @@ describe("ChatChannel v2 migrations (Task 7 baseline reset)", () => {
 
   it("migration is idempotent (re-run is noop)", async () => {
     const stub = chatStub(`idempotent-v2-${crypto.randomUUID()}`);
-    await stub.fetch(new Request("https://x/ping"));
+    await schemaVersion(stub);
 
     let extraRuns = 0;
     const extra = {
@@ -156,7 +152,7 @@ describe("ChatChannel v2 migrations (Task 7 baseline reset)", () => {
   it("baseline and defensive migration both satisfy Task 7 assertions", async () => {
     const freshStub = chatStub(`assertions-fresh-${crypto.randomUUID()}`);
     const legacyStub = chatStub(`assertions-legacy-${crypto.randomUUID()}`);
-    await freshStub.fetch(new Request("https://x/ping"));
+    await schemaVersion(freshStub);
 
     await withDoState(legacyStub, (ctx) => {
       applyBaselineSchema(ctx, CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA);

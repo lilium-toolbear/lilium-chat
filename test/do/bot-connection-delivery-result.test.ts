@@ -3,8 +3,10 @@ import { env } from "cloudflare:workers";
 import { BOT_GATEWAY_API_VERSION, buildDeliveryAck } from "../../src/chat/bot-gateway-protocol";
 import { createTestChannel, getNamedDo } from "../helpers";
 
-function botConnectionStub(botId: string): DurableObjectStub {
-  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace, botId);
+import type { BotConnection } from "../../src/do/bot-connection";
+
+function botConnectionStub(botId: string): DurableObjectStub<BotConnection> {
+  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace<BotConnection>, botId);
 }
 
 const REGISTRY = () =>
@@ -52,7 +54,7 @@ afterEach(async () => {
 
 async function openConnection(
   botId: string,
-): Promise<{ ws: WebSocket; stub: DurableObjectStub }> {
+): Promise<{ ws: WebSocket; stub: DurableObjectStub<BotConnection> }> {
   const stub = botConnectionStub(botId);
   const res = await stub.fetch(
     new Request("https://x/bot", {
@@ -125,19 +127,7 @@ describe("BotConnection delivery_result routing", () => {
     await nextMessageOfType(ws, "ready");
 
     const outboxId = `out-${crypto.randomUUID()}`;
-    const enq = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(
-          enqueuePayload({ outbox_id: outboxId, channel_id: channelId, target_id: "inv-e2e" }),
-        ),
-      }),
-    );
-    expect(enq.status).toBe(200);
+    await stub.enqueueDelivery(botId, enqueuePayload({ outbox_id: outboxId, channel_id: channelId, target_id: "inv-e2e" }));
 
     const deliveryFrame = JSON.parse(await nextMessageOfType(ws, "delivery")) as { delivery_id: string };
     ws.send(
@@ -185,19 +175,7 @@ describe("BotConnection delivery_result routing", () => {
 
     const channelId = crypto.randomUUID();
     await createTestChannel(env, { channelId, ownerId: "owner-1" });
-    const enq = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(
-          enqueuePayload({ outbox_id: `out-${crypto.randomUUID()}`, channel_id: channelId }),
-        ),
-      }),
-    );
-    expect(enq.status).toBe(200);
+    await stub.enqueueDelivery(botId, enqueuePayload({ outbox_id: `out-${crypto.randomUUID()}`, channel_id: channelId }));
     const deliveryFrame = JSON.parse(await nextMessageOfType(ws, "delivery")) as { delivery_id: string };
     ws.send(
       JSON.stringify({
@@ -229,19 +207,7 @@ describe("BotConnection delivery_result routing", () => {
     );
     await nextMessageOfType(ws, "ready");
 
-    const enq = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(
-          enqueuePayload({ outbox_id: `out-${crypto.randomUUID()}`, channel_id: channelId }),
-        ),
-      }),
-    );
-    expect(enq.status).toBe(200);
+    await stub.enqueueDelivery(botId, enqueuePayload({ outbox_id: `out-${crypto.randomUUID()}`, channel_id: channelId }));
     const deliveryFrame = JSON.parse(await nextMessageOfType(ws, "delivery")) as { delivery_id: string };
     ws.send(
       JSON.stringify({
@@ -287,19 +253,7 @@ describe("BotConnection delivery_result routing", () => {
     );
     await nextMessageOfType(ws, "ready");
 
-    const enq = await stub.fetch(
-      new Request("https://x/internal/enqueue-delivery", {
-        method: "POST",
-        headers: {
-          "X-Verified-Bot-Id": botId,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(
-          enqueuePayload({ outbox_id: `out-${crypto.randomUUID()}`, channel_id: channelId }),
-        ),
-      }),
-    );
-    expect(enq.status).toBe(200);
+    await stub.enqueueDelivery(botId, enqueuePayload({ outbox_id: `out-${crypto.randomUUID()}`, channel_id: channelId }));
     const deliveryFrame = JSON.parse(await nextMessageOfType(ws, "delivery")) as { delivery_id: string };
     ws.send(
       JSON.stringify({

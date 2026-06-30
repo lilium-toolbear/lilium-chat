@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo, setupOwnedChannelForUser } from "../helpers";
+import {
+  addTestMember,
+  createTestChannel,
+  dumpChannelFanout,
+  getNamedDo,
+  readMyChannels,
+  removeTestMember,
+  sendTestMessage,
+  setupOwnedChannelForUser,
+} from "../helpers";
 import { liveStartAndAck, nextAck, nextMessage, sendHeartbeat, upgradeUserConnection } from "../ws-helpers";
+import type { ChannelFanout } from "../../src/do/channel-fanout";
+import type { ChatChannel } from "../../src/do/chat-channel";
+import type { UserDirectory } from "../../src/do/user-directory";
 
-async function joinTestChannel(userId: string): Promise<{ channelStub: DurableObjectStub; channelId: string }> {
+async function joinTestChannel(userId: string): Promise<{ channelStub: DurableObjectStub<ChatChannel>; channelId: string }> {
   const { stub, channelId } = await setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
   return { channelStub: stub, channelId };
 }
@@ -26,10 +38,8 @@ describe("UserConnection session.live_start", () => {
     expect(payload.session_id).toBe(sessionId);
     expect(payload.subscribed_channel_count).toBeGreaterThanOrEqual(1);
 
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
-    const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
-    }))).json()) as { leases: Array<{ session_id: string }> };
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
+    const dump = await dumpChannelFanout(fanout, channelId);
     expect(dump.leases.some((l) => l.session_id === sessionId)).toBe(true);
 
     await liveStartAndAck(ws, "cmd-ls-2");
@@ -48,67 +58,35 @@ describe("UserConnection session.live_start", () => {
     const channelId = crypto.randomUUID();
     const ownerId = "u-live-add-owner";
     const memberId = "u-live-add-member";
-    const channel = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
-    await channel.fetch(new Request("https://x/internal/create-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channel_id: channelId,
-        creator_user_id: ownerId,
-        title: "Live add",
-        topic: null,
-        avatar_attachment_id: null,
-        visibility: "private",
-        initial_members: [],
-      }),
-    }));
+    const channel = await createTestChannel(env, { channelId, ownerId, title: "Live add", visibility: "private" });
 
     const { ws, stub, sessionId } = await upgradeUserConnection(memberId);
     await liveStartAndAck(ws, "cmd-live-before-add");
 
-    await channel.fetch(new Request("https://x/internal/members-add", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        idempotency_key: "k-live-add-member",
-        channel_id: channelId,
-        user_id: memberId,
-        role: "member",
-      }),
-    }));
+    await addTestMember(channel, { actorUserId: ownerId, targetUserId: memberId, channelId, idempotencyKey: "k-live-add-member" });
 
     const { runDurableObjectAlarm, runInDurableObject } = await import("cloudflare:test") as {
       runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void>;
       runInDurableObject: (stub: DurableObjectStub, fn: (instance: unknown, state: any) => void | Promise<void>) => Promise<void>;
     };
-    await runDurableObjectAlarm(channel);
+    let status = "";
+    for (let i = 0; i < 5; i++) {
+      await runDurableObjectAlarm(channel);
+      await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+        const row = state.storage.sql
+          .exec("SELECT status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
+          .toArray()[0] as { status: string } | undefined;
+        status = row?.status ?? "";
+      });
+      if (status === "active") break;
+    }
+    expect(status).toBe("active");
 
-    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
-      const row = state.storage.sql
-        .exec("SELECT status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
-        .toArray()[0] as { status: string } | undefined;
-      expect(row?.status).toBe("active");
-    });
-
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
-    const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
-    }))).json()) as { leases: Array<{ session_id: string; user_id: string }> };
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
+    const dump = await dumpChannelFanout(fanout, channelId);
     expect(dump.leases.some((l) => l.session_id === sessionId && l.user_id === memberId)).toBe(true);
 
-    const send = await channel.fetch(new Request("https://x/internal/message-send", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command_id: "cmd-live-add-message",
-        dedupe_principal_key: `user:${ownerId}`,
-        type: "text",
-        text: "live add delivery",
-        reply_to: null,
-        mentions: [],
-        channel_id: channelId,
-      }),
-    }));
+    const send = await sendTestMessage(channel, { userId: ownerId, channelId, commandId: "cmd-live-add-message", text: "live add delivery" });
     expect(send.status).toBe(200);
     const sent = await send.json() as { event_id: string };
     const delivered = nextEventFrame(ws, sent.event_id);
@@ -125,20 +103,7 @@ describe("UserConnection session.live_start", () => {
     const channelId = crypto.randomUUID();
     const ownerId = "u-live-rem-owner";
     const memberId = "u-live-rem-member";
-    const channel = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
-    await channel.fetch(new Request("https://x/internal/create-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channel_id: channelId,
-        creator_user_id: ownerId,
-        title: "Live remove",
-        topic: null,
-        avatar_attachment_id: null,
-        visibility: "private",
-        initial_members: [],
-      }),
-    }));
+    const channel = await createTestChannel(env, { channelId, ownerId, title: "Live remove", visibility: "private" });
 
     const { runDurableObjectAlarm, runInDurableObject } = await import("cloudflare:test") as {
       runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void>;
@@ -149,27 +114,10 @@ describe("UserConnection session.live_start", () => {
     await liveStartAndAck(first.ws, "cmd-live-rem-1");
     await liveStartAndAck(second.ws, "cmd-live-rem-2");
 
-    await channel.fetch(new Request("https://x/internal/members-add", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        idempotency_key: "k-live-remove-add-member",
-        channel_id: channelId,
-        user_id: memberId,
-        role: "member",
-      }),
-    }));
+    await addTestMember(channel, { actorUserId: ownerId, targetUserId: memberId, channelId, idempotencyKey: "k-live-remove-add-member" });
     await runDurableObjectAlarm(channel);
 
-    await channel.fetch(new Request("https://x/internal/members-remove", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        idempotency_key: "k-live-remove-member",
-        channel_id: channelId,
-        user_id: memberId,
-      }),
-    }));
+    await removeTestMember(channel, { actorUserId: ownerId, targetUserId: memberId, channelId, idempotencyKey: "k-live-remove-member" });
     await runDurableObjectAlarm(channel);
 
     await runInDurableObject(first.stub, async (_instance: unknown, state: any) => {
@@ -182,10 +130,8 @@ describe("UserConnection session.live_start", () => {
       ]));
     });
 
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
-    const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
-    }))).json()) as { leases: Array<{ session_id: string; user_id: string }> };
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
+    const dump = await dumpChannelFanout(fanout, channelId);
     expect(dump.leases.filter((l) => l.user_id === memberId)).toHaveLength(0);
 
     first.ws.close();
@@ -201,30 +147,14 @@ describe("UserConnection session.live_start", () => {
 
     const { ws, stub, sessionId } = await upgradeUserConnection(memberId);
     await liveStartAndAck(ws, "cmd-live-rejoin-1");
-    const dir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], memberId);
+    const dir = getNamedDo<UserDirectory>(env.USER_DIRECTORY, memberId);
 
-    await dir.fetch(new Request("https://x/internal/upsert-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "join", channel_id: channelId, kind: "channel", membership_version: 1 }),
-    }));
-    await stub.fetch(new Request("https://x/internal/live-memberships-changed", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ affected_user_id: memberId, reason: "member_added", changed_channel_id: channelId, membership_version: 1 }),
-    }));
+    await dir.upsertChannelProjection(memberId, { action: "join", channel_id: channelId, kind: "channel", membership_version: 1 });
+    await stub.liveMembershipsChanged({ affected_user_id: memberId, reason: "member_added", changed_channel_id: channelId, membership_version: 1 });
 
     let closedLeaseId = "";
-    await dir.fetch(new Request("https://x/internal/upsert-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "leave", channel_id: channelId, kind: "channel", membership_version: 2 }),
-    }));
-    await stub.fetch(new Request("https://x/internal/live-memberships-changed", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ affected_user_id: memberId, reason: "member_removed", changed_channel_id: channelId, membership_version: 2 }),
-    }));
+    await dir.upsertChannelProjection(memberId, { action: "leave", channel_id: channelId, kind: "channel", membership_version: 2 });
+    await stub.liveMembershipsChanged({ affected_user_id: memberId, reason: "member_removed", changed_channel_id: channelId, membership_version: 2 });
     await runInDurableObject(stub, async (_instance: unknown, state: any) => {
       const row = state.storage.sql
         .exec("SELECT lease_id, status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
@@ -233,16 +163,8 @@ describe("UserConnection session.live_start", () => {
       closedLeaseId = row?.lease_id ?? "";
     });
 
-    await dir.fetch(new Request("https://x/internal/upsert-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "join", channel_id: channelId, kind: "channel", membership_version: 3 }),
-    }));
-    await stub.fetch(new Request("https://x/internal/live-memberships-changed", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ affected_user_id: memberId, reason: "member_added", changed_channel_id: channelId, membership_version: 3 }),
-    }));
+    await dir.upsertChannelProjection(memberId, { action: "join", channel_id: channelId, kind: "channel", membership_version: 3 });
+    await stub.liveMembershipsChanged({ affected_user_id: memberId, reason: "member_added", changed_channel_id: channelId, membership_version: 3 });
 
     await runInDurableObject(stub, async (_instance: unknown, state: any) => {
       const row = state.storage.sql
@@ -262,21 +184,13 @@ describe("UserConnection session.live_start", () => {
       runInDurableObject: (stub: DurableObjectStub, fn: (instance: unknown, state: any) => void | Promise<void>) => Promise<void>;
     };
 
-    const dir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], memberId);
-    await dir.fetch(new Request("https://x/internal/upsert-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": memberId, "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "join", channel_id: channelId, kind: "channel", membership_version: 1 }),
-    }));
+    const dir = getNamedDo<UserDirectory>(env.USER_DIRECTORY, memberId);
+    await dir.upsertChannelProjection(memberId, { action: "join", channel_id: channelId, kind: "channel", membership_version: 1 });
 
     const { ws, stub, sessionId } = await upgradeUserConnection(memberId);
     await liveStartAndAck(ws, "cmd-live-dir-fail-start");
 
-    await dir.fetch(new Request("https://x/internal/test-my-channels-failure", {
-      method: "POST",
-      headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: true }),
-    }));
+    await dir.debugSetMyChannelsFailure(true);
 
     sendHeartbeat(ws, "cmd-live-dir-fail-heartbeat");
     const raw = await nextAck(ws);
@@ -293,52 +207,26 @@ describe("UserConnection session.live_start", () => {
     });
 
     ws.close();
-    await dir.fetch(new Request("https://x/internal/test-my-channels-failure", {
-      method: "POST",
-      headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: false }),
-    }));
+    await dir.debugSetMyChannelsFailure(false);
   });
 
   it("keeps live leases after channel dissolve while my_channels retains the tombstone", async () => {
     const channelId = crypto.randomUUID();
     const ownerId = "u-live-dis-owner";
     const memberId = "u-live-dis-member";
-    const channel = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const channel = await createTestChannel(env, { channelId, ownerId, title: "Live dissolve", visibility: "private" });
     const { runDurableObjectAlarm, runInDurableObject } = await import("cloudflare:test") as {
       runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void>;
       runInDurableObject: (stub: DurableObjectStub, fn: (instance: unknown, state: any) => void | Promise<void>) => Promise<void>;
     };
 
-    await channel.fetch(new Request("https://x/internal/create-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channel_id: channelId,
-        creator_user_id: ownerId,
-        title: "Live dissolve",
-        topic: null,
-        avatar_attachment_id: null,
-        visibility: "private",
-        initial_members: [],
-      }),
-    }));
-
     const { ws, stub, sessionId } = await upgradeUserConnection(memberId);
     await liveStartAndAck(ws, "cmd-live-dissolve");
 
-    await channel.fetch(new Request("https://x/internal/members-add", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: "k-live-dissolve-add", channel_id: channelId, user_id: memberId, role: "member" }),
-    }));
+    await addTestMember(channel, { actorUserId: ownerId, targetUserId: memberId, channelId, idempotencyKey: "k-live-dissolve-add" });
     await runDurableObjectAlarm(channel);
 
-    await channel.fetch(new Request("https://x/internal/dissolve", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: "k-live-dissolve", channel_id: channelId }),
-    }));
+    await channel.dissolveChannel({ user_id: ownerId, idempotency_key: "k-live-dissolve", channel_id: channelId });
     let status = "";
     for (let i = 0; i < 5; i++) {
       await runDurableObjectAlarm(channel);
@@ -352,10 +240,8 @@ describe("UserConnection session.live_start", () => {
     }
     expect(status).toBe("active");
 
-    const dir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], memberId);
-    const myRes = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": memberId } }));
-    const myBody = await myRes.json() as { items: Array<{ channel_id: string }> };
-    expect(myBody.items.some((row) => row.channel_id === channelId)).toBe(true);
+    const myItems = await readMyChannels(env, memberId);
+    expect(myItems.some((row) => row.channel_id === channelId)).toBe(true);
 
     ws.close();
   });
@@ -384,11 +270,7 @@ describe("UserConnection /deliver membership gate", () => {
       membershipVersion = row?.membership_version ?? 0;
     });
 
-    await channelStub.fetch(new Request("https://x/internal/test-leave", {
-      method: "POST",
-      headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId }),
-    }));
+    await channelStub.debugLeaveMember({ user_id: userId });
     await runDurableObjectAlarm(channelStub);
 
     const eventJson = JSON.stringify({
@@ -400,19 +282,14 @@ describe("UserConnection /deliver membership gate", () => {
       occurred_at: "2026-06-27T00:00:00Z",
       payload: {},
     });
-    const deliverRes = await stub.fetch(new Request("https://x/deliver", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Channel-Id": channelId },
-      body: JSON.stringify({
-        lease_id: leaseId,
-        channel_id: channelId,
-        session_id: sessionId,
-        event_id: "e-member-gate",
-        event_json: eventJson,
-        membership_version_at_event: membershipVersion + 10,
-      }),
-    }));
-    const body = (await deliverRes.json()) as { delivered: boolean; reason?: string };
+    const body = await stub.deliver({
+      lease_id: leaseId,
+      channel_id: channelId,
+      session_id: sessionId,
+      event_id: "e-member-gate",
+      event_json: eventJson,
+      membership_version_at_event: membershipVersion + 10,
+    });
     expect(body.delivered).toBe(false);
     expect(body.reason).toBe("membership_not_active");
 
@@ -430,14 +307,12 @@ describe("UserConnection session.heartbeat membership", () => {
   it("does not refresh fanout leases when TTL is still fresh", async () => {
     const userId = "u-heartbeat-skip-upsert";
     const { channelId } = await joinTestChannel(userId);
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
 
     const { ws, stub, sessionId } = await upgradeUserConnection(userId);
     await liveStartAndAck(ws, "cmd-hb-skip-live-start");
 
-    const beforeDump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
-    }))).json()) as { leases: Array<{ updated_at: string }> };
+    const beforeDump = await dumpChannelFanout(fanout, channelId);
     expect(beforeDump.leases.length).toBeGreaterThan(0);
     const updatedAtBefore = beforeDump.leases[0]?.updated_at ?? "";
 
@@ -462,9 +337,7 @@ describe("UserConnection session.heartbeat membership", () => {
       expect(row?.last_seen_at).toBe(freshLastSeenAt);
     });
 
-    const afterDump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
-    }))).json()) as { leases: Array<{ updated_at: string }> };
+    const afterDump = await dumpChannelFanout(fanout, channelId);
     expect(afterDump.leases[0]?.updated_at).toBe(updatedAtBefore);
     ws.close();
   });
@@ -504,26 +377,16 @@ describe("UserConnection session.heartbeat membership", () => {
     const userId = "u-heartbeat-member";
     const { channelStub, channelId } = await joinTestChannel(userId);
 
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
     const { ws, stub, sessionId } = await upgradeUserConnection(userId);
     await liveStartAndAck(ws);
 
-    await channelStub.fetch(new Request("https://x/internal/test-leave", {
-      method: "POST",
-      headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId }),
-    }));
+    await channelStub.debugLeaveMember({ user_id: userId });
 
     const { runInDurableObject, runDurableObjectAlarm } = await import("cloudflare:test");
     for (let i = 0; i < 40; i++) {
       await runDurableObjectAlarm(channelStub);
-      const dir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], userId);
-      const dirRes = await dir.fetch(new Request("https://x/my-channels", {
-        headers: { "X-Verified-User-Id": userId },
-      }));
-      const items = dirRes.ok
-        ? ((await dirRes.json()) as { items: Array<{ channel_id: string }> }).items ?? []
-        : [];
+      const items = await readMyChannels(env, userId);
       if (!items.some((it) => it.channel_id === channelId)) break;
       await new Promise((r) => setTimeout(r, 50));
     }
@@ -533,9 +396,7 @@ describe("UserConnection session.heartbeat membership", () => {
     const hbRaw = await nextAck(ws);
     expect(JSON.parse(hbRaw).frame_type).toBe("command_ack");
 
-    const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
-    }))).json()) as { leases: Array<{ session_id: string }> };
+    const dump = await dumpChannelFanout(fanout, channelId);
     expect(dump.leases.some((l) => l.session_id === sessionId)).toBe(false);
 
     let leaseId = "";
@@ -556,18 +417,13 @@ describe("UserConnection session.heartbeat membership", () => {
       occurred_at: "2026-06-27T00:00:00Z",
       payload: {},
     });
-    const deliverRes = await stub.fetch(new Request("https://x/deliver", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Channel-Id": channelId },
-      body: JSON.stringify({
-        lease_id: leaseId,
-        channel_id: channelId,
-        session_id: sessionId,
-        event_json: eventJson,
-        membership_version_at_event: 99,
-      }),
-    }));
-    const body = (await deliverRes.json()) as { delivered: boolean; reason?: string };
+    const body = await stub.deliver({
+      lease_id: leaseId,
+      channel_id: channelId,
+      session_id: sessionId,
+      event_json: eventJson,
+      membership_version_at_event: 99,
+    });
     expect(body.delivered).toBe(false);
     expect(body.reason).toBe("lease_closed");
     ws.close();

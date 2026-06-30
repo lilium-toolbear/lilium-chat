@@ -1,6 +1,7 @@
 import type { Env } from "../env";
 import type { ChannelSummaryApi } from "../contract/channel-api";
-import { inflateChannelSummaryForViewer, type ChannelSummaryFromDo } from "./channel-summary";
+import { apiErrorFromRemote } from "../errors";
+import { inflateChannelSummaryForViewer } from "./channel-summary";
 
 export interface MyChannelIndexRow {
   channel_id: string;
@@ -18,13 +19,14 @@ export async function inflateMyChannelSummaries(input: {
   const items = await Promise.all(
     input.myChannels.map(async (mc) => {
       const stub = input.env.CHAT_CHANNEL.getByName(mc.channel_id);
-      const res = await stub.fetch(
-        new Request("https://x/internal/summary", {
-          headers: { "X-Verified-User-Id": input.viewerUserId },
-        }),
-      );
-      if (!res.ok) return null;
-      const summary = (await res.json()) as ChannelSummaryFromDo;
+      let summary;
+      try {
+        summary = await stub.getSummary(input.viewerUserId);
+      } catch (err) {
+        const apiErr = apiErrorFromRemote(err);
+        if (apiErr?.code === "FORBIDDEN" || apiErr?.code === "CHANNEL_NOT_FOUND") return null;
+        throw apiErr ?? err;
+      }
       return inflateChannelSummaryForViewer({
         summary,
         viewerUserId: input.viewerUserId,

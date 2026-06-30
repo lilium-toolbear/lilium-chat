@@ -9,21 +9,9 @@ describe("spike: single alarm earliest-wins over multiple pendings", () => {
     const id = tEnv.SCHEDULER_PROBE.idFromName("alarm-1");
     const stub = tEnv.SCHEDULER_PROBE.get(id);
 
-    await stub.fetch(
-      new Request("https://x/setup", {
-        method: "POST",
-        body: JSON.stringify({ rows: [100, 50, 300] }),
-      }),
-    );
+    await stub.setup([100, 50, 300]);
 
-    const runRes = await stub.fetch(
-      new Request("https://x/run", {
-        method: "POST",
-        body: JSON.stringify({ now: 75 }),
-      }),
-    );
-
-    const body = (await runRes.json()) as { processed: number[]; nextAlarm: number | null };
+    const body = await stub.run(75);
     expect(body.processed).toEqual([50]);
     expect(body.nextAlarm).toBe(100);
   });

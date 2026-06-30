@@ -5,9 +5,11 @@ import {
   computeFinalizeRequestHash,
   buildBotStreamWsUrl,
 } from "../../src/chat/stream-registry";
-import { createTestChannel, getNamedDo } from "../helpers";
-import { tableExists, indexExists } from "../../src/do/sql-migrations";
-import { CHAT_CHANNEL_CURRENT_SCHEMA_VERSION } from "../../src/do/migrations/chat-channel";
+import type { StartStreamEffectResponse } from "../../src/chat/stream-registry";
+import { createTestChannel, expectDoRpcError, getNamedDo, readDoSchemaVersion } from "../helpers";
+import { tableExists, indexExists } from "../../src/do/shared/sql-migrations";
+import { CHAT_CHANNEL_CURRENT_SCHEMA_VERSION } from "../../src/do/chat-channel/data/migrations";
+import type { ChatChannel } from "../../src/do/chat-channel";
 
 const BOT_ID = "bot-stream-test-1";
 
@@ -19,30 +21,30 @@ async function createChannelStub() {
 }
 
 async function registerStream(
-  stub: DurableObjectStub,
+  stub: DurableObjectStub<ChatChannel>,
   input: {
     channelId: string;
     clientEffectId: string;
     requestHash?: string;
   },
-) {
+): Promise<{ ok: true; body: StartStreamEffectResponse } | { ok: false; code: string }> {
   const requestHash = input.requestHash ?? JSON.stringify({ format: "plain" });
-  const res = await stub.fetch(
-    new Request("https://x/internal/stream-registry-register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channel_id: input.channelId,
-        bot_id: BOT_ID,
-        client_effect_id: input.clientEffectId,
-        request_hash: requestHash,
-        sender_bot_display_name: "Stream Bot",
-        sender_bot_avatar_url: null,
-        message: { type: "text", format: "plain" },
-      }),
-    }),
-  );
-  return { res, requestHash, body: res.ok ? ((await res.json()) as Record<string, unknown>) : null };
+  try {
+    const body = await stub.streamRegistryRegister({
+      channel_id: input.channelId,
+      bot_id: BOT_ID,
+      client_effect_id: input.clientEffectId,
+      request_hash: requestHash,
+      sender_bot_display_name: "Stream Bot",
+      sender_bot_avatar_url: null,
+      message: { type: "text", format: "plain" },
+    });
+    return { ok: true, body };
+  } catch (err) {
+    const { apiErrorFromRemote } = await import("../../src/errors");
+    const apiErr = apiErrorFromRemote(err);
+    return { ok: false, code: apiErr?.code ?? "CHAT_WORKER_UNAVAILABLE" };
+  }
 }
 
 async function withDoState(
@@ -72,11 +74,10 @@ describe("stream-registry helpers", () => {
   });
 });
 
-describe("ChatChannel stream registry internal routes", () => {
+describe("ChatChannel stream registry RPC", () => {
   it("migration creates message_stream_registry table and indexes", async () => {
     const channelId = `stream-mig-${crypto.randomUUID()}`;
-    const stub = getNamedDo(env.CHAT_CHANNEL as unknown as DurableObjectNamespace, channelId);
-    await stub.fetch(new Request("https://x/ping"));
+    const stub = await createTestChannel(env, { channelId, ownerId: `owner-${crypto.randomUUID()}` });
 
     await withDoState(stub, (ctx) => {
       expect(tableExists(ctx, "message_stream_registry")).toBe(true);
@@ -84,35 +85,29 @@ describe("ChatChannel stream registry internal routes", () => {
       expect(indexExists(ctx, "idx_message_stream_registry_expiry")).toBe(true);
     });
 
-    const versionRes = await stub.fetch(
-      new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
-    );
-    const versionBody = (await versionRes.json()) as { current_version: number };
-    expect(versionBody.current_version).toBe(CHAT_CHANNEL_CURRENT_SCHEMA_VERSION);
+    const version = await readDoSchemaVersion(stub);
+    expect(version.current_version).toBe(CHAT_CHANNEL_CURRENT_SCHEMA_VERSION);
   });
 
   it("register + check happy path", async () => {
     const { stub, channelId } = await createChannelStub();
     const clientEffectId = `eff-${crypto.randomUUID()}`;
-    const { res, body } = await registerStream(stub, { channelId, clientEffectId });
-    expect(res.status).toBe(200);
-    expect(body?.message_id).toBeTruthy();
-    const messageId = body!.message_id as string;
-    const stream = body!.stream as { ws_url: string; expires_at: string; channel_id: string; message_id: string };
-    expect(stream.ws_url).toBe(buildBotStreamWsUrl(channelId, messageId));
-    expect(stream.channel_id).toBe(channelId);
-    expect(stream.message_id).toBe(messageId);
-    expect(stream.expires_at).toBeTruthy();
+    const registered = await registerStream(stub, { channelId, clientEffectId });
+    expect(registered.ok).toBe(true);
+    if (!registered.ok) return;
+    const body = registered.body;
+    expect(body.message_id).toBeTruthy();
+    const messageId = body.message_id;
+    expect(body.stream.ws_url).toBe(buildBotStreamWsUrl(channelId, messageId));
+    expect(body.stream.channel_id).toBe(channelId);
+    expect(body.stream.message_id).toBe(messageId);
+    expect(body.stream.expires_at).toBeTruthy();
 
-    const checkRes = await stub.fetch(
-      new Request("https://x/internal/stream-registry-check", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel_id: channelId, message_id: messageId, bot_id: BOT_ID }),
-      }),
-    );
-    expect(checkRes.status).toBe(200);
-    const checkBody = (await checkRes.json()) as { ok: boolean; status: string };
+    const checkBody = await stub.streamRegistryCheck({
+      channel_id: channelId,
+      message_id: messageId,
+      bot_id: BOT_ID,
+    });
     expect(checkBody.ok).toBe(true);
     expect(checkBody.status).toBe("streaming");
   });
@@ -125,12 +120,11 @@ describe("ChatChannel stream registry internal routes", () => {
     const first = await registerStream(stub, { channelId, clientEffectId, requestHash });
     const second = await registerStream(stub, { channelId, clientEffectId, requestHash });
 
-    expect(first.res.status).toBe(200);
-    expect(second.res.status).toBe(200);
-    expect(second.body?.message_id).toBe(first.body?.message_id);
-    expect((second.body?.stream as { ws_url: string }).ws_url).toBe(
-      (first.body?.stream as { ws_url: string }).ws_url,
-    );
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    expect(second.body.message_id).toBe(first.body.message_id);
+    expect(second.body.stream.ws_url).toBe(first.body.stream.ws_url);
 
     await withDoState(stub, (ctx) => {
       const count = ctx.storage.sql
@@ -144,37 +138,39 @@ describe("ChatChannel stream registry internal routes", () => {
     const { stub, channelId } = await createChannelStub();
     const clientEffectId = `eff-conflict-${crypto.randomUUID()}`;
     const first = await registerStream(stub, { channelId, clientEffectId, requestHash: "hash-a" });
-    expect(first.res.status).toBe(200);
+    expect(first.ok).toBe(true);
 
     const second = await registerStream(stub, { channelId, clientEffectId, requestHash: "hash-b" });
-    expect(second.res.status).toBe(409);
-    const err = (await second.res.json()) as { error: { code: string } };
-    expect(err.error.code).toBe("BOT_EFFECT_CONFLICT");
+    expect(second.ok).toBe(false);
+    if (second.ok) return;
+    expect(second.code).toBe("BOT_EFFECT_CONFLICT");
   });
 
   it("check rejects wrong bot, missing registry, expired, and non-streaming status", async () => {
     const { stub, channelId } = await createChannelStub();
     const clientEffectId = `eff-check-${crypto.randomUUID()}`;
-    const { body } = await registerStream(stub, { channelId, clientEffectId });
-    const messageId = body!.message_id as string;
+    const registered = await registerStream(stub, { channelId, clientEffectId });
+    expect(registered.ok).toBe(true);
+    if (!registered.ok) return;
+    const messageId = registered.body.message_id;
 
-    const wrongBot = await stub.fetch(
-      new Request("https://x/internal/stream-registry-check", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel_id: channelId, message_id: messageId, bot_id: "other-bot" }),
+    await expectDoRpcError(
+      () => stub.streamRegistryCheck({
+        channel_id: channelId,
+        message_id: messageId,
+        bot_id: "other-bot",
       }),
+      "BOT_STREAM_NOT_FOUND",
     );
-    expect(wrongBot.status).toBe(404);
 
-    const missing = await stub.fetch(
-      new Request("https://x/internal/stream-registry-check", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel_id: channelId, message_id: crypto.randomUUID(), bot_id: BOT_ID }),
+    await expectDoRpcError(
+      () => stub.streamRegistryCheck({
+        channel_id: channelId,
+        message_id: crypto.randomUUID(),
+        bot_id: BOT_ID,
       }),
+      "BOT_STREAM_NOT_FOUND",
     );
-    expect(missing.status).toBe(404);
 
     await withDoState(stub, (ctx) => {
       ctx.storage.sql.exec(
@@ -184,21 +180,23 @@ describe("ChatChannel stream registry internal routes", () => {
         messageId,
       );
     });
-    const expired = await stub.fetch(
-      new Request("https://x/internal/stream-registry-check", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel_id: channelId, message_id: messageId, bot_id: BOT_ID }),
+    await expectDoRpcError(
+      () => stub.streamRegistryCheck({
+        channel_id: channelId,
+        message_id: messageId,
+        bot_id: BOT_ID,
       }),
+      "BOT_STREAM_EXPIRED",
     );
-    expect(expired.status).toBe(410);
   });
 
   it("finalize writes message + stream_finalized event and is idempotent", async () => {
     const { stub, channelId } = await createChannelStub();
     const clientEffectId = `eff-fin-${crypto.randomUUID()}`;
-    const { body } = await registerStream(stub, { channelId, clientEffectId });
-    const messageId = body!.message_id as string;
+    const registered = await registerStream(stub, { channelId, clientEffectId });
+    expect(registered.ok).toBe(true);
+    if (!registered.ok) return;
+    const messageId = registered.body.message_id;
     const resolvedText = "final stream text";
     const finalizeRequestHash = await computeFinalizeRequestHash({
       final_seq: 1,
@@ -214,31 +212,16 @@ describe("ChatChannel stream registry internal routes", () => {
       resolved_text: resolvedText,
       finalize_request_hash: finalizeRequestHash,
       final_seq: 1,
-      components: [],
-      attachment_ids: [],
+      components: [] as unknown[],
+      attachment_ids: [] as string[],
     };
 
-    const first = await stub.fetch(
-      new Request("https://x/internal/stream-finalize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(finalizeBody),
-      }),
-    );
-    expect(first.status).toBe(200);
-    const firstPayload = (await first.json()) as { message_id: string; event_id: string };
+    const firstPayload = await stub.streamFinalize(finalizeBody);
     expect(firstPayload.message_id).toBe(messageId);
     expect(firstPayload.event_id).toBeTruthy();
 
-    const second = await stub.fetch(
-      new Request("https://x/internal/stream-finalize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(finalizeBody),
-      }),
-    );
-    expect(second.status).toBe(200);
-    expect(await second.json()).toEqual(firstPayload);
+    const secondPayload = await stub.streamFinalize(finalizeBody);
+    expect(secondPayload).toEqual(firstPayload);
 
     await withDoState(stub, (ctx) => {
       const registry = ctx.storage.sql
@@ -272,21 +255,24 @@ describe("ChatChannel stream registry internal routes", () => {
       components: [],
       attachment_ids: [],
     });
-    const conflict = await stub.fetch(
-      new Request("https://x/internal/stream-finalize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...finalizeBody, finalize_request_hash: conflictHash, final_seq: 2, resolved_text: "different" }),
+    await expectDoRpcError(
+      () => stub.streamFinalize({
+        ...finalizeBody,
+        finalize_request_hash: conflictHash,
+        final_seq: 2,
+        resolved_text: "different",
       }),
+      "BOT_STREAM_CONFLICT",
     );
-    expect(conflict.status).toBe(409);
   });
 
   it("abandon with partial writes failed message and is idempotent", async () => {
     const { stub, channelId } = await createChannelStub();
     const clientEffectId = `eff-abn-${crypto.randomUUID()}`;
-    const { body } = await registerStream(stub, { channelId, clientEffectId });
-    const messageId = body!.message_id as string;
+    const registered = await registerStream(stub, { channelId, clientEffectId });
+    expect(registered.ok).toBe(true);
+    if (!registered.ok) return;
+    const messageId = registered.body.message_id;
     const partial = "partial text";
     const abandonedTextHash = await computeAbandonedTextHash(partial);
 
@@ -298,25 +284,10 @@ describe("ChatChannel stream registry internal routes", () => {
       abandoned_text_hash: abandonedTextHash,
     };
 
-    const first = await stub.fetch(
-      new Request("https://x/internal/stream-abandon", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(abandonBody),
-      }),
-    );
-    expect(first.status).toBe(200);
-    const firstPayload = (await first.json()) as { message_id: string; event_id: string };
-
-    const second = await stub.fetch(
-      new Request("https://x/internal/stream-abandon", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(abandonBody),
-      }),
-    );
-    expect(second.status).toBe(200);
-    expect(await second.json()).toEqual(firstPayload);
+    const firstPayload = await stub.streamAbandon(abandonBody);
+    const secondPayload = await stub.streamAbandon(abandonBody);
+    expect(secondPayload).toEqual(firstPayload);
+    if (!("event_id" in firstPayload)) return;
 
     await withDoState(stub, (ctx) => {
       const registry = ctx.storage.sql
@@ -342,27 +313,21 @@ describe("ChatChannel stream registry internal routes", () => {
   it("abandon with empty partial marks registry abandoned without canonical rows", async () => {
     const { stub, channelId } = await createChannelStub();
     const clientEffectId = `eff-empty-${crypto.randomUUID()}`;
-    const { body } = await registerStream(stub, { channelId, clientEffectId });
-    const messageId = body!.message_id as string;
+    const registered = await registerStream(stub, { channelId, clientEffectId });
+    expect(registered.ok).toBe(true);
+    if (!registered.ok) return;
+    const messageId = registered.body.message_id;
     const emptyHash = await computeAbandonedTextHash("");
 
-    const res = await stub.fetch(
-      new Request("https://x/internal/stream-abandon", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          channel_id: channelId,
-          message_id: messageId,
-          bot_id: BOT_ID,
-          resolved_partial: "",
-          abandoned_text_hash: emptyHash,
-        }),
-      }),
-    );
-    expect(res.status).toBe(200);
-    const payload = (await res.json()) as { ok: boolean; canonical: boolean };
-    expect(payload.ok).toBe(true);
-    expect(payload.canonical).toBe(false);
+    const payload = await stub.streamAbandon({
+      channel_id: channelId,
+      message_id: messageId,
+      bot_id: BOT_ID,
+      resolved_partial: "",
+      abandoned_text_hash: emptyHash,
+    });
+    expect("ok" in payload && payload.ok).toBe(true);
+    expect("canonical" in payload && payload.canonical).toBe(false);
 
     await withDoState(stub, (ctx) => {
       const registry = ctx.storage.sql

@@ -1,6 +1,7 @@
 import type { Env } from "../env";
 import { getS3Client, isTestS3ClientActive, type S3Client } from "./client";
 import { s3BrowserUploadUrl, s3ObjectUrl, s3PublicObjectUrl } from "./url";
+import { logSwallowedError } from "../errors";
 
 export interface S3EnvLike {
   S3_ENDPOINT: string;
@@ -58,7 +59,8 @@ export async function headObjectKey(
     if (contentType !== expectedContentType) return { ok: false, contentType, contentLength };
     if (contentLength !== expectedSize) return { ok: false, contentType, contentLength };
     return { ok: true, contentType, contentLength };
-  } catch {
+  } catch (err) {
+    logSwallowedError("s3_head_object_failed", err, { key });
     return { ok: false };
   }
 }

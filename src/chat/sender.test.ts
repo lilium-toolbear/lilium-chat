@@ -36,7 +36,7 @@ beforeEach(() => {
 describe("projectMessagesForBrowser (history path)", () => {
   it("projects a user message with resolved sender + injected mentions", async () => {
     mockedResolve.mockResolvedValueOnce(new Map<string, UserSummary>([
-      ["u1", { user_id: "u1", display_name: "alice", avatar_url: "https://x/a.png" }],
+      ["u1", { user_id: "u1", display_name: "alice", avatar_url: "https://example.test/a.png" }],
     ]));
 
     const env = makeEnv() as Env;
@@ -49,7 +49,7 @@ describe("projectMessagesForBrowser (history path)", () => {
     expect(out[0]).toBeDefined();
     expect((out[0] as { sender: { kind: string; user: { user_id: string; display_name: string; avatar_url: string | null } } }).sender).toEqual({
       kind: "user",
-      user: { user_id: "u1", display_name: "alice", avatar_url: "https://x/a.png" },
+      user: { user_id: "u1", display_name: "alice", avatar_url: "https://example.test/a.png" },
     });
     expect((out[0] as { mentions: unknown[] }).mentions).toEqual([{ user_id: "u2", start: 0, end: 4 }]);
   });

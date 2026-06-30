@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 
-import { makeJwt, setupOwnedChannelForUser, TEST_SECRET } from "../helpers";
+import { makeJwt, sendTestMessage, setupOwnedChannelForUser, TEST_SECRET } from "../helpers";
 import { liveStartAndAck, upgradeUserConnection } from "../ws-helpers";
 
 const SELF = (await import("../../src/index")).default as {
@@ -17,27 +17,11 @@ describe("hibernation wake: attachment restore + HTTP catch-up", () => {
       visibility: "public_listed",
     });
 
-    const beforeSend = (await (
-      await channelStub.fetch(new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }))
-    ).json()) as { last_event_id: string | null };
+    const beforeSend = await channelStub.getSummary(userId);
     const staleCursor = beforeSend.last_event_id ?? "";
 
     const send = (await (
-      await channelStub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            command_id: "cm-hib-1",
-            dedupe_principal_key: `user:${userId}`,
-            type: "text",
-            text: "before reconnect",
-            reply_to: null,
-            mentions: [],
-            channel_id: channelId,
-          }),
-        }),
-      )
+      await sendTestMessage(channelStub, { userId, channelId, commandId: "cm-hib-1", text: "before reconnect" })
     ).json()) as { event_id: string };
 
     const { ws } = await upgradeUserConnection(userId);

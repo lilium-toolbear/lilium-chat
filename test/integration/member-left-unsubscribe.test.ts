@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 
-import { getNamedDo, setupOwnedChannelForUser } from "../helpers";
+import { dumpChannelFanout, getNamedDo, setupOwnedChannelForUser } from "../helpers";
 import { liveStartAndAck } from "../ws-helpers";
+import type { ChannelFanout } from "../../src/do/channel-fanout";
+import type { ChatChannel } from "../../src/do/chat-channel";
+import type { UserConnection } from "../../src/do/user-connection";
 
-async function joinTestChannel(userId: string): Promise<{ channelStub: DurableObjectStub; channelId: string }> {
+async function joinTestChannel(userId: string): Promise<{ channelStub: DurableObjectStub<ChatChannel>; channelId: string }> {
   const { stub, channelId } = await setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
   return { channelStub: stub, channelId };
 }
@@ -13,30 +16,22 @@ describe("member.left → ChannelFanout drops the user", () => {
   it("after leave + alarm, ChannelFanout has no lease for the user", async () => {
     const userId = "u-leave-1";
     const { channelStub, channelId } = await joinTestChannel(userId);
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
-    await fanout.fetch(
-      new Request("https://x/lease-upsert", {
-        method: "POST",
-        headers: { "X-Channel-Id": channelId, "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userId, session_id: "s-leave-1", lease_id: "lease-leave-1", membership_version: 1 }),
-      }),
-    );
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
+    await fanout.leaseUpsert({
+      channel_id: channelId,
+      user_id: userId,
+      session_id: "s-leave-1",
+      lease_id: "lease-leave-1",
+      membership_version: 1,
+    });
 
-    await channelStub.fetch(
-      new Request("https://x/internal/test-leave", {
-        method: "POST",
-        headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userId }),
-      }),
-    );
+    await channelStub.debugLeaveMember({ user_id: userId });
 
     const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
     let drained = false;
     for (let i = 0; i < 60; i++) {
       await runDurableObjectAlarm(channelStub);
-      const dump = (await (await fanout.fetch(new Request("https://x/dump", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as {
-        leases: Array<{ user_id?: string }>;
-      };
+      const dump = await dumpChannelFanout(fanout, channelId);
       if (dump.leases.filter((s) => s.user_id === userId).length === 0) {
         drained = true;
         break;
@@ -50,7 +45,7 @@ describe("member.left → ChannelFanout drops the user", () => {
     const userId = "u-leave-2";
     const { channelStub, channelId } = await joinTestChannel(userId);
 
-    const uc = getNamedDo(env.USER_CONNECTION as unknown as Parameters<typeof getNamedDo>[0], userId);
+    const uc = getNamedDo<UserConnection>(env.USER_CONNECTION, userId);
     const up = await uc.fetch(new Request("https://x/ws", { headers: { Upgrade: "websocket", "X-Verified-User-Id": userId } }));
     const ws = up.webSocket as WebSocket;
     ws.accept();
@@ -75,13 +70,7 @@ describe("member.left → ChannelFanout drops the user", () => {
     });
     expect(leaseId).toBeTruthy();
 
-    await channelStub.fetch(
-      new Request("https://x/internal/test-leave", {
-        method: "POST",
-        headers: { "X-Test-Only": "1", "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userId }),
-      }),
-    );
+    await channelStub.debugLeaveMember({ user_id: userId });
     await runDurableObjectAlarm(channelStub);
 
     const laterEvent = JSON.stringify({
@@ -93,28 +82,18 @@ describe("member.left → ChannelFanout drops the user", () => {
       occurred_at: "2026-06-23T00:00:00Z",
       payload: {},
     });
-    const deliverRes = await uc.fetch(
-      new Request("https://x/deliver", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Channel-Id": channelId },
-        body: JSON.stringify({
-          lease_id: leaseId,
-          channel_id: channelId,
-          session_id: sessionId,
-          event_json: laterEvent,
-          membership_version_at_event: membershipVersion + 10,
-        }),
-      }),
-    );
-    expect(deliverRes.status).toBe(200);
-    const db = (await deliverRes.json()) as { delivered: boolean; reason?: string };
+    const db = await uc.deliver({
+      lease_id: leaseId,
+      channel_id: channelId,
+      session_id: sessionId,
+      event_json: laterEvent,
+      membership_version_at_event: membershipVersion + 10,
+    });
     expect(db.delivered).toBe(false);
     expect(db.reason).toBe("membership_not_active");
 
     await new Promise((r) => setTimeout(r, 150));
-    const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as {
-      event_json?: string;
-    };
+    const probe = await uc.debugLastDeliver();
     expect(probe.event_json ?? "").not.toContain('"e-after-leave"');
     ws.close();
   });
@@ -123,7 +102,7 @@ describe("member.left → ChannelFanout drops the user", () => {
     const userId = "u-leave-3";
     const { channelId } = await joinTestChannel(userId);
 
-    const uc = getNamedDo(env.USER_CONNECTION as unknown as Parameters<typeof getNamedDo>[0], userId);
+    const uc = getNamedDo<UserConnection>(env.USER_CONNECTION, userId);
     const up = await uc.fetch(new Request("https://x/ws", { headers: { Upgrade: "websocket", "X-Verified-User-Id": userId } }));
     const ws = up.webSocket as WebSocket;
     ws.accept();
@@ -132,23 +111,18 @@ describe("member.left → ChannelFanout drops the user", () => {
       frame_type: "event", api_version: "lilium.chat.v2", event_id: "e-stale-session", type: "message.created",
       channel_id: channelId, occurred_at: "2026-06-23T00:00:00Z", payload: {},
     });
-    const deliverRes = await uc.fetch(new Request("https://x/deliver", {
-      method: "POST", headers: { "Content-Type": "application/json", "X-Channel-Id": channelId },
-      body: JSON.stringify({
-        session_id: "old-session-gone",
-        channel_id: channelId,
-        lease_id: "old-lease",
-        event_json: staleEvent,
-        membership_version_at_event: 0,
-      }),
-    }));
-    expect(deliverRes.status).toBe(200);
-    const db = (await deliverRes.json()) as { delivered: boolean; reason?: string };
+    const db = await uc.deliver({
+      session_id: "old-session-gone",
+      channel_id: channelId,
+      lease_id: "old-lease",
+      event_json: staleEvent,
+      membership_version_at_event: 0,
+    });
     expect(db.delivered).toBe(false);
     expect(db.reason).toBe("session_not_found");
 
     await new Promise((r) => setTimeout(r, 150));
-    const probe = (await (await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }))).json()) as { event_json?: string };
+    const probe = await uc.debugLastDeliver();
     expect(probe.event_json ?? "").not.toContain('"e-stale-session"');
     ws.close();
   });

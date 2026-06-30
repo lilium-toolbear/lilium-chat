@@ -4,6 +4,7 @@ import type { MessageRow } from "../contract/persisted";
 import type { WireChatMessage } from "../contract/message";
 import { isAllowedBotMessageFormat } from "./bot-message-format";
 import { isRecord } from "../contract/utils";
+import { logSwallowedError } from "../errors";
 
 export type NonStreamBotEffectType = "send_message" | "update_message" | "disable_components";
 export type BotEffectType = NonStreamBotEffectType | "start_stream";
@@ -295,7 +296,8 @@ export function parseStoredComponents(raw: string | null | undefined): WireChatM
   try {
     const parsed = JSON.parse(raw) as unknown;
     return Array.isArray(parsed) ? (parsed as WireChatMessage["components"]) : [];
-  } catch {
+  } catch (err) {
+    logSwallowedError("stored_components_json_invalid", err);
     return [];
   }
 }
@@ -311,7 +313,8 @@ export function disableComponentsInJson(
     components = Array.isArray(parsed)
       ? parsed.filter((item): item is Record<string, unknown> => isRecord(item))
       : [];
-  } catch {
+  } catch (err) {
+    logSwallowedError("disable_components_json_invalid", err);
     components = [];
   }
   const next = components.map((component) => {

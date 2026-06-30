@@ -1,5 +1,6 @@
 import { isRecord } from "../contract/utils";
 import type { CommandInvocationProjection } from "../contract/message";
+import { logSwallowedError } from "../errors";
 
 export interface StoredCommandInvocation {
   bot_command_id: string;
@@ -49,7 +50,8 @@ export function parseInvocationJson(raw: string | null | undefined): CommandInvo
       invoked_name: parsed.invoked_name,
       options,
     };
-  } catch {
+  } catch (err) {
+    logSwallowedError("command_invocation_json_invalid", err);
     return null;
   }
 }

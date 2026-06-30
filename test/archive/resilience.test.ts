@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { createOwnedTestChannel } from "../helpers";
 import { RUNTIME_TABLE_BLACKLIST } from "../../src/archive/payload";
+import { canonicalDmPairKey } from "../../src/chat/dm-pair";
+import type { DMDirectory } from "../../src/do/dm-directory";
 
 describe("archive resilience", () => {
   it("create-channel commits business rows and archive_outbox together", async () => {
@@ -52,42 +54,28 @@ describe("archive resilience", () => {
 describe("dm directory archive", () => {
   it("get-or-create-dm appends archive only on insert", async () => {
     const { getNamedDo } = await import("../helpers");
-    const stub = getNamedDo(env.DM_DIRECTORY as unknown as DurableObjectNamespace, "shared");
     const userA = crypto.randomUUID();
     const userB = crypto.randomUUID();
+    const { pair_key } = canonicalDmPairKey(userA, userB);
+    const stub = getNamedDo<DMDirectory>(env.DM_DIRECTORY as unknown as DurableObjectNamespace<DMDirectory>, pair_key);
 
-    const res1 = await stub.fetch(
-      new Request("https://x/internal/get-or-create-dm", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_a: userA, user_b: userB, created_by: userA }),
-      }),
-    );
-    expect(res1.ok).toBe(true);
-    const body1 = (await res1.json()) as { created: boolean };
+    const body1 = await stub.getOrCreateDm({ user_a: userA, user_b: userB, created_by: userA });
     expect(body1.created).toBe(true);
 
     const { runInDurableObject } = await import("cloudflare:test");
     let countAfterCreate = 0;
-    await runInDurableObject(stub, async (_inst, state) => {
-      const s = state as DurableObjectState;
-      const row = s.storage.sql.exec("SELECT COUNT(*) AS n FROM archive_outbox").toArray()[0] as { n: number };
+    await runInDurableObject(stub, async (instance: unknown) => {
+      const ctx = (instance as { ctx: DurableObjectState }).ctx;
+      const row = ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM archive_outbox").toArray()[0] as { n: number };
       countAfterCreate = row.n;
     });
     expect(countAfterCreate).toBeGreaterThanOrEqual(1);
 
-    const res2 = await stub.fetch(
-      new Request("https://x/internal/get-or-create-dm", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_a: userA, user_b: userB, created_by: userA }),
-      }),
-    );
-    expect(res2.ok).toBe(true);
+    await stub.getOrCreateDm({ user_a: userA, user_b: userB, created_by: userA });
 
-    await runInDurableObject(stub, async (_inst, state) => {
-      const s = state as DurableObjectState;
-      const row = s.storage.sql.exec("SELECT COUNT(*) AS n FROM archive_outbox").toArray()[0] as { n: number };
+    await runInDurableObject(stub, async (instance: unknown) => {
+      const ctx = (instance as { ctx: DurableObjectState }).ctx;
+      const row = ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM archive_outbox").toArray()[0] as { n: number };
       expect(row.n).toBe(countAfterCreate);
     });
   });

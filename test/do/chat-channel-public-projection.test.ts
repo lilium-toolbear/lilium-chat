@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { createTestChannel, getNamedDo, joinTestChannel, addTestMember, sendTestMessage } from "../helpers";
+import type { ChatChannel } from "../../src/do/chat-channel";
+import type { ChannelDirectory } from "../../src/do/channel-directory";
 
 const { runInDurableObject, runDurableObjectAlarm } = await import("cloudflare:test") as {
   runInDurableObject: (stub: unknown, cb: (instance: unknown) => Promise<void>) => Promise<void>;
@@ -42,21 +44,14 @@ function parsePayload(r: OutboxRow): { action: string; channel_id: string; field
 }
 
 async function createChannel(opts: { channelId: string; ownerId: string; visibility: string; title?: string }) {
-  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], opts.channelId);
-  const res = await stub.fetch(new Request("https://x/internal/create-channel", {
-    method: "POST",
-    headers: { "X-Verified-User-Id": opts.ownerId, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      channel_id: opts.channelId,
-      creator_user_id: opts.ownerId,
-      title: opts.title ?? "PubChan",
-      topic: null,
-      avatar_attachment_id: null,
-      visibility: opts.visibility,
-      initial_members: [],
-    }),
-  }));
-  return { res, stub };
+  const stub = await createTestChannel(env, {
+    channelId: opts.channelId,
+    ownerId: opts.ownerId,
+    title: opts.title ?? "PubChan",
+    visibility: opts.visibility,
+  });
+  await stub.getSummary(opts.ownerId);
+  return { stub };
 }
 
 async function flushAlarm(stub: DurableObjectStub): Promise<void> {
@@ -95,31 +90,19 @@ describe("ChatChannel channel_directory projection outbox", () => {
     const { stub } = await createChannel({ channelId, ownerId: "u-a2-3", visibility: "private", title: "VisPriv" });
 
     // private → public_listed
-    await stub.fetch(new Request("https://x/internal/update-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-3", "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: "ik-vis-pub", channel_id: channelId, visibility: "public_listed" }),
-    }));
+    await stub.updateChannel({ user_id: "u-a2-3", idempotency_key: "ik-vis-pub", channel_id: channelId, visibility: "public_listed" });
     let rows = await listDirectoryOutbox(stub);
     const toPub = rows.map(parsePayload).find((p) => p.channel_id === channelId && p.action === "upsert");
     expect(toPub).toBeDefined();
 
     // public_listed → public_listed with title change
-    await stub.fetch(new Request("https://x/internal/update-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-3", "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: "ik-vis-title", channel_id: channelId, title: "NewTitle" }),
-    }));
+    await stub.updateChannel({ user_id: "u-a2-3", idempotency_key: "ik-vis-title", channel_id: channelId, title: "NewTitle" });
     rows = await listDirectoryOutbox(stub);
     const titleUpserts = rows.map(parsePayload).filter((p) => p.channel_id === channelId && p.action === "upsert");
     expect(titleUpserts.length).toBeGreaterThanOrEqual(2);
 
     // public_listed → private
-    await stub.fetch(new Request("https://x/internal/update-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-3", "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: "ik-vis-priv", channel_id: channelId, visibility: "private" }),
-    }));
+    await stub.updateChannel({ user_id: "u-a2-3", idempotency_key: "ik-vis-priv", channel_id: channelId, visibility: "private" });
     rows = await listDirectoryOutbox(stub);
     const dels = rows.map(parsePayload).filter((p) => p.channel_id === channelId && p.action === "delete");
     expect(dels.length).toBeGreaterThanOrEqual(1);
@@ -128,11 +111,7 @@ describe("ChatChannel channel_directory projection outbox", () => {
   it("dissolve writes delete outbox row (when public)", async () => {
     const channelId = uniqId("a20401");
     const { stub } = await createChannel({ channelId, ownerId: "u-a2-4", visibility: "public_listed", title: "DissolvePub" });
-    await stub.fetch(new Request("https://x/internal/dissolve", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-4", "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: "ik-dissolve", channel_id: channelId }),
-    }));
+    await stub.dissolveChannel({ user_id: "u-a2-4", idempotency_key: "ik-dissolve", channel_id: channelId });
     const rows = await listDirectoryOutbox(stub);
     const dels = rows.map(parsePayload).filter((p) => p.channel_id === channelId && p.action === "delete");
     expect(dels.length).toBeGreaterThanOrEqual(1);
@@ -144,22 +123,14 @@ describe("ChatChannel channel_directory projection outbox", () => {
     const { stub: pubStub } = await createChannel({ channelId: pubId, ownerId: "u-a2-5", visibility: "public_listed", title: "PubJoin" });
     const { stub: privStub } = await createChannel({ channelId: privId, ownerId: "u-a2-5b", visibility: "private", title: "PrivJoin" });
 
-    await pubStub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-joiner", "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: "u-a2-joiner" }),
-    }));
+    await joinTestChannel(pubStub, "u-a2-joiner");
     const pubRows = await listDirectoryOutbox(pubStub);
     const pubUpserts = pubRows.map(parsePayload).filter((p) => p.channel_id === pubId && p.action === "upsert");
     const joinUpsert = pubUpserts[pubUpserts.length - 1];
     expect(joinUpsert).toBeDefined();
     expect(joinUpsert!.fields!.member_count).toBe(2); // creator(1) + joiner
 
-    await privStub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-joiner2", "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: "u-a2-joiner2" }),
-    }));
+    await addTestMember(privStub, { actorUserId: "u-a2-5b", targetUserId: "u-a2-joiner2", channelId: privId });
     const privRows = await listDirectoryOutbox(privStub);
     expect(privRows.find((r) => parsePayload(r).channel_id === privId)).toBeUndefined();
   });
@@ -168,20 +139,7 @@ describe("ChatChannel channel_directory projection outbox", () => {
     const channelId = uniqId("a20601");
     const { stub } = await createChannel({ channelId, ownerId: "u-a2-6", visibility: "public_listed", title: "PubMsg" });
     // owner is already a member; send a message
-    const res = await stub.fetch(new Request("https://x/internal/message-send", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-6", "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command_id: "cm-a2-6-1",
-        dedupe_principal_key: "user:u-a2-6",
-        type: "text",
-        text: "hello directory",
-        reply_to: null,
-        attachment_ids: [],
-        mentions: [],
-        channel_id: channelId,
-      }),
-    }));
+    const res = await sendTestMessage(stub, { userId: "u-a2-6", channelId, commandId: "cm-a2-6-1", text: "hello directory" });
     expect(res.status).toBe(200);
     const rows = await listDirectoryOutbox(stub);
     const upserts = rows.map(parsePayload).filter((p) => p.channel_id === channelId && p.action === "upsert");
@@ -197,20 +155,7 @@ describe("ChatChannel channel_directory projection outbox", () => {
   it("message.send on a private channel writes no channel_directory outbox", async () => {
     const channelId = uniqId("a20701");
     const { stub } = await createChannel({ channelId, ownerId: "u-a2-7", visibility: "private", title: "PrivMsg" });
-    const res = await stub.fetch(new Request("https://x/internal/message-send", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-7", "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command_id: "cm-a2-7-1",
-        dedupe_principal_key: "user:u-a2-7",
-        type: "text",
-        text: "private hello",
-        reply_to: null,
-        attachment_ids: [],
-        mentions: [],
-        channel_id: channelId,
-      }),
-    }));
+    const res = await sendTestMessage(stub, { userId: "u-a2-7", channelId, commandId: "cm-a2-7-1", text: "private hello" });
     expect(res.status).toBe(200);
     const rows = await listDirectoryOutbox(stub);
     expect(rows.find((r) => parsePayload(r).channel_id === channelId)).toBeUndefined();
@@ -222,21 +167,22 @@ describe("ChatChannel channel_directory projection outbox", () => {
     const { stub: pubStub } = await createChannel({ channelId: pubId, ownerId: "u-a2-9", visibility: "public_listed", title: "PubInvite" });
     const { stub: privStub } = await createChannel({ channelId: privId, ownerId: "u-a2-9b", visibility: "private", title: "PrivInvite" });
 
-    const createPubInviteRes = await pubStub.fetch(new Request("https://x/internal/invites-create", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-9", "Content-Type": "application/json" },
-      body: JSON.stringify({ operation_id: "ik-invite-pub", channel_id: pubId, expires_in_seconds: 3600, max_uses: null }),
-    }));
-    expect(createPubInviteRes.status).toBe(200);
-    const { invite_code: pubInviteCode } = (await createPubInviteRes.json()) as { invite_code: string };
+    const createPubInviteRes = await pubStub.createInvite({
+      user_id: "u-a2-9",
+      operation_id: "ik-invite-pub",
+      channel_id: pubId,
+      expires_in_seconds: 3600,
+      max_uses: null,
+    });
+    const { invite_code: pubInviteCode } = createPubInviteRes;
 
     const rowsBefore = await listDirectoryOutbox(pubStub);
-    const acceptPubRes = await pubStub.fetch(new Request("https://x/internal/invites-accept", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-invite-joiner", "Content-Type": "application/json" },
-      body: JSON.stringify({ operation_id: "ik-accept-pub", channel_id: pubId, invite_code: pubInviteCode }),
-    }));
-    expect(acceptPubRes.status).toBe(200);
+    await pubStub.acceptInvite({
+      user_id: "u-invite-joiner",
+      operation_id: "ik-accept-pub",
+      channel_id: pubId,
+      invite_code: pubInviteCode,
+    });
 
     const rowsAfter = await listDirectoryOutbox(pubStub);
     const newRows = rowsAfter.slice(rowsBefore.length);
@@ -246,29 +192,30 @@ describe("ChatChannel channel_directory projection outbox", () => {
     expect(acceptUpsert!.fields!.title).toBe("PubInvite");
     expect(acceptUpsert!.fields!.status).toBe("active");
 
-    const createPrivInviteRes = await privStub.fetch(new Request("https://x/internal/invites-create", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-9b", "Content-Type": "application/json" },
-      body: JSON.stringify({ operation_id: "ik-invite-priv", channel_id: privId, expires_in_seconds: 3600, max_uses: null }),
-    }));
-    expect(createPrivInviteRes.status).toBe(200);
-    const { invite_code: privInviteCode } = (await createPrivInviteRes.json()) as { invite_code: string };
+    const createPrivInviteRes = await privStub.createInvite({
+      user_id: "u-a2-9b",
+      operation_id: "ik-invite-priv",
+      channel_id: privId,
+      expires_in_seconds: 3600,
+      max_uses: null,
+    });
+    const { invite_code: privInviteCode } = createPrivInviteRes;
 
     const privRowsBefore = await listDirectoryOutbox(privStub);
     expect(privRowsBefore.length).toBe(0);
 
-    const acceptPrivRes = await privStub.fetch(new Request("https://x/internal/invites-accept", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-invite-joiner2", "Content-Type": "application/json" },
-      body: JSON.stringify({ operation_id: "ik-accept-priv", channel_id: privId, invite_code: privInviteCode }),
-    }));
-    expect(acceptPrivRes.status).toBe(200);
+    await privStub.acceptInvite({
+      user_id: "u-invite-joiner2",
+      operation_id: "ik-accept-priv",
+      channel_id: privId,
+      invite_code: privInviteCode,
+    });
 
     const privRowsAfter = await listDirectoryOutbox(privStub);
     expect(privRowsAfter.length).toBe(0);
   });
 
-  it("alarm flush delivers an upsert payload to ChannelDirectory(shared)/internal/apply-projection and marks delivered", async () => {
+  it("alarm flush delivers an upsert payload to ChannelDirectory(shared) RPC and marks delivered", async () => {
     const channelId = uniqId("a20801");
     const { stub } = await createChannel({ channelId, ownerId: "u-a2-8", visibility: "public_listed", title: "PubFlush" });
     // schedule + run the alarm
@@ -283,9 +230,8 @@ describe("ChatChannel channel_directory projection outbox", () => {
     expect(ours.every((r) => r.status === "delivered")).toBe(true);
 
     // the directory now has the row
-    const dirStub = getNamedDo(env.CHANNEL_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], "shared");
-    const listRes = await dirStub.fetch(new Request("https://x/internal/list?limit=100"));
-    const listBody = (await listRes.json()) as { items: Array<{ channel_id: string; title: string }> };
+    const dirStub = getNamedDo<ChannelDirectory>(env.CHANNEL_DIRECTORY as unknown as DurableObjectNamespace<ChannelDirectory>, "shared");
+    const listBody = await dirStub.listPublicChannels({ q: "", limit: 100, cursor: null });
     const row = listBody.items.find((i) => i.channel_id === channelId);
     expect(row).toBeDefined();
     expect(row!.title).toBe("PubFlush");
@@ -320,29 +266,15 @@ describe("ChatChannel channel_directory projection outbox", () => {
     expect(failed).toBeDefined();
 
     // Now write a fresh, valid outbox row (simulating a subsequent message.send repair) and flush.
-    await stub.fetch(new Request("https://x/internal/message-send", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-a2-9", "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command_id: "cm-a2-9-repair",
-        dedupe_principal_key: "user:u-a2-9",
-        type: "text",
-        text: "repair",
-        reply_to: null,
-        attachment_ids: [],
-        mentions: [],
-        channel_id: channelId,
-      }),
-    }));
+    await sendTestMessage(stub, { userId: "u-a2-9", channelId, commandId: "cm-a2-9-repair", text: "repair" });
     await runInDurableObject(stub, async (instance: unknown) => {
       await (instance as { scheduleOutboxAlarm: (nowIso: string) => Promise<void> }).scheduleOutboxAlarm(new Date().toISOString());
     });
     await flushAlarm(stub);
 
     // the directory row converged (repair): a valid row exists for this channel
-    const dirStub = getNamedDo(env.CHANNEL_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], "shared");
-    const listRes = await dirStub.fetch(new Request("https://x/internal/list?limit=100"));
-    const listBody = (await listRes.json()) as { items: Array<{ channel_id: string; title: string }> };
+    const dirStub = getNamedDo<ChannelDirectory>(env.CHANNEL_DIRECTORY as unknown as DurableObjectNamespace<ChannelDirectory>, "shared");
+    const listBody = await dirStub.listPublicChannels({ q: "", limit: 100, cursor: null });
     const row = listBody.items.find((i) => i.channel_id === channelId);
     expect(row).toBeDefined();
     expect(row!.title).toBe("PubRepair");

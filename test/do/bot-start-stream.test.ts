@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { BOT_GATEWAY_API_VERSION } from "../../src/chat/bot-gateway-protocol";
 import { buildBotStreamWsUrl } from "../../src/chat/stream-registry";
-import { createTestChannel, getNamedDo } from "../helpers";
+import { createTestChannel, enqueueBotInvocationDelivery, getNamedDo, userConnectionTestStub } from "../helpers";
+import type { BotConnection } from "../../src/do/bot-connection";
+import type { ChatChannel } from "../../src/do/chat-channel";
 import { liveStartAndAck, upgradeUserConnection } from "../ws-helpers";
 
 const REGISTRY = () =>
@@ -48,8 +50,8 @@ afterEach(async () => {
   seededBots.clear();
 });
 
-function botConnectionStub(botId: string): DurableObjectStub {
-  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace, botId);
+function botConnectionStub(botId: string): DurableObjectStub<BotConnection> {
+  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace<BotConnection>, botId);
 }
 
 async function openBotConnection(botId: string): Promise<WebSocket> {
@@ -105,28 +107,10 @@ async function applyStartStreamOnChannel(input: {
   const botWs = await openBotConnection(input.botId);
   const stub = botConnectionStub(input.botId);
   const outboxId = `out-${crypto.randomUUID()}`;
-  const enq = await stub.fetch(
-    new Request("https://x/internal/enqueue-delivery", {
-      method: "POST",
-      headers: {
-        "X-Verified-Bot-Id": input.botId,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        outbox_id: outboxId,
-        channel_id: input.channelId,
-        kind: "command_invocation",
-        target_id: "inv-stream",
-        request_json: JSON.stringify({
-          channel_id: input.channelId,
-          invocation_id: "inv-stream",
-          command: { name: "ask" },
-          invoker: { user_id: "owner-1" },
-        }),
-      }),
-    }),
-  );
-  expect(enq.status).toBe(200);
+  await enqueueBotInvocationDelivery(stub, input.botId, {
+    outbox_id: outboxId,
+    channel_id: input.channelId,
+  });
 
   const deliveryFrame = JSON.parse(await nextMessageOfType(botWs, "delivery")) as { delivery_id: string };
   botWs.send(
@@ -223,12 +207,14 @@ describe("start_stream via bot delivery_result", () => {
     const ack = await applyStartStreamOnChannel({ botId, channelId, clientEffectId });
     const messageId = ack.effect_results?.[0]?.message_id as string;
 
-    const historyRes = await channelStub.fetch(
-      new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": viewerUserId } }),
+    const history = await (channelStub as DurableObjectStub<ChatChannel>).getMessages(viewerUserId, {
+      before: null,
+      after: null,
+      limit: 10,
+    });
+    const found = history.items.some(
+      (item) => "message" in item.payload && item.payload.message?.message_id === messageId,
     );
-    expect(historyRes.status).toBe(200);
-    const history = (await historyRes.json()) as { items: Array<{ payload?: { message?: { message_id?: string } } }> };
-    const found = history.items.some((item) => item.payload?.message?.message_id === messageId);
     expect(found).toBe(false);
   });
 
@@ -241,10 +227,8 @@ describe("start_stream via bot delivery_result", () => {
     const ack = await applyStartStreamOnChannel({ botId, channelId, clientEffectId });
     const messageId = ack.effect_results?.[0]?.message_id as string;
 
-    const uc = getNamedDo(env.USER_CONNECTION as unknown as DurableObjectNamespace, viewerUserId);
-    const probe = (await (
-      await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1" } }))
-    ).json()) as { event_json: string | null };
+    const uc = userConnectionTestStub(env, viewerUserId);
+    const probe = await uc.debugLastDeliver();
     expect(probe.event_json).toBeTruthy();
     const frame = JSON.parse(probe.event_json!) as {
       frame_type: string;

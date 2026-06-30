@@ -1,4 +1,5 @@
 import { sha256Hex } from "./command-options";
+import { logSwallowedError } from "../errors";
 
 export const STREAM_DEFAULT_TTL_SECONDS = 300;
 
@@ -95,7 +96,8 @@ export function parseStreamRegistryMessageJson(raw: string): StreamRegistryMessa
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     return sanitizeStreamMessageMetadata(parsed);
-  } catch {
+  } catch (err) {
+    logSwallowedError("stream_registry_message_json_invalid", err);
     return sanitizeStreamMessageMetadata({});
   }
 }

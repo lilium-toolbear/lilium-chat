@@ -1,10 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo, createTestChannel } from "../../test/helpers";
-
-type GetNamedDoArg = Parameters<typeof getNamedDo>[0];
-const chatChannel = env.CHAT_CHANNEL as unknown as GetNamedDoArg;
-const userDirectory = env.USER_DIRECTORY as unknown as GetNamedDoArg;
+import { createTestChannel, joinTestChannel, readMyChannels } from "../../test/helpers";
 
 describe("projection outbox delivery (reviewer P0-1)", () => {
   it("flush delivers join → UserDirectory my_channels contains the channel", async () => {
@@ -17,22 +13,13 @@ describe("projection outbox delivery (reviewer P0-1)", () => {
       title: "Lilium",
       visibility: "public_listed",
     });
-    const jr = await stub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId }),
-    }));
-    const { channel_id } = await jr.json() as { channel_id: string };
+    const jr = await joinTestChannel(stub, userId);
+    const { channel_id } = jr;
     const { runInDurableObject } = await import("cloudflare:test");
     await runInDurableObject(stub, async (instance) => { await (instance as { alarm: () => Promise<void> }).alarm(); });
-    const dir = getNamedDo(userDirectory, userId);
-    const res = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
-    const body = await res.json() as { items: Array<{ channel_id: string }> };
-    expect(body.items.find((r) => r.channel_id === channel_id)).toBeDefined();
-    const probe = await stub.fetch(new Request("https://x/internal/outbox-pending?target_kind=user_directory", {
-      headers: { "X-Test-Only": "1" },
-    }));
-    const pb = await probe.json() as { count: number };
+    const items = await readMyChannels(env, userId);
+    expect(items.find((r) => r.channel_id === channel_id)).toBeDefined();
+    const pb = await stub.debugOutboxPending("user_directory");
     expect(pb.count).toBe(0);
   });
 
@@ -46,16 +33,10 @@ describe("projection outbox delivery (reviewer P0-1)", () => {
       title: "Lilium",
       visibility: "public_listed",
     });
-    await stub.fetch(new Request("https://x/internal/join", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId }),
-    }));
+    await joinTestChannel(stub, userId);
     const { runInDurableObject } = await import("cloudflare:test");
     await runInDurableObject(stub, async (instance) => { await (instance as { alarm: () => Promise<void> }).alarm(); });
-    const dir = getNamedDo(userDirectory, userId);
-    const res = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
-    const body = await res.json() as { items: Array<{ channel_id: string }> };
-    expect(body.items.length).toBeGreaterThan(0);
+    const items = await readMyChannels(env, userId);
+    expect(items.length).toBeGreaterThan(0);
   });
 });

@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 
 import { OUTBOX_MAX_ATTEMPTS } from "../../src/contract/outbox";
-import { bumpFanoutRetry } from "../../src/do/fanout-scheduler";
-import { computeRetryBackoffMs } from "../../src/do/retry-backoff";
+import { bumpFanoutRetry } from "../../src/do/channel-fanout/fanout-scheduler";
+import { computeRetryBackoffMs } from "../../src/do/shared/retry-backoff";
+import type { ChannelFanout } from "../../src/do/channel-fanout";
 import { getNamedDo } from "../helpers";
 
 describe("fanout scheduler retry", () => {
@@ -15,7 +16,7 @@ describe("fanout scheduler retry", () => {
 
   it("bumpFanoutRetry transitions to dead_letter when max attempts reached", async () => {
     const channelId = "ch-fanout-retry-dl";
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
     const queueId = "q-dead-letter-1";
     const nowIso = "2026-06-28T00:00:00.000Z";
 
@@ -47,7 +48,7 @@ describe("fanout scheduler retry", () => {
 
   it("bumpFanoutRetry keeps pending with exponential backoff under max attempts", async () => {
     const channelId = "ch-fanout-retry-pending";
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
     const queueId = "q-retry-pending-1";
     const nowIso = "2026-06-28T00:00:00.000Z";
 

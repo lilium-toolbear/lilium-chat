@@ -1,31 +1,39 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { dumpChannelFanout, getNamedDo } from "../helpers";
+import type { ChannelFanout } from "../../src/do/channel-fanout";
 
 describe("ChannelFanout leases", () => {
-  it("rejects legacy register-online and removes stale fanout leases on enqueue", async () => {
+  it("upserts leases through RPC", async () => {
+    const channelId = "ch-leases-rpc";
+    const userId = "u-leases-rpc";
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
+
+    const upsert = await fanout.leaseUpsert({
+      channel_id: channelId,
+      lease_id: "lease-rpc",
+      user_id: userId,
+      session_id: "s-rpc",
+      membership_version: 2,
+    });
+    expect(upsert.ok).toBe(true);
+
+    const dump = await dumpChannelFanout(fanout, channelId);
+    expect(dump.leases).toContainEqual(expect.objectContaining({ lease_id: "lease-rpc", user_id: userId }));
+  });
+
+  it("removes stale fanout leases on enqueue", async () => {
     const channelId = "ch-leases-1";
     const userId = "u-leases-1";
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
 
-    const gone = await fanout.fetch(new Request("https://x/register-online", {
-      method: "POST",
-      headers: { "X-Channel-Id": channelId, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, session_id: "s-1", membership_version: 1 }),
-    }));
-    expect(gone.status).toBe(410);
-
-    const upsert = await fanout.fetch(new Request("https://x/lease-upsert", {
-      method: "POST",
-      headers: { "X-Channel-Id": channelId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        lease_id: "lease-1",
-        user_id: userId,
-        session_id: "s-1",
-        membership_version: 2,
-      }),
-    }));
-    expect(upsert.status).toBe(200);
+    await fanout.leaseUpsert({
+      channel_id: channelId,
+      lease_id: "lease-1",
+      user_id: userId,
+      session_id: "s-1",
+      membership_version: 2,
+    });
 
     const evt = JSON.stringify({
       frame_type: "event",
@@ -36,16 +44,14 @@ describe("ChannelFanout leases", () => {
       occurred_at: "2026-06-27T00:00:00Z",
       payload: {},
     });
-    const enq = await fanout.fetch(new Request("https://x/fanout-enqueue", {
-      method: "POST",
-      headers: { "X-Channel-Id": channelId, "Content-Type": "application/json" },
-      body: JSON.stringify({ event_id: "e-lease-1", event_json: evt, membership_version_at_event: 2 }),
-    }));
-    expect(enq.status).toBe(200);
+    await fanout.fanoutEnqueue({
+      channel_id: channelId,
+      event_id: "e-lease-1",
+      event_json: evt,
+      membership_version_at_event: 2,
+    });
 
-    const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
-    }))).json()) as { leases: Array<{ lease_id: string }>; queue: Array<{ target_session_id: string }> };
+    const dump = await dumpChannelFanout(fanout, channelId);
     expect(dump.leases.some((l) => l.lease_id === "lease-1")).toBe(false);
     expect(dump.queue).toEqual([]);
   });
@@ -53,7 +59,7 @@ describe("ChannelFanout leases", () => {
   it("deletes stale fanout lease when deliver returns membership_not_active", async () => {
     const channelId = "ch-leases-stale";
     const userId = "u-leases-stale";
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
     const uc = getNamedDo(env.USER_CONNECTION as unknown as Parameters<typeof getNamedDo>[0], userId);
 
     const wsRes = await uc.fetch(new Request("https://x/ws", {
@@ -86,16 +92,13 @@ describe("ChannelFanout leases", () => {
       );
     });
 
-    await fanout.fetch(new Request("https://x/lease-upsert", {
-      method: "POST",
-      headers: { "X-Channel-Id": channelId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        lease_id: "lease-stale",
-        user_id: userId,
-        session_id: sessionId,
-        membership_version: 1,
-      }),
-    }));
+    await fanout.leaseUpsert({
+      channel_id: channelId,
+      lease_id: "lease-stale",
+      user_id: userId,
+      session_id: sessionId,
+      membership_version: 1,
+    });
 
     const evt = JSON.stringify({
       frame_type: "event",
@@ -106,19 +109,18 @@ describe("ChannelFanout leases", () => {
       occurred_at: "2026-06-27T00:00:00Z",
       payload: {},
     });
-    await fanout.fetch(new Request("https://x/fanout-enqueue", {
-      method: "POST",
-      headers: { "X-Channel-Id": channelId, "Content-Type": "application/json" },
-      body: JSON.stringify({ event_id: "e-stale", event_json: evt, membership_version_at_event: 99 }),
-    }));
+    await fanout.fanoutEnqueue({
+      channel_id: channelId,
+      event_id: "e-stale",
+      event_json: evt,
+      membership_version_at_event: 99,
+    });
 
     const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
     let leaseGone = false;
     for (let i = 0; i < 40; i++) {
       await runDurableObjectAlarm(fanout);
-      const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-        headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
-      }))).json()) as { leases: Array<{ lease_id: string }>; queue: Array<{ status: string }> };
+      const dump = await dumpChannelFanout(fanout, channelId);
       if (!dump.leases.some((l) => l.lease_id === "lease-stale")) {
         leaseGone = true;
         expect(dump.queue).toEqual([]);

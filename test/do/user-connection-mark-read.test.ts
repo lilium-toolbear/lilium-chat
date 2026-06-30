@@ -1,26 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { createTestChannel, getNamedDo, readMyChannels } from "../helpers";
 import { nextAck } from "../ws-helpers";
+import type { ChatChannel } from "../../src/do/chat-channel";
+import type { UserConnection } from "../../src/do/user-connection";
 
-async function setupChannelAndJoin(userId: string, channelId: string) {
-  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
-  await stub.fetch(new Request("https://x/internal/create-channel", {
-    method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ channel_id: channelId, creator_user_id: userId, title: "M", topic: null, avatar_attachment_id: null, visibility: "private", initial_members: [] }),
-  }));
+async function setupChannelAndJoin(userId: string, channelId: string): Promise<DurableObjectStub<ChatChannel>> {
+  const stub = await createTestChannel(env, { channelId, ownerId: userId, title: "M", visibility: "private" });
   // flush the join outbox so my_channels is populated before WS upgrade
   const { runDurableObjectAlarm } = await import("cloudflare:test") as any;
   await runDurableObjectAlarm(stub);
   // Robustness: the user_directory join outbox may lag under load; poll my_channels until the row
   // is active (same pattern as the member-left-unsubscribe fix). Re-flush the alarm if needed.
-  const dir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], userId);
   for (let i = 0; i < 100; i++) {
-    const myRes = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
-    if (myRes.ok) {
-      const items = ((await myRes.json()) as { items: Array<{ channel_id: string }> }).items;
-      if (items.some((m) => m.channel_id === channelId)) return stub;
-    }
+    const items = await readMyChannels(env, userId);
+    if (items.some((m) => m.channel_id === channelId)) return stub;
     await runDurableObjectAlarm(stub);
     await new Promise((r) => setTimeout(r, 50));
   }
@@ -28,7 +22,7 @@ async function setupChannelAndJoin(userId: string, channelId: string) {
 }
 
 async function upgrade(userId: string) {
-  const stub = getNamedDo(env.USER_CONNECTION as unknown as Parameters<typeof getNamedDo>[0], userId);
+  const stub = getNamedDo<UserConnection>(env.USER_CONNECTION, userId);
   const res = await stub.fetch(new Request("https://x/ws", { headers: { Upgrade: "websocket", "X-Verified-User-Id": userId } }));
   expect(res.status).toBe(101);
   const ws = res.webSocket as WebSocket;

@@ -1,15 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { makeJwt, TEST_SECRET, getNamedDo, setupOwnedChannelForUser } from "../helpers";
+import { dumpChannelFanout, makeJwt, TEST_SECRET, getNamedDo, setupOwnedChannelForUser } from "../helpers";
 import { liveStartAndAck } from "../ws-helpers";
+import type { ChannelFanout } from "../../src/do/channel-fanout";
 
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
 };
-
-interface FanoutDump {
-  leases: Array<{ user_id?: string }>;
-}
 
 function nextMessage(ws: WebSocket, timeoutMs = 3000): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -52,11 +49,10 @@ describe("e2e: message.send → committed_ack → message.created self-receive",
     ws.accept();
     await liveStartAndAck(ws);
 
-    const fanoutStub = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const fanoutStub = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
     let registered = false;
     for (let i = 0; i < 40; i++) {
-      const dumpResponse = await fanoutStub.fetch(new Request("https://x/dump", { headers: { "X-Test-Only": "1", "X-Channel-Id": channelId } }));
-      const dump = (await dumpResponse.json()) as FanoutDump;
+      const dump = await dumpChannelFanout(fanoutStub, channelId);
       if (dump.leases.some((s) => s.user_id === userId)) {
         registered = true;
         break;

@@ -89,11 +89,11 @@ describe("resolveActorForLiveBroadcast", () => {
         { user_id: "u1", display_name: "Alice", avatar_url: null },
       ], [
         "u2",
-        { user_id: "u2", display_name: "Bob", avatar_url: "https://x/b.png" },
+        { user_id: "u2", display_name: "Bob", avatar_url: "https://example.test/b.png" },
       ]]),
     );
     expect((live as any).actor).toEqual({ user_id: "u1", display_name: "Alice", avatar_url: null });
-    expect((live as any).user).toEqual({ user_id: "u2", display_name: "Bob", avatar_url: "https://x/b.png" });
+    expect((live as any).user).toEqual({ user_id: "u2", display_name: "Bob", avatar_url: "https://example.test/b.png" });
     expect(live).not.toHaveProperty("actor_id");
     expect(live).not.toHaveProperty("user_id");
   });

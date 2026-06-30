@@ -30,11 +30,11 @@ describe("resolveUserSummaries", () => {
     const ids = ["u1", "u2"];
     const map = await resolveUserSummaries(ids, env, {
       clientFactory: fakeClientFactory({ 0: [
-        { user_id: "u1", display_name: "alice", avatar_url: "https://x/a.png" },
+        { user_id: "u1", display_name: "alice", avatar_url: "https://example.test/a.png" },
         { user_id: "u2", display_name: null, avatar_url: null },
       ] }),
     });
-    expect(map.get("u1")).toEqual({ user_id: "u1", display_name: "alice", avatar_url: "https://x/a.png" });
+    expect(map.get("u1")).toEqual({ user_id: "u1", display_name: "alice", avatar_url: "https://example.test/a.png" });
     expect(map.get("u2")).toEqual({ user_id: "u2", display_name: null, avatar_url: null });
   });
 

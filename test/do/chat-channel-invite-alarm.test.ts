@@ -1,28 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { createTestChannel, getNamedDo } from "../helpers";
+import type { InviteDirectory } from "../../src/do/invite-directory";
 
 describe("ChatChannel alarm: invite_directory outbox", () => {
   it("flushes invite outbox to InviteDirectory and marks delivered", async () => {
     const channelId = "0199aa00-0000-7000-8000-000000000001";
     const ownerId = "u-invite-alarm-1";
     const inviteCode = "invite-corr-1-code";
-    const chatStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
-
-    const created = await chatStub.fetch(new Request("https://x/internal/create-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channel_id: channelId,
-        creator_user_id: ownerId,
-        title: "Invite test",
-        topic: null,
-        avatar_attachment_id: null,
-        visibility: "private",
-        initial_members: [],
-      }),
-    }));
-    expect(created.status).toBe(200);
+    const chatStub = await createTestChannel(env, { channelId, ownerId, title: "Invite test", visibility: "private" });
+    await chatStub.getSummary(ownerId);
 
     const now = new Date().toISOString();
     const payload = {
@@ -77,9 +64,10 @@ describe("ChatChannel alarm: invite_directory outbox", () => {
     }
     expect(inviteOutboxStatus).toBe("delivered");
 
-    const inviteStub = getNamedDo(env.INVITE_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], "shared");
-    const inviteRes = await inviteStub.fetch(new Request(`https://x/get?code=${inviteCode}`));
-    const inviteRow = (await inviteRes.json()) as { channel_id?: string; status?: string };
+    const inviteStub = getNamedDo<InviteDirectory>(env.INVITE_DIRECTORY as unknown as DurableObjectNamespace<InviteDirectory>, "shared");
+    const inviteRow = await inviteStub.getInviteRoute(inviteCode);
+    expect(inviteRow).not.toBeNull();
+    if (inviteRow === null) throw new Error("invite route missing");
     expect(inviteRow.channel_id).toBe(channelId);
     expect(inviteRow.status).toBe("active");
   });

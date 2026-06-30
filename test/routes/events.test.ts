@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { makeJwt, TEST_SECRET, setupOwnedChannelForUser } from "../helpers";
+import { makeJwt, sendTestMessage, TEST_SECRET, setupOwnedChannelForUser } from "../helpers";
 
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
@@ -24,23 +24,9 @@ describe("GET /api/chat/events", () => {
     const token = await makeJwt({ sub: userId }, TEST_SECRET);
 
     const { stub: channelStub, channelId } = await setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
-    const send = (await (
-      await channelStub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            command_id: "cm-ev-1",
-            dedupe_principal_key: `user:${userId}`,
-            type: "text",
-            text: "hi",
-            reply_to: null,
-            mentions: [],
-            channel_id: channelId,
-          }),
-        }),
-      )
-    ).json()) as { event_id: string };
+    const send = (await (await sendTestMessage(channelStub, { userId, channelId, commandId: "cm-ev-1", text: "hi" })).json()) as {
+      event_id: string;
+    };
 
     const res = await authedEventsReq(userId, token, `channel_id=${channelId}&after_event_id=`);
     expect(res.status).toBe(200);
@@ -73,21 +59,7 @@ describe("GET /api/chat/events", () => {
     const token = await makeJwt({ sub: userId }, TEST_SECRET);
 
     const { stub: channelStub, channelId } = await setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
-    await channelStub.fetch(
-      new Request("https://x/internal/message-send", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          command_id: "cm-ev-2",
-          dedupe_principal_key: `user:${userId}`,
-          type: "text",
-          text: "yo",
-          reply_to: null,
-          mentions: [],
-          channel_id: channelId,
-        }),
-      }),
-    );
+    await sendTestMessage(channelStub, { userId, channelId, commandId: "cm-ev-2", text: "yo" });
 
     const cursors = btoa("{}").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     const res = await authedEventsReq(userId, token, `cursors=${cursors}`);

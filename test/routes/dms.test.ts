@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
-import { makeJwt, TEST_SECRET } from "../helpers";
+import { makeJwt, readMyChannels, TEST_SECRET } from "../helpers";
 
 vi.mock("../../src/profile/resolve", () => ({
   resolveUserSummaries: vi.fn(async (userIds: string[]) => {
@@ -138,19 +138,13 @@ describe("POST /api/chat/dms", () => {
     const body = await res.json() as { channel: { channel_id: string } };
     const chStub = env.CHAT_CHANNEL.getByName(body.channel.channel_id);
     const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
-    const dirStub = env.USER_DIRECTORY.getByName(USER_B);
     for (let i = 0; i < 40; i++) {
       await runDurableObjectAlarm(chStub);
-      const listRes = await dirStub.fetch(new Request("https://x/my-channels", {
-        headers: { "X-Verified-User-Id": USER_B },
-      }));
-      if (listRes.ok) {
-        const items = ((await listRes.json()) as { items: Array<{ channel_id: string; kind: string }> }).items;
-        const row = items.find((it) => it.channel_id === body.channel.channel_id);
-        if (row) {
-          expect(row.kind).toBe("dm");
-          return;
-        }
+      const items = await readMyChannels(env, USER_B);
+      const row = items.find((it) => it.channel_id === body.channel.channel_id);
+      if (row) {
+        expect(row.kind).toBe("dm");
+        return;
       }
       await new Promise((r) => setTimeout(r, 50));
     }

@@ -1,4 +1,5 @@
 import type { Env } from "../env";
+import { logSwallowedError } from "../errors";
 import { Client } from "./pg-client";
 
 export interface UserSummary {
@@ -61,8 +62,8 @@ export async function resolveUserSummaries(
     } finally {
       try {
         await client?.end();
-      } catch {
-        // ignore
+      } catch (err) {
+        logSwallowedError("resolve_user_summaries_pg_client_end_failed", err);
       }
     }
   }

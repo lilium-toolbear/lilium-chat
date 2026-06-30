@@ -1,23 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { addTestMember, createTestChannel, readMyChannels, sendTestMessage } from "../helpers";
 import { nextAck, upgradeUserConnection } from "../ws-helpers";
+import type { ChatChannel } from "../../src/do/chat-channel";
 
-async function setupChannelAndJoin(userId: string, channelId: string) {
-  const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
-  await stub.fetch(new Request("https://x/internal/create-channel", {
-    method: "POST", headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-    body: JSON.stringify({ channel_id: channelId, creator_user_id: userId, title: "WS", topic: null, avatar_attachment_id: null, visibility: "private", initial_members: [] }),
-  }));
+async function setupChannelAndJoin(userId: string, channelId: string): Promise<DurableObjectStub<ChatChannel>> {
+  const stub = await createTestChannel(env, { channelId, ownerId: userId, title: "WS", visibility: "private" });
   const { runDurableObjectAlarm } = await import("cloudflare:test") as { runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void> };
   await runDurableObjectAlarm(stub);
-  const dir = getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], userId);
   for (let i = 0; i < 100; i++) {
-    const myRes = await dir.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": userId } }));
-    if (myRes.ok) {
-      const items = ((await myRes.json()) as { items: Array<{ channel_id: string }> }).items;
-      if (items.some((m) => m.channel_id === channelId)) return stub;
-    }
+    const items = await readMyChannels(env, userId);
+    if (items.some((m) => m.channel_id === channelId)) return stub;
     await runDurableObjectAlarm(stub);
     await new Promise((r) => setTimeout(r, 50));
   }
@@ -25,26 +18,14 @@ async function setupChannelAndJoin(userId: string, channelId: string) {
 }
 
 async function seedMessage(
-  stub: DurableObjectStub,
+  stub: DurableObjectStub<ChatChannel>,
   userId: string,
   channelId: string,
   commandId: string,
   text: string,
 ): Promise<{ message_id: string }> {
   const send = (await (
-    await stub.fetch(new Request("https://x/internal/message-send", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command_id: commandId,
-        dedupe_principal_key: `user:${userId}`,
-        type: "text",
-        text,
-        reply_to: null,
-        mentions: [],
-        channel_id: channelId,
-      }),
-    }))
+    await sendTestMessage(stub, { userId, channelId, commandId, text })
   ).json()) as { message: { message_id: string } };
   return send.message;
 }
@@ -72,11 +53,7 @@ describe("UserConnection message lifecycle WS", () => {
     const cid = "01a40011-0000-7000-8000-000000000001";
     const sysStub = await setupChannelAndJoin(ownerId, cid);
     const send = await seedMessage(sysStub, ownerId, cid, "cmd-send-ws-e2", "orig");
-    await sysStub.fetch(new Request("https://x/internal/members-add", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: "cmd-add-ws-e2", channel_id: cid, user_id: memberId, role: "member" }),
-    }));
+    await addTestMember(sysStub, { actorUserId: ownerId, targetUserId: memberId, channelId: cid, idempotencyKey: "cmd-add-ws-e2" });
     const { ws } = await upgradeUserConnection(memberId);
     ws.send(JSON.stringify({
       frame_type: "command",

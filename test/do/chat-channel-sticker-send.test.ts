@@ -1,100 +1,70 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo, fakeS3PublicPath, findTimelineMessageCreated, type TimelineHistoryItem } from "../helpers";
+import {
+  createTestChannel,
+  fakeS3PublicPath,
+  findTimelineMessageCreated,
+  getNamedDo,
+  mutateTestMessage,
+  readTestMessages,
+  replayTestEvents,
+  sendTestMessage,
+  type TimelineHistoryItem,
+} from "../helpers";
 import { setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
+import type { ChatChannel } from "../../src/do/chat-channel";
+import type { UserDirectory } from "../../src/do/user-directory";
 
 function chatStub(channelId: string) {
-  return getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
+  return getNamedDo<ChatChannel>(env.CHAT_CHANNEL, channelId);
 }
 
 function udStub(userId: string) {
-  return getNamedDo(env.USER_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], userId);
+  return getNamedDo<UserDirectory>(env.USER_DIRECTORY, userId);
 }
 
 async function createChannel(channelId: string, ownerId: string) {
-  const stub = chatStub(channelId);
-  const res = await stub.fetch(
-    new Request("https://x/internal/create-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channel_id: channelId,
-        creator_user_id: ownerId,
-        title: "Sticker send test",
-        topic: null,
-        avatar_attachment_id: null,
-        visibility: "private",
-        initial_members: [],
-      }),
-    }),
-  );
-  expect(res.status).toBe(200);
+  const stub = await createTestChannel(env, { channelId, ownerId, title: "Sticker send test", visibility: "private" });
+  await stub.getSummary(ownerId);
   return stub;
 }
 
 async function presignAndFinalize(userId: string, fake: FakeS3): Promise<{ attachment_id: string; upload_url: string }> {
   const key = `idem-sticker-send-${userId}`;
-  const presignRes = await udStub(userId).fetch(
-    new Request("https://x/internal/attachment-presign", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": key, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filename: "sticker.png",
-        mime_type: "image/png",
-        size_bytes: 12345,
-        width: 128,
-        height: 128,
-        blurhash: "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
-      }),
-    }),
-  );
-  expect(presignRes.status).toBe(200);
-  const presignBody = (await presignRes.json()) as { attachment_id: string; upload_url: string };
+  const presignRes = await udStub(userId).presignUpload(userId, key, "attachment", {
+    filename: "sticker.png",
+    mime_type: "image/png",
+    size_bytes: 12345,
+    width: 128,
+    height: 128,
+    blurhash: "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
+  });
+  const presignBody = presignRes;
   fake.objects.set(fakeS3PublicPath(presignBody.attachment_id), { contentType: "image/png", contentLength: 12345 });
 
-  const finalizeRes = await udStub(userId).fetch(
-    new Request("https://x/internal/attachment-finalize", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": `${key}-fin`, "Content-Type": "application/json" },
-      body: JSON.stringify({ attachment_id: presignBody.attachment_id }),
-    }),
-  );
-  expect(finalizeRes.status).toBe(200);
+  const finalizeRes = await udStub(userId).finalizeUpload(userId, `${key}-fin`, { attachment_id: presignBody.attachment_id });
+  expect(finalizeRes.attachment.attachment_id).toBe(presignBody.attachment_id);
   return presignBody;
 }
 
 async function saveSticker(userId: string, channelId: string, attachmentId: string): Promise<{ sticker_id: string }> {
-  const res = await udStub(userId).fetch(
-    new Request("https://x/internal/sticker-save", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({ operation_id: `op-save-${userId}-${attachmentId}`, channel_id: channelId, attachment_id: attachmentId }),
-    }),
-  );
-  expect(res.status).toBe(200);
-  const body = (await res.json()) as { sticker: { sticker_id: string } };
-  return { sticker_id: body.sticker.sticker_id };
+  const res = await udStub(userId).saveSticker(userId, {
+    operation_id: `op-save-${userId}-${attachmentId}`,
+    channel_id: channelId,
+    attachment_id: attachmentId,
+  });
+  return { sticker_id: res.sticker.sticker_id };
 }
 
 async function sendStickerMessage(channelId: string, senderId: string, stickerId: string, cmdId: string) {
-  return chatStub(channelId).fetch(
-    new Request("https://x/internal/message-send", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": senderId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command_id: cmdId,
-        dedupe_principal_key: `user:${senderId}`,
-        type: "sticker",
-        text: "",
-        reply_to: null,
-        sticker_id: stickerId,
-        attachment_ids: [],
-        mentions: [],
-        channel_id: channelId,
-      }),
-    }),
-  );
+  return sendTestMessage(chatStub(channelId), {
+    userId: senderId,
+    channelId,
+    commandId: cmdId,
+    type: "sticker",
+    stickerId,
+  });
 }
 
 describe("ChatChannel message.send type=sticker", () => {
@@ -130,14 +100,8 @@ describe("ChatChannel message.send type=sticker", () => {
     const { attachment_id } = await presignAndFinalize(userId, fake);
     const { sticker_id } = await saveSticker(userId, channelId, attachment_id);
 
-    const delRes = await udStub(userId).fetch(
-      new Request("https://x/internal/sticker-delete", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({ sticker_id, operation_id: `op-del-${userId}` }),
-      }),
-    );
-    expect(delRes.status).toBe(200);
+    const delRes = await udStub(userId).deleteSticker(userId, { sticker_id, operation_id: `op-del-${userId}` });
+    expect(delRes.deleted).toBe(true);
 
     const res = await sendStickerMessage(channelId, userId, sticker_id, "cmd-sticker-2");
     expect(res.status).toBe(404);
@@ -174,9 +138,7 @@ describe("ChatChannel message.send type=sticker", () => {
     expect(sendRes.status).toBe(200);
     const sendBody = (await sendRes.json()) as { message: { message_id: string } };
 
-    const historyRes = await stub.fetch(new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": userId } }));
-    expect(historyRes.status).toBe(200);
-    const historyBody = (await historyRes.json()) as { items: TimelineHistoryItem[] };
+    const historyBody = await readTestMessages(stub, userId);
     const live = findTimelineMessageCreated(historyBody.items, sendBody.message.message_id);
     expect(live).toBeDefined();
     expect(live!.payload!.message!.type).toBe("sticker");
@@ -195,9 +157,7 @@ describe("ChatChannel message.send type=sticker", () => {
     expect(sendRes.status).toBe(200);
     const sendBody = (await sendRes.json()) as { event_id: string; message: { message_id: string } };
 
-    const replayRes1 = await stub.fetch(new Request("https://x/internal/replay?after=", { headers: { "X-Verified-User-Id": userId } }));
-    expect(replayRes1.status).toBe(200);
-    const replayBody1 = (await replayRes1.json()) as { events: Array<{ event_id: string; event_json: string }> };
+    const replayBody1 = await replayTestEvents(stub, userId) as { events: Array<{ event_id: string; event_json: string }> };
     const createdEvent = replayBody1.events
       .map((e) => ({ ...e, frame: JSON.parse(e.event_json) as { type: string; payload?: { message?: { message_id: string; type: string; sticker: { sticker_id: string } | null } } } }))
       .find((e) => e.frame.type === "message.created" && e.frame.payload?.message?.message_id === sendBody.message.message_id);
@@ -206,18 +166,16 @@ describe("ChatChannel message.send type=sticker", () => {
     expect(createdEvent!.frame.payload!.message!.sticker).not.toBeNull();
     expect(createdEvent!.frame.payload!.message!.sticker!.sticker_id).toBe(sticker_id);
 
-    const recallRes = await stub.fetch(
-      new Request("https://x/internal/message-recall", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-        body: JSON.stringify({ operation_id: "op-recall-6", message_id: sendBody.message.message_id, channel_id: channelId }),
-      }),
-    );
+    const recallRes = await mutateTestMessage(stub, {
+      userId,
+      channelId,
+      messageId: sendBody.message.message_id,
+      operation: "message.recall",
+      operationId: "op-recall-6",
+    });
     expect(recallRes.status).toBe(200);
 
-    const replayRes2 = await stub.fetch(new Request(`https://x/internal/replay?after=${encodeURIComponent(sendBody.event_id)}`, { headers: { "X-Verified-User-Id": userId } }));
-    expect(replayRes2.status).toBe(200);
-    const replayBody2 = (await replayRes2.json()) as { events: Array<{ event_id: string; event_json: string }> };
+    const replayBody2 = await replayTestEvents(stub, userId, sendBody.event_id) as { events: Array<{ event_id: string; event_json: string }> };
     const recalledEvent = replayBody2.events
       .map((e) => ({ ...e, frame: JSON.parse(e.event_json) as { type: string; payload?: { message?: { message_id: string; status: string; sticker: unknown } } } }))
       .find((e) => e.frame.type.startsWith("message.") && e.frame.payload?.message?.message_id === sendBody.message.message_id);

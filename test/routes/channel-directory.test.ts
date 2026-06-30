@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { getNamedDo } from "../helpers";
 import { makeJwt, TEST_SECRET } from "../helpers";
+import type { ChannelDirectory } from "../../src/do/channel-directory";
 
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
@@ -25,11 +26,10 @@ async function createPublicChannel(ownerId: string, title: string, idemKey: stri
 
 // Wait for a channel's channel_directory outbox to be flushed into the ChannelDirectory read model.
 async function waitForDirectoryRow(channelId: string, timeoutMs = 5000): Promise<void> {
-  const dirStub = getNamedDo(env.CHANNEL_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], "shared");
+  const dirStub = getNamedDo<ChannelDirectory>(env.CHANNEL_DIRECTORY as unknown as DurableObjectNamespace<ChannelDirectory>, "shared");
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const res = await dirStub.fetch(new Request("https://x/internal/list?limit=100"));
-    const body = (await res.json()) as { items: { channel_id: string }[] };
+    const body = await dirStub.listPublicChannels({ q: "", limit: 100, cursor: null });
     if (body.items.some((i) => i.channel_id === channelId)) return;
     // Trigger a flush by poking the channel's alarm (alarm flush happens in the DO's alarm handler).
     const chStub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], channelId);
@@ -76,7 +76,7 @@ describe("GET /api/chat/channels/directory", () => {
     expect(row!.last_read_event_id).toBeNull();
   });
 
-  it("active-member viewer → role from ChatChannel/internal/summary.my_role + last_read_event_id from UserDirectory", async () => {
+  it("active-member viewer → role from ChatChannel summary RPC + last_read_event_id from UserDirectory", async () => {
     const cid = await createPublicChannel("u-dir-owner-3", "DirMember3", "ck-dir-member-3");
     // viewer joins the channel
     const joinRes = await SELF.fetch(new Request(`https://chat.kuma.homes/api/chat/channels/${cid}/join`, {

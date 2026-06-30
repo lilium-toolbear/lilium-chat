@@ -1,19 +1,33 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import { makeJwt, TEST_SECRET, fakeS3PublicPath, getTimelineMessageIdFromHistory, type TimelineHistoryItem } from "../helpers";
+import {
+  addTestMember,
+  createTestChannel,
+  fakeS3PublicPath,
+  getNamedDo,
+  getTimelineMessageIdFromHistory,
+  makeJwt,
+  mutateTestMessage,
+  readTestMessages,
+  sendTestMessage,
+  TEST_SECRET,
+  type TimelineHistoryItem,
+} from "../helpers";
 import { setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
+import type { ChatChannel } from "../../src/do/chat-channel";
+import type { UserDirectory } from "../../src/do/user-directory";
 
 const SELF = (await import("../../src/index")).default as {
   fetch: (request: Request, envOverride?: unknown, ctx?: { waitUntil: () => void; passThroughOnException: () => void }) => Promise<Response> | Response;
 };
 
 function chatStub(channelId: string) {
-  return (env.CHAT_CHANNEL as unknown as { getByName: (name: string) => { fetch: (req: Request) => Promise<Response> } }).getByName(channelId);
+  return getNamedDo<ChatChannel>(env.CHAT_CHANNEL, channelId);
 }
 
 function udStub(userId: string) {
-  return (env.USER_DIRECTORY as unknown as { getByName: (name: string) => { fetch: (req: Request) => Promise<Response> } }).getByName(userId);
+  return getNamedDo<UserDirectory>(env.USER_DIRECTORY, userId);
 }
 
 async function authedReq(userId: string, method: string, path: string, body?: unknown, idemKey?: string): Promise<Response> {
@@ -26,83 +40,45 @@ async function authedReq(userId: string, method: string, path: string, body?: un
 }
 
 async function createChannel(channelId: string, ownerId: string) {
-  const res = await chatStub(channelId).fetch(
-    new Request("https://x/internal/create-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channel_id: channelId,
-        creator_user_id: ownerId,
-        title: "Sticker route test",
-        topic: null,
-        avatar_attachment_id: null,
-        visibility: "private",
-        initial_members: [],
-      }),
-    }),
-  );
-  expect(res.status).toBe(200);
+  const stub = await createTestChannel(env, { channelId, ownerId, title: "Sticker route test", visibility: "private" });
+  await stub.getSummary(ownerId);
 }
 
 async function addMember(channelId: string, ownerId: string, memberId: string) {
-  const res = await chatStub(channelId).fetch(
-    new Request("https://x/internal/members-add", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: `idem-add-${channelId}-${memberId}`, channel_id: channelId, user_id: memberId, role: "member" }),
-    }),
-  );
-  expect(res.status).toBe(200);
+  await addTestMember(chatStub(channelId), {
+    actorUserId: ownerId,
+    targetUserId: memberId,
+    channelId,
+    idempotencyKey: `idem-add-${channelId}-${memberId}`,
+  });
 }
 
 async function presignAndFinalize(userId: string, fake: FakeS3): Promise<{ attachment_id: string; upload_url: string }> {
   const key = `idem-sticker-route-${userId}`;
-  const presignRes = await udStub(userId).fetch(
-    new Request("https://x/internal/attachment-presign", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": key, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filename: "img.png",
-        mime_type: "image/png",
-        size_bytes: 12345,
-        width: 128,
-        height: 128,
-        blurhash: "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
-      }),
-    }),
-  );
-  expect(presignRes.status).toBe(200);
-  const presignBody = (await presignRes.json()) as { attachment_id: string; upload_url: string };
+  const presignRes = await udStub(userId).presignUpload(userId, key, "attachment", {
+    filename: "img.png",
+    mime_type: "image/png",
+    size_bytes: 12345,
+    width: 128,
+    height: 128,
+    blurhash: "LFE.~f_3%D%M01V@kWM{Rj%Mt7WBt7WB",
+  });
+  const presignBody = presignRes;
   fake.objects.set(fakeS3PublicPath(presignBody.attachment_id), { contentType: "image/png", contentLength: 12345 });
 
-  const finalizeRes = await udStub(userId).fetch(
-    new Request("https://x/internal/attachment-finalize", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Idempotency-Key": `${key}-fin`, "Content-Type": "application/json" },
-      body: JSON.stringify({ attachment_id: presignBody.attachment_id }),
-    }),
-  );
-  expect(finalizeRes.status).toBe(200);
+  const finalizeRes = await udStub(userId).finalizeUpload(userId, `${key}-fin`, { attachment_id: presignBody.attachment_id });
+  expect(finalizeRes.attachment.attachment_id).toBe(presignBody.attachment_id);
   return presignBody;
 }
 
 async function sendImageMessage(channelId: string, senderId: string, attachmentId: string) {
-  const res = await chatStub(channelId).fetch(
-    new Request("https://x/internal/message-send", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": senderId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command_id: `cmd-sticker-route-${senderId}`,
-        dedupe_principal_key: `user:${senderId}`,
-        type: "image",
-        text: "",
-        reply_to: null,
-        attachment_ids: [attachmentId],
-        mentions: [],
-        channel_id: channelId,
-      }),
-    }),
-  );
+  const res = await sendTestMessage(chatStub(channelId), {
+    userId: senderId,
+    channelId,
+    commandId: `cmd-sticker-route-${senderId}`,
+    type: "image",
+    attachmentIds: [attachmentId],
+  });
   expect(res.status).toBe(200);
 }
 
@@ -211,23 +187,13 @@ describe("Sticker library HTTP routes", () => {
     expect(saveRes.status).toBe(200);
     const saveBody = (await saveRes.json()) as { sticker: { sticker_id: string } };
 
-    const sendRes = await chatStub(channelId).fetch(
-      new Request("https://x/internal/message-send", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          command_id: `cmd-sticker-route-msg-${ownerId}`,
-          dedupe_principal_key: `user:${ownerId}`,
-          type: "sticker",
-          text: "",
-          reply_to: null,
-          sticker_id: saveBody.sticker.sticker_id,
-          attachment_ids: [],
-          mentions: [],
-          channel_id: channelId,
-        }),
-      }),
-    );
+    const sendRes = await sendTestMessage(chatStub(channelId), {
+      userId: ownerId,
+      channelId,
+      commandId: `cmd-sticker-route-msg-${ownerId}`,
+      type: "sticker",
+      stickerId: saveBody.sticker.sticker_id,
+    });
     expect(sendRes.status).toBe(200);
 
     // Member saves the sticker from the owner's sticker message using its canonical attachment_id.
@@ -280,20 +246,16 @@ describe("Sticker library HTTP routes", () => {
     const { attachment_id } = await presignAndFinalize(ownerId, fake);
     await sendImageMessage(channelId, ownerId, attachment_id);
 
-    const historyRes = await chatStub(channelId).fetch(
-      new Request("https://x/internal/messages?limit=10", { headers: { "X-Verified-User-Id": ownerId } }),
-    );
-    expect(historyRes.status).toBe(200);
-    const historyBody = (await historyRes.json()) as { items: TimelineHistoryItem[] };
+    const historyBody = await readTestMessages(chatStub(channelId), ownerId);
     const messageId = getTimelineMessageIdFromHistory(historyBody.items);
 
-    const recallRes = await chatStub(channelId).fetch(
-      new Request("https://x/internal/message-recall", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": ownerId, "Content-Type": "application/json" },
-        body: JSON.stringify({ operation_id: "op-recall", message_id: messageId, channel_id: channelId }),
-      }),
-    );
+    const recallRes = await mutateTestMessage(chatStub(channelId), {
+      userId: ownerId,
+      channelId,
+      messageId,
+      operation: "message.recall",
+      operationId: "op-recall",
+    });
     expect(recallRes.status).toBe(200);
 
     const res = await authedReq(memberId, "POST", "/api/chat/stickers", {

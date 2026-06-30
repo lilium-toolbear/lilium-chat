@@ -6,11 +6,18 @@ import type {
 } from "../contract/bot-api";
 import type { Env } from "../env";
 import { botRegistryStub } from "../auth/bot";
-import { ApiError } from "../errors";
+import { ApiError, apiErrorFromRemote, logSwallowedError } from "../errors";
 import { getIdentity } from "./channel-mutations";
+import { requireChannelIdParam } from "./path-params";
+import type { ChatChannel } from "../do/chat-channel";
+import type { BotRegistry } from "../do/bot-registry";
 
-function chatChannelStub(env: Env, channelId: string): DurableObjectStub {
-  return env.CHAT_CHANNEL.getByName(channelId);
+function chatChannelStub(env: Env, channelId: string): DurableObjectStub<ChatChannel> {
+  return env.CHAT_CHANNEL.getByName(channelId) as DurableObjectStub<ChatChannel>;
+}
+
+function botRegistryRpc(env: Env): DurableObjectStub<BotRegistry> {
+  return botRegistryStub(env) as DurableObjectStub<BotRegistry>;
 }
 
 async function mapError(res: Response, fallback: string): Promise<ApiError> {
@@ -30,43 +37,22 @@ async function fetchCommandSnapshot(env: Env, botCommandId: string): Promise<{
   default_member_permission: "member" | "admin" | "owner";
   execution: { mode: "stateless" | "stateful"; stateful?: unknown };
 }> {
-  const res = await botRegistryStub(env).fetch(
-    new Request(`https://x/internal/command-get?bot_command_id=${encodeURIComponent(botCommandId)}`),
-  );
-  if (res.status === 404) {
-    throw new ApiError("COMMAND_NOT_FOUND", "command not found");
-  }
-  if (!res.ok) {
-    throw new ApiError("CHAT_WORKER_UNAVAILABLE", "failed to fetch command snapshot");
-  }
-  const body = (await res.json()) as {
-    bot_command_id?: unknown;
-    name?: unknown;
-    aliases?: unknown;
-    description?: unknown;
-    help_text?: unknown;
-    bot?: { bot_id?: unknown; display_name?: unknown; avatar_url?: unknown };
-    options?: unknown;
-    default_member_permission?: unknown;
-    execution?: { mode?: unknown; stateful?: unknown };
+  let body: {
+    bot_command_id: string;
+    name: string;
+    aliases: string[];
+    description: string;
+    help_text?: string;
+    bot: { bot_id: string; display_name: string; avatar_url: string | null };
+    options: unknown[];
+    default_member_permission: "member" | "admin" | "owner";
+    execution: { mode: "stateless" | "stateful"; stateful?: unknown };
   };
-  if (
-    typeof body.bot_command_id !== "string" ||
-    typeof body.name !== "string" ||
-    !Array.isArray(body.aliases) ||
-    typeof body.description !== "string" ||
-    !body.bot ||
-    typeof body.bot.bot_id !== "string" ||
-    typeof body.bot.display_name !== "string" ||
-    (body.bot.avatar_url !== null && typeof body.bot.avatar_url !== "string") ||
-    !Array.isArray(body.options) ||
-    !body.execution ||
-    (body.execution.mode !== "stateless" && body.execution.mode !== "stateful") ||
-    (body.default_member_permission !== "member" &&
-      body.default_member_permission !== "admin" &&
-      body.default_member_permission !== "owner")
-  ) {
-    throw new ApiError("CHAT_WORKER_UNAVAILABLE", "invalid command snapshot from registry");
+  try {
+    body = await botRegistryRpc(env).getCommand(botCommandId);
+  } catch (err) {
+    logSwallowedError("bot_registry_get_command_failed", err, { bot_command_id: botCommandId });
+    throw new ApiError("COMMAND_NOT_FOUND", "command not found");
   }
   return {
     bot_command_id: body.bot_command_id,
@@ -95,9 +81,8 @@ export async function updateCommandBindingHandler(
   c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
 ): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
   const botCommandId = c.req.param("bot_command_id");
-  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
   if (!botCommandId) throw new ApiError("COMMAND_NOT_FOUND", "bot_command_id required");
   const idempotencyKey = c.req.header("Idempotency-Key") ?? "";
   if (!idempotencyKey) throw new ApiError("INVALID_MESSAGE", "Idempotency-Key required");
@@ -112,23 +97,18 @@ export async function updateCommandBindingHandler(
     : null;
 
   const stub = chatChannelStub(env, channelId);
-  const res = await stub.fetch(
-    new Request("https://x/internal/command-binding-update", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": userId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        operation_id: idempotencyKey,
-        channel_id: channelId,
-        bot_command_id: botCommandId,
-        status: body.status,
-        permission_override: body.permission_override ?? null,
-        stateful_max_ttl_seconds: body.stateful_max_ttl_seconds ?? null,
-        command_snapshot: commandSnapshot,
-      }),
-    }),
-  );
-  if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE");
-  const out = (await res.json()) as CommandBindingUpdateResponse;
+  const out = await stub.commandBindingUpdate({
+    user_id: userId,
+    operation_id: idempotencyKey,
+    channel_id: channelId,
+    bot_command_id: botCommandId,
+    status: body.status,
+    permission_override: body.permission_override ?? null,
+    stateful_max_ttl_seconds: body.stateful_max_ttl_seconds ?? null,
+    command_snapshot: commandSnapshot,
+  }).catch((err) => {
+    throw apiErrorFromRemote(err) ?? err;
+  });
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }
 
@@ -137,27 +117,21 @@ export async function listChannelCommandsHandler(
   c: Context<{ Bindings: Env; Variables: { requestId: string } }>,
 ): Promise<Response> {
   const { userId, env } = await getIdentity(c);
-  const channelId = c.req.param("channel_id");
-  if (!channelId) throw new ApiError("CHANNEL_NOT_FOUND", "channel not found");
+  const channelId = requireChannelIdParam(c.req.param("channel_id"));
 
   const stub = chatChannelStub(env, channelId);
-  const summaryRes = await stub.fetch(
-    new Request("https://x/internal/summary", { headers: { "X-Verified-User-Id": userId } }),
-  );
-  if (summaryRes.ok) {
-    const summary = (await summaryRes.json()) as { kind?: string };
+  try {
+    const summary = await stub.getSummary(userId);
     if (summary.kind === "dm") {
       return c.json({ version: 0, items: [] }, 200, { "X-Request-Id": c.get("requestId") });
     }
+  } catch (err) {
+    const apiErr = apiErrorFromRemote(err);
+    if (!apiErr || (apiErr.code !== "FORBIDDEN" && apiErr.code !== "CHANNEL_NOT_FOUND")) {
+      throw apiErr ?? err;
+    }
   }
 
-  const res = await stub.fetch(
-    new Request(
-      `https://x/internal/channel-commands?channel_id=${encodeURIComponent(channelId)}&user_id=${encodeURIComponent(userId)}`,
-      { method: "GET", headers: { "X-Verified-User-Id": userId } },
-    ),
-  );
-  if (!res.ok) throw await mapError(res, "CHAT_WORKER_UNAVAILABLE");
-  const out = (await res.json()) as CommandManifestResponse;
+  const out = await stub.getChannelCommands(userId, channelId);
   return c.json(out, 200, { "X-Request-Id": c.get("requestId") });
 }

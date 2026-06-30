@@ -1,6 +1,7 @@
 import { Client } from "../profile/pg-client.js";
 import type { ArchiveRecord } from "../archive/payload.js";
 import type { ArchiveConsumerEnv } from "./env.js";
+import { logSwallowedError } from "../errors.js";
 import { pingPg } from "./pg-writer.js";
 import { processArchiveMessageBatch } from "./process-batch.js";
 
@@ -31,8 +32,8 @@ export default {
     } finally {
       try {
         await client.end();
-      } catch {
-        // ignore
+      } catch (err) {
+        logSwallowedError("archive_consumer_pg_client_end_failed", err);
       }
     }
   },

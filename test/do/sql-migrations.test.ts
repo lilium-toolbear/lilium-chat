@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { getNamedDo, readDoSchemaVersion } from "../helpers";
 import {
   applyBaselineSchema,
   columnExists,
@@ -8,18 +8,18 @@ import {
   tableExists,
   type BaselineDetector,
   type SqlMigration,
-} from "../../src/do/sql-migrations";
+} from "../../src/do/shared/sql-migrations";
 import {
   CHANNEL_DIRECTORY_BASELINE_SCHEMA,
   CHANNEL_DIRECTORY_CURRENT_SCHEMA_VERSION,
   channelDirectoryBaseline,
   channelDirectoryMigrations,
-} from "../../src/do/migrations/channel-directory";
+} from "../../src/do/channel-directory/migrations";
 import {
   DM_DIRECTORY_CURRENT_SCHEMA_VERSION,
   dmDirectoryBaseline,
   dmDirectoryMigrations,
-} from "../../src/do/migrations/dm-directory";
+} from "../../src/do/dm-directory/migrations";
 
 function directoryStub(name: string) {
   return getNamedDo(env.CHANNEL_DIRECTORY as unknown as DurableObjectNamespace, name);
@@ -38,11 +38,7 @@ async function withDoState(stub: DurableObjectStub, fn: (ctx: DurableObjectState
 }
 
 async function schemaVersion(stub: DurableObjectStub): Promise<{ current_version: number; applied: Array<{ version: number }> }> {
-  const res = await stub.fetch(
-    new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
-  );
-  expect(res.status).toBe(200);
-  return (await res.json()) as { current_version: number; applied: Array<{ version: number }> };
+  return readDoSchemaVersion(stub);
 }
 
 describe("migrateSqlite", () => {
@@ -55,7 +51,7 @@ describe("migrateSqlite", () => {
 
   it("existing baseline tables without schema_migrations re-run idempotent baseline DDL and stamp baseline", async () => {
     const stub = directoryStub(`migrate-legacy-${crypto.randomUUID()}`);
-    await stub.fetch(new Request("https://x/ping"));
+    await schemaVersion(stub);
 
     await withDoState(stub, (ctx) => {
       ctx.storage.sql.exec(
@@ -188,18 +184,14 @@ describe("migrateSqlite", () => {
 describe("DMDirectory migrateSqlite", () => {
   it("empty DB runs baseline and stamps version 1", async () => {
     const stub = dmDirectoryStub(`dm-migrate-empty-${crypto.randomUUID()}`);
-    const res = await stub.fetch(
-      new Request("https://x/internal/schema-version", { headers: { "X-Test-Only": "1" } }),
-    );
-    expect(res.status).toBe(200);
-    const body = await res.json() as { current_version: number; applied: Array<{ version: number }> };
+    const body = await readDoSchemaVersion(stub);
     expect(body.current_version).toBe(DM_DIRECTORY_CURRENT_SCHEMA_VERSION);
     expect(body.applied.map((row) => row.version)).toEqual([1, 2]);
   });
 
   it("dm_pairs table exists after migration", async () => {
     const stub = dmDirectoryStub(`dm-migrate-table-${crypto.randomUUID()}`);
-    await stub.fetch(new Request("https://x/ping"));
+    await readDoSchemaVersion(stub);
 
     await withDoState(stub, (ctx) => {
       migrateSqlite(ctx, "DMDirectory", dmDirectoryBaseline, dmDirectoryMigrations);

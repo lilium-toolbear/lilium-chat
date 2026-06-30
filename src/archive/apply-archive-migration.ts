@@ -1,4 +1,4 @@
-import { indexExists, tableExists } from "../do/sql-migrations";
+import { indexExists, tableExists } from "../do/shared/sql-migrations";
 
 /** Idempotent DDL for archive_seq + archive_outbox (spec §4.1). */
 export function applyArchiveOutboxMigration(ctx: DurableObjectState): void {

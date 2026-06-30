@@ -3,6 +3,7 @@ import type { MessageProjectionEventPayload } from "../contract/events";
 import { fallbackUserDisplayName, type UserSummary } from "../contract/primitives";
 import type { WireChatMessage } from "../contract/message";
 import { buildWireEventFrame, type EventFrame } from "../contract/wire-frames";
+import { logSwallowedError } from "../errors";
 import type { ChatEventPayloadByType, ChatEventType } from "../contract/events";
 import { parseInvocationJson } from "./command-invocation";
 
@@ -45,7 +46,8 @@ export function buildMessageCreatedPayload(raw: {
   if (raw.reply_snapshot_json) {
     try {
       replySnapshot = JSON.parse(raw.reply_snapshot_json);
-    } catch {
+    } catch (err) {
+      logSwallowedError("message_reply_snapshot_json_invalid", err, { message_id: raw.message_id });
       replySnapshot = null;
     }
   }

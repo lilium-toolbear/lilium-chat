@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
-import { makeJwt, TEST_SECRET, setupOwnedChannelForUser } from "../../test/helpers";
+import { makeJwt, sendTestMessage, TEST_SECRET, setupOwnedChannelForUser } from "../../test/helpers";
 
 async function call(path: string, userId = "00000000-0000-7000-8000-000000000301"): Promise<Response> {
   const a = (await import("../index")).default;
@@ -26,19 +26,7 @@ describe("GET /api/chat/channels/{id}/messages", () => {
   it("returns seeded messages via GET after internal send", async () => {
     const uid = "00000000-0000-7000-8000-000000000302";
     const { channelId, stub } = await setupOwnedChannelForUser(env, uid);
-    const sendRes = await stub.fetch(new Request("https://x/internal/message-send", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": uid, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command_id: "cmd-route-msg-1",
-        dedupe_principal_key: `user:${uid}`,
-        type: "text",
-        text: "hello route test",
-        reply_to: null,
-        mentions: [],
-        channel_id: channelId,
-      }),
-    }));
+    const sendRes = await sendTestMessage(stub, { userId: uid, channelId, commandId: "cmd-route-msg-1", text: "hello route test" });
     expect(sendRes.status).toBe(200);
 
     const res = await call(`/api/chat/channels/${channelId}/messages`, uid);

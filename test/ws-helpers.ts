@@ -1,11 +1,12 @@
 import { expect } from "vitest";
 import { env } from "cloudflare:workers";
 import { getNamedDo } from "./helpers";
+import type { UserConnection } from "../src/do/user-connection";
 
 export async function upgradeUserConnection(
   userId: string,
-): Promise<{ ws: WebSocket; stub: DurableObjectStub; sessionId: string }> {
-  const stub = getNamedDo(env.USER_CONNECTION as unknown as Parameters<typeof getNamedDo>[0], userId);
+): Promise<{ ws: WebSocket; stub: DurableObjectStub<UserConnection>; sessionId: string }> {
+  const stub = getNamedDo<UserConnection>(env.USER_CONNECTION, userId);
   const res = await stub.fetch(new Request("https://x/ws", {
     headers: { Upgrade: "websocket", "X-Verified-User-Id": userId },
   }));
@@ -74,6 +75,7 @@ export function nextAck(ws: WebSocket, timeoutMs = 2000): Promise<string> {
         }
       } catch {
         // ignore non-JSON frames
+        // TODO: should we drop the connection when malformed frames found?
       }
     };
     ws.addEventListener("message", handler as EventListener);

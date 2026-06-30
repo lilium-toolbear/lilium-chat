@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
+import type { MessageMutationAckPayload } from "../../src/contract/idempotency";
 
-import { setupOwnedChannelForUser } from "../helpers";
+import {
+  expectDoRpcError,
+  joinTestChannel,
+  replayTestEvents,
+  rpcSendMessage,
+  sendTestMessage,
+  setupOwnedChannelForUser,
+} from "../helpers";
+import type { ChatChannel } from "../../src/do/chat-channel";
 
 const { runInDurableObject } = await import("cloudflare:test") as {
   runInDurableObject: (stub: unknown, cb: (instance: unknown) => Promise<void>) => Promise<void>;
@@ -24,30 +33,18 @@ async function listProjectionOutbox(stub: DurableObjectStub): Promise<OutboxRow[
   return out;
 }
 
-async function setupChannelAndJoin(userId: string): Promise<{ stub: DurableObjectStub; channelId: string }> {
+async function setupChannelAndJoin(userId: string): Promise<{ stub: DurableObjectStub<ChatChannel>; channelId: string }> {
   return setupOwnedChannelForUser(env, userId, { title: "Lilium", visibility: "public_listed" });
 }
 
-describe("ChatChannel /internal/message-send", () => {
+async function parseSend(res: Response): Promise<MessageMutationAckPayload> {
+  return (await res.json()) as MessageMutationAckPayload;
+}
+
+describe("ChatChannel message send RPC", () => {
   it("writes a message + event + outbox rows and returns full projection", async () => {
     const { stub, channelId } = await setupChannelAndJoin("u-ms-1");
-    const res = await stub.fetch(
-      new Request("https://x/internal/message-send", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": "u-ms-1", "Content-Type": "application/json" },
-        body: JSON.stringify({
-          command_id: "cm-1",
-          dedupe_principal_key: "user:u-ms-1",
-          type: "text",
-          text: "hello",
-          reply_to: null,
-          mentions: [],
-          channel_id: channelId,
-        }),
-      }),
-    );
-    expect(res.status).toBe(200);
-    const out = (await res.json()) as { channel_id: string; event_id: string; message: { message_id: string; command_id: string; sender: { user: { display_name: string } } } };
+    const out = await parseSend(await sendTestMessage(stub, { userId: "u-ms-1", channelId, commandId: "cm-1", text: "hello" }));
     expect(out.channel_id).toBe(channelId);
     expect(out.event_id).toBeTruthy();
     expect(out.message.message_id).toBeTruthy();
@@ -62,21 +59,7 @@ describe("ChatChannel /internal/message-send", () => {
 
   it("rejects a non-member with FORBIDDEN", async () => {
     const { stub, channelId } = await setupChannelAndJoin("u-ms-2");
-    const res = await stub.fetch(
-      new Request("https://x/internal/message-send", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": "u-stranger", "Content-Type": "application/json" },
-        body: JSON.stringify({
-          command_id: "cm-x",
-          dedupe_principal_key: "user:u-stranger",
-          type: "text",
-          text: "hi",
-          reply_to: null,
-          mentions: [],
-          channel_id: channelId,
-        }),
-      }),
-    );
+    const res = await sendTestMessage(stub, { userId: "u-stranger", channelId, commandId: "cm-x", text: "hi" });
     expect(res.status).toBe(403);
   });
 
@@ -87,27 +70,20 @@ describe("ChatChannel /internal/message-send", () => {
       type: "text",
       text: "dup",
       reply_to: null,
-      mentions: [],
+      attachment_ids: [] as string[],
+      mentions: [] as Array<{ user_id: string; start: number; end: number }>,
       channel_id: channelId,
     };
-    const a = (await (
-      await stub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": "u-ms-3", "Content-Type": "application/json" },
-          body: JSON.stringify({ ...body, command_id: "cm-dup" }),
-        }),
-      )
-    ).json()) as { channel_id: string; event_id: string; message: { message_id: string } };
-    const b = (await (
-      await stub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": "u-ms-3", "Content-Type": "application/json" },
-          body: JSON.stringify({ ...body, command_id: "cm-dup" }),
-        }),
-      )
-    ).json()) as { channel_id: string; event_id: string; message: { message_id: string } };
+    const a = (await (await rpcSendMessage(stub, { user_id: "u-ms-3", command_id: "cm-dup", ...body })).json()) as {
+      channel_id: string;
+      event_id: string;
+      message: { message_id: string };
+    };
+    const b = (await (await rpcSendMessage(stub, { user_id: "u-ms-3", command_id: "cm-dup", ...body })).json()) as {
+      channel_id: string;
+      event_id: string;
+      message: { message_id: string };
+    };
 
     expect(a.message.message_id).toBe(b.message.message_id);
     expect(a.event_id).toBe(b.event_id);
@@ -119,26 +95,15 @@ describe("ChatChannel /internal/message-send", () => {
       dedupe_principal_key: "user:u-ms-7",
       type: "text",
       reply_to: null,
-      mentions: [],
+      attachment_ids: [] as string[],
+      mentions: [] as Array<{ user_id: string; start: number; end: number }>,
       channel_id: channelId,
     };
 
-    const a = await stub.fetch(
-      new Request("https://x/internal/message-send", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": "u-ms-7", "Content-Type": "application/json" },
-        body: JSON.stringify({ ...base, command_id: "cm-conflict", text: "first" }),
-      }),
-    );
+    const a = await rpcSendMessage(stub, { user_id: "u-ms-7", ...base, command_id: "cm-conflict", text: "first" });
     expect(a.status).toBe(200);
 
-    const b = await stub.fetch(
-      new Request("https://x/internal/message-send", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": "u-ms-7", "Content-Type": "application/json" },
-        body: JSON.stringify({ ...base, command_id: "cm-conflict", text: "different" }),
-      }),
-    );
+    const b = await rpcSendMessage(stub, { user_id: "u-ms-7", ...base, command_id: "cm-conflict", text: "different" });
     expect(b.status).toBe(409);
     const bb = (await b.json()) as { error: { code: string } };
     expect(bb.error.code).toBe("IDEMPOTENCY_CONFLICT");
@@ -146,85 +111,25 @@ describe("ChatChannel /internal/message-send", () => {
 
   it("different users, same command_id → different messages (namespacing)", async () => {
     const { stub, channelId } = await setupChannelAndJoin("u-ms-4");
-    await stub.fetch(
-      new Request("https://x/internal/join", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": "u-ms-5", "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: "u-ms-5" }),
-      }),
-    );
+    await joinTestChannel(stub, "u-ms-5");
 
-    const a = (await (
-      await stub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": "u-ms-4", "Content-Type": "application/json" },
-          body: JSON.stringify({
-            command_id: "shared",
-            dedupe_principal_key: "user:u-ms-4",
-            type: "text",
-            text: "a",
-            reply_to: null,
-            mentions: [],
-            channel_id: channelId,
-          }),
-        }),
-      )
-    ).json()) as { channel_id: string; event_id: string; message: { message_id: string } };
-    const b = (await (
-      await stub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": "u-ms-5", "Content-Type": "application/json" },
-          body: JSON.stringify({
-            command_id: "shared",
-            dedupe_principal_key: "user:u-ms-5",
-            type: "text",
-            text: "b",
-            reply_to: null,
-            mentions: [],
-            channel_id: channelId,
-          }),
-        }),
-      )
-    ).json()) as { channel_id: string; event_id: string; message: { message_id: string } };
+    const a = await parseSend(await sendTestMessage(stub, { userId: "u-ms-4", channelId, commandId: "shared", text: "a" }));
+    const b = await parseSend(await sendTestMessage(stub, { userId: "u-ms-5", channelId, commandId: "shared", text: "b" }));
 
     expect(a.message.message_id).not.toBe(b.message.message_id);
   });
 
-  it("/internal/replay returns the message.created event_json after creation, filtered by status", async () => {
+  it("replay RPC returns the message.created event_json after creation, filtered by status", async () => {
     const { stub, channelId } = await setupChannelAndJoin("u-ms-6");
-    const send = (await (
-      await stub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": "u-ms-6", "Content-Type": "application/json" },
-          body: JSON.stringify({
-            command_id: "cm-r",
-            dedupe_principal_key: "user:u-ms-6",
-            type: "text",
-            text: "replay me",
-            reply_to: null,
-            mentions: [],
-            channel_id: channelId,
-          }),
-        }),
-      )
-    ).json()) as { channel_id: string; event_id: string; message: { message_id: string } };
+    const send = await parseSend(await sendTestMessage(stub, { userId: "u-ms-6", channelId, commandId: "cm-r", text: "replay me" }));
 
-    const replay = (await (
-      await stub.fetch(new Request(`https://x/internal/replay?after=`, { headers: { "X-Verified-User-Id": "u-ms-6" } }))
-    ).json()) as { events: Array<{ event_id: string; event_json: string }> };
+    const replay = await replayTestEvents(stub, "u-ms-6");
 
     const found = replay.events.find((e) => e.event_id === send.event_id);
     expect(found).toBeDefined();
     expect(found?.event_json).toContain('"message.created"');
   });
 
-  // P0-2 regression: idempotency_keys.response_json must store the FULL committed ack payload,
-  // written co-atomically with the business rows — no crash window where response_json is "{}" and a
-  // duplicate retry returns event_id:"" / message:null. We can't crash the DO mid-txn, but we assert
-  // a duplicate retry returns the SAME complete ack (event_id + message present, not degraded).
   it("P0-2: duplicate retry returns the same complete ack (response_json is full, not {})", async () => {
     const { stub, channelId } = await setupChannelAndJoin("u-ms-7");
     const body = {
@@ -233,23 +138,15 @@ describe("ChatChannel /internal/message-send", () => {
       type: "text",
       text: "p0-2 ack integrity",
       reply_to: null,
-      mentions: [],
+      attachment_ids: [] as string[],
+      mentions: [] as Array<{ user_id: string; start: number; end: number }>,
       channel_id: channelId,
     };
-    const r1 = await (await stub.fetch(new Request("https://x/internal/message-send", {
-      method: "POST", headers: { "X-Verified-User-Id": "u-ms-7", "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }))).json() as { event_id: string; message: { message_id: string } };
+    const r1 = (await (await rpcSendMessage(stub, { user_id: "u-ms-7", ...body })).json()) as { event_id: string; message: { message_id: string } };
     expect(r1.event_id).toBeTruthy();
     expect(r1.message.message_id).toBeTruthy();
 
-    // Duplicate retry (same operation_id + same body) must return the SAME committed ack —
-    // event_id present, message present (NOT the degraded {event_id:"",message:null} fallback
-    // that an empty response_json would produce).
-    const r2 = await (await stub.fetch(new Request("https://x/internal/message-send", {
-      method: "POST", headers: { "X-Verified-User-Id": "u-ms-7", "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }))).json() as { event_id: string; message: { message_id: string } | null };
+    const r2 = (await (await rpcSendMessage(stub, { user_id: "u-ms-7", ...body })).json()) as { event_id: string; message: { message_id: string } | null };
     expect(r2.event_id).toBe(r1.event_id);
     expect(r2.message).not.toBeNull();
     expect(r2.message!.message_id).toBe(r1.message.message_id);
@@ -257,46 +154,15 @@ describe("ChatChannel /internal/message-send", () => {
 
   it("persists reply_to and reply_snapshot when replying to a visible message", async () => {
     const { stub, channelId } = await setupChannelAndJoin("u-ms-reply");
-    const original = (await (
-      await stub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": "u-ms-reply", "Content-Type": "application/json" },
-          body: JSON.stringify({
-            command_id: "cm-reply-target",
-            dedupe_principal_key: "user:u-ms-reply",
-            type: "text",
-            text: "original message",
-            reply_to: null,
-            mentions: [],
-            channel_id: channelId,
-          }),
-        }),
-      )
-    ).json()) as { message: { message_id: string } };
+    const original = await parseSend(await sendTestMessage(stub, { userId: "u-ms-reply", channelId, commandId: "cm-reply-target", text: "original message" }));
 
-    const reply = (await (
-      await stub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": "u-ms-reply", "Content-Type": "application/json" },
-          body: JSON.stringify({
-            command_id: "cm-reply-send",
-            dedupe_principal_key: "user:u-ms-reply",
-            type: "text",
-            text: "my reply",
-            reply_to: original.message.message_id,
-            mentions: [],
-            channel_id: channelId,
-          }),
-        }),
-      )
-    ).json()) as {
-      message: {
-        reply_to: string | null;
-        reply_snapshot: { message_id: string; text_preview: string; status: string } | null;
-      };
-    };
+    const reply = await parseSend(await sendTestMessage(stub, {
+      userId: "u-ms-reply",
+      channelId,
+      commandId: "cm-reply-send",
+      text: "my reply",
+      replyTo: original.message.message_id,
+    }));
 
     expect(reply.message.reply_to).toBe(original.message.message_id);
     expect(reply.message.reply_snapshot).toMatchObject({
@@ -308,21 +174,13 @@ describe("ChatChannel /internal/message-send", () => {
 
   it("rejects reply_to when target message is missing", async () => {
     const { stub, channelId } = await setupChannelAndJoin("u-ms-reply-miss");
-    const res = await stub.fetch(
-      new Request("https://x/internal/message-send", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": "u-ms-reply-miss", "Content-Type": "application/json" },
-        body: JSON.stringify({
-          command_id: "cm-reply-miss",
-          dedupe_principal_key: "user:u-ms-reply-miss",
-          type: "text",
-          text: "orphan reply",
-          reply_to: "00000000-0000-7000-8000-000000009999",
-          mentions: [],
-          channel_id: channelId,
-        }),
-      }),
-    );
+    const res = await sendTestMessage(stub, {
+      userId: "u-ms-reply-miss",
+      channelId,
+      commandId: "cm-reply-miss",
+      text: "orphan reply",
+      replyTo: "00000000-0000-7000-8000-000000009999",
+    });
     expect(res.status).toBe(404);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("MESSAGE_NOT_FOUND");

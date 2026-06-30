@@ -1,6 +1,7 @@
 import type { Env } from "../env";
+import { logSwallowedError } from "../errors";
 import { OUTBOX_MAX_ATTEMPTS } from "../contract/outbox";
-import { bumpQueueRetry } from "../do/retry-backoff";
+import { bumpQueueRetry } from "../do/shared/retry-backoff";
 
 export const STATEFUL_BOT_DELIVERY_KINDS = {
   sessionStart: "stateful_session_start",
@@ -19,6 +20,25 @@ export interface StatefulBotDeliveryRow {
   kind: string;
   event_id: string | null;
   request_json: string;
+}
+
+interface StatefulSessionRefPayload {
+  session_id: string;
+  channel_id: string;
+  bot_id: string;
+  status: string;
+  updated_at: string;
+}
+
+function isStatefulSessionRefPayload(value: unknown): value is StatefulSessionRefPayload {
+  const ref = value as Partial<StatefulSessionRefPayload> | null;
+  return ref !== null &&
+    typeof ref === "object" &&
+    typeof ref.session_id === "string" &&
+    typeof ref.channel_id === "string" &&
+    typeof ref.bot_id === "string" &&
+    typeof ref.status === "string" &&
+    typeof ref.updated_at === "string";
 }
 
 export function enqueueStatefulBotDelivery(
@@ -51,21 +71,6 @@ export function enqueueStatefulBotDelivery(
   );
 }
 
-async function postBotConnection(
-  env: Env,
-  botId: string,
-  path: string,
-  body: unknown,
-): Promise<Response> {
-  return env.BOT_CONNECTION.getByName(botId).fetch(
-    new Request(`https://x${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Verified-Bot-Id": botId },
-      body: JSON.stringify(body),
-    }),
-  );
-}
-
 export async function flushStatefulBotDeliveryRow(
   env: Env,
   sql: DurableObjectState["storage"]["sql"],
@@ -79,20 +84,18 @@ export async function flushStatefulBotDeliveryRow(
     let payload: { ref?: unknown; start_frame?: unknown };
     try {
       payload = JSON.parse(row.request_json) as { ref?: unknown; start_frame?: unknown };
-    } catch {
+    } catch (err) {
+      logSwallowedError("stateful_bot_delivery_json_invalid", err, { outbox_id: row.outbox_id, kind: row.kind });
       return { ok: false, error: "invalid session start payload" };
     }
     if (!payload.ref || !payload.start_frame) {
       return { ok: false, error: "invalid session start payload" };
     }
-    const refRes = await postBotConnection(env, row.bot_id, "/internal/stateful-session-ref-upsert", payload.ref);
-    if (!refRes.ok) {
-      return { ok: false, error: `${refRes.status}: ${await refRes.text()}` };
+    if (!isStatefulSessionRefPayload(payload.ref)) {
+      return { ok: false, error: "invalid session start payload" };
     }
-    const frameRes = await postBotConnection(env, row.bot_id, "/internal/push-session-frame", payload.start_frame);
-    if (!frameRes.ok) {
-      return { ok: false, error: `${frameRes.status}: ${await frameRes.text()}` };
-    }
+    await env.BOT_CONNECTION.getByName(row.bot_id).upsertStatefulSessionRef(payload.ref);
+    await env.BOT_CONNECTION.getByName(row.bot_id).pushSessionFrame(row.bot_id, payload.start_frame);
     return { ok: true };
   }
 
@@ -100,11 +103,12 @@ export async function flushStatefulBotDeliveryRow(
     let ref: unknown;
     try {
       ref = JSON.parse(row.request_json);
-    } catch {
+    } catch (err) {
+      logSwallowedError("stateful_bot_delivery_json_invalid", err, { outbox_id: row.outbox_id, kind: row.kind });
       return { ok: false, error: "invalid ref payload" };
     }
-    const res = await postBotConnection(env, row.bot_id, "/internal/stateful-session-ref-upsert", ref);
-    if (!res.ok) return { ok: false, error: `${res.status}: ${await res.text()}` };
+    if (!isStatefulSessionRefPayload(ref)) return { ok: false, error: "invalid ref payload" };
+    await env.BOT_CONNECTION.getByName(row.bot_id).upsertStatefulSessionRef(ref);
     return { ok: true };
   }
 
@@ -115,12 +119,12 @@ export async function flushStatefulBotDeliveryRow(
       const parsed = JSON.parse(row.request_json) as { frame?: unknown; seq?: unknown };
       frame = parsed.frame;
       seq = typeof parsed.seq === "number" ? parsed.seq : null;
-    } catch {
+    } catch (err) {
+      logSwallowedError("stateful_bot_delivery_json_invalid", err, { outbox_id: row.outbox_id, kind: row.kind });
       return { ok: false, error: "invalid session input payload" };
     }
     if (!frame) return { ok: false, error: "invalid session input payload" };
-    const res = await postBotConnection(env, row.bot_id, "/internal/push-session-frame", frame);
-    if (!res.ok) return { ok: false, error: `${res.status}: ${await res.text()}` };
+    await env.BOT_CONNECTION.getByName(row.bot_id).pushSessionFrame(row.bot_id, frame);
     if (seq !== null) {
       sql.exec(
         "UPDATE stateful_session_inputs SET status='sent', sent_at=? WHERE session_id=? AND seq=? AND status='pending'",
@@ -136,18 +140,15 @@ export async function flushStatefulBotDeliveryRow(
     let payload: { close_frame?: unknown; delete_ref?: boolean };
     try {
       payload = JSON.parse(row.request_json) as { close_frame?: unknown; delete_ref?: boolean };
-    } catch {
+    } catch (err) {
+      logSwallowedError("stateful_bot_delivery_json_invalid", err, { outbox_id: row.outbox_id, kind: row.kind });
       return { ok: false, error: "invalid session close payload" };
     }
     if (payload.close_frame) {
-      const closeRes = await postBotConnection(env, row.bot_id, "/internal/push-session-frame", payload.close_frame);
-      if (!closeRes.ok) return { ok: false, error: `${closeRes.status}: ${await closeRes.text()}` };
+      await env.BOT_CONNECTION.getByName(row.bot_id).pushSessionFrame(row.bot_id, payload.close_frame);
     }
     if (payload.delete_ref !== false) {
-      const delRes = await postBotConnection(env, row.bot_id, "/internal/stateful-session-ref-delete", {
-        session_id: sessionId,
-      });
-      if (!delRes.ok) return { ok: false, error: `${delRes.status}: ${await delRes.text()}` };
+      await env.BOT_CONNECTION.getByName(row.bot_id).deleteStatefulSessionRef({ session_id: sessionId });
     }
     return { ok: true };
   }

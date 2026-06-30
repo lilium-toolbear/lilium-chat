@@ -21,9 +21,9 @@ describe("POST /api/chat/channels", () => {
       title: "Route Channel", topic: null, avatar_attachment_id: null, visibility: "private", initial_members: [],
     }, "client-key-create-1");
     expect(res.status).toBe(201);
-    const body = (await res.json()) as { channel: { channel_id: string; kind: string }; membership: { role: string } };
+    const body = (await res.json()) as { channel: { channel_id: string; kind: string }; joined_at: string };
     expect(body.channel.kind).toBe("channel");
-    expect(body.membership.role).toBe("owner");
+    expect(body.joined_at).toBeTruthy();
   });
 
   it("is idempotent: same Idempotency-Key returns the same channel_id", async () => {

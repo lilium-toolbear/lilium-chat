@@ -1,19 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { dumpChannelFanout, getNamedDo } from "../helpers";
 import { upgradeUserConnection } from "../ws-helpers";
+import type { ChannelFanout } from "../../src/do/channel-fanout";
 
 describe("UserConnection thin WS connect", () => {
   it("returns 101 with v2 subprotocol without cross-DO side effects", async () => {
     const userId = "u-connect-thin";
     const channelId = "ch-connect-thin";
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as Parameters<typeof getNamedDo>[0], channelId);
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
 
     const { stub } = await upgradeUserConnection(userId);
 
-    const dump = (await (await fanout.fetch(new Request("https://x/dump", {
-      headers: { "X-Test-Only": "1", "X-Channel-Id": channelId },
-    }))).json()) as { leases: unknown[] };
+    const dump = await dumpChannelFanout(fanout, channelId);
     expect(dump.leases.length).toBe(0);
 
     const { runInDurableObject } = await import("cloudflare:test");

@@ -1,20 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { getNamedDo } from "../helpers";
+import { createTestChannel, replayTestEvents, sendTestMessage } from "../helpers";
 
-describe("ChatChannel /internal/replay actor projection", () => {
+describe("ChatChannel replay RPC actor projection", () => {
   it("replays member.joined with resolved actor + user (not bare ids)", async () => {
     const cid = "0198aaaa-0000-7000-8000-000000000001";
-    const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], cid);
     // Create the channel (owner=u-replay-owner), which writes channel.created + member.joined events.
-    await stub.fetch(new Request("https://x/internal/create-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-replay-owner", "Content-Type": "application/json" },
-      body: JSON.stringify({ channel_id: cid, creator_user_id: "u-replay-owner", title: "R", topic: null, avatar_attachment_id: null, visibility: "private", initial_members: [{ user_id: "u-replay-target", role: "member" }] }),
-    }));
-    const res = await stub.fetch(new Request("https://x/internal/replay?after=", { headers: { "X-Verified-User-Id": "u-replay-owner" } }));
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { events: Array<{ event_json: string }> };
+    const stub = await createTestChannel(env, {
+      channelId: cid,
+      ownerId: "u-replay-owner",
+      title: "R",
+      visibility: "private",
+      initial_members: [{ user_id: "u-replay-target", role: "member" }],
+    });
+    const res = await replayTestEvents(stub, "u-replay-owner");
+    const body = res;
     const frames = body.events.map((e) => JSON.parse(e.event_json) as { type: string; payload: Record<string, unknown> });
     // member.joined(initial member, actor=system) — assert subject user is resolved on the wire.
     const joined = frames.find((f) => {
@@ -33,14 +33,9 @@ describe("ChatChannel /internal/replay actor projection", () => {
 
   it("replays channel.created with resolved actor, not bare actor_id", async () => {
     const cid = "0198bbbb-0000-7000-8000-000000000001";
-    const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], cid);
-    await stub.fetch(new Request("https://x/internal/create-channel", {
-      method: "POST",
-      headers: { "X-Verified-User-Id": "u-replay-owner2", "Content-Type": "application/json" },
-      body: JSON.stringify({ channel_id: cid, creator_user_id: "u-replay-owner2", title: "R2", topic: null, avatar_attachment_id: null, visibility: "private", initial_members: [] }),
-    }));
-    const res = await stub.fetch(new Request("https://x/internal/replay?after=", { headers: { "X-Verified-User-Id": "u-replay-owner2" } }));
-    const frames = ((await res.json()) as { events: Array<{ event_json: string }> }).events.map((e) => JSON.parse(e.event_json) as { type: string; payload: Record<string, unknown> });
+    const stub = await createTestChannel(env, { channelId: cid, ownerId: "u-replay-owner2", title: "R2", visibility: "private" });
+    const res = await replayTestEvents(stub, "u-replay-owner2");
+    const frames = res.events.map((e) => JSON.parse(e.event_json) as { type: string; payload: Record<string, unknown> });
     const created = frames.find((f) => f.type === "channel.created")!;
     expect(created.payload).toHaveProperty("actor");
     expect(created.payload).not.toHaveProperty("actor_id");
@@ -48,42 +43,11 @@ describe("ChatChannel /internal/replay actor projection", () => {
 
   it("replays message.created with full message projection", async () => {
     const cid = "0198cccc-0000-7000-8000-000000000001";
-    const stub = getNamedDo(env.CHAT_CHANNEL as unknown as Parameters<typeof getNamedDo>[0], cid);
-    await stub.fetch(
-      new Request("https://x/internal/create-channel", {
-        method: "POST",
-        headers: { "X-Verified-User-Id": "u-replay-sender", "Content-Type": "application/json" },
-        body: JSON.stringify({
-          channel_id: cid,
-          creator_user_id: "u-replay-sender",
-          title: "R3",
-          topic: null,
-          avatar_attachment_id: null,
-          visibility: "private",
-          initial_members: [],
-        }),
-      }),
-    );
+    const stub = await createTestChannel(env, { channelId: cid, ownerId: "u-replay-sender", title: "R3", visibility: "private" });
     const send = (await (
-      await stub.fetch(
-        new Request("https://x/internal/message-send", {
-          method: "POST",
-          headers: { "X-Verified-User-Id": "u-replay-sender", "Content-Type": "application/json" },
-          body: JSON.stringify({
-            command_id: "cm-replay-projection",
-            dedupe_principal_key: "user:u-replay-sender",
-            type: "text",
-            text: "projection check",
-            reply_to: null,
-            mentions: [],
-            channel_id: cid,
-          }),
-        }),
-      )
+      await sendTestMessage(stub, { userId: "u-replay-sender", channelId: cid, commandId: "cm-replay-projection", text: "projection check" })
     ).json()) as { event_id: string };
-    const replay = (await (
-      await stub.fetch(new Request(`https://x/internal/replay?after=`, { headers: { "X-Verified-User-Id": "u-replay-sender" } }))
-    ).json()) as { events: Array<{ event_json: string }> };
+    const replay = await replayTestEvents(stub, "u-replay-sender");
 
     const frames = replay.events.map((e) => JSON.parse(e.event_json) as { type: string; payload: Record<string, unknown> });
     const created = frames.find((f) => f.type === "message.created");

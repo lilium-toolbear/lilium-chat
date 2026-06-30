@@ -1,3 +1,37 @@
+import type { EffectResult } from "./bot-gateway";
+
+export interface StreamRegistryCheckResponse {
+  ok: true;
+  channel_id: string;
+  message_id: string;
+  bot_id: string;
+  status: string;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface StreamRegistryPeekResponse {
+  status: string;
+}
+
+export interface InteractionSubmitResponse {
+  channel_id: string;
+  interaction_id: string;
+  event_id: string;
+}
+
+export interface BotDeliveryResultInput {
+  delivery_id: string;
+  outbox_id: string;
+  bot_id: string;
+  channel_id: string;
+  effects: unknown[];
+}
+
+export type BotDeliveryResultResponse =
+  | { status: "applied"; effect_results: EffectResult[] }
+  | { status: "failed"; error: { code: string; message: string } };
+
 export interface BotCommandCatalogEntry {
   bot_command_id: string;
   name: string;
@@ -18,6 +52,30 @@ export interface CommandBindingUpdateResponse {
   bot_command_id: string;
   status: string;
   permission_override: string | null;
+}
+
+export interface CommandInvokeResponse {
+  channel_id: string;
+  invocation_id: string;
+  event_id?: string;
+  message_id?: string;
+  message?: unknown;
+  session_id?: string;
+  invocation_message?: unknown;
+}
+
+export interface VisibleAttachmentProjection {
+  attachment_id: string;
+  url: string;
+  mime_type: string;
+  width: number | null;
+  height: number | null;
+  size_bytes: number;
+  blurhash: string | null;
+}
+
+export interface VisibleAttachmentResponse {
+  attachment: VisibleAttachmentProjection;
 }
 
 export type CommandExecutionMode = "stateless" | "stateful";

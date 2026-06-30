@@ -13,7 +13,11 @@ import { BOT_STREAM_API_VERSION } from "../../src/contract/bot-stream";
 import { computeAbandonedTextHash, computeFinalizeRequestHash } from "../../src/chat/stream-registry";
 import { hashBotToken } from "../../src/auth/bot";
 import { botStreamDoName } from "../../src/do/bot-stream-connection";
-import { createTestChannel, drainPoolWorkerTeardown, getNamedDo } from "../helpers";
+import { createTestChannel, drainPoolWorkerTeardown, expectDoRpcError, getNamedDo } from "../helpers";
+import type { ChannelFanout } from "../../src/do/channel-fanout";
+import type { UserConnection } from "../../src/do/user-connection";
+import type { ChatChannel } from "../../src/do/chat-channel";
+import type { BotConnection } from "../../src/do/bot-connection";
 import { liveStartAndAck, upgradeUserConnection } from "../ws-helpers";
 
 const REGISTRY = () =>
@@ -82,8 +86,8 @@ afterAll(async () => {
   await drainPoolWorkerTeardown();
 });
 
-function botConnectionStub(botId: string): DurableObjectStub {
-  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace, botId);
+function botConnectionStub(botId: string): DurableObjectStub<BotConnection> {
+  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace<BotConnection>, botId);
 }
 
 function streamStub(channelId: string, messageId: string): DurableObjectStub {
@@ -93,8 +97,8 @@ function streamStub(channelId: string, messageId: string): DurableObjectStub {
   );
 }
 
-function channelStub(channelId: string): DurableObjectStub {
-  return getNamedDo(env.CHAT_CHANNEL as unknown as DurableObjectNamespace, channelId);
+function channelStub(channelId: string): DurableObjectStub<ChatChannel> {
+  return getNamedDo(env.CHAT_CHANNEL as unknown as DurableObjectNamespace<ChatChannel>, channelId);
 }
 
 async function nextMessageOfType(ws: WebSocket, type: string, timeoutMs = 5000): Promise<string> {
@@ -150,28 +154,18 @@ async function applyStartStream(input: {
   const botWs = await openBotConnection(input.botId);
   const stub = botConnectionStub(input.botId);
   const outboxId = `out-${crypto.randomUUID()}`;
-  const enq = await stub.fetch(
-    new Request("https://x/internal/enqueue-delivery", {
-      method: "POST",
-      headers: {
-        "X-Verified-Bot-Id": input.botId,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        outbox_id: outboxId,
-        channel_id: input.channelId,
-        kind: "command_invocation",
-        target_id: "inv-stream",
-        request_json: JSON.stringify({
-          channel_id: input.channelId,
-          invocation_id: "inv-stream",
-          command: { name: "ask" },
-          invoker: { user_id: "owner-1" },
-        }),
-      }),
+  await stub.enqueueDelivery(input.botId, {
+    outbox_id: outboxId,
+    channel_id: input.channelId,
+    kind: "command_invocation",
+    target_id: "inv-stream",
+    request_json: JSON.stringify({
+      channel_id: input.channelId,
+      invocation_id: "inv-stream",
+      command: { name: "ask" },
+      invoker: { user_id: "owner-1" },
     }),
-  );
-  expect(enq.status).toBe(200);
+  });
 
   const deliveryFrame = JSON.parse(await nextMessageOfType(botWs, "delivery")) as { delivery_id: string };
   botWs.send(
@@ -312,7 +306,7 @@ async function appendAndFlush(
 
 async function seedDeliverableLease(
   uc: DurableObjectStub,
-  fanout: DurableObjectStub,
+  fanout: DurableObjectStub<ChannelFanout>,
   channelId: string,
   userId: string,
   sessionId: string,
@@ -341,18 +335,14 @@ async function seedDeliverableLease(
       expiresAt,
     );
   });
-  await fanout.fetch(
-    new Request("https://x/lease-upsert", {
-      method: "POST",
-      headers: { "X-Channel-Id": channelId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        lease_id: leaseId,
-        user_id: userId,
-        session_id: sessionId,
-        membership_version: 1,
-      }),
-    }),
-  );
+  await fanout.leaseUpsert({
+    channel_id: channelId,
+    lease_id: leaseId,
+    user_id: userId,
+    session_id: sessionId,
+    membership_version: 1,
+    expires_at: expiresAt,
+  });
 }
 
 describe("BotStreamConnection expiry and abandon", () => {
@@ -396,8 +386,8 @@ describe("BotStreamConnection expiry and abandon", () => {
     });
     const messageId = ack.effect_results?.[0]?.message_id as string;
 
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as DurableObjectNamespace, channelId);
-    const uc = getNamedDo(env.USER_CONNECTION as unknown as DurableObjectNamespace, viewerUserId);
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT as unknown as DurableObjectNamespace<ChannelFanout>, channelId);
+    const uc = getNamedDo<UserConnection>(env.USER_CONNECTION as unknown as DurableObjectNamespace<UserConnection>, viewerUserId);
     const wsRes = await uc.fetch(
       new Request("https://x/ws", { headers: { Upgrade: "websocket", "X-Verified-User-Id": viewerUserId } }),
     );
@@ -416,9 +406,7 @@ describe("BotStreamConnection expiry and abandon", () => {
 
     await forceStreamExpiry(channelId, messageId);
 
-    const probe = (await (
-      await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1" } }))
-    ).json()) as { event_json: string | null };
+    const probe = await uc.debugLastDeliver();
     expect(probe.event_json).toBeTruthy();
     const frame = JSON.parse(probe.event_json!) as { frame_type: string; type: string; payload: { message_id: string } };
     expect(frame.frame_type).toBe("stream_event");
@@ -553,23 +541,19 @@ describe("BotStreamConnection expiry and abandon", () => {
       components: [],
       attachment_ids: [],
     });
-    const finRes = await channelStub(channelId).fetch(
-      new Request("https://x/internal/stream-finalize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          channel_id: channelId,
-          message_id: messageId,
-          bot_id: botId,
-          resolved_text: "keep me",
-          finalize_request_hash: finalizeHash,
-          final_seq: 1,
-          components: [],
-          attachment_ids: [],
-        }),
+    await expectDoRpcError(
+      () => channelStub(channelId).streamFinalize({
+        channel_id: channelId,
+        message_id: messageId,
+        bot_id: botId,
+        resolved_text: "keep me",
+        finalize_request_hash: finalizeHash,
+        final_seq: 1,
+        components: [],
+        attachment_ids: [],
       }),
+      "BOT_STREAM_EXPIRED",
     );
-    expect(finRes.status).toBe(410);
 
     await runInDurableObject(channelStub(channelId), async (instance: unknown) => {
       const ctx = (instance as { ctx: DurableObjectState }).ctx;
@@ -613,25 +597,11 @@ describe("BotStreamConnection expiry and abandon", () => {
       abandoned_text_hash: abandonedTextHash,
     };
 
-    const first = await channelStub(channelId).fetch(
-      new Request("https://x/internal/stream-abandon", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(abandonBody),
-      }),
-    );
-    const second = await channelStub(channelId).fetch(
-      new Request("https://x/internal/stream-abandon", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(abandonBody),
-      }),
-    );
-    expect(first.status).toBe(200);
-    expect(second.status).toBe(200);
-    const firstBody = (await first.json()) as { event_id: string };
-    const secondBody = (await second.json()) as { event_id: string };
-    expect(secondBody.event_id).toBe(firstBody.event_id);
+    const firstBody = await channelStub(channelId).streamAbandon(abandonBody);
+    const secondBody = await channelStub(channelId).streamAbandon(abandonBody);
+    if ("event_id" in firstBody && "event_id" in secondBody) {
+      expect(secondBody.event_id).toBe(firstBody.event_id);
+    }
 
     const { runInDurableObject } = await import("cloudflare:test");
     await runInDurableObject(channelStub(channelId), async (instance: unknown) => {

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { computeEffectRequestHash } from "../../src/chat/bot-effects";
-import { createTestChannel, getNamedDo } from "../helpers";
+import { createTestChannel, expectDoRpcError, getNamedDo } from "../helpers";
 
 const REGISTRY = () =>
   getNamedDo(env.BOT_REGISTRY as unknown as DurableObjectNamespace, "registry");
@@ -72,39 +72,31 @@ function sendMessageEffect(clientEffectId: string, text: string) {
   };
 }
 
-describe("ChatChannel /internal/bot-delivery-result", () => {
+describe("ChatChannel botDeliveryResult RPC", () => {
   it("applies send_message and returns effect_results", async () => {
     const botId = `bot-effect-send-${crypto.randomUUID()}`;
     await seedBot(botId);
     const channelId = crypto.randomUUID();
     const stub = await createTestChannel(env, { channelId, ownerId: "owner-1" });
     const effect = sendMessageEffect("eff-send-1", "from bot");
-    const res = await stub.fetch(
-      new Request("https://x/internal/bot-delivery-result", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          delivery_id: "del-1",
-          outbox_id: "out-1",
-          bot_id: botId,
-          channel_id: channelId,
-          effects: [effect],
-        }),
-      }),
-    );
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      status: string;
-      effect_results: Array<{ type: string; message_id: string; event_id: string }>;
-    };
+    const body = await stub.botDeliveryResult({
+      delivery_id: "del-1",
+      outbox_id: "out-1",
+      bot_id: botId,
+      channel_id: channelId,
+      effects: [effect],
+    });
     expect(body.status).toBe("applied");
-    expect(body.effect_results[0]?.type).toBe("send_message");
-    expect(body.effect_results[0]?.message_id).toBeTruthy();
-    expect(body.effect_results[0]?.event_id).toBeTruthy();
+    if (body.status !== "applied") return;
+    const sendResult = body.effect_results.find((r) => r.type === "send_message");
+    expect(sendResult?.type).toBe("send_message");
+    if (sendResult?.type !== "send_message") return;
+    expect(sendResult.message_id).toBeTruthy();
+    expect(sendResult.event_id).toBeTruthy();
 
     await withDoState(stub, (ctx) => {
       const message = ctx.storage.sql
-        .exec("SELECT sender_kind, sender_bot_id, text FROM messages WHERE message_id=?", body.effect_results[0]!.message_id)
+        .exec("SELECT sender_kind, sender_bot_id, text FROM messages WHERE message_id=?", sendResult.message_id)
         .toArray()[0] as { sender_kind: string; sender_bot_id: string; text: string };
       expect(message.sender_kind).toBe("bot");
       expect(message.sender_bot_id).toBe(botId);
@@ -125,28 +117,24 @@ describe("ChatChannel /internal/bot-delivery-result", () => {
       channel_id: channelId,
       effects: [effect],
     };
-    const first = (await (
-      await stub.fetch(
-        new Request("https://x/internal/bot-delivery-result", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        }),
-      )
-    ).json()) as { effect_results: Array<{ message_id: string; event_id: string }> };
+    const first = await stub.botDeliveryResult(payload);
+    expect(first.status).toBe("applied");
 
-    const second = (await (
-      await stub.fetch(
-        new Request("https://x/internal/bot-delivery-result", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...payload, delivery_id: "del-b", outbox_id: "out-b" }),
-        }),
-      )
-    ).json()) as { effect_results: Array<{ message_id: string; event_id: string }> };
+    const second = await stub.botDeliveryResult({
+      ...payload,
+      delivery_id: "del-b",
+      outbox_id: "out-b",
+    });
+    expect(second.status).toBe("applied");
+    if (first.status !== "applied" || second.status !== "applied") return;
+    const firstSend = first.effect_results.find((r) => r.type === "send_message");
+    const secondSend = second.effect_results.find((r) => r.type === "send_message");
+    expect(firstSend?.type).toBe("send_message");
+    expect(secondSend?.type).toBe("send_message");
+    if (firstSend?.type !== "send_message" || secondSend?.type !== "send_message") return;
 
-    expect(second.effect_results[0]?.message_id).toBe(first.effect_results[0]?.message_id);
-    expect(second.effect_results[0]?.event_id).toBe(first.effect_results[0]?.event_id);
+    expect(secondSend.message_id).toBe(firstSend.message_id);
+    expect(secondSend.event_id).toBe(firstSend.event_id);
   });
 
   it("returns BOT_EFFECT_CONFLICT when client_effect_id is reused with different body", async () => {
@@ -161,25 +149,13 @@ describe("ChatChannel /internal/bot-delivery-result", () => {
       channel_id: channelId,
     };
     const first = sendMessageEffect("eff-conflict", "first");
-    await stub.fetch(
-      new Request("https://x/internal/bot-delivery-result", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...base, effects: [first] }),
-      }),
-    );
+    await stub.botDeliveryResult({ ...base, effects: [first] });
     const secondEffect = sendMessageEffect("eff-conflict", "different");
     expect(computeEffectRequestHash(first)).not.toBe(computeEffectRequestHash(secondEffect));
-    const conflict = await stub.fetch(
-      new Request("https://x/internal/bot-delivery-result", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...base, delivery_id: "del-c2", effects: [secondEffect] }),
-      }),
+    await expectDoRpcError(
+      () => stub.botDeliveryResult({ ...base, delivery_id: "del-c2", effects: [secondEffect] }),
+      "BOT_EFFECT_CONFLICT",
     );
-    expect(conflict.status).toBe(409);
-    const err = (await conflict.json()) as { error: { code: string } };
-    expect(err.error.code).toBe("BOT_EFFECT_CONFLICT");
   });
 
   it("rejects append_stream with BOT_EFFECT_INVALID", async () => {
@@ -187,22 +163,15 @@ describe("ChatChannel /internal/bot-delivery-result", () => {
     await seedBot(botId);
     const channelId = crypto.randomUUID();
     const stub = await createTestChannel(env, { channelId, ownerId: "owner-1" });
-    const res = await stub.fetch(
-      new Request("https://x/internal/bot-delivery-result", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          delivery_id: "del-s",
-          outbox_id: "out-s",
-          bot_id: botId,
-          channel_id: channelId,
-          effects: [{ type: "append_stream", client_effect_id: "eff-stream", seq: 1, delta: "x" }],
-        }),
-      }),
-    );
-    expect(res.status).toBe(422);
-    const body = (await res.json()) as { status: string; error: { code: string } };
+    const body = await stub.botDeliveryResult({
+      delivery_id: "del-s",
+      outbox_id: "out-s",
+      bot_id: botId,
+      channel_id: channelId,
+      effects: [{ type: "append_stream", client_effect_id: "eff-stream", seq: 1, delta: "x" }],
+    });
     expect(body.status).toBe("failed");
+    if (body.status !== "failed") return;
     expect(body.error.code).toBe("BOT_EFFECT_INVALID");
   });
 });

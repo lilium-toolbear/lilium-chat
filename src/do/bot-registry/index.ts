@@ -1,0 +1,1 @@
+export { BotRegistry } from "./object";

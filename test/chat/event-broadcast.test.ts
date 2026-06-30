@@ -76,13 +76,13 @@ describe("resolveSenderForLiveBroadcast", () => {
     });
     const live = await resolveSenderForLiveBroadcast(
       persisted,
-      async () => new Map([["u-1", { user_id: "u-1", display_name: "Alice", avatar_url: "https://x/a.png" }]]),
+      async () => new Map([["u-1", { user_id: "u-1", display_name: "Alice", avatar_url: "https://example.test/a.png" }]]),
     );
     const sender = (live.message as Record<string, unknown>).sender as Record<string, unknown>;
     expect(sender.kind).toBe("user");
     expect(sender).toHaveProperty("user");
     expect((sender.user as Record<string, unknown>).display_name).toBe("Alice");
-    expect((sender.user as Record<string, unknown>).avatar_url).toBe("https://x/a.png");
+    expect((sender.user as Record<string, unknown>).avatar_url).toBe("https://example.test/a.png");
   });
 
   it("falls back to a user-<shortid> summary when the sender is not in pg", async () => {

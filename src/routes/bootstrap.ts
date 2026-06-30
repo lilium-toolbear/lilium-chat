@@ -1,6 +1,6 @@
 import type { Context } from "hono";
 import type { Env } from "../env";
-import { ApiError } from "../errors";
+import { ApiError, logSwallowedError } from "../errors";
 import { resolveUserSummaries, type UserSummary } from "../profile/resolve";
 import { inflateMyChannelSummaries } from "../chat/channel-list";
 import { fallbackUserDisplayName } from "../contract/primitives";
@@ -58,10 +58,7 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
   const { userId: user_id, env } = await getIdentity(c);
 
   const dirStub = env.USER_DIRECTORY.getByName(user_id);
-  const dirRes = await dirStub.fetch(new Request("https://x/my-channels", { headers: { "X-Verified-User-Id": user_id } }));
-  const myChannels = dirRes.ok
-    ? ((await dirRes.json()) as { items: MyChannel[] }).items
-    : [];
+  const myChannels = (await dirStub.listMyChannels(user_id).catch(() => ({ items: [] as MyChannel[] }))).items;
 
   const channels = await inflateMyChannelSummaries({
     env,
@@ -76,12 +73,8 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
   const messages = activeChannel
     ? await (async () => {
       const stub = c.env.CHAT_CHANNEL.getByName(activeChannel.channel_id);
-      const mres = await stub.fetch(new Request("https://x/internal/messages?limit=50", {
-        headers: { "X-Verified-User-Id": user_id },
-      }));
-      if (!mres.ok) return { items: [] as EventFrame[], next_cursor: null };
-
-      const body = await mres.json() as { items: EventFrame[]; next_cursor: string | null };
+      const body = await stub.getMessages(user_id, { before: null, after: null, limit: 50 })
+        .catch(() => ({ items: [] as EventFrame[], next_cursor: null }));
       return {
         items: body.items,
         next_cursor: body.next_cursor,
@@ -99,12 +92,14 @@ export async function bootstrapHandler(c: Context<{ Bindings: Env; Variables: { 
   let commandManifest: CommandManifestResponse | null = null;
   if (shouldAttachManifest && activeChannel) {
     const stub = c.env.CHAT_CHANNEL.getByName(activeChannel.channel_id);
-    const res = await stub.fetch(new Request(
-      `https://x/internal/command-manifest?channel_id=${encodeURIComponent(activeChannel.channel_id)}`,
-      { headers: { "X-Verified-User-Id": user_id } },
-    ));
-    if (res.ok) {
-      commandManifest = await res.json() as CommandManifestResponse;
+    try {
+      commandManifest = await stub.getCommandManifest(user_id, activeChannel.channel_id);
+    } catch (err) {
+      logSwallowedError("bootstrap_command_manifest_failed", err, {
+        channel_id: activeChannel.channel_id,
+        user_id,
+      });
+      commandManifest = null;
     }
   }
 

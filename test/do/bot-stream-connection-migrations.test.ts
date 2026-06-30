@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
 import { getNamedDo } from "../helpers";
-import { tableExists } from "../../src/do/sql-migrations";
-import { BOT_STREAM_CONNECTION_CURRENT_SCHEMA_VERSION } from "../../src/do/migrations/bot-stream-connection";
+import { tableExists } from "../../src/do/shared/sql-migrations";
+import { BOT_STREAM_CONNECTION_CURRENT_SCHEMA_VERSION } from "../../src/do/bot-stream-connection/migrations";
 import { botStreamDoName } from "../../src/do/bot-stream-connection";
 
 function streamStub(channelId: string, messageId: string) {

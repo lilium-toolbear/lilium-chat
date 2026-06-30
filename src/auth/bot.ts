@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { botStreamDoName } from "../do/bot-stream-connection";
 import { ApiError } from "../errors";
+import type { BotRegistry } from "../do/bot-registry";
 
 const BOT_STREAM_CONNECT_SCOPES = ["chat:runtime:connect", "chat:messages:write"] as const;
 
@@ -12,8 +13,8 @@ const BOT_STREAM_CONNECT_SCOPES = ["chat:runtime:connect", "chat:messages:write"
 // happen in one place doing SELECT ... WHERE token_hash=?).
 
 /** Singleton BotRegistry stub (token hash lookup needs one place). */
-export function botRegistryStub(env: Env): DurableObjectStub {
-  return env.BOT_REGISTRY.get(env.BOT_REGISTRY.idFromName("registry"));
+export function botRegistryStub(env: Env): DurableObjectStub<BotRegistry> {
+  return env.BOT_REGISTRY.get(env.BOT_REGISTRY.idFromName("registry")) as DurableObjectStub<BotRegistry>;
 }
 
 /** BotConnection DO stub (by bot_id). */
@@ -55,20 +56,14 @@ export interface BotIdentity {
  */
 export async function verifyBotToken(env: Env, token: string): Promise<BotIdentity> {
   const tokenHash = await hashBotToken(token);
-  const res = await botRegistryStub(env).fetch(
-    new Request("https://x/internal/token-verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token_hash: tokenHash }),
-    }),
-  );
-  if (res.status === 401) throw new ApiError("UNAUTHORIZED", "Invalid bot token");
-  if (!res.ok) throw new ApiError("UNAUTHORIZED", "Invalid bot token");
-  const body = (await res.json()) as { bot_id?: unknown; scopes?: unknown };
-  if (typeof body.bot_id !== "string" || !Array.isArray(body.scopes)) {
-    throw new ApiError("UNAUTHORIZED", "Invalid bot token");
+  try {
+    return await botRegistryStub(env).verifyTokenHash(tokenHash);
+  } catch (err) {
+    if ((err as { code?: unknown; remote?: unknown }).remote === true && (err as { code?: unknown }).code === "UNAUTHORIZED") {
+      throw new ApiError("UNAUTHORIZED", "Invalid bot token");
+    }
+    throw err;
   }
-  return { bot_id: body.bot_id, scopes: body.scopes as string[] };
 }
 
 /**

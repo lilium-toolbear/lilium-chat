@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { getNamedDo } from "../helpers";
+import type { ChannelDirectory } from "../../src/do/channel-directory";
 
-const DIR = () => getNamedDo(env.CHANNEL_DIRECTORY as unknown as Parameters<typeof getNamedDo>[0], "shared");
+const DIR = () => getNamedDo<ChannelDirectory>(env.CHANNEL_DIRECTORY as unknown as DurableObjectNamespace<ChannelDirectory>, "shared");
 
 type Row = {
   channel_id: string;
@@ -15,9 +16,7 @@ type Row = {
 };
 
 async function listAll(): Promise<Row[]> {
-  const res = await DIR().fetch(new Request("https://x/internal/list?limit=100"));
-  expect(res.status).toBe(200);
-  const body = (await res.json()) as { items: Row[]; next_cursor: string | null };
+  const body = await DIR().listPublicChannels({ q: "", limit: 100, cursor: null });
   return body.items;
 }
 
@@ -48,22 +47,14 @@ async function deleteRow(channelId: string): Promise<void> {
 }
 
 function upsert(channelId: string, fields: Record<string, unknown>, fieldsPresent: string[]) {
-  return DIR().fetch(new Request("https://x/internal/apply-projection", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "upsert", channel_id: channelId, fields, fields_present: fieldsPresent }),
-  }));
+  return DIR().applyProjection({ action: "upsert", channel_id: channelId, fields, fields_present: fieldsPresent });
 }
 
 function del(channelId: string) {
-  return DIR().fetch(new Request("https://x/internal/apply-projection", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "delete", channel_id: channelId }),
-  }));
+  return DIR().applyProjection({ action: "delete", channel_id: channelId });
 }
 
-describe("ChannelDirectory /internal/apply-projection", () => {
+describe("ChannelDirectory applyProjection", () => {
   it("upsert with a full snapshot inserts a new row (all NOT NULL fields present)", async () => {
     const id = "0199cd00-0000-7000-8000-00000000a001";
     const res = await upsert(id, {
@@ -73,7 +64,7 @@ describe("ChannelDirectory /internal/apply-projection", () => {
       last_message_at: null,
       status: "active",
     }, ["title", "avatar_url", "member_count", "last_message_at", "status"]);
-    expect(res.status).toBe(200);
+    expect(res).toEqual({ ok: true });
     const rows = await rawRows();
     const r = rows.find((x) => x.channel_id === id);
     expect(r).toBeDefined();
@@ -90,13 +81,13 @@ describe("ChannelDirectory /internal/apply-projection", () => {
       title: "First", avatar_url: null, member_count: 1, last_message_at: null, status: "active",
     }, ["title", "avatar_url", "member_count", "last_message_at", "status"]);
     await upsert(id, {
-      title: "Second", avatar_url: "https://x/a.png", member_count: 5,
+      title: "Second", avatar_url: "https://example.test/a.png", member_count: 5,
       last_message_at: "2026-06-26T00:00:00.000Z", status: "active",
     }, ["title", "avatar_url", "member_count", "last_message_at", "status"]);
     const rows = await rawRows();
     const r = rows.find((x) => x.channel_id === id);
     expect(r!.title).toBe("Second");
-    expect(r!.avatar_url).toBe("https://x/a.png");
+    expect(r!.avatar_url).toBe("https://example.test/a.png");
     expect(r!.member_count).toBe(5);
     expect(r!.last_message_at).toBe("2026-06-26T00:00:00.000Z");
   });
@@ -104,7 +95,7 @@ describe("ChannelDirectory /internal/apply-projection", () => {
   it("upsert where avatar_url=null (in fields_present) writes NULL (explicit null preserved)", async () => {
     const id = "0199cd00-0000-7000-8000-00000000a003";
     await upsert(id, {
-      title: "Avatar", avatar_url: "https://x/a.png", member_count: 1, last_message_at: null, status: "active",
+      title: "Avatar", avatar_url: "https://example.test/a.png", member_count: 1, last_message_at: null, status: "active",
     }, ["title", "avatar_url", "member_count", "last_message_at", "status"]);
     await upsert(id, {
       title: "Avatar", avatar_url: null, member_count: 1, last_message_at: null, status: "active",
@@ -130,9 +121,9 @@ describe("ChannelDirectory /internal/apply-projection", () => {
       title: "Del", avatar_url: null, member_count: 1, last_message_at: null, status: "active",
     }, ["title", "avatar_url", "member_count", "last_message_at", "status"]);
     const r1 = await del(id);
-    expect(r1.status).toBe(200);
+    expect(r1).toEqual({ ok: true });
     const r2 = await del(id);
-    expect(r2.status).toBe(200);
+    expect(r2).toEqual({ ok: true });
     const rows = await rawRows();
     expect(rows.find((x) => x.channel_id === id)).toBeUndefined();
   });
@@ -149,7 +140,7 @@ describe("ChannelDirectory /internal/apply-projection", () => {
       title: "Repair", avatar_url: null, member_count: 2,
       last_message_at: "2026-06-26T00:00:01.000Z", status: "active",
     }, ["title", "avatar_url", "member_count", "last_message_at", "status"]);
-    expect(r.status).toBe(200);
+    expect(r).toEqual({ ok: true });
     const rows = await rawRows();
     const row = rows.find((x) => x.channel_id === id);
     expect(row).toBeDefined();
@@ -160,7 +151,7 @@ describe("ChannelDirectory /internal/apply-projection", () => {
   });
 });
 
-describe("ChannelDirectory /internal/list", () => {
+describe("ChannelDirectory listPublicChannels", () => {
   it("returns only status='active' rows", async () => {
     const activeId = "0199cd00-0000-7000-8000-00000000b001";
     const dissolvedId = "0199cd00-0000-7000-8000-00000000b002";
@@ -185,8 +176,7 @@ describe("ChannelDirectory /internal/list", () => {
     await upsert(b, {
       title: "Gophers", avatar_url: null, member_count: 1, last_message_at: null, status: "active",
     }, ["title", "avatar_url", "member_count", "last_message_at", "status"]);
-    const res = await DIR().fetch(new Request("https://x/internal/list?q=Rust&limit=100"));
-    const body = (await res.json()) as { items: Row[] };
+    const body = await DIR().listPublicChannels({ q: "Rust", limit: 100, cursor: null });
     const titles = body.items.map((i) => i.title);
     expect(titles).toContain("Rustaceans");
     expect(titles).not.toContain("Gophers");
@@ -225,15 +215,13 @@ describe("ChannelDirectory /internal/list", () => {
     expect(orderedIds).toEqual([ids[0], ids[1], ids[2]]);
 
     // keyset pagination: page 1 limit 1 → first item + next_cursor; page 2 → second item.
-    const page1 = await DIR().fetch(new Request("https://x/internal/list?limit=1"));
-    const p1 = (await page1.json()) as { items: Row[]; next_cursor: string };
+    const p1 = await DIR().listPublicChannels({ q: "", limit: 1, cursor: null });
     expect(p1.items.length).toBe(1);
     const filtered1 = p1.items.filter((i) => ids.includes(i.channel_id));
     // page1 may include other rows from prior tests; find our newest.
     const firstOurs = filtered1[0] ?? p1.items[0];
     // cursor past the first of our set: fetch page 2 with the cursor
-    const page2 = await DIR().fetch(new Request(`https://x/internal/list?limit=100&cursor=${encodeURIComponent(p1.next_cursor ?? "")}`));
-    const p2 = (await page2.json()) as { items: Row[]; next_cursor: string | null };
+    const p2 = await DIR().listPublicChannels({ q: "", limit: 100, cursor: p1.next_cursor ?? "" });
     // the second page must NOT re-include the first page's row.
     expect(firstOurs).toBeDefined();
     if (firstOurs) {
@@ -242,10 +230,8 @@ describe("ChannelDirectory /internal/list", () => {
   });
 
   it("limit is clamped to 100", async () => {
-    const res = await DIR().fetch(new Request("https://x/internal/list?limit=99999"));
-    expect(res.status).toBe(200);
     // No assertion on count (the table may have many rows); the handler must not error on a huge limit.
-    const body = (await res.json()) as { items: Row[] };
+    const body = await DIR().listPublicChannels({ q: "", limit: 99999, cursor: null });
     expect(Array.isArray(body.items)).toBe(true);
   });
 

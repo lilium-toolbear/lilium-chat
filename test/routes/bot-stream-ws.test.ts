@@ -4,7 +4,8 @@ import { BOT_GATEWAY_API_VERSION } from "../../src/chat/bot-gateway-protocol";
 import { buildBotStreamHello, parseBotStreamReady } from "../../src/chat/bot-stream-protocol";
 import { BOT_STREAM_API_VERSION } from "../../src/contract/bot-stream";
 import { hashBotToken } from "../../src/auth/bot";
-import { createTestChannel, drainPoolWorkerTeardown, getNamedDo } from "../helpers";
+import { createTestChannel, drainPoolWorkerTeardown, enqueueBotInvocationDelivery, getNamedDo } from "../helpers";
+import type { BotConnection } from "../../src/do/bot-connection";
 import { liveStartAndAck, upgradeUserConnection } from "../ws-helpers";
 
 const SELF = (await import("../../src/index")).default as {
@@ -79,8 +80,8 @@ afterAll(async () => {
   await drainPoolWorkerTeardown();
 });
 
-function botConnectionStub(botId: string): DurableObjectStub {
-  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace, botId);
+function botConnectionStub(botId: string): DurableObjectStub<BotConnection> {
+  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace<BotConnection>, botId);
 }
 
 async function nextMessageOfType(ws: WebSocket, type: string, timeoutMs = 3000): Promise<string> {
@@ -136,28 +137,10 @@ async function applyStartStream(input: {
   const botWs = await openBotConnection(input.botId);
   const stub = botConnectionStub(input.botId);
   const outboxId = `out-${crypto.randomUUID()}`;
-  const enq = await stub.fetch(
-    new Request("https://x/internal/enqueue-delivery", {
-      method: "POST",
-      headers: {
-        "X-Verified-Bot-Id": input.botId,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        outbox_id: outboxId,
-        channel_id: input.channelId,
-        kind: "command_invocation",
-        target_id: "inv-stream",
-        request_json: JSON.stringify({
-          channel_id: input.channelId,
-          invocation_id: "inv-stream",
-          command: { name: "ask" },
-          invoker: { user_id: "owner-1" },
-        }),
-      }),
-    }),
-  );
-  expect(enq.status).toBe(200);
+  await enqueueBotInvocationDelivery(stub, input.botId, {
+    outbox_id: outboxId,
+    channel_id: input.channelId,
+  });
 
   const deliveryFrame = JSON.parse(await nextMessageOfType(botWs, "delivery")) as { delivery_id: string };
   botWs.send(

@@ -73,6 +73,17 @@ Worker (`src/index.ts`) authenticates and routes to DOs by name. Browser WS (`sr
 
 Internal test routes need `ALLOW_INTERNAL_TEST_ROUTES=1` + `X-Test-Only: 1` (test worker only).
 
+### Durable Object RPC rules
+
+- DO-to-DO internal calls use Durable Object RPC methods, not `stub.fetch()` HTTP simulation.
+- Keep HTTP entrypoints only for real Worker/WS boundaries and explicitly test-gated debug/shell routes. Browser WS and Bot Gateway WS remain HTTP upgrade paths.
+- Application-level DO RPC methods are not external HTTP APIs: return typed domain data, not `Response`; throw typed errors for failures. Only Hono handlers, real `fetch()` entrypoints, and WS upgrade paths return `Response`.
+- Public RPC methods should carry the real typed contract. Do not add one-line compatibility proxy methods that only translate to a private HTTP route.
+- Test/debug inspection without a real HTTP boundary should be a test-gated RPC method.
+- Wrap constructor schema migration in `ctx.blockConcurrencyWhile(async () => { ... })`.
+- When handling DO RPC exceptions, retry only platform/transport failures: `err.remote === false && err.retryable === true && err.overloaded !== true`. Remote user-code exceptions (`err.remote === true`) are business results; do not retry them. Business `ApiError.retryable` is client-facing API semantics only, not an internal DO retry trigger.
+- Before using subagents or editing a worktree, verify `pwd && git branch --show-current`. Stop if the cwd is not the intended worktree or the branch is not the intended branch.
+
 ### Load-bearing invariants
 
 - **No cross-DO 2PC.** Consistency via **durable outbox** + per-DO **alarm** (`scheduleNextAlarm`/`runDueJobs`). **Do not call `ctx.storage.setAlarm` directly.**
@@ -86,7 +97,7 @@ Internal test routes need `ALLOW_INTERNAL_TEST_ROUTES=1` + `X-Test-Only: 1` (tes
 
 ### SQLite migrations
 
-Per-DO modules under `src/do/migrations/<do-name>.ts`: baseline + versioned `SqlMigration[]`. Runner in DO constructor. **Add migrations, do not edit baselines.** Quote user-influenced identifiers via `quoteIdent`.
+Per-DO modules under `src/do/<binding>/` (`object.ts`, `migrations.ts`, `index.ts`). Shared DO utilities live in `src/do/shared/`. Baseline + versioned `SqlMigration[]` in each module's `migrations.ts`. Runner in DO constructor. **Add migrations, do not edit baselines.** Quote user-influenced identifiers via `quoteIdent`.
 
 ### Error contract & request id
 
@@ -112,7 +123,7 @@ Phase plans in `docs/superpowers/plans/`. Follow task order, write failing tests
 
 ## Testing Guidelines
 
-Vitest via `@cloudflare/vitest-pool-workers` + miniflare (real DO SQLite + WS hibernation). `test/helpers.ts`: `makeJwt`, `getNamedDo`. DO-to-DO: `stub.fetch(new Request("https://x/internal/...", {...}))`. Poll async outbox/alarm effects — avoid fixed sleeps under load.
+Vitest via `@cloudflare/vitest-pool-workers` + miniflare (real DO SQLite + WS hibernation). `test/helpers.ts`: `makeJwt`, `getNamedDo<T>`. Internal DO production paths should call RPC methods directly; use `stub.fetch(new Request("https://x/...", {...}))` only for WebSocket upgrade tests or real Worker route tests that intentionally exercise an HTTP boundary. Poll async outbox/alarm effects — avoid fixed sleeps under load.
 
 ## Commit & Pull Request Guidelines
 

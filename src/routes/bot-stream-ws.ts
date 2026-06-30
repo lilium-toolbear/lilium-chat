@@ -2,7 +2,7 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { botStreamConnectionStub, verifyBotStreamConnectScopes, verifyBotToken } from "../auth/bot";
 import { BOT_STREAM_API_VERSION } from "../contract/bot-stream";
-import { ApiError, errorResponse } from "../errors";
+import { ApiError, apiErrorFromRemote, errorResponse } from "../errors";
 
 /** GET /api/chat/bot/channels/:channel_id/streams/:message_id/ws — stream WS upgrade. */
 export async function botStreamWsUpgradeHandler(
@@ -41,29 +41,21 @@ export async function botStreamWsUpgradeHandler(
     return errorResponse(new ApiError("BOT_STREAM_NOT_FOUND", "stream registry not found"), requestId);
   }
 
-  const checkRes = await c.env.CHAT_CHANNEL.getByName(channelId).fetch(
-    new Request("https://x/internal/stream-registry-check", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ channel_id: channelId, message_id: messageId, bot_id: botId }),
-    }),
-  );
+  const checkRes = await c.env.CHAT_CHANNEL.getByName(channelId).streamRegistryCheck({
+    channel_id: channelId,
+    message_id: messageId,
+    bot_id: botId,
+  }).catch((err: unknown) => {
+    const apiErr = err instanceof ApiError ? err : apiErrorFromRemote(err);
+    if (apiErr) return apiErr;
+    return new ApiError("CHAT_WORKER_UNAVAILABLE", "stream registry check failed");
+  });
 
-  if (!checkRes.ok) {
-    let code = "CHAT_WORKER_UNAVAILABLE";
-    let message = "stream registry check failed";
-    try {
-      const body = (await checkRes.json()) as { error?: { code?: string; message?: string } };
-      if (typeof body.error?.code === "string") code = body.error.code;
-      if (typeof body.error?.message === "string") message = body.error.message;
-    } catch {
-      // use defaults
-    }
-    return errorResponse(new ApiError(code, message), requestId);
+  if (checkRes instanceof ApiError) {
+    return errorResponse(checkRes, requestId);
   }
 
-  const checkBody = (await checkRes.json()) as { expires_at?: string };
-  const expiresAt = typeof checkBody.expires_at === "string" ? checkBody.expires_at : "";
+  const expiresAt = typeof checkRes.expires_at === "string" ? checkRes.expires_at : "";
 
   const upstream = new Request(c.req.raw, c.req.raw);
   upstream.headers.set("Sec-WebSocket-Protocol", BOT_STREAM_API_VERSION);

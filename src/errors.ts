@@ -105,6 +105,27 @@ export function errorResponse(err: ApiError, requestId: string): Response {
   );
 }
 
+export function apiErrorFromRemote(err: unknown): ApiError | null {
+  if (!err || typeof err !== "object") return null;
+  const remote = err as Record<string, unknown>;
+  if (remote.remote !== true || typeof remote.code !== "string") return null;
+
+  const opts: { retryable?: boolean; httpStatus?: number } = {};
+  if (typeof remote.retryable === "boolean") opts.retryable = remote.retryable;
+  if (typeof remote.httpStatus === "number") opts.httpStatus = remote.httpStatus;
+
+  const apiErr = new ApiError(
+    remote.code,
+    typeof remote.message === "string" ? remote.message : remote.code,
+    opts,
+  );
+  for (const [key, val] of Object.entries(remote)) {
+    if (key === "remote" || key === "code" || key === "message" || key === "retryable" || key === "httpStatus") continue;
+    Object.assign(apiErr, { [key]: val });
+  }
+  return apiErr;
+}
+
 /** DO-internal JSON error envelope (no request_id). */
 export function doErrorResponse(
   code: string,
@@ -120,4 +141,15 @@ export function idempotencyConflictResponse(
   message = "operation_id reused with different body",
 ): Response {
   return doErrorResponse("IDEMPOTENCY_CONFLICT", message, { retryable: false, httpStatus: 409 });
+}
+/** Best-effort paths that must not throw; log for observability. */
+export function logSwallowedError(
+  event: string,
+  err: unknown,
+  fields?: Record<string, unknown>,
+): void {
+  console.warn(event, {
+    error: err instanceof Error ? err.message : String(err),
+    ...fields,
+  });
 }

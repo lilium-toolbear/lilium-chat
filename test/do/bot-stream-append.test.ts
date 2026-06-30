@@ -12,7 +12,9 @@ import { validateAppendSeq } from "../../src/chat/stream-seq";
 import { BOT_STREAM_API_VERSION } from "../../src/contract/bot-stream";
 import { hashBotToken } from "../../src/auth/bot";
 import { botStreamDoName } from "../../src/do/bot-stream-connection";
-import { createTestChannel, drainPoolWorkerTeardown, getNamedDo } from "../helpers";
+import { createTestChannel, drainPoolWorkerTeardown, enqueueBotInvocationDelivery, getNamedDo, userConnectionTestStub } from "../helpers";
+import type { BotConnection } from "../../src/do/bot-connection";
+import type { ChannelFanout } from "../../src/do/channel-fanout";
 import { liveStartAndAck, upgradeUserConnection } from "../ws-helpers";
 
 const REGISTRY = () =>
@@ -81,8 +83,8 @@ afterAll(async () => {
   await drainPoolWorkerTeardown();
 });
 
-function botConnectionStub(botId: string): DurableObjectStub {
-  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace, botId);
+function botConnectionStub(botId: string): DurableObjectStub<BotConnection> {
+  return getNamedDo(env.BOT_CONNECTION as unknown as DurableObjectNamespace<BotConnection>, botId);
 }
 
 function streamStub(channelId: string, messageId: string): DurableObjectStub {
@@ -145,28 +147,10 @@ async function applyStartStream(input: {
   const botWs = await openBotConnection(input.botId);
   const stub = botConnectionStub(input.botId);
   const outboxId = `out-${crypto.randomUUID()}`;
-  const enq = await stub.fetch(
-    new Request("https://x/internal/enqueue-delivery", {
-      method: "POST",
-      headers: {
-        "X-Verified-Bot-Id": input.botId,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        outbox_id: outboxId,
-        channel_id: input.channelId,
-        kind: "command_invocation",
-        target_id: "inv-stream",
-        request_json: JSON.stringify({
-          channel_id: input.channelId,
-          invocation_id: "inv-stream",
-          command: { name: "ask" },
-          invoker: { user_id: "owner-1" },
-        }),
-      }),
-    }),
-  );
-  expect(enq.status).toBe(200);
+  await enqueueBotInvocationDelivery(stub, input.botId, {
+    outbox_id: outboxId,
+    channel_id: input.channelId,
+  });
 
   const deliveryFrame = JSON.parse(await nextMessageOfType(botWs, "delivery")) as { delivery_id: string };
   botWs.send(
@@ -274,7 +258,7 @@ async function yieldToStreamDo(): Promise<void> {
 
 async function seedDeliverableLease(
   uc: DurableObjectStub,
-  fanout: DurableObjectStub,
+  fanout: DurableObjectStub<ChannelFanout>,
   channelId: string,
   userId: string,
   sessionId: string,
@@ -306,18 +290,14 @@ async function seedDeliverableLease(
       expiresAt,
     );
   });
-  await fanout.fetch(
-    new Request("https://x/lease-upsert", {
-      method: "POST",
-      headers: { "X-Channel-Id": channelId, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        lease_id: leaseId,
-        user_id: userId,
-        session_id: sessionId,
-        membership_version: 1,
-      }),
-    }),
-  );
+  await fanout.leaseUpsert({
+    channel_id: channelId,
+    lease_id: leaseId,
+    user_id: userId,
+    session_id: sessionId,
+    membership_version: 1,
+    expires_at: expiresAt,
+  });
 }
 
 describe("stream-seq validation", () => {
@@ -490,7 +470,7 @@ describe("BotStreamConnection append", () => {
     const messageId = ack.effect_results?.[0]?.message_id as string;
     const expiresAt = ack.effect_results?.[0]?.stream?.expires_at as string;
 
-    const fanout = getNamedDo(env.CHANNEL_FANOUT as unknown as DurableObjectNamespace, channelId);
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT as unknown as DurableObjectNamespace<ChannelFanout>, channelId);
     const uc = getNamedDo(env.USER_CONNECTION as unknown as DurableObjectNamespace, viewerUserId);
     const wsRes = await uc.fetch(
       new Request("https://x/ws", { headers: { Upgrade: "websocket", "X-Verified-User-Id": viewerUserId } }),
@@ -514,9 +494,7 @@ describe("BotStreamConnection append", () => {
     await yieldToStreamDo();
     await triggerStreamAlarm(channelId, messageId);
 
-    const probe = (await (
-      await uc.fetch(new Request("https://x/test-last-deliver", { headers: { "X-Test-Only": "1" } }))
-    ).json()) as { event_json: string | null };
+    const probe = await userConnectionTestStub(env, viewerUserId).debugLastDeliver();
     expect(probe.event_json).toBeTruthy();
     const frame = JSON.parse(probe.event_json!) as {
       frame_type: string;
