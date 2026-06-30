@@ -1,6 +1,6 @@
 # ToolBear Chat Browser/Bot API Contract
 
-状态：实现前 API contract（v2.26，v4.4-aligned —— … + 2026-06-27 DM §5.2c；+ 2026-06-30 Bot streaming §9.13–§9.16）
+状态：实现前 API contract（v2.27，v4.4-aligned —— … + 2026-06-27 DM §5.2c；+ 2026-06-30 Bot streaming §9.13–§9.16；+ 2026-06-30 Rich UI interaction lifecycle §9.5/§9.6）
 日期：2026-06-22（权威文件：`docs/api-contract.md`）
 范围：lilium-chat 后端（Cloudflare Worker + Durable Object）的 browser/bot-facing wire shape
 权威来源：
@@ -68,6 +68,7 @@
 - **v2.24 (2026-06-30)**：Bot streaming finalize 规则收紧。§9.15.4 `final_seq` 必须等于 `received_seq`（`>` gap / `<` conflict）；finalize 前 flush 使 `ack_seq == received_seq`；幂等键改为 `finalize_request_hash`（含 `final_seq`、`resolved_text`、`components`、`attachment_ids`）；`final_text_hash` 保留为诊断字段。§12.4 同步。
 - **v2.25 (2026-06-30)**：Bot streaming abandon 语义调整。非空 durable partial text 在 expiry/abandon 时写入 canonical abandoned message（`stream_state=abandoned`、`status=failed`）；`message.stream_abandoned` 为 canonical event；空 buffer 仅 live-only `message.stream_abandon_cleanup`。§12.4 / Message 枚举同步。
 - **v2.26 (2026-06-30)**：Rich UI components 与 Bot streaming 互斥。`MessageComponent` **仅**允许非 stream Bot 消息（`send_message` / `update_message`，`stream_state=none`）；`start_stream` / Stream WS `finalize` / stream 消息投影 **禁止**非空 `components`；stream 正文仅为 `text`（`format=plain|markdown`）。§3.7、§3.8、§9.13 D11、§9.14、§9.15.2/§9.15.4、§9.16、§12.4 同步。
+- **v2.27 (2026-06-30)**：Rich UI bot lifecycle wire projection + interaction delivery-complete 澄清（**非 breaking**）。§9.5 `command.invoked` broadcast 示例补 `actor` / `command_name`（wire projection）；§9.6 `interaction.created` 示例补 `actor` / `component_label`；新增 §9.6.1 `message_interaction` delivery 完成后 emit `interaction.completed` / `interaction.failed` 的触发规则与 payload 示例（含空 `effects: []` 成功路径）；新增 bot runtime lifecycle 事件的 **storage vs wire projection** 表（对齐 `system.notice` v2.3 模式）；§10.3 replay 规则补 `command.invoked` / `interaction.created` 的 actor/label 回填说明。
 
 ## 1. 边界
 
@@ -2370,7 +2371,7 @@ Worker 接受 command 并在事务提交后返回 committed_ack (v2.6 delta：ac
 }
 ```
 
-随后广播：
+随后广播（v2.27 delta：以下为 **Browser wire projection**；storage 字段见 §9.6.2）：
 
 ```json
 {
@@ -2384,10 +2385,19 @@ Worker 接受 command 并在事务提交后返回 committed_ack (v2.6 delta：ac
       "invocation_id": "00000000-0000-7000-8000-000000000811",
       "status": "pending",
       "created_at": "2026-06-21T05:30:00Z"
+    },
+    "command_id": "00000000-0000-7000-8000-000000000812",
+    "command_name": "werewolf",
+    "actor": {
+      "user_id": "00000000-0000-7000-8000-000000000101",
+      "display_name": "alice",
+      "avatar_url": null
     }
   }
 }
 ```
+
+`command_name` 为 Browser 展示用 slash 名：优先 `invoked_name`（alias 命中时），否则 canonical `command_name`。`actor` 为调用者 UserSummary，live broadcast 与 HTTP replay 均由 `actor_user_id` 实时 resolve（§9.6.2）。
 
 Slash command 是 command invocation，不是普通 text message。前端输入以 `/` 开头并选中命令后必须发送 `command.invoke` frame。
 
@@ -2443,7 +2453,7 @@ Worker 接受 command 并在事务提交后返回 committed_ack (v2.6 delta：ac
 }
 ```
 
-随后广播事件 (v2 delta)：
+随后广播事件（v2.27 delta：以下为 **Browser wire projection**；storage 字段见 §9.6.2）：
 
 ```json
 {
@@ -2457,10 +2467,19 @@ Worker 接受 command 并在事务提交后返回 committed_ack (v2.6 delta：ac
       "interaction_id": "00000000-0000-7000-8000-000000000a21",
       "status": "pending",
       "created_at": "2026-06-21T05:30:00Z"
+    },
+    "command_id": "00000000-0000-7000-8000-000000000a31",
+    "component_label": "确认",
+    "actor": {
+      "user_id": "00000000-0000-7000-8000-000000000101",
+      "display_name": "alice",
+      "avatar_url": null
     }
   }
 }
 ```
+
+`component_label` 取自目标 message 当前 `components_json` 中匹配 `component_id` 的 `label` 字段（button/select 等）；replay 时按当前 message 状态重新 resolve。`actor` 为提交者 UserSummary。
 
 Worker 校验当前用户能看见该消息、消息来自 Bot、component 未 disabled、`custom_id` 与持久化组件一致、**`interaction_policy` 门禁通过**（§3.8）、**`value` 形状与 `kind` 匹配**（见下表）。前端不解析 `custom_id`，只原样提交。
 
@@ -2480,6 +2499,84 @@ Worker 校验当前用户能看见该消息、消息来自 Bot、component 未 d
 - **Bot**：收到 delivery 后处理业务语义（谁该得奖励、状态如何变）；`multi` policy 下可能收到并发 delivery，Bot 自行 dedupe；`disable_components` / `update_message` 用于 Bot 主动更新 UI，非 primary 互斥手段（`exclusive` 已由平台锁死）。
 
 **delivery 顺序不变量（v2.18 delta）：** 同一 `channel_id` 内，Bot 经 `message_interaction` delivery 收到的 interaction，其 `interaction_id` 对应 committed 顺序与频道 `interaction.created` event 顺序一致。Bot 应按 delivery 到达顺序处理；重试 delivery 不改变已应用的业务结果（effect / interaction lifecycle 幂等）。
+
+#### 9.6.1 Interaction delivery 完成（v2.27 delta）
+
+`interaction.submit` committed 后，Chat 写入 `bot_delivery_outbox(kind=message_interaction)` 并向 Bot Gateway 异步 delivery。Bot 回 `delivery_result`（含 `effects`，可为空数组）后，ChatChannel 在同一 `message_interaction` outbox 行上完成 interaction lifecycle：
+
+| 结果 | `interactions.status` | timeline event |
+|---|---|---|
+| `delivery_result` 成功应用（含 `effects: []`） | `completed` | `interaction.completed` |
+| effect 校验/应用失败（如 `BOT_EFFECT_INVALID`） | `failed` | `interaction.failed` |
+| 已 `completed` / `failed`（幂等重放） | 不变 | 不重复 emit |
+
+`interaction.completed` 为 **content-bearing** event：`payload.message` 为完整 Browser-visible Message 投影（与 §6.2 `message.*` event 同形，含当前 `components`），关联被交互的 bot message（`interaction.message_id`）。`payload.command_id` 等于 submit 时的 durable `command_id`（≡ `operation_id`）。
+
+```json
+{
+  "frame_type": "event",
+  "event_id": "01J...",
+  "type": "interaction.completed",
+  "channel_id": "00000000-0000-7000-8000-000000000201",
+  "occurred_at": "2026-06-21T05:30:05Z",
+  "payload": {
+    "command_id": "00000000-0000-7000-8000-000000000a31",
+    "channel_id": "00000000-0000-7000-8000-000000000201",
+    "event_id": "01J...",
+    "message": {
+      "message_id": "00000000-0000-7000-8000-000000000301",
+      "channel_id": "00000000-0000-7000-8000-000000000201",
+      "sender": { "kind": "bot", "bot": { "bot_id": "...", "display_name": "...", "avatar_url": null } },
+      "type": "text",
+      "format": "plain",
+      "status": "normal",
+      "stream_state": "none",
+      "text": "Pick one",
+      "components": [],
+      "mentions": [],
+      "attachments": [],
+      "created_at": "2026-06-21T05:29:00Z",
+      "updated_at": "2026-06-21T05:30:05Z",
+      "edited_at": null,
+      "deleted_at": null,
+      "recalled_at": null
+    }
+  }
+}
+```
+
+`interaction.failed` payload：
+
+```json
+{
+  "frame_type": "event",
+  "event_id": "01J...",
+  "type": "interaction.failed",
+  "channel_id": "00000000-0000-7000-8000-000000000201",
+  "occurred_at": "2026-06-21T05:30:05Z",
+  "payload": {
+    "command_id": "00000000-0000-7000-8000-000000000a31",
+    "error_code": "BOT_EFFECT_INVALID",
+    "error_message": "invalid effect",
+    "retryable": false
+  }
+}
+```
+
+Bot 可在 `delivery_result.effects` 中返回 `send_message` / `update_message` / `disable_components` 表达交互结果；这些 effect 与 `interaction.completed` **同一 delivery 处理路径**内应用，随后 emit `interaction.completed`（message 投影反映 effect 应用后的当前状态）。`exclusive` policy 的 component 锁定仍在 `interaction.submit` 事务内由平台完成（`message.updated`），不等待 bot delivery。
+
+#### 9.6.2 Bot runtime lifecycle storage vs wire projection（v2.27 delta）
+
+以下 payload 为 **Browser projection**（live broadcast + HTTP `GET .../events` replay）。`events.payload_json`（DO storage）**不持久化 UserSummary** 或 component label 文案，只存引用字段；输出时实时 resolve（与 `system.notice` §10.4 规则一致）。
+
+| event type | storage（`payload_json`） | wire 额外字段（输出时 resolve） |
+|---|---|---|
+| `command.invoked` | `invocation`（id/status/created_at）、`command_id`、`actor_user_id`、`command_name`、`invoked_name` | `actor` UserSummary；`command_name` = `invoked_name` 非空时取 alias/canonical 展示名，否则 canonical `command_name` |
+| `interaction.created` | `interaction`（id/status/created_at）、`command_id`、`actor_user_id`、`message_id`、`component_id` | `actor` UserSummary；`component_label` 从 `message_id` 当前 `components_json` 解析 |
+| `interaction.completed` | `command_id`、`message` 消息引用字段（同 `message.*` persisted shape，无 UserSummary） | `message` 完整 Browser 投影（含 components）；replay 按当前 `message.status` 过滤（§10.3） |
+| `interaction.failed` | `command_id`、`error_code`、`error_message`、`retryable` | 同 storage（无 UserSummary 字段） |
+
+实现时切勿把 `display_name` / `avatar_url` / `component_label` 落进 DO storage。
 
 ### 9.7 Bot Gateway WebSocket RPC
 
@@ -3179,6 +3276,7 @@ GET /api/chat/events?cursors=<base64url(JSON {channel_id: after_event_id})>
 - **所有 content-bearing event replay（message.created / message.updated / message.stream_* / interaction.completed / command.completed）都通过当前 message status 过滤** (v2 delta)。deleted/recalled 的消息，其 created/updated/stream_* event 不重放；deleted/recalled event 只返回 tombstone。
 - `message.deleted` 和 `message.recalled` replay 只返回 `message_id`、`channel_id`、`status`、操作时间和操作者摘要，不返回原始 `text`、`attachments`、`components`、`mentions`。
 - event payload 不持久化 UserSummary profile，只存 actor 引用；UserSummary 在输出时实时 resolve (v2 delta)。
+- **`command.invoked` / `interaction.created` replay**（v2.27 delta）：storage 只存 `actor_user_id`（及 `command_name`/`invoked_name` 或 `message_id`+`component_id`）；HTTP replay 与 live broadcast 回填 `actor` UserSummary 与 `command_name` / `component_label`（见 §9.6.2）。
 - 前端收到 `message.deleted` 或 `message.recalled` 后，从本地时间线移除该消息项。
 
 ### 10.4 EventEnvelope
@@ -3196,6 +3294,8 @@ GET /api/chat/events?cursors=<base64url(JSON {channel_id: after_event_id})>
 ```
 
 `message.*` 事件 payload 形状（v4.0 addendum）：`message.created` / `message.updated` / `message.recalled` / `message.deleted` 的 `payload` 为 `{ channel_id, event_id, message }`，其中 `message` 为**完整 Browser-visible Message 投影**（sender UserSummary、type、format、status、stream_state、text、reply_to、reply_snapshot、attachments、components、mentions、created/updated/edited/deleted/recalled 时间戳），与对应 committed ack 的 `payload.message` **同形**——同一 `projectMessageForBrowser` builder 产物（完整 `message.created` event 示例见 §6.2）。`message.recalled` / `message.deleted` 的 event payload 必须用安全投影：`text=null`、`attachments=[]`、`components=[]`、`mentions=[]`，不泄露原文/附件/components/mentions。`events.payload_json`（DO storage）不持久化 UserSummary，只存 sender/actor 引用；`sender` 的 `display_name`/`avatar_url` 在输出时（live broadcast + replay）由 `resolveUserSummaries` 实时回填。
+
+`interaction.completed` 的 `payload.message` 与 `message.*` event **同形**（content-bearing，replay 按当前 message status 过滤，§10.3）。`command.invoked` / `interaction.created` 的 wire payload 含 `actor` 等展示字段，storage 规则见 §9.6.2。
 
 事件类型：
 
