@@ -5,6 +5,7 @@ import {
   buildPlatformPermissionListText,
   computeManageableCommands,
   platformHelpManifestItem,
+  platformPermissionManifestItem,
   resolveManageableCommandName,
 } from "./platform-commands";
 import type { ChannelBindingRow } from "./official-command-manifest";
@@ -29,8 +30,18 @@ function makeItem(name: string, botName: string): CommandManifestItem {
 }
 
 describe("buildPlatformHelpText", () => {
-  it("returns a fallback when no commands are visible", () => {
-    expect(buildPlatformHelpText([platformHelpManifestItem()])).toBe("当前频道没有可用命令。");
+  it("lists built-in platform commands when only help is available", () => {
+    const text = buildPlatformHelpText([platformHelpManifestItem()]);
+    expect(text).toContain("**system**");
+    expect(text).toContain("](/command:help)");
+    expect(text).toContain("查看可用命令");
+  });
+
+  it("includes permission when present in manifest items", () => {
+    const text = buildPlatformHelpText([platformHelpManifestItem(), platformPermissionManifestItem()]);
+    expect(text).toContain("](/command:help)");
+    expect(text).toContain("](/command:permission)");
+    expect(text).toContain("管理频道命令开关");
   });
 
   it("groups visible commands by bot display name", () => {
@@ -41,8 +52,14 @@ describe("buildPlatformHelpText", () => {
     ]);
 
     expect(text).toContain("**工具熊**");
-    expect(text).toContain("/pay — pay description");
-    expect(text).toContain("/balance — balance description");
+    expect(text).toContain("](/command:pay)");
+    expect(text).toContain("pay description");
+    expect(text).toContain("](/command:balance)");
+    expect(text).toContain("balance description");
+  });
+
+  it("returns help text for a named platform command", () => {
+    expect(buildPlatformHelpText([platformHelpManifestItem()], "help")).toBe("查看可用命令");
   });
 });
 
@@ -84,8 +101,8 @@ describe("platform permission helpers", () => {
     ];
     const manageable = computeManageableCommands(bindingRows, []);
     const text = buildPlatformPermissionListText(manageable);
-    expect(text).toContain("/ask");
-    expect(text).toContain("/talk");
+    expect(text).toContain("](/command:ask)");
+    expect(text).toContain("](/command:talk)");
     expect(resolveManageableCommandName(manageable, "talk")?.bot_command_id).toBe("cmd-2");
   });
 });

@@ -14,6 +14,13 @@ export const PLATFORM_BOT_DISPLAY_NAME = "system";
 export const PLATFORM_BOT_AVATAR_URL =
   "https://s3.kuma.homes/chat/avatars/019f134b-4324-7300-9023-b092c06ac4b2.png";
 
+/** Virtual href prefix for slash-command chips in bot markdown (`[text](/command:name)`). */
+export const PLATFORM_COMMAND_CHIP_LINK_PREFIX = "/command:";
+
+export function formatPlatformCommandChipMarkdown(commandName: string): string {
+  return `[\`/${commandName}\`](${PLATFORM_COMMAND_CHIP_LINK_PREFIX}${commandName})`;
+}
+
 export function platformBotSummary(): CommandManifestBotSummary {
   return {
     bot_id: PLATFORM_BOT_ID,
@@ -124,7 +131,9 @@ export function buildPlatformPermissionListText(commands: readonly ManageableCom
   const enabled = commands.filter((command) => command.enabled);
   const disabled = commands.filter((command) => !command.enabled);
   const formatLines = (items: readonly ManageableCommandInfo[]) =>
-    items.length > 0 ? items.map((item) => `- \`/${item.name}\``).join("\n") : "- 无";
+    items.length > 0
+      ? items.map((item) => `- ${formatPlatformCommandChipMarkdown(item.name)}`).join("\n")
+      : "- 无";
 
   return [
     "## 当前频道命令权限",
@@ -139,21 +148,16 @@ export function buildPlatformPermissionListText(commands: readonly ManageableCom
 
 export function buildPlatformPermissionMutationText(commandName: string, enabled: boolean): string {
   const status = enabled ? "开启" : "关闭";
-  return `当前频道已将 \`/${commandName}\` ${status}。`;
+  return `当前频道已将 ${formatPlatformCommandChipMarkdown(commandName)} ${status}。`;
 }
 
 export function buildPlatformHelpText(
   items: readonly CommandManifestItem[],
   commandOption?: string,
 ): string {
-  const visible = items.filter(
-    (item) =>
-      item.bot_command_id !== PLATFORM_HELP_BOT_COMMAND_ID &&
-      item.bot_command_id !== PLATFORM_PERMISSION_BOT_COMMAND_ID,
-  );
   if (commandOption && commandOption.trim().length > 0) {
     const needle = commandOption.trim().toLowerCase();
-    const match = visible.find(
+    const match = items.find(
       (item) =>
         item.name.toLowerCase() === needle ||
         item.aliases.some((alias) => alias.toLowerCase() === needle),
@@ -163,7 +167,7 @@ export function buildPlatformHelpText(
   }
 
   const groups = new Map<string, CommandManifestItem[]>();
-  for (const item of visible) {
+  for (const item of items) {
     const key = item.bot.display_name;
     const list = groups.get(key) ?? [];
     list.push(item);
@@ -174,7 +178,7 @@ export function buildPlatformHelpText(
   for (const [botName, commands] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
     lines.push(`**${botName}**`);
     for (const command of [...commands].sort((a, b) => a.name.localeCompare(b.name))) {
-      lines.push(`/${command.name} — ${command.description}`);
+      lines.push(`${formatPlatformCommandChipMarkdown(command.name)} — ${command.description}`);
     }
     lines.push("");
   }
