@@ -9,7 +9,7 @@ import {
 } from "../../shared/sql-migrations";
 import { applyArchiveOutboxMigration } from "../../../archive/apply-archive-migration";
 
-export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026070102;
+export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026070103;
 
 export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS channel_meta (
@@ -146,6 +146,7 @@ export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
     effects_request_hash TEXT NOT NULL,
     effect_results_json TEXT NOT NULL,
     applied_at TEXT NOT NULL,
+    finalize_completed_at TEXT,
     PRIMARY KEY (session_id, effect_seq)
   )`,
   `CREATE TABLE IF NOT EXISTS interactions (
@@ -591,7 +592,7 @@ export const chatChannelMigrations: SqlMigration[] = [
     },
   },
   {
-    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    version: 2026070102,
     name: "attachments owner_bot_id and channel_id for bot uploads",
     up(ctx) {
       if (!tableExists(ctx, "attachments")) return;
@@ -626,6 +627,20 @@ export const chatChannelMigrations: SqlMigration[] = [
         ctx.storage.sql.exec("ALTER TABLE attachments_bot_scope RENAME TO attachments");
       } else if (!columnExists(ctx, "attachments", "channel_id")) {
         ctx.storage.sql.exec("ALTER TABLE attachments ADD COLUMN channel_id TEXT");
+      }
+    },
+  },
+  {
+    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    name: "stateful_session_effects_applied finalize_completed_at",
+    up(ctx) {
+      if (
+        tableExists(ctx, "stateful_session_effects_applied") &&
+        !columnExists(ctx, "stateful_session_effects_applied", "finalize_completed_at")
+      ) {
+        ctx.storage.sql.exec(
+          "ALTER TABLE stateful_session_effects_applied ADD COLUMN finalize_completed_at TEXT",
+        );
       }
     },
   },

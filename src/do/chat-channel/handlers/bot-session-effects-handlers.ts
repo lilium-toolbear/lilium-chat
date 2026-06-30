@@ -6,6 +6,7 @@ import { ApiError } from "../../../errors";
 import {
   applyValidatedEffects,
   finalizeAppliedEffects,
+  rebuildFinalizePayloadFromEffectResults,
   statefulSessionEffectOutboxId,
 } from "./apply-bot-effects";
 import type { Constructor } from "../mixin";
@@ -20,16 +21,18 @@ function loadStoredSessionEffectAck(
   sql: DurableObjectStorage["sql"],
   sessionId: string,
   effectSeq: number,
-): { effects_request_hash: string; effect_results_json: string } | undefined {
+): { effects_request_hash: string; effect_results_json: string; finalize_completed_at: string | null } | undefined {
   return sql
     .exec(
-      `SELECT effects_request_hash, effect_results_json
+      `SELECT effects_request_hash, effect_results_json, finalize_completed_at
        FROM stateful_session_effects_applied
        WHERE session_id=? AND effect_seq=?`,
       sessionId,
       effectSeq,
     )
-    .toArray()[0] as { effects_request_hash: string; effect_results_json: string } | undefined;
+    .toArray()[0] as
+    | { effects_request_hash: string; effect_results_json: string; finalize_completed_at: string | null }
+    | undefined;
 }
 
 function parseStoredEffectResults(raw: string): EffectResult[] | null {
@@ -39,6 +42,59 @@ function parseStoredEffectResults(raw: string): EffectResult[] | null {
   } catch {
     return null;
   }
+}
+
+function markSessionEffectFinalizeCompleted(
+  sql: DurableObjectStorage["sql"],
+  sessionId: string,
+  effectSeq: number,
+  completedAt: string,
+): void {
+  sql.exec(
+    "UPDATE stateful_session_effects_applied SET finalize_completed_at=? WHERE session_id=? AND effect_seq=?",
+    completedAt,
+    sessionId,
+    effectSeq,
+  );
+}
+
+async function ensureStoredSessionEffectFinalizeCompleted(
+  channel: ReturnType<typeof asHandlerRef>,
+  env: Env,
+  input: {
+    sessionId: string;
+    effectSeq: number;
+    channelId: string;
+    effectResults: EffectResult[];
+    finalizeCompletedAt: string | null;
+  },
+): Promise<void> {
+  if (input.finalizeCompletedAt) return;
+
+  const finalizePayload = rebuildFinalizePayloadFromEffectResults(
+    channel,
+    input.channelId,
+    input.effectResults,
+  );
+  const now = channel.nowIso();
+  await finalizeAppliedEffects(
+    channel,
+    env,
+    {
+      status: "applied",
+      effect_results: input.effectResults,
+      ...finalizePayload,
+    },
+    now,
+  );
+  channel.ctx.storage.transactionSync(() => {
+    markSessionEffectFinalizeCompleted(
+      channel.ctx.storage.sql,
+      input.sessionId,
+      input.effectSeq,
+      now,
+    );
+  });
 }
 
 export function BotSessionEffectsMixin<T extends Constructor<ChatChannelCore>>(Base: T) {
@@ -121,6 +177,13 @@ export function BotSessionEffectsMixin<T extends Constructor<ChatChannelCore>>(B
         if (!effectResults) {
           return sessionEffectsRejected("BOT_EFFECT_INVALID", "stored effect ack invalid");
         }
+        await ensureStoredSessionEffectFinalizeCompleted(asHandlerRef(this), this.env, {
+          sessionId: body.session_id,
+          effectSeq: body.effect_seq,
+          channelId: sessionRow.channel_id,
+          effectResults,
+          finalizeCompletedAt: stored.finalize_completed_at,
+        });
         return { status: "applied", effect_results: effectResults };
       }
 
@@ -140,6 +203,8 @@ export function BotSessionEffectsMixin<T extends Constructor<ChatChannelCore>>(B
       }
 
       const now = this.nowIso();
+      await finalizeAppliedEffects(asHandlerRef(this), this.env, applyResult, now);
+
       this.ctx.storage.transactionSync(() => {
         this.ctx.storage.sql.exec(
           "UPDATE stateful_command_sessions SET effect_last_acked_seq=? WHERE session_id=? AND effect_last_acked_seq=?",
@@ -149,17 +214,17 @@ export function BotSessionEffectsMixin<T extends Constructor<ChatChannelCore>>(B
         );
         this.ctx.storage.sql.exec(
           `INSERT INTO stateful_session_effects_applied (
-             session_id, effect_seq, effects_request_hash, effect_results_json, applied_at
-           ) VALUES (?, ?, ?, ?, ?)`,
+             session_id, effect_seq, effects_request_hash, effect_results_json, applied_at, finalize_completed_at
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
           body.session_id,
           body.effect_seq,
           effectsRequestHash,
           JSON.stringify(applyResult.effect_results),
           now,
+          now,
         );
       });
 
-      await finalizeAppliedEffects(asHandlerRef(this), this.env, applyResult, now);
       return { status: "applied", effect_results: applyResult.effect_results };
     }
   };

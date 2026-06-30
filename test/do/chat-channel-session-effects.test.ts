@@ -78,7 +78,17 @@ async function seedActiveSession(input: {
   sessionId: string;
   effectLastAckedSeq?: number;
   status?: string;
+  listenRules?: {
+    message_types: string[];
+    include_bot_messages: boolean;
+    include_own_messages: boolean;
+  };
 }): Promise<void> {
+  const listenRules = input.listenRules ?? {
+    message_types: ["text"],
+    include_bot_messages: false,
+    include_own_messages: true,
+  };
   await withDoState(input.stub, (ctx) => {
     ctx.storage.sql.exec(
       `INSERT INTO stateful_command_sessions (
@@ -93,7 +103,7 @@ async function seedActiveSession(input: {
       "inv-1",
       "user-1",
       input.status ?? "active",
-      JSON.stringify({ message_types: ["text"], include_bot_messages: false, include_own_messages: true }),
+      JSON.stringify(listenRules),
       input.effectLastAckedSeq ?? 0,
       "2026-06-30T00:00:00.000Z",
       "2026-07-01T00:00:00.000Z",
@@ -166,6 +176,69 @@ describe("ChatChannel botSessionEffects RPC", () => {
         .exec("SELECT COUNT(*) AS c FROM messages WHERE channel_id=? AND text=?", channelId, "once")
         .toArray()[0] as { c: number };
       expect(Number(count.c)).toBe(1);
+    });
+  });
+
+  it("replays finalize side effects when ack persisted before finalize completed", async () => {
+    const botId = `bot-session-finalize-replay-${crypto.randomUUID()}`;
+    await seedBot(botId);
+    const channelId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const stub = await createTestChannel(env, { channelId, ownerId: "owner-1" });
+    await seedActiveSession({
+      stub,
+      channelId,
+      botId,
+      sessionId,
+      listenRules: {
+        message_types: ["text"],
+        include_bot_messages: true,
+        include_own_messages: true,
+      },
+    });
+
+    const effect = sendMessageEffect("eff-finalize-replay", "finalize replay text");
+    const first = await stub.botSessionEffects({
+      session_id: sessionId,
+      bot_id: botId,
+      effect_seq: 1,
+      effects: [effect],
+    });
+    expect(first.status).toBe("applied");
+
+    await withDoState(stub, (ctx) => {
+      ctx.storage.sql.exec("DELETE FROM stateful_session_inputs WHERE session_id=?", sessionId);
+      ctx.storage.sql.exec(
+        "UPDATE stateful_session_effects_applied SET finalize_completed_at=NULL WHERE session_id=? AND effect_seq=1",
+        sessionId,
+      );
+      const inputCount = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM stateful_session_inputs WHERE session_id=?", sessionId)
+        .toArray()[0] as { c: number };
+      expect(Number(inputCount.c)).toBe(0);
+    });
+
+    const replay = await stub.botSessionEffects({
+      session_id: sessionId,
+      bot_id: botId,
+      effect_seq: 1,
+      effects: [effect],
+    });
+    expect(replay.status).toBe("applied");
+
+    await withDoState(stub, (ctx) => {
+      const inputCount = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM stateful_session_inputs WHERE session_id=?", sessionId)
+        .toArray()[0] as { c: number };
+      expect(Number(inputCount.c)).toBe(1);
+
+      const finalized = ctx.storage.sql
+        .exec(
+          "SELECT finalize_completed_at FROM stateful_session_effects_applied WHERE session_id=? AND effect_seq=1",
+          sessionId,
+        )
+        .toArray()[0] as { finalize_completed_at: string | null };
+      expect(finalized.finalize_completed_at).toBeTruthy();
     });
   });
 

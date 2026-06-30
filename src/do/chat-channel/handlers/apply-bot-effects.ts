@@ -867,6 +867,64 @@ export async function finalizeAppliedEffects(
   }
 }
 
+function toMessageRow(row: BotEffectMessageContextRow): MessageRow {
+  const { components_json: _componentsJson, ...messageRow } = row;
+  return messageRow;
+}
+
+export function rebuildFinalizePayloadFromEffectResults(
+  channel: ChatChannelHandlerRef,
+  channelId: string,
+  effectResults: EffectResult[],
+): Pick<
+  Extract<ApplyValidatedEffectsResult, { status: "applied" }>,
+  "messageCreatedEnqueues" | "streamStartedEmits" | "scheduleOutbox"
+> {
+  const messageCreatedEnqueues: MessageCreatedStatefulInput[] = [];
+  const streamStartedEmits: StreamStartedEmit[] = [];
+
+  for (const result of effectResults) {
+    if (result.type === "send_message") {
+      if (!result.message_id || !result.event_id) continue;
+      const ctxRow = loadMessageRow(channel, channelId, result.message_id);
+      if (!ctxRow) continue;
+      const components = parseStoredComponents(ctxRow.components_json);
+      const attachments =
+        ctxRow.type === "image"
+          ? loadMessageAttachmentProjections(channel.ctx.storage.sql, result.message_id)
+          : [];
+      const messageRow = toMessageRow(ctxRow);
+      messageCreatedEnqueues.push({
+        channelId,
+        messageId: result.message_id,
+        eventId: result.event_id,
+        occurredAt: ctxRow.created_at,
+        messageRow,
+        messageProjection: projectMessageForBrowser(messageRow, { components, attachments }),
+      });
+      continue;
+    }
+
+    if (result.type === "start_stream") {
+      const ctxRow = loadMessageRow(channel, channelId, result.message_id);
+      if (!ctxRow) continue;
+      streamStartedEmits.push({
+        channelId,
+        messageRow: toMessageRow(ctxRow),
+        components: parseStoredComponents(ctxRow.components_json),
+        occurredAt: ctxRow.created_at,
+      });
+    }
+  }
+
+  const scheduleOutbox =
+    streamStartedEmits.length > 0 ||
+    messageCreatedEnqueues.length > 0 ||
+    effectResults.some((result) => result.type !== "start_stream");
+
+  return { messageCreatedEnqueues, streamStartedEmits, scheduleOutbox };
+}
+
 export function resolveInteractionDeliveryContext(
   channel: ChatChannelHandlerRef,
   outboxId: string,
