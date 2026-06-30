@@ -1,6 +1,9 @@
 import type { Context } from "hono";
 import type { Env } from "../env";
+import { botStreamDoName } from "../do/bot-stream-connection";
 import { ApiError } from "../errors";
+
+const BOT_STREAM_CONNECT_SCOPES = ["chat:runtime:connect", "chat:messages:write"] as const;
 
 // Phase 7 Bot Gateway WS RPC. Bot auth path is separate from Browser JWT:
 // bot API uses `Authorization: Bearer <bot_token>`; the Worker hashes the
@@ -16,6 +19,20 @@ export function botRegistryStub(env: Env): DurableObjectStub {
 /** BotConnection DO stub (by bot_id). */
 export function botConnectionStub(env: Env, botId: string): DurableObjectStub {
   return env.BOT_CONNECTION.get(env.BOT_CONNECTION.idFromName(botId));
+}
+
+/** BotStreamConnection DO stub (by channel_id#message_id). */
+export function botStreamConnectionStub(env: Env, channelId: string, messageId: string): DurableObjectStub {
+  return env.BOT_STREAM_CONNECTION.get(env.BOT_STREAM_CONNECTION.idFromName(botStreamDoName(channelId, messageId)));
+}
+
+/** Require scopes for Stream WS connect (§9.15.1). */
+export function verifyBotStreamConnectScopes(scopes: string[]): void {
+  for (const scope of BOT_STREAM_CONNECT_SCOPES) {
+    if (!scopes.includes(scope)) {
+      throw new ApiError("BOT_SCOPE_DENIED", `Missing scope: ${scope}`);
+    }
+  }
 }
 
 /** SHA-256 hex digest of the bot token plaintext. Stored as `bot_tokens.token_hash`. */

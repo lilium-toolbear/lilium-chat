@@ -131,7 +131,8 @@ export class BotStreamConnection extends DurableObject<Env> {
       return new Response("missing X-Channel-Id or X-Message-Id", { status: 400 });
     }
 
-    const row = this.loadStreamState(channelId, messageId);
+    const expiresAtHeader = request.headers.get("X-Stream-Expires-At") ?? "";
+    const row = this.ensureStreamState(channelId, messageId, botId, expiresAtHeader);
     if (!row) return new Response("stream not found", { status: 404 });
     if (row.bot_id !== botId) return new Response("forbidden", { status: 403 });
     if (row.status !== "streaming") {
@@ -187,6 +188,33 @@ export class BotStreamConnection extends DurableObject<Env> {
     } catch {
       // socket may already be closed
     }
+  }
+
+  private ensureStreamState(
+    channelId: string,
+    messageId: string,
+    botId: string,
+    expiresAt: string,
+  ): StreamStateRow | null {
+    const existing = this.loadStreamState(channelId, messageId);
+    if (existing) return existing;
+    if (!expiresAt) return null;
+
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO stream_state (
+        channel_id, message_id, bot_id, status, ack_seq, flushed_text,
+        pending_bytes, expires_at, created_at, updated_at
+      ) VALUES (?, ?, ?, 'streaming', 0, '', 0, ?, ?, ?)
+      ON CONFLICT(channel_id, message_id) DO NOTHING`,
+      channelId,
+      messageId,
+      botId,
+      expiresAt,
+      now,
+      now,
+    );
+    return this.loadStreamState(channelId, messageId);
   }
 
   private loadStreamState(channelId: string, messageId: string): StreamStateRow | null {
