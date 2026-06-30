@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { BOT_GATEWAY_API_VERSION } from "../../src/chat/bot-gateway-protocol";
 import { buildBotStreamHello, parseBotStreamReady } from "../../src/chat/bot-stream-protocol";
 import { BOT_STREAM_API_VERSION } from "../../src/contract/bot-stream";
 import { hashBotToken } from "../../src/auth/bot";
-import { createTestChannel, getNamedDo } from "../helpers";
+import { createTestChannel, drainPoolWorkerTeardown, getNamedDo } from "../helpers";
 import { liveStartAndAck, upgradeUserConnection } from "../ws-helpers";
 
 const SELF = (await import("../../src/index")).default as {
@@ -73,6 +73,10 @@ async function cleanupBot(botId: string): Promise<void> {
 
 afterEach(async () => {
   for (const botId of [...seededBotIds]) await cleanupBot(botId);
+});
+
+afterAll(async () => {
+  await drainPoolWorkerTeardown();
 });
 
 function botConnectionStub(botId: string): DurableObjectStub {

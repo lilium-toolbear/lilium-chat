@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { BOT_GATEWAY_API_VERSION } from "../../src/chat/bot-gateway-protocol";
 import {
@@ -13,7 +13,7 @@ import { BOT_STREAM_API_VERSION } from "../../src/contract/bot-stream";
 import { computeAbandonedTextHash, computeFinalizeRequestHash } from "../../src/chat/stream-registry";
 import { hashBotToken } from "../../src/auth/bot";
 import { botStreamDoName } from "../../src/do/bot-stream-connection";
-import { createTestChannel, getNamedDo } from "../helpers";
+import { createTestChannel, drainPoolWorkerTeardown, getNamedDo } from "../helpers";
 import { liveStartAndAck, upgradeUserConnection } from "../ws-helpers";
 
 const REGISTRY = () =>
@@ -76,6 +76,10 @@ afterEach(async () => {
     });
   }
   seededBotIds.clear();
+});
+
+afterAll(async () => {
+  await drainPoolWorkerTeardown();
 });
 
 function botConnectionStub(botId: string): DurableObjectStub {
