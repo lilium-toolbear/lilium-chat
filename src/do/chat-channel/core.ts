@@ -14,7 +14,7 @@ import type {
   ManagementPersistedPayload,
   ManagementPersistedPayloadByType,
 } from "../../contract/persisted";
-import { buildReplayEventsPage, type ReplayEnvelope } from "../../chat/replay-projection";
+import { buildReplayEventsPage, type ReplayEnvelope, type ReplayEventsPage } from "../../chat/replay-projection";
 import { buildTimelineHistoryPage, type TimelineHistoryPage } from "../../chat/timeline-history";
 import type { ChatEventPayloadByType } from "../../contract/events";
 import type {
@@ -165,11 +165,27 @@ export class ChatChannelCore extends DurableObject<Env> {
   }
 
   async replayEvents(userId: string, after: string): Promise<{ events: ReplayEnvelope[] }> {
+    const page = await buildReplayEventsPage({
+      sql: this.ctx.storage.sql,
+      env: this.env,
+      userId,
+      after,
+    });
+    return {
+      events: page.events.map((frame) => ({
+        event_id: frame.event_id,
+        event_json: JSON.stringify(frame),
+      })),
+    };
+  }
+
+  async replayEventsPage(userId: string, after: string, limit: number): Promise<ReplayEventsPage> {
     return buildReplayEventsPage({
       sql: this.ctx.storage.sql,
       env: this.env,
       userId,
       after,
+      limit,
     });
   }
 

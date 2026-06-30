@@ -53,6 +53,19 @@ export interface ReplayEnvelope {
   event_json: string;
 }
 
+export interface ReplayEventsPage {
+  events: EventFrame[];
+  latest_event_id: string | null;
+  next_cursor: string | null;
+}
+
+function resolveChannelLatestEventId(sql: SyncSql, channelId: string): string | null {
+  const row = sql
+    .exec("SELECT event_id FROM events WHERE channel_id=? ORDER BY event_id DESC LIMIT 1", channelId)
+    .toArray()[0] as { event_id: string } | undefined;
+  return row?.event_id ?? null;
+}
+
 export function parseReplayRows(rows: ReplaySqlEventRow[]): ReplayEventRow[] {
   return rows.map((row) => ({
     event_id: typeof row.event_id === "string" ? row.event_id : String(row.event_id ?? ""),
@@ -331,12 +344,15 @@ export async function buildReplayEventsPage(opts: {
   env: Env;
   userId: string;
   after: string;
-}): Promise<{ events: ReplayEnvelope[] }> {
+  limit?: number;
+}): Promise<ReplayEventsPage> {
   const { sql, env, userId, after } = opts;
   const meta = sql.exec("SELECT channel_id, visibility FROM channel_meta LIMIT 1").toArray()[0] as
     | { channel_id: string; visibility: string }
     | undefined;
-  if (meta === undefined) return { events: [] };
+  if (meta === undefined) {
+    return { events: [], latest_event_id: null, next_cursor: null };
+  }
 
   const member = userId
     ? (sql.exec(
@@ -349,14 +365,29 @@ export async function buildReplayEventsPage(opts: {
     throw new ApiError("FORBIDDEN", "not a member");
   }
 
-  const rows = sql
-    .exec(
-      "SELECT event_id, event_type, payload_json, occurred_at FROM events WHERE channel_id=? AND event_id > ? ORDER BY event_id",
-      meta.channel_id,
-      after,
-    )
-    .toArray() as unknown as ReplaySqlEventRow[];
-  const parsedRows = parseReplayRows(rows);
+  const pageLimit = opts.limit !== undefined ? Math.max(1, Math.min(100, Math.floor(opts.limit))) : null;
+  const queryLimit = pageLimit !== null ? pageLimit + 1 : null;
+
+  const rows = queryLimit !== null
+    ? (sql
+        .exec(
+          "SELECT event_id, event_type, payload_json, occurred_at FROM events WHERE channel_id=? AND event_id > ? ORDER BY event_id LIMIT ?",
+          meta.channel_id,
+          after,
+          queryLimit,
+        )
+        .toArray() as unknown as ReplaySqlEventRow[])
+    : (sql
+        .exec(
+          "SELECT event_id, event_type, payload_json, occurred_at FROM events WHERE channel_id=? AND event_id > ? ORDER BY event_id",
+          meta.channel_id,
+          after,
+        )
+        .toArray() as unknown as ReplaySqlEventRow[]);
+
+  const hasMore = pageLimit !== null && rows.length > pageLimit;
+  const slice = hasMore ? rows.slice(0, pageLimit) : rows;
+  const parsedRows = parseReplayRows(slice);
   const rawMap = await resolveUserSummaries(Array.from(new Set(collectReplayUserIds(sql, parsedRows))), env);
   const { liveMap, liveSenderMap } = buildLiveUserMaps(rawMap);
   const frames = projectParsedEventRows({
@@ -367,10 +398,9 @@ export async function buildReplayEventsPage(opts: {
     liveSenderMap,
   });
 
-  const out: ReplayEnvelope[] = frames.map((frame) => ({
-    event_id: frame.event_id,
-    event_json: JSON.stringify(frame),
-  }));
+  const latest_event_id =
+    frames.length > 0 ? frames[frames.length - 1]!.event_id : resolveChannelLatestEventId(sql, meta.channel_id);
+  const next_cursor = hasMore && slice.length > 0 ? String(slice[slice.length - 1]!.event_id ?? "") : null;
 
-  return { events: out };
+  return { events: frames, latest_event_id, next_cursor };
 }
