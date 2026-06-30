@@ -1,4 +1,12 @@
 import { buildEventFrame, type UserSummary as LiveUserSummary } from "./event-broadcast";
+import { parseStoredComponents } from "./bot-effects";
+import {
+  type CommandInvokedPersistedPayload,
+  type InteractionCreatedPersistedPayload,
+  projectCommandInvokedWirePayload,
+  projectInteractionCreatedWirePayload,
+  resolveComponentLabelFromJson,
+} from "./bot-lifecycle-events";
 import { projectMessageForBrowser, type MessageStickerSnapshot } from "./message-projection";
 import { buildReplyTargetStatusLookup } from "./reply-snapshot";
 import { projectAttachmentForBrowser, type AttachmentRow as ChatAttachmentRow } from "./attachment-projection";
@@ -6,6 +14,7 @@ import { resolveActorWithMap } from "./channel-events";
 import type { Env } from "../env";
 import {
   isChatEventType,
+  REPLAY_BOT_LIFECYCLE_EVENT_TYPES,
   REPLAY_MANAGEMENT_EVENT_TYPES,
   REPLAY_MESSAGE_EVENT_TYPES,
   type ChatEventPayloadByType,
@@ -76,10 +85,14 @@ function projectReplayMessagePayload(
   }
   const messageRow = sql
     .exec(
-      "SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id, type, format, status, text, reply_to, reply_snapshot_json, stream_state, created_at, updated_at, edited_at, deleted_at, deleted_by, recalled_at, invocation_json FROM messages WHERE message_id=?",
+      `SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id,
+              sender_bot_display_name, sender_bot_avatar_url, type, format, status, text,
+              reply_to, reply_snapshot_json, components_json, stream_state, created_at, updated_at,
+              edited_at, deleted_at, deleted_by, recalled_at, invocation_json
+       FROM messages WHERE message_id=?`,
       messageId,
     )
-    .toArray()[0] as MessageRow | undefined;
+    .toArray()[0] as (MessageRow & { components_json?: string | null }) | undefined;
   if (!messageRow) {
     return persistedPayload;
   }
@@ -120,14 +133,59 @@ function projectReplayMessagePayload(
       mentions: replayMentions,
       attachments: replayAttachments,
       sticker: replayStickerRow ?? null,
+      components: parseStoredComponents(messageRow.components_json ?? "[]"),
       replyTargetStatus,
     }),
   };
 }
 
+function projectReplayBotLifecyclePayload(
+  sql: SyncSql,
+  eventType: string,
+  persistedPayload: unknown,
+  liveMap: Map<string, LiveUserSummary>,
+): ChatEventPayloadByType[ChatEventType] | unknown {
+  if (eventType === "command.invoked") {
+    const persisted = persistedPayload as CommandInvokedPersistedPayload;
+    const actorUserId = persisted.actor_user_id;
+    const actor = actorUserId
+      ? liveMap.get(actorUserId) ?? {
+          user_id: actorUserId,
+          display_name: actorUserId,
+          avatar_url: null,
+        }
+      : undefined;
+    if (!actor) return persistedPayload;
+    return projectCommandInvokedWirePayload(persisted, actor);
+  }
+
+  if (eventType === "interaction.created") {
+    const persisted = persistedPayload as InteractionCreatedPersistedPayload;
+    const actorUserId = persisted.actor_user_id;
+    const actor = actorUserId
+      ? liveMap.get(actorUserId) ?? {
+          user_id: actorUserId,
+          display_name: actorUserId,
+          avatar_url: null,
+        }
+      : undefined;
+    if (!actor) return persistedPayload;
+    const messageRow = sql
+      .exec("SELECT components_json FROM messages WHERE message_id=?", persisted.message_id)
+      .toArray()[0] as { components_json: string | null } | undefined;
+    const componentLabel = messageRow
+      ? resolveComponentLabelFromJson(messageRow.components_json ?? "[]", persisted.component_id)
+      : null;
+    return projectInteractionCreatedWirePayload(persisted, actor, componentLabel);
+  }
+
+  return persistedPayload;
+}
+
 export function collectReplayUserIds(sql: SyncSql, parsedRows: ReplayEventRow[]): string[] {
   const messageReplayTypes = REPLAY_MESSAGE_EVENT_TYPES;
   const managementTypes = REPLAY_MANAGEMENT_EVENT_TYPES;
+  const botLifecycleTypes = REPLAY_BOT_LIFECYCLE_EVENT_TYPES;
   const userIdsToResolve: string[] = [];
 
   for (const r of parsedRows) {
@@ -137,6 +195,17 @@ export function collectReplayUserIds(sql: SyncSql, parsedRows: ReplayEventRow[])
         const messageId = p.message?.message_id;
         if (messageId) {
           userIdsToResolve.push(...extractMessageSenderUserId(sql, messageId));
+        }
+      } catch {
+        // ignore malformed payload
+      }
+      continue;
+    }
+    if (botLifecycleTypes.has(r.event_type)) {
+      try {
+        const p = JSON.parse(r.payload_json) as { actor_user_id?: string };
+        if (typeof p.actor_user_id === "string" && p.actor_user_id) {
+          userIdsToResolve.push(p.actor_user_id);
         }
       } catch {
         // ignore malformed payload
@@ -176,6 +245,7 @@ export function projectParsedEventRows(opts: {
   const { sql, channelId, parsedRows, liveMap, liveSenderMap, allowedEventTypes } = opts;
   const messageReplayTypes = REPLAY_MESSAGE_EVENT_TYPES;
   const managementTypes = REPLAY_MANAGEMENT_EVENT_TYPES;
+  const botLifecycleTypes = REPLAY_BOT_LIFECYCLE_EVENT_TYPES;
   const out: EventFrame[] = [];
 
   for (const r of parsedRows) {
@@ -198,10 +268,24 @@ export function projectParsedEventRows(opts: {
         if (projected === null) {
           continue;
         }
-        wirePayload = projected;
+        if (
+          (r.event_type === "interaction.completed" || r.event_type === "command.completed") &&
+          typeof persistedPayload === "object" &&
+          persistedPayload !== null &&
+          "command_id" in persistedPayload
+        ) {
+          wirePayload = {
+            ...(projected as Record<string, unknown>),
+            command_id: (persistedPayload as { command_id?: string }).command_id,
+          };
+        } else {
+          wirePayload = projected;
+        }
       } catch {
         continue;
       }
+    } else if (botLifecycleTypes.has(r.event_type)) {
+      wirePayload = projectReplayBotLifecyclePayload(sql, r.event_type, persistedPayload, liveMap);
     } else if (managementTypes.has(r.event_type) && r.event_type !== "read_state.updated") {
       wirePayload = resolveActorWithMap(persistedPayload as ManagementPersistedPayload, liveMap);
     }

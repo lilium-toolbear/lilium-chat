@@ -24,8 +24,8 @@ export type WireMessageSender = MessageSender | UnresolvedBotSender | { kind: st
 
 export type MessageType = "text" | "image" | "sticker" | "system";
 export type MessageFormat = "plain" | "markdown";
-export type MessageLifecycleStatus = "normal" | "edited" | "deleted" | "recalled";
-export type MessageStreamState = "none" | "streaming" | "final";
+export type MessageLifecycleStatus = "normal" | "edited" | "deleted" | "recalled" | "failed";
+export type MessageStreamState = "none" | "streaming" | "final" | "abandoned";
 
 export interface ReplySnapshotMediaPreview {
   kind: "image" | "sticker";

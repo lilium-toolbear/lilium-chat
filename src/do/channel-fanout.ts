@@ -199,6 +199,45 @@ export class ChannelFanout extends DurableObject<Env> {
       return Response.json({ ok: true, delivered_to: sessions.length });
     }
 
+    if (url.pathname === "/internal/deliver-stream-frame") {
+      if (request.method !== "POST") {
+        return new Response("method not allowed", { status: 405 });
+      }
+      const body = (await request.json()) as {
+        channel_id?: string;
+        frame?: unknown;
+      };
+      if (typeof body.channel_id !== "string" || body.channel_id.length === 0) {
+        return new Response("missing channel_id", { status: 400 });
+      }
+      if (body.frame === undefined || body.frame === null) {
+        return new Response("missing frame", { status: 400 });
+      }
+      const frameJson = JSON.stringify(body.frame);
+      const ts = nowIso();
+      this.pruneExpiredLeases(body.channel_id, ts);
+
+      const sessions = this.ctx.storage.sql
+        .exec(
+          "SELECT user_id, session_id, lease_id FROM fanout_leases WHERE channel_id=? AND expires_at > ?",
+          body.channel_id,
+          ts,
+        )
+        .toArray() as unknown as FanoutLeaseTarget[];
+
+      let deliveredCount = 0;
+      for (const s of sessions) {
+        try {
+          const result = await this.deliverStreamFrameToLease(body.channel_id, s, frameJson);
+          if (result.delivered) deliveredCount += 1;
+        } catch {
+          // best-effort live-only delivery
+        }
+      }
+
+      return Response.json({ ok: true, delivered_to: deliveredCount, lease_count: sessions.length });
+    }
+
     if (url.pathname === "/dump") {
       const gate = requireTestOnly(request, this.env);
       if (gate) return gate;
@@ -396,6 +435,46 @@ export class ChannelFanout extends DurableObject<Env> {
       reason,
     });
     return { delivered: false, stale: true };
+  }
+
+  private async deliverStreamFrameToLease(
+    channelId: string,
+    targetLease: FanoutLeaseTarget,
+    frameJson: string,
+  ): Promise<{ delivered: boolean }> {
+    const target = this.env.USER_CONNECTION.getByName(targetLease.user_id);
+    const res = await target.fetch(new Request("https://x/deliver-stream-frame", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Channel-Id": channelId,
+      },
+      body: JSON.stringify({
+        lease_id: targetLease.lease_id,
+        channel_id: channelId,
+        session_id: targetLease.session_id,
+        frame_json: frameJson,
+      }),
+    }));
+    if (!res.ok) return { delivered: false };
+
+    const body = (await res.json()) as DeliverResponse;
+    if (body.delivered) return { delivered: true };
+
+    const reason = body.reason ?? "unknown";
+    if (STALE_LEASE_REASONS.has(reason)) {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM fanout_leases WHERE channel_id=? AND lease_id=?",
+        channelId,
+        targetLease.lease_id,
+      );
+      console.log("fanout_lease_deleted", {
+        channel_id: channelId,
+        lease_id: targetLease.lease_id,
+        reason,
+      });
+    }
+    return { delivered: false };
   }
 
   private enqueueFanoutRetry(

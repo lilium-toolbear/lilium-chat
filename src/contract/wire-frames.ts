@@ -1,6 +1,7 @@
 import type { ChatEventPayloadByType, ChatEventType } from "./events";
 import type { ManagementPersistedEventType } from "./persisted";
 import type { ChatId, IsoDateTimeString } from "./primitives";
+import type { LiveStreamEventType, WireStreamEventFrame } from "./bot-stream";
 
 /** WebSocket / fanout event frame (includes api_version). */
 export type WireChatEventFrame<T extends ChatEventType = ChatEventType> = {
@@ -48,3 +49,23 @@ export function buildWireEventFrame<T extends ChatEventType>(args: {
     payload: args.payload,
   };
 }
+
+export function buildWireStreamEventFrame<T extends LiveStreamEventType>(args: {
+  type: T;
+  channel_id: string;
+  payload: WireStreamEventFrame<T>["payload"];
+  stream_seq?: number;
+  occurred_at?: string;
+}): WireStreamEventFrame<T> {
+  return {
+    frame_type: "stream_event",
+    api_version: "lilium.chat.stream.v1",
+    channel_id: args.channel_id,
+    type: args.type,
+    payload: args.payload,
+    ...(args.stream_seq !== undefined ? { stream_seq: args.stream_seq } : {}),
+    ...(args.occurred_at !== undefined ? { occurred_at: args.occurred_at } : {}),
+  };
+}
+
+export type { WireStreamEventFrame, StreamEventFrame } from "./bot-stream";

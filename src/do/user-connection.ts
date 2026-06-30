@@ -5,6 +5,7 @@ import { migrateUserConnectionSchema } from "./migrations/user-connection";
 import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame, type UserEventFrame } from "../ws/frames";
 import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditCommand, parseMessageRecallCommand, parseMessageSendCommand } from "../chat/command";
 import { parseCommandInvokeCommand } from "../chat/command-invoke";
+import { parseInteractionSubmitCommand } from "../chat/interaction-submit";
 import type { MessageMutationAckPayload, MessageMutationInternalRequest } from "../contract/idempotency";
 import { requireTestOnly } from "./do-errors";
 
@@ -173,6 +174,18 @@ export class UserConnection extends DurableObject<Env> {
         membership_version_at_event?: number;
       };
       const result = await this.handleDeliver(body);
+      return Response.json(result);
+    }
+
+    if (url.pathname === "/deliver-stream-frame") {
+      if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+      const body = (await request.json()) as {
+        lease_id?: string;
+        channel_id?: string;
+        session_id?: string;
+        frame_json?: string;
+      };
+      const result = await this.handleDeliverStreamFrame(body);
       return Response.json(result);
     }
 
@@ -406,7 +419,10 @@ export class UserConnection extends DurableObject<Env> {
 
     if (frame.command === "interaction.submit") {
       const channelId = frame.channel_id ?? "";
-      if (!channelId) { sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "missing channel_id")); return; }
+      if (!channelId) {
+        sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "missing channel_id"));
+        return;
+      }
       const chStub = this.env.CHAT_CHANNEL.getByName(channelId);
       const summaryRes = await chStub.fetch(new Request("https://x/internal/summary", {
         headers: { "X-Verified-User-Id": attachment.user_id },
@@ -418,7 +434,50 @@ export class UserConnection extends DurableObject<Env> {
           return;
         }
       }
-      sendCommandError(ws, frame.command_id, responseError("INVALID_MESSAGE", "unsupported command"));
+
+      const parsed = parseInteractionSubmitCommand(frame);
+      if (!parsed.ok) {
+        sendCommandError(ws, frame.command_id, parsed.error);
+        return;
+      }
+
+      const isMember = await this.ensureActiveMember(attachment.user_id, parsed.command.channel_id);
+      if (!isMember) {
+        sendCommandError(ws, frame.command_id, responseError("CHANNEL_NOT_FOUND", "channel not found or not a member"));
+        return;
+      }
+      const submitRes = await chStub.fetch(new Request("https://x/internal/interaction-submit", {
+        method: "POST",
+        headers: {
+          "X-Verified-User-Id": attachment.user_id,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          operation_id: parsed.command.command_id,
+          channel_id: parsed.command.channel_id,
+          message_id: parsed.command.message_id,
+          component_id: parsed.command.component_id,
+          custom_id: parsed.command.custom_id,
+          value: parsed.command.value,
+        }),
+      }));
+      if (!submitRes.ok) {
+        const body = await submitRes.json().catch(() => null);
+        sendCommandError(ws, frame.command_id, normalizeEventError(body));
+        return;
+      }
+      const out = await submitRes.json() as {
+        channel_id: string;
+        interaction_id: string;
+        event_id: string;
+      };
+      ws.send(JSON.stringify({
+        frame_type: "command_ack",
+        command: "interaction.submit",
+        command_id: frame.command_id,
+        status: "committed",
+        payload: out,
+      }));
       return;
     }
 
@@ -938,6 +997,54 @@ export class UserConnection extends DurableObject<Env> {
         const att = ws.deserializeAttachment() as ConnectionAttachment | null;
         if (att) {
           ws.serializeAttachment({ ...att, last_deliver: eventJson });
+        }
+      }
+      return { delivered: true };
+    } catch {
+      return { delivered: false, reason: "socket_send_failed" };
+    }
+  }
+
+  private async handleDeliverStreamFrame(body: {
+    lease_id?: string;
+    channel_id?: string;
+    session_id?: string;
+    frame_json?: string;
+  }): Promise<DeliverResult> {
+    const sessionId = body.session_id ?? "";
+    const channelId = body.channel_id ?? "";
+    const leaseId = body.lease_id ?? "";
+    const frameJson = body.frame_json ?? "";
+
+    if (!sessionId || !channelId || !frameJson) {
+      return { delivered: false, reason: "invalid_frame" };
+    }
+
+    const session = this.getSessionRow(sessionId);
+    if (!session) return { delivered: false, reason: "session_not_found" };
+    if (session.status === "closed") return { delivered: false, reason: "session_closed" };
+
+    const lease = this.getLeaseRow(sessionId, channelId);
+    if (!lease) return { delivered: false, reason: "lease_not_found" };
+    if (lease.status !== "active") return { delivered: false, reason: "lease_closed" };
+    if (leaseId && lease.lease_id !== leaseId) return { delivered: false, reason: "lease_not_found" };
+    if (lease.expires_at <= nowIso()) return { delivered: false, reason: "lease_closed" };
+
+    const ws = this.findSocketBySession(sessionId);
+    if (!ws) return { delivered: false, reason: "socket_not_found" };
+
+    const membership = await this.confirmActiveMembership(session.user_id, channelId);
+    if (!membership.active) {
+      await this.closeLocalLease(sessionId, channelId, lease.lease_id);
+      return { delivered: false, reason: "membership_not_active" };
+    }
+
+    try {
+      ws.send(frameJson);
+      if (this.env.ALLOW_INTERNAL_TEST_ROUTES === "1") {
+        const att = ws.deserializeAttachment() as ConnectionAttachment | null;
+        if (att) {
+          ws.serializeAttachment({ ...att, last_deliver: frameJson });
         }
       }
       return { delivered: true };

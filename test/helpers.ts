@@ -200,3 +200,8 @@ export function getTimelineMessageIdFromHistory(items: TimelineHistoryItem[]): s
   if (!messageId) throw new Error("no message.created in timeline history");
   return messageId;
 }
+
+/** Let pending DO console-log RPC finish before vitest pool worker teardown. */
+export async function drainPoolWorkerTeardown(): Promise<void> {
+  await new Promise((r) => setTimeout(r, 500));
+}

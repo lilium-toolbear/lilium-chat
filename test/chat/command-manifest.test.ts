@@ -3,11 +3,13 @@ import type { CommandManifestItem, CommandManifestResponse } from "../../src/con
 import {
   applyCommandManifestDelta,
   appendPlatformHelpItem,
+  appendPlatformPermissionItem,
+  appendPlatformCommandItems,
   buildManifestRemoveDelta,
   buildManifestUpsertDelta,
   projectCommandManifest,
 } from "../../src/chat/command-manifest";
-import { PLATFORM_HELP_BOT_COMMAND_ID } from "../../src/chat/platform-commands";
+import { PLATFORM_HELP_BOT_COMMAND_ID, PLATFORM_PERMISSION_BOT_COMMAND_ID } from "../../src/chat/platform-commands";
 
 function makeItem(overrides: Partial<CommandManifestItem> = {}): CommandManifestItem {
   return {
@@ -162,5 +164,29 @@ describe("appendPlatformHelpItem", () => {
   it("appends platform /help command to manifest", () => {
     const manifest = appendPlatformHelpItem(projectCommandManifest(1, []));
     expect(manifest.items.some((item) => item.bot_command_id === PLATFORM_HELP_BOT_COMMAND_ID)).toBe(true);
+  });
+});
+
+describe("appendPlatformCommandItems", () => {
+  it("appends /permission for owner/admin only", () => {
+    const base = projectCommandManifest(1, []);
+    expect(
+      appendPlatformCommandItems(base, "owner").items.some(
+        (item) => item.bot_command_id === PLATFORM_PERMISSION_BOT_COMMAND_ID,
+      ),
+    ).toBe(true);
+    expect(
+      appendPlatformCommandItems(base, "member").items.some(
+        (item) => item.bot_command_id === PLATFORM_PERMISSION_BOT_COMMAND_ID,
+      ),
+    ).toBe(false);
+  });
+
+  it("does not duplicate platform permission item", () => {
+    const once = appendPlatformPermissionItem(projectCommandManifest(1, []));
+    const twice = appendPlatformPermissionItem(once);
+    expect(
+      twice.items.filter((item) => item.bot_command_id === PLATFORM_PERMISSION_BOT_COMMAND_ID),
+    ).toHaveLength(1);
   });
 });

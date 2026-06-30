@@ -9,7 +9,7 @@ import {
 } from "../sql-migrations";
 import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
 
-export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026062902;
+export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026063001;
 
 export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS channel_meta (
@@ -455,6 +455,13 @@ export const chatChannelMigrations: SqlMigration[] = [
       if (tableExists(ctx, "interactions") && !columnExists(ctx, "interactions", "error_code")) {
         ctx.storage.sql.exec("ALTER TABLE interactions ADD COLUMN error_code TEXT");
       }
+      if (!indexExists(ctx, "uniq_interaction_per_user_once")) {
+        ctx.storage.sql.exec(
+          `CREATE UNIQUE INDEX uniq_interaction_per_user_once
+           ON interactions(message_id, component_id, actor_user_id)
+           WHERE status IN ('pending', 'completed')`,
+        );
+      }
 
       if (!tableExists(ctx, "bot_delivery_outbox")) {
         ctx.storage.sql.exec(`CREATE TABLE bot_delivery_outbox (
@@ -500,11 +507,51 @@ export const chatChannelMigrations: SqlMigration[] = [
     },
   },
   {
-    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    version: 2026062902,
     name: "messages invocation_json for slash command display",
     up(ctx) {
       if (tableExists(ctx, "messages") && !columnExists(ctx, "messages", "invocation_json")) {
         ctx.storage.sql.exec("ALTER TABLE messages ADD COLUMN invocation_json TEXT");
+      }
+    },
+  },
+  {
+    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    name: "message_stream_registry for bot streaming",
+    up(ctx) {
+      if (!tableExists(ctx, "message_stream_registry")) {
+        ctx.storage.sql.exec(`CREATE TABLE message_stream_registry (
+          channel_id        TEXT NOT NULL,
+          message_id        TEXT NOT NULL,
+          bot_id            TEXT NOT NULL,
+          client_effect_id  TEXT NOT NULL,
+          status            TEXT NOT NULL,
+          sender_bot_display_name TEXT NOT NULL,
+          sender_bot_avatar_url   TEXT,
+          message_json      TEXT NOT NULL,
+          created_at        TEXT NOT NULL,
+          expires_at        TEXT NOT NULL,
+          finalized_at      TEXT,
+          abandoned_at      TEXT,
+          final_event_id    TEXT,
+          final_text_hash   TEXT,
+          finalize_request_hash TEXT,
+          finalized_response_json TEXT,
+          abandoned_event_id TEXT,
+          abandoned_text_hash TEXT,
+          abandoned_response_json TEXT,
+          PRIMARY KEY (channel_id, message_id)
+        )`);
+      }
+      if (!indexExists(ctx, "idx_message_stream_registry_bot")) {
+        ctx.storage.sql.exec(
+          "CREATE INDEX idx_message_stream_registry_bot ON message_stream_registry(bot_id, status, expires_at)",
+        );
+      }
+      if (!indexExists(ctx, "idx_message_stream_registry_expiry")) {
+        ctx.storage.sql.exec(
+          "CREATE INDEX idx_message_stream_registry_expiry ON message_stream_registry(status, expires_at)",
+        );
       }
     },
   },

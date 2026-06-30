@@ -24,3 +24,31 @@ describe("ApiError HTTP status mapping (Phase 3 codes)", () => {
     expect(new ApiError("BOT_OFFLINE", "x").retryable).toBe(true);
   });
 });
+
+describe("ApiError HTTP status mapping (bot streaming codes)", () => {
+  it("BOT_STREAM_NOT_FOUND → 404", () => {
+    expect(new ApiError("BOT_STREAM_NOT_FOUND", "x").httpStatus).toBe(404);
+    expect(new ApiError("BOT_STREAM_NOT_FOUND", "x").retryable).toBe(false);
+  });
+  it("BOT_STREAM_EXPIRED → 410", () => {
+    expect(new ApiError("BOT_STREAM_EXPIRED", "x").httpStatus).toBe(410);
+  });
+  it("BOT_STREAM_SEQUENCE_GAP → 409 retryable", () => {
+    expect(new ApiError("BOT_STREAM_SEQUENCE_GAP", "x").httpStatus).toBe(409);
+    expect(new ApiError("BOT_STREAM_SEQUENCE_GAP", "x").retryable).toBe(true);
+  });
+  it("BOT_STREAM_CONFLICT → 409", () => {
+    expect(new ApiError("BOT_STREAM_CONFLICT", "x").httpStatus).toBe(409);
+  });
+  it("BOT_SCOPE_DENIED → 403", () => {
+    expect(new ApiError("BOT_SCOPE_DENIED", "x").httpStatus).toBe(403);
+  });
+  it("COMMAND_PERMISSION_DENIED → 403", () => {
+    expect(new ApiError("COMMAND_PERMISSION_DENIED", "x").httpStatus).toBe(403);
+  });
+  it("COMPONENT_ALREADY_USED / INTERACTION_* → 409/403", () => {
+    expect(new ApiError("COMPONENT_ALREADY_USED", "x").httpStatus).toBe(409);
+    expect(new ApiError("INTERACTION_ALREADY_SUBMITTED", "x").httpStatus).toBe(409);
+    expect(new ApiError("INTERACTION_FORBIDDEN_TARGET", "x").httpStatus).toBe(403);
+  });
+});

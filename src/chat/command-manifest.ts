@@ -4,7 +4,7 @@ import type {
   CommandManifestResponse,
 } from "../contract/bot-api";
 import { parseCommandBindingSnapshot } from "./command-snapshot";
-import { platformHelpManifestItem } from "./platform-commands";
+import { platformHelpManifestItem, platformPermissionManifestItem } from "./platform-commands";
 
 type PermissionLevel = CommandManifestItem["effective_member_permission"];
 
@@ -66,6 +66,31 @@ export function appendPlatformHelpItem(manifest: CommandManifestResponse): Comma
     return a.bot_command_id.localeCompare(b.bot_command_id);
   });
   return { version: manifest.version, items };
+}
+
+export function appendPlatformPermissionItem(manifest: CommandManifestResponse): CommandManifestResponse {
+  const permissionItem = platformPermissionManifestItem();
+  if (manifest.items.some((item) => item.bot_command_id === permissionItem.bot_command_id)) {
+    return manifest;
+  }
+  const items = [...manifest.items, permissionItem];
+  items.sort((a, b) => {
+    const byName = a.name.localeCompare(b.name);
+    if (byName !== 0) return byName;
+    return a.bot_command_id.localeCompare(b.bot_command_id);
+  });
+  return { version: manifest.version, items };
+}
+
+export function appendPlatformCommandItems(
+  manifest: CommandManifestResponse,
+  callerRole?: string | null,
+): CommandManifestResponse {
+  const withHelp = appendPlatformHelpItem(manifest);
+  if (callerRole === "owner" || callerRole === "admin") {
+    return appendPlatformPermissionItem(withHelp);
+  }
+  return withHelp;
 }
 
 export function buildManifestUpsertDelta(

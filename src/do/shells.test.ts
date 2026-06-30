@@ -9,6 +9,7 @@ const DO_BINDINGS = [
   ["INVITE_DIRECTORY", "InviteDirectory"],
   ["BOT_REGISTRY", "BotRegistry"],
   ["CHANNEL_FANOUT", "ChannelFanout"],
+  ["BOT_STREAM_CONNECTION", "BotStreamConnection"],
   ["DM_DIRECTORY", "DMDirectory"],
 ] as const;
 

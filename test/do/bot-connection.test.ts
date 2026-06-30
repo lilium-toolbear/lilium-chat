@@ -286,7 +286,7 @@ describe("BotConnection DO (7b-connection)", () => {
     second.ws.close();
   });
 
-  it("replies delivery_result ack failed when delivery_result not implemented", async () => {
+  it("replies delivery_result ack failed for unknown delivery_id", async () => {
     const botId = `bot-delivery-result-${crypto.randomUUID()}`;
     const { ws } = await openConnection(botId);
     ws.send(

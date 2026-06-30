@@ -72,4 +72,5 @@ export interface ChatChannelHost {
   handleChannelCommands(request: Request): Promise<Response>;
   handleCommandManifest(request: Request): Promise<Response>;
   handleCommandInvoke(request: Request): Promise<Response>;
+  handleInteractionSubmit(request: Request): Promise<Response>;
 }

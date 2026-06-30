@@ -14,6 +14,7 @@ export type ChatEventType =
   | "message.stream_started"
   | "message.stream_delta"
   | "message.stream_finalized"
+  | "message.stream_abandoned"
   | "member.joined"
   | "member.left"
   | "member.removed"
@@ -43,6 +44,7 @@ export const CHAT_EVENT_TYPES = [
   "message.stream_started",
   "message.stream_delta",
   "message.stream_finalized",
+  "message.stream_abandoned",
   "member.joined",
   "member.left",
   "member.removed",
@@ -86,6 +88,8 @@ export type DomainTimelineEventType = (typeof DOMAIN_TIMELINE_EVENT_TYPES)[numbe
 /** Event types returned by channel timeline history HTTP (`GET .../messages`, bootstrap). */
 export const TIMELINE_HISTORY_EVENT_TYPES: ReadonlySet<string> = new Set([
   "message.created",
+  "message.stream_finalized",
+  "message.stream_abandoned",
   ...DOMAIN_TIMELINE_EVENT_TYPES,
 ]);
 
@@ -98,6 +102,16 @@ export const REPLAY_MESSAGE_EVENT_TYPES: ReadonlySet<string> = new Set([
   "message.updated",
   "message.recalled",
   "message.deleted",
+  "message.stream_finalized",
+  "message.stream_abandoned",
+  "interaction.completed",
+  "command.completed",
+]);
+
+/** Bot lifecycle events replay resolves actor refs and enriches display fields. */
+export const REPLAY_BOT_LIFECYCLE_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "command.invoked",
+  "interaction.created",
 ]);
 
 /** Management events replay resolves actor refs to live UserSummary. */
@@ -169,8 +183,21 @@ export interface MessageStreamDeltaPayload {
 
 export interface MessageStreamFinalizedPayload {
   channel_id?: ChatId;
-  message_id?: ChatId;
+  event_id?: ChatId;
   message?: WireChatMessage;
+}
+
+/** Live-only; delivered via `frame_type=stream_event`, not HTTP history. */
+export interface MessageStreamAbandonCleanupPayload {
+  channel_id?: ChatId;
+  message_id: ChatId;
+}
+
+/** Canonical channel event for non-empty partial stream abandon. */
+export interface MessageStreamAbandonedPayload {
+  channel_id?: ChatId;
+  event_id?: ChatId;
+  message: WireChatMessage;
 }
 
 export interface ChannelCreatedEventPayload {
@@ -285,6 +312,8 @@ export interface CommandInvokedEventPayload {
     created_at: IsoDateTimeString;
   };
   command_id?: ChatId;
+  command_name?: string;
+  actor?: UserSummary;
 }
 
 export interface CommandCompletedEventPayload {
@@ -308,6 +337,8 @@ export interface InteractionCreatedEventPayload {
     created_at: IsoDateTimeString;
   };
   command_id?: ChatId;
+  component_label?: string;
+  actor?: UserSummary;
 }
 
 export interface InteractionCompletedEventPayload {
@@ -351,6 +382,7 @@ export interface ChatEventPayloadByType {
   "message.stream_started": MessageStreamStartedPayload;
   "message.stream_delta": MessageStreamDeltaPayload;
   "message.stream_finalized": MessageStreamFinalizedPayload;
+  "message.stream_abandoned": MessageStreamAbandonedPayload;
   "member.joined": MemberJoinedEventPayload;
   "member.left": MemberLeftEventPayload;
   "member.removed": MemberRemovedEventPayload;

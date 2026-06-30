@@ -1,16 +1,52 @@
 import {
   BOT_GATEWAY_API_VERSION,
+  MAIN_GATEWAY_EFFECT_TYPES,
+  REJECTED_MAIN_GATEWAY_STREAM_EFFECT_TYPES,
+  type BotDeliveryAck,
+  type BotDeliveryAckError,
   type BotDeliveryBody,
   type BotDeliveryFrame,
+  type BotEffectWire,
+  type EffectResult,
+  type MainGatewayEffectType,
 } from "../contract/bot-gateway";
 import { isRecord } from "../contract/utils";
 
 export {
   BOT_GATEWAY_API_VERSION,
+  MAIN_GATEWAY_EFFECT_TYPES,
+  REJECTED_MAIN_GATEWAY_STREAM_EFFECT_TYPES,
+  type BotDeliveryAck,
+  type BotDeliveryAckError,
   type BotDeliveryBody,
   type BotDeliveryFrame,
   type BotDeliveryRequestBody,
+  type BotEffectWire,
+  type EffectResult,
+  type GenericAppliedEffectResult,
+  type MainGatewayEffectType,
+  type StartStreamEffectResult,
 } from "../contract/bot-gateway";
+
+export {
+  BOT_STREAM_API_VERSION,
+  BROWSER_STREAM_EVENT_API_VERSION,
+  LIVE_STREAM_EVENT_TYPES,
+  type BotStreamAppendAckFrame,
+  type BotStreamAppendFrame,
+  type BotStreamErrorFrame,
+  type BotStreamFinalizeFrame,
+  type BotStreamFinalizedAckFrame,
+  type BotStreamHelloFrame,
+  type BotStreamIncomingFrame,
+  type BotStreamOutgoingFrame,
+  type BotStreamPingFrame,
+  type BotStreamPongFrame,
+  type BotStreamReadyFrame,
+  type LiveStreamEventType,
+  type StreamEventFrame,
+  type WireStreamEventFrame,
+} from "../contract/bot-stream";
 
 export interface ParsedHello {
   type: "hello";
@@ -26,11 +62,6 @@ export interface ParsedDeliveryResult {
   effects: unknown[];
 }
 
-export interface DeliveryAckError {
-  code: string;
-  message: string;
-}
-
 export interface BotReadyFrame {
   type: "ready";
   api_version: string;
@@ -44,13 +75,17 @@ export interface BotPongFrame {
   api_version: string;
 }
 
-export interface BotDeliveryAck {
-  type: "delivery_ack";
-  api_version: string;
-  delivery_id: string;
-  status: "applied" | "failed";
-  error?: DeliveryAckError;
+export class MainGatewayEffectValidationError extends Error {
+  readonly code: "BOT_EFFECT_INVALID";
+  constructor(message: string) {
+    super(message);
+    this.name = "MainGatewayEffectValidationError";
+    this.code = "BOT_EFFECT_INVALID";
+  }
 }
+
+const MAIN_GATEWAY_EFFECT_TYPE_SET = new Set<string>(MAIN_GATEWAY_EFFECT_TYPES);
+const REJECTED_STREAM_EFFECT_TYPE_SET = new Set<string>(REJECTED_MAIN_GATEWAY_STREAM_EFFECT_TYPES);
 
 function asObject(raw: string): Record<string, unknown> {
   const value = JSON.parse(raw);
@@ -115,17 +150,41 @@ export function parseDeliveryResult(raw: string): ParsedDeliveryResult {
   };
 }
 
+/** Reject append_stream/finalize_stream and unknown types before DO application. */
+export function validateMainGatewayEffects(effects: unknown[]): BotEffectWire[] {
+  const parsed: BotEffectWire[] = [];
+  for (const raw of effects) {
+    if (!isRecord(raw)) {
+      throw new MainGatewayEffectValidationError("invalid effect body");
+    }
+    const type = raw.type;
+    const clientEffectId = raw.client_effect_id;
+    if (typeof type !== "string" || typeof clientEffectId !== "string" || clientEffectId.length === 0) {
+      throw new MainGatewayEffectValidationError("effect requires type and client_effect_id");
+    }
+    if (REJECTED_STREAM_EFFECT_TYPE_SET.has(type)) {
+      throw new MainGatewayEffectValidationError(`${type} must use Stream WS`);
+    }
+    if (!MAIN_GATEWAY_EFFECT_TYPE_SET.has(type)) {
+      throw new MainGatewayEffectValidationError(`unsupported effect type: ${type}`);
+    }
+    parsed.push({ ...raw, type, client_effect_id: clientEffectId });
+  }
+  return parsed;
+}
+
 export function buildDeliveryAck(
   deliveryId: string,
   status: "applied" | "failed",
-  error?: DeliveryAckError,
+  opts?: { error?: BotDeliveryAckError; effect_results?: EffectResult[] },
 ): BotDeliveryAck {
   return {
     type: "delivery_ack",
     api_version: BOT_GATEWAY_API_VERSION,
     delivery_id: deliveryId,
     status,
-    ...(error ? { error } : {}),
+    ...(opts?.effect_results !== undefined ? { effect_results: opts.effect_results } : {}),
+    ...(opts?.error ? { error: opts.error } : {}),
   };
 }
 

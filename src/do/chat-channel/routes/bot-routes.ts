@@ -1,4 +1,5 @@
 import type { ChatChannelHost } from "../host";
+import { handleBotDeliveryResult } from "../bot-delivery-result-handlers";
 import {
   flushStatefulSessionTimeouts,
   handleBotSessionCloseFromBot,
@@ -15,6 +16,12 @@ function asStatefulHost(host: ChatChannelHost): StatefulSessionHost {
 }
 
 export async function dispatchBotRoutes(host: ChatChannelHost, request: Request, url: URL): Promise<Response | null> {
+  if (url.pathname === "/internal/bot-delivery-result" && request.method === "POST") {
+    const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body) return new Response("invalid payload", { status: 400 });
+    return handleBotDeliveryResult(host, host.env, body);
+  }
+
   if (url.pathname === "/internal/command-binding-update") {
     return host.handleCommandBindingUpdate(request);
   }
@@ -26,6 +33,9 @@ export async function dispatchBotRoutes(host: ChatChannelHost, request: Request,
   }
   if (url.pathname === "/internal/command-invoke") {
     return host.handleCommandInvoke(request);
+  }
+  if (url.pathname === "/internal/interaction-submit") {
+    return host.handleInteractionSubmit(request);
   }
 
   const statefulHost = asStatefulHost(host);

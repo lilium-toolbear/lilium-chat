@@ -30,4 +30,4 @@ jobs:
         run: npm run typecheck
 
       - name: Test
-        run: npm run test:once -- --no-file-parallelism --test-timeout=60000 --hook-timeout=60000
+        run: npm run test:once
