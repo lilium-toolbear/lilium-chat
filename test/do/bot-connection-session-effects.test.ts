@@ -278,12 +278,7 @@ describe("BotConnection session.effects routing", () => {
     const botGateway = await openBotGateway(botId);
     openedBotSockets.push(botGateway.ws);
 
-    const botStub = botConnectionStub(botId);
-    const channelStub = getNamedDo<ChatChannel>(env.CHAT_CHANNEL, channelId);
-    const { runInDurableObject } = await import("cloudflare:test");
-    await runInDurableObject(channelStub, async (instance: unknown) => {
-      const channel = instance as ChatChannel;
-      const ctx = (channel as { ctx: DurableObjectState }).ctx;
+    await withChannel(channelId, (ctx) => {
       ctx.storage.sql.exec(
         `INSERT INTO stateful_command_sessions (
            session_id, channel_id, bot_id, bot_command_id, invocation_id, started_by_user_id,
@@ -303,9 +298,10 @@ describe("BotConnection session.effects routing", () => {
       );
     });
 
+    const botStub = botConnectionStub(botId);
+    const { runInDurableObject } = await import("cloudflare:test");
     await runInDurableObject(botStub, async (instance: unknown) => {
-      const botConn = instance as BotConnection;
-      const ctx = (botConn as { ctx: DurableObjectState }).ctx;
+      const ctx = (instance as { ctx: DurableObjectState }).ctx;
       ctx.storage.sql.exec(
         `INSERT INTO active_stateful_session_refs (session_id, channel_id, bot_id, status, updated_at)
          VALUES (?, ?, ?, 'active', ?)`,

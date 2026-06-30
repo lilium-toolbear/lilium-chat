@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { computeEffectRequestHash } from "../../src/chat/bot-effects";
 import { createTestChannel, expectDoRpcError, fakeS3PublicPath, getNamedDo } from "../helpers";
+import type { ChatChannel } from "../../src/do/chat-channel";
 import { setTestS3Client } from "../../src/s3/presign";
 import { FakeS3 } from "../fake-s3";
 
@@ -107,7 +108,7 @@ async function seedBotBinding(channelId: string, botId: string, userId: string):
 }
 
 async function presignAndFinalizeBotAttachment(
-  stub: DurableObjectStub,
+  stub: DurableObjectStub<ChatChannel>,
   channelId: string,
   botId: string,
   fake: FakeS3,

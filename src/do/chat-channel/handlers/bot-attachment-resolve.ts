@@ -50,7 +50,7 @@ export function loadMessageAttachmentProjections(
        WHERE ma.message_id=?`,
       messageId,
     )
-    .toArray() as AttachmentRow[];
+    .toArray() as unknown as AttachmentRow[];
   const projections: MessageImageAttachment[] = [];
   for (const row of rows) {
     const projection = projectAttachmentForBrowser(row);

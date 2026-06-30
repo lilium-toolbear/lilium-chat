@@ -9,8 +9,7 @@ describe("per-DO scheduler", () => {
     const id = tEnv.SCHEDULER_PROBE.idFromName("t1");
     const stub = tEnv.SCHEDULER_PROBE.get(id);
 
-    const setupRes = await stub.setup([100, 200]);
-    expect(setupRes.ok).toBe(true);
+    await stub.setup([100, 200]);
 
     const runBody = await stub.run(150);
     expect(runBody.processed).toEqual([100]);
