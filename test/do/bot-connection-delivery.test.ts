@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { BOT_GATEWAY_API_VERSION } from "../../src/chat/bot-gateway-protocol";
-import { getNamedDo } from "../helpers";
+import { createTestChannel, getNamedDo } from "../helpers";
 
 function botConnectionStub(botId: string): DurableObjectStub {
   return getNamedDo(
@@ -238,8 +238,9 @@ describe("BotConnection DO delivery queue (7b)", () => {
     expect(status).toBe("sent");
   });
 
-  it("marks known deliveries failed when placeholder delivery_result is received", async () => {
+  it("marks known deliveries completed when empty delivery_result is received", async () => {
     const botId = `bot-delivery-result-terminal-${crypto.randomUUID()}`;
+    await createTestChannel(env, { channelId: "channel-delivery", ownerId: "owner-delivery" });
     const { ws, stub } = await openConnection(botId);
     ws.send(
       JSON.stringify({
@@ -302,7 +303,7 @@ describe("BotConnection DO delivery queue (7b)", () => {
           )
           .toArray()[0]?.status ?? null;
     });
-    expect(status).toBe("failed");
+    expect(status).toBe("completed");
     ws.close();
   });
 

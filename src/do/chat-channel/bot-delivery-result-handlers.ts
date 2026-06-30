@@ -1,0 +1,601 @@
+import { uuidv7 } from "../../ids/uuidv7";
+import { buildEventFrame, buildMessageLifecyclePayload } from "../../chat/event-broadcast";
+import {
+  BotEffectValidationError,
+  computeEffectRequestHash,
+  disableComponentsInJson,
+  parseStoredComponents,
+  toGenericEffectResult,
+  validateNonStreamEffectsForApply,
+  type BotEffectMessageContextRow,
+  type ParsedNonStreamEffect,
+} from "../../chat/bot-effects";
+import { projectMessageForBrowser } from "../../chat/message-projection";
+import { botDedupePrincipalKey } from "../../chat/stream-registry";
+import type { EffectResult } from "../../contract/bot-gateway";
+import type { BotEffectWire } from "../../contract/bot-gateway";
+import type { MessageRow } from "../../contract/persisted";
+import type { WireChatMessage } from "../../contract/message";
+import { isRecord } from "../../contract/utils";
+import type { Env } from "../../env";
+import { doErrorResponse } from "../../errors";
+import type { ChatChannelHost } from "./host";
+import {
+  appendChatChannelArchive,
+  collectDefinedChanges,
+  rvEvent,
+  upsertEventChange,
+  upsertMessageChange,
+} from "../../archive/chat-channel-record";
+
+interface BotDeliveryResultBody {
+  delivery_id?: unknown;
+  outbox_id?: unknown;
+  bot_id?: unknown;
+  channel_id?: unknown;
+  effects?: unknown;
+}
+
+interface BotSummary {
+  display_name: string;
+  avatar_url: string | null;
+}
+
+function loadMessageRow(
+  host: ChatChannelHost,
+  channelId: string,
+  messageId: string,
+): BotEffectMessageContextRow | null {
+  const row = host.ctx.storage.sql
+    .exec(
+      `SELECT message_id, command_id, channel_id, sender_kind, sender_user_id, sender_bot_id,
+              sender_bot_display_name, sender_bot_avatar_url, type, format, status, text,
+              reply_to, reply_snapshot_json, components_json, stream_state, created_at, updated_at,
+              edited_at, deleted_at, deleted_by, recalled_at, invocation_json
+       FROM messages WHERE message_id=? AND channel_id=?`,
+      messageId,
+      channelId,
+    )
+    .toArray()[0] as BotEffectMessageContextRow | undefined;
+  return row ?? null;
+}
+
+async function fetchBotSummary(env: Env, botId: string): Promise<BotSummary | null> {
+  const res = await env.BOT_REGISTRY.getByName("registry").fetch(
+    new Request(`https://x/internal/bot-get?bot_id=${encodeURIComponent(botId)}`),
+  );
+  if (!res.ok) return null;
+  const body = (await res.json()) as { display_name?: unknown; avatar_url?: unknown };
+  return {
+    display_name: typeof body.display_name === "string" ? body.display_name : botId,
+    avatar_url: typeof body.avatar_url === "string" ? body.avatar_url : null,
+  };
+}
+
+function insertBotLifecycleEvent(
+  host: ChatChannelHost,
+  input: {
+    eventId: string;
+    eventType: "message.created" | "message.updated";
+    channelId: string;
+    botId: string;
+    occurredAt: string;
+    messageRow: MessageRow;
+    components: WireChatMessage["components"];
+    membershipVersion: number;
+  },
+): void {
+  const liveMessage = projectMessageForBrowser(input.messageRow, { components: input.components });
+  const liveEventFrame = buildEventFrame({
+    event_id: input.eventId,
+    type: input.eventType,
+    channel_id: input.channelId,
+    occurred_at: input.occurredAt,
+    payload: { message: liveMessage },
+  });
+  const persistedPayload = buildMessageLifecyclePayload({
+    message_id: input.messageRow.message_id,
+    command_id: input.messageRow.command_id,
+    channel_id: input.messageRow.channel_id,
+    sender_kind: input.messageRow.sender_kind,
+    sender_user_id: input.messageRow.sender_user_id,
+    sender_bot_id: input.messageRow.sender_bot_id,
+    status: input.messageRow.status,
+    created_at: input.messageRow.created_at,
+    updated_at: input.messageRow.updated_at,
+    edited_at: input.messageRow.edited_at,
+    deleted_at: input.messageRow.deleted_at,
+    deleted_by: input.messageRow.deleted_by,
+    recalled_at: input.messageRow.recalled_at,
+    stream_state: input.messageRow.stream_state,
+    reply_to: input.messageRow.reply_to,
+    reply_snapshot_json: input.messageRow.reply_snapshot_json,
+    type: input.messageRow.type,
+    format: input.messageRow.format,
+    text: input.messageRow.text,
+    invocation_json: input.messageRow.invocation_json,
+  });
+  host.ctx.storage.sql.exec(
+    "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, ?, ?, 'bot', ?, ?, ?, ?)",
+    input.eventId,
+    input.eventType,
+    input.channelId,
+    input.botId,
+    JSON.stringify(persistedPayload),
+    input.membershipVersion,
+    input.occurredAt,
+  );
+  host.insertOutboxRowForFanout(
+    input.channelId,
+    input.eventId,
+    JSON.stringify(liveEventFrame),
+    input.membershipVersion,
+    input.occurredAt,
+  );
+}
+
+function applySendMessageEffect(
+  host: ChatChannelHost,
+  input: {
+    channelId: string;
+    botId: string;
+    botSummary: BotSummary;
+    effect: Extract<ParsedNonStreamEffect, { type: "send_message" }>;
+    now: string;
+    nowMs: number;
+    membershipVersion: number;
+    outboxId: string;
+    requestHash: string;
+  },
+): { message_id: string; event_id: string; effectResult: EffectResult } {
+  const messageId = uuidv7(input.nowMs);
+  const eventId = host.nextEventId(input.nowMs + 1);
+  const componentsJson = JSON.stringify(input.effect.message.components);
+  host.ctx.storage.sql.exec(
+    `INSERT INTO messages (
+       message_id, command_id, dedupe_principal_key, channel_id, sender_kind, sender_user_id,
+       sender_bot_id, sender_bot_display_name, sender_bot_avatar_url, type, format, status, text,
+       reply_to, reply_snapshot_json, components_json, stream_state, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, 'bot', NULL, ?, ?, ?, ?, ?, 'normal', ?, ?, NULL, ?, 'none', ?, ?)`,
+    messageId,
+    input.effect.client_effect_id,
+    botDedupePrincipalKey(input.botId),
+    input.channelId,
+    input.botId,
+    input.botSummary.display_name,
+    input.botSummary.avatar_url,
+    input.effect.message.type,
+    input.effect.message.format,
+    input.effect.message.text,
+    input.effect.message.reply_to_message_id,
+    componentsJson,
+    input.now,
+    input.now,
+  );
+
+  const messageRow: MessageRow = {
+    message_id: messageId,
+    command_id: input.effect.client_effect_id,
+    channel_id: input.channelId,
+    sender_kind: "bot",
+    sender_user_id: null,
+    sender_bot_id: input.botId,
+    sender_bot_display_name: input.botSummary.display_name,
+    sender_bot_avatar_url: input.botSummary.avatar_url,
+    type: input.effect.message.type,
+    format: input.effect.message.format,
+    status: "normal",
+    text: input.effect.message.text,
+    reply_to: input.effect.message.reply_to_message_id,
+    reply_snapshot_json: null,
+    stream_state: "none",
+    created_at: input.now,
+    updated_at: input.now,
+    edited_at: null,
+    deleted_at: null,
+    deleted_by: null,
+    recalled_at: null,
+  };
+
+  insertBotLifecycleEvent(host, {
+    eventId,
+    eventType: "message.created",
+    channelId: input.channelId,
+    botId: input.botId,
+    occurredAt: input.now,
+    messageRow,
+    components: input.effect.message.components as WireChatMessage["components"],
+    membershipVersion: input.membershipVersion,
+  });
+
+  const responseJson = JSON.stringify({ message_id: messageId, event_id: eventId });
+  host.ctx.storage.sql.exec(
+    `INSERT INTO bot_effects_applied (
+       channel_id, bot_id, client_effect_id, effect_type, request_hash,
+       message_id, response_json, applied_at, outbox_id
+     ) VALUES (?, ?, ?, 'send_message', ?, ?, ?, ?, ?)`,
+    input.channelId,
+    input.botId,
+    input.effect.client_effect_id,
+    input.requestHash,
+    messageId,
+    responseJson,
+    input.now,
+    input.outboxId,
+  );
+
+  appendChatChannelArchive(host.ctx, input.channelId, input.now, [eventId], () =>
+    collectDefinedChanges([
+      upsertMessageChange(host.ctx.storage.sql, messageId, input.channelId, rvEvent(eventId)),
+      upsertEventChange(host.ctx.storage.sql, eventId),
+    ]),
+  );
+
+  return {
+    message_id: messageId,
+    event_id: eventId,
+    effectResult: toGenericEffectResult({
+      client_effect_id: input.effect.client_effect_id,
+      type: "send_message",
+      message_id: messageId,
+      event_id: eventId,
+    }),
+  };
+}
+
+function applyUpdateMessageEffect(
+  host: ChatChannelHost,
+  input: {
+    channelId: string;
+    botId: string;
+    effect: Extract<ParsedNonStreamEffect, { type: "update_message" }>;
+    now: string;
+    nowMs: number;
+    membershipVersion: number;
+    outboxId: string;
+    requestHash: string;
+    existing: BotEffectMessageContextRow;
+  },
+): { message_id: string; event_id: string; effectResult: EffectResult } {
+  const nextText = input.effect.message.text ?? input.existing.text ?? "";
+  const nextComponentsJson =
+    input.effect.message.components !== undefined
+      ? JSON.stringify(input.effect.message.components)
+      : (input.existing.components_json ?? "[]");
+  const nextStatus =
+    input.effect.message.text !== undefined && input.existing.status === "normal"
+      ? "edited"
+      : input.existing.status;
+  const editedAt = input.effect.message.text !== undefined ? input.now : input.existing.edited_at;
+
+  host.ctx.storage.sql.exec(
+    `UPDATE messages
+     SET text=?, components_json=?, status=?, updated_at=?, edited_at=?
+     WHERE message_id=? AND channel_id=?`,
+    nextText,
+    nextComponentsJson,
+    nextStatus,
+    input.now,
+    editedAt,
+    input.effect.message_id,
+    input.channelId,
+  );
+
+  const messageRow: MessageRow = {
+    ...input.existing,
+    text: nextText,
+    status: nextStatus,
+    updated_at: input.now,
+    edited_at: editedAt,
+  };
+  const eventId = host.nextEventId(input.nowMs);
+  insertBotLifecycleEvent(host, {
+    eventId,
+    eventType: "message.updated",
+    channelId: input.channelId,
+    botId: input.botId,
+    occurredAt: input.now,
+    messageRow,
+    components: parseStoredComponents(nextComponentsJson),
+    membershipVersion: input.membershipVersion,
+  });
+
+  const responseJson = JSON.stringify({ message_id: input.effect.message_id, event_id: eventId });
+  host.ctx.storage.sql.exec(
+    `INSERT INTO bot_effects_applied (
+       channel_id, bot_id, client_effect_id, effect_type, request_hash,
+       message_id, response_json, applied_at, outbox_id
+     ) VALUES (?, ?, ?, 'update_message', ?, ?, ?, ?, ?)`,
+    input.channelId,
+    input.botId,
+    input.effect.client_effect_id,
+    input.requestHash,
+    input.effect.message_id,
+    responseJson,
+    input.now,
+    input.outboxId,
+  );
+
+  appendChatChannelArchive(host.ctx, input.channelId, input.now, [eventId], () =>
+    collectDefinedChanges([
+      upsertMessageChange(host.ctx.storage.sql, input.effect.message_id, input.channelId, rvEvent(eventId)),
+      upsertEventChange(host.ctx.storage.sql, eventId),
+    ]),
+  );
+
+  return {
+    message_id: input.effect.message_id,
+    event_id: eventId,
+    effectResult: toGenericEffectResult({
+      client_effect_id: input.effect.client_effect_id,
+      type: "update_message",
+      message_id: input.effect.message_id,
+      event_id: eventId,
+    }),
+  };
+}
+
+function applyDisableComponentsEffect(
+  host: ChatChannelHost,
+  input: {
+    channelId: string;
+    botId: string;
+    effect: Extract<ParsedNonStreamEffect, { type: "disable_components" }>;
+    now: string;
+    nowMs: number;
+    membershipVersion: number;
+    outboxId: string;
+    requestHash: string;
+    existing: BotEffectMessageContextRow;
+  },
+): { message_id: string; event_id: string; effectResult: EffectResult } {
+  const nextComponentsJson = disableComponentsInJson(
+    input.existing.components_json ?? "[]",
+    input.effect.component_ids,
+  );
+
+  host.ctx.storage.sql.exec(
+    "UPDATE messages SET components_json=?, updated_at=? WHERE message_id=? AND channel_id=?",
+    nextComponentsJson,
+    input.now,
+    input.effect.message_id,
+    input.channelId,
+  );
+
+  const messageRow: MessageRow = {
+    ...input.existing,
+    updated_at: input.now,
+  };
+  const eventId = host.nextEventId(input.nowMs);
+  insertBotLifecycleEvent(host, {
+    eventId,
+    eventType: "message.updated",
+    channelId: input.channelId,
+    botId: input.botId,
+    occurredAt: input.now,
+    messageRow,
+    components: parseStoredComponents(nextComponentsJson),
+    membershipVersion: input.membershipVersion,
+  });
+
+  const responseJson = JSON.stringify({ message_id: input.effect.message_id, event_id: eventId });
+  host.ctx.storage.sql.exec(
+    `INSERT INTO bot_effects_applied (
+       channel_id, bot_id, client_effect_id, effect_type, request_hash,
+       message_id, response_json, applied_at, outbox_id
+     ) VALUES (?, ?, ?, 'disable_components', ?, ?, ?, ?, ?)`,
+    input.channelId,
+    input.botId,
+    input.effect.client_effect_id,
+    input.requestHash,
+    input.effect.message_id,
+    responseJson,
+    input.now,
+    input.outboxId,
+  );
+
+  appendChatChannelArchive(host.ctx, input.channelId, input.now, [eventId], () =>
+    collectDefinedChanges([
+      upsertMessageChange(host.ctx.storage.sql, input.effect.message_id, input.channelId, rvEvent(eventId)),
+      upsertEventChange(host.ctx.storage.sql, eventId),
+    ]),
+  );
+
+  return {
+    message_id: input.effect.message_id,
+    event_id: eventId,
+    effectResult: toGenericEffectResult({
+      client_effect_id: input.effect.client_effect_id,
+      type: "disable_components",
+      message_id: input.effect.message_id,
+      event_id: eventId,
+    }),
+  };
+}
+
+function cachedEffectResult(
+  clientEffectId: string,
+  effectType: string,
+  responseJson: string,
+): EffectResult {
+  const cached = JSON.parse(responseJson) as { message_id?: string; event_id?: string };
+  return toGenericEffectResult({
+    client_effect_id: clientEffectId,
+    type: effectType as "send_message" | "update_message" | "disable_components",
+    message_id: cached.message_id,
+    event_id: cached.event_id,
+  });
+}
+
+export async function handleBotDeliveryResult(
+  host: ChatChannelHost,
+  env: Env,
+  body: BotDeliveryResultBody,
+): Promise<Response> {
+  if (
+    typeof body.delivery_id !== "string" ||
+    typeof body.outbox_id !== "string" ||
+    typeof body.bot_id !== "string" ||
+    typeof body.channel_id !== "string" ||
+    !Array.isArray(body.effects)
+  ) {
+    return new Response("invalid payload", { status: 400 });
+  }
+
+  const deliveryId = body.delivery_id;
+  const outboxId = body.outbox_id;
+  const botId = body.bot_id;
+  const channelId = body.channel_id;
+
+  const meta = host.ctx.storage.sql
+    .exec("SELECT channel_id, kind, status, membership_version FROM channel_meta LIMIT 1")
+    .toArray()[0] as
+    | { channel_id: string; kind: string; status: string; membership_version: number }
+    | undefined;
+  if (!meta || meta.channel_id !== channelId) {
+    return doErrorResponse("CHANNEL_NOT_FOUND", "channel not found", { httpStatus: 404 });
+  }
+  if (meta.kind === "dm") {
+    return doErrorResponse("UNSUPPORTED_CHANNEL_KIND", "operation not supported for DM channels", {
+      httpStatus: 409,
+    });
+  }
+  const dissolved = host.assertNotDissolved(meta.status);
+  if (dissolved) {
+    return doErrorResponse(dissolved.code, dissolved.message, { httpStatus: 409 });
+  }
+
+  const effects = body.effects as BotEffectWire[];
+  let parsedEffects: ParsedNonStreamEffect[];
+  try {
+    parsedEffects = validateNonStreamEffectsForApply(effects, {
+      botId,
+      loadMessage: (messageId) => loadMessageRow(host, channelId, messageId),
+    });
+  } catch (err) {
+    const message = err instanceof BotEffectValidationError ? err.message : "invalid effect";
+    return Response.json(
+      { status: "failed", error: { code: "BOT_EFFECT_INVALID", message } },
+      { status: 422 },
+    );
+  }
+
+  let botSummary: BotSummary | null = null;
+  if (parsedEffects.some((effect) => effect.type === "send_message")) {
+    botSummary = await fetchBotSummary(env, botId);
+    if (!botSummary) {
+      return Response.json(
+        { status: "failed", error: { code: "BOT_NOT_FOUND", message: "bot not found" } },
+        { status: 404 },
+      );
+    }
+  }
+
+  const now = host.nowIso();
+  const nowMs = Date.parse(now);
+  const effectResults: EffectResult[] = [];
+
+  try {
+    await host.ctx.storage.transaction(async () => {
+      for (const raw of effects) {
+        const requestHash = computeEffectRequestHash(raw);
+        const existing = host.ctx.storage.sql
+          .exec(
+            "SELECT request_hash, response_json, effect_type FROM bot_effects_applied WHERE channel_id=? AND bot_id=? AND client_effect_id=?",
+            channelId,
+            botId,
+            raw.client_effect_id,
+          )
+          .toArray()[0] as
+          | { request_hash: string; response_json: string | null; effect_type: string }
+          | undefined;
+        if (existing) {
+          if (existing.request_hash !== requestHash) {
+            throw Object.assign(new Error("client_effect_id reused with different body"), {
+              code: "BOT_EFFECT_CONFLICT",
+            });
+          }
+          if (existing.response_json) {
+            effectResults.push(
+              cachedEffectResult(raw.client_effect_id, existing.effect_type, existing.response_json),
+            );
+            continue;
+          }
+        }
+
+        const effect = parsedEffects.find((item) => item.client_effect_id === raw.client_effect_id);
+        if (!effect) continue;
+
+        if (effect.type === "send_message") {
+          if (!botSummary) {
+            throw new BotEffectValidationError("bot summary unavailable");
+          }
+          effectResults.push(
+            applySendMessageEffect(host, {
+              channelId,
+              botId,
+              botSummary,
+              effect,
+              now,
+              nowMs: nowMs + effectResults.length,
+              membershipVersion: meta.membership_version,
+              outboxId,
+              requestHash,
+            }).effectResult,
+          );
+          continue;
+        }
+
+        const existingRow = loadMessageRow(host, channelId, effect.message_id);
+        if (!existingRow) {
+          throw new BotEffectValidationError("message not found");
+        }
+
+        if (effect.type === "update_message") {
+          effectResults.push(
+            applyUpdateMessageEffect(host, {
+              channelId,
+              botId,
+              effect,
+              now,
+              nowMs: nowMs + effectResults.length,
+              membershipVersion: meta.membership_version,
+              outboxId,
+              requestHash,
+              existing: existingRow,
+            }).effectResult,
+          );
+          continue;
+        }
+
+        effectResults.push(
+          applyDisableComponentsEffect(host, {
+            channelId,
+            botId,
+            effect,
+            now,
+            nowMs: nowMs + effectResults.length,
+            membershipVersion: meta.membership_version,
+            outboxId,
+            requestHash,
+            existing: existingRow,
+          }).effectResult,
+        );
+      }
+    });
+  } catch (err) {
+    if (isRecord(err) && err.code === "BOT_EFFECT_CONFLICT") {
+      return doErrorResponse("BOT_EFFECT_CONFLICT", "client_effect_id reused with different body", {
+        httpStatus: 409,
+      });
+    }
+    const message = err instanceof BotEffectValidationError ? err.message : "invalid effect";
+    return Response.json(
+      { status: "failed", error: { code: "BOT_EFFECT_INVALID", message } },
+      { status: 422 },
+    );
+  }
+
+  await host.scheduleOutboxAlarm(now);
+  return Response.json({ status: "applied", effect_results: effectResults });
+}

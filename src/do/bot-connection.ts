@@ -8,10 +8,13 @@ import {
   type BotDeliveryBody,
   type BotDeliveryFrame,
   type BotDeliveryRequestBody,
+  MainGatewayEffectValidationError,
   parseDeliveryResult,
   parseHello,
   type ParsedDeliveryResult,
+  validateMainGatewayEffects,
 } from "../chat/bot-gateway-protocol";
+import type { EffectResult } from "../contract/bot-gateway";
 import { uuidv7 } from "../ids/uuidv7";
 import { handleSchemaVersionRequest } from "./sql-migrations";
 import { migrateBotConnectionSchema } from "./migrations/bot-connection";
@@ -693,6 +696,94 @@ export class BotConnection extends DurableObject<Env> {
     const attachment = ws.deserializeAttachment() as BotConnectionAttachment | null;
     this.touchConnected(attachment?.bot_id ?? "", attachment?.session_id);
     const now = this.nowIso();
+
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT delivery_id, bot_id, channel_id, source_outbox_id, status FROM bot_deliveries WHERE delivery_id=?",
+        parsed.delivery_id,
+      )
+      .toArray()[0] as BotDeliveryRow | undefined;
+
+    if (!row) {
+      ws.send(
+        JSON.stringify(
+          buildDeliveryAck(parsed.delivery_id, "failed", {
+            error: { code: "BOT_EFFECT_INVALID", message: "unknown delivery_id" },
+          }),
+        ),
+      );
+      return;
+    }
+
+    if (row.status === "completed") {
+      ws.send(JSON.stringify(buildDeliveryAck(parsed.delivery_id, "applied")));
+      return;
+    }
+
+    let validatedEffects;
+    try {
+      validatedEffects = validateMainGatewayEffects(parsed.effects);
+    } catch (err) {
+      const message =
+        err instanceof MainGatewayEffectValidationError ? err.message : "invalid effects";
+      this.ctx.storage.sql.exec(
+        "UPDATE bot_deliveries SET status='failed', updated_at=?, next_attempt_at=? WHERE delivery_id=? AND status IN ('pending', 'sent')",
+        now,
+        String(Date.now()),
+        parsed.delivery_id,
+      );
+      ws.send(
+        JSON.stringify(
+          buildDeliveryAck(parsed.delivery_id, "failed", {
+            error: { code: "BOT_EFFECT_INVALID", message },
+          }),
+        ),
+      );
+      return;
+    }
+
+    const channelStub = this.env.CHAT_CHANNEL.getByName(row.channel_id);
+    const applyRes = await channelStub.fetch(
+      new Request("https://x/internal/bot-delivery-result", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          delivery_id: parsed.delivery_id,
+          outbox_id: row.source_outbox_id,
+          bot_id: row.bot_id,
+          channel_id: row.channel_id,
+          effects: validatedEffects,
+        }),
+      }),
+    );
+
+    const applyBody = (await applyRes.json().catch(() => ({}))) as {
+      status?: string;
+      effect_results?: EffectResult[];
+      error?: { code?: string; message?: string };
+    };
+
+    if (applyRes.ok && applyBody.status === "applied") {
+      this.ctx.storage.sql.exec(
+        "UPDATE bot_deliveries SET status='completed', updated_at=?, next_attempt_at=? WHERE delivery_id=?",
+        now,
+        String(Date.now()),
+        parsed.delivery_id,
+      );
+      ws.send(
+        JSON.stringify(
+          buildDeliveryAck(parsed.delivery_id, "applied", {
+            ...(Array.isArray(applyBody.effect_results)
+              ? { effect_results: applyBody.effect_results }
+              : {}),
+          }),
+        ),
+      );
+      return;
+    }
+
+    const errorCode = applyBody.error?.code ?? "BOT_EFFECT_INVALID";
+    const errorMessage = applyBody.error?.message ?? "effect application failed";
     this.ctx.storage.sql.exec(
       "UPDATE bot_deliveries SET status='failed', updated_at=?, next_attempt_at=? WHERE delivery_id=? AND status IN ('pending', 'sent')",
       now,
@@ -702,10 +793,7 @@ export class BotConnection extends DurableObject<Env> {
     ws.send(
       JSON.stringify(
         buildDeliveryAck(parsed.delivery_id, "failed", {
-          error: {
-            code: "BOT_EFFECT_INVALID",
-            message: "delivery_result not implemented yet",
-          },
+          error: { code: errorCode, message: errorMessage },
         }),
       ),
     );
