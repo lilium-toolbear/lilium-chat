@@ -134,13 +134,13 @@ async function applyStartStream(input: {
   channelId: string;
   clientEffectId: string;
 }) {
-  const botWs = await openBotConnection(input.botId);
   const stub = botConnectionStub(input.botId);
   const outboxId = `out-${crypto.randomUUID()}`;
   await enqueueBotInvocationDelivery(stub, input.botId, {
     outbox_id: outboxId,
     channel_id: input.channelId,
   });
+  const botWs = await openBotConnection(input.botId);
 
   const deliveryFrame = JSON.parse(await nextMessageOfType(botWs, "delivery")) as { delivery_id: string };
   botWs.send(

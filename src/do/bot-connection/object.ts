@@ -408,6 +408,22 @@ export class BotConnection extends DurableObject<Env> {
     };
   }
 
+  private pendingDeliveriesForBot(botId: string): BotDeliveryRow[] {
+    return this.ctx.storage.sql
+      .exec(
+        "SELECT * FROM bot_deliveries WHERE bot_id=? AND status IN ('pending', 'sent') ORDER BY created_at ASC",
+        botId,
+      )
+      .toArray() as unknown as BotDeliveryRow[];
+  }
+
+  private async flushDeliveriesForBot(botId: string): Promise<void> {
+    const rows = this.pendingDeliveriesForBot(botId);
+    if (rows.length === 0) return;
+    await this.flushPendingAndSentDeliveries(rows, Date.now());
+    await this.scheduleDeliveryAlarm();
+  }
+
   private async flushPendingAndSentDeliveries(
     rows: BotDeliveryRow[],
     nowMs: number,
@@ -517,6 +533,7 @@ export class BotConnection extends DurableObject<Env> {
             return false;
           }
         });
+        await this.flushDeliveriesForBot(attachment.bot_id);
         return;
       }
 

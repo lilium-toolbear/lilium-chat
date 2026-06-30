@@ -144,13 +144,13 @@ async function applyStartStream(input: {
   channelId: string;
   clientEffectId: string;
 }) {
-  const botWs = await openBotConnection(input.botId);
   const stub = botConnectionStub(input.botId);
   const outboxId = `out-${crypto.randomUUID()}`;
   await enqueueBotInvocationDelivery(stub, input.botId, {
     outbox_id: outboxId,
     channel_id: input.channelId,
   });
+  const botWs = await openBotConnection(input.botId);
 
   const deliveryFrame = JSON.parse(await nextMessageOfType(botWs, "delivery")) as { delivery_id: string };
   botWs.send(
@@ -358,9 +358,9 @@ describe("BotStreamConnection append", () => {
     const expiresAt = ack.effect_results?.[0]?.stream?.expires_at as string;
 
     const { ws: ws1 } = await openStreamWs({ botId, channelId, messageId, expiresAt });
+    const ack1Promise = nextMessageOfType(ws1, "append_ack");
     ws1.send(JSON.stringify(buildBotStreamAppend({ seq: 1, delta: "hello" })));
     await yieldToStreamDo();
-    const ack1Promise = nextMessageOfType(ws1, "append_ack");
     await triggerStreamAlarm(channelId, messageId);
     const ack1 = parseBotStreamAppendAck(await ack1Promise);
     expect(ack1.ack_seq).toBe(1);
@@ -375,17 +375,14 @@ describe("BotStreamConnection append", () => {
     expect(preReconnect.stream_state[0]?.flushed_text).toBe("hello");
     expect(Number(preReconnect.stream_state[0]?.ack_seq)).toBe(1);
 
-    await new Promise<void>((resolve) => {
-      ws1.addEventListener("close", () => resolve(), { once: true });
-      ws1.close();
-    });
+    ws1.close();
 
     const { ws: ws2, ready } = await openStreamWs({ botId, channelId, messageId, expiresAt });
     expect(ready.ack_seq).toBe(1);
 
+    const ack2Promise = nextMessageOfType(ws2, "append_ack");
     ws2.send(JSON.stringify(buildBotStreamAppend({ seq: 2, delta: "!" })));
     await yieldToStreamDo();
-    const ack2Promise = nextMessageOfType(ws2, "append_ack");
     await triggerStreamAlarm(channelId, messageId);
     const ack2 = parseBotStreamAppendAck(await ack2Promise);
     expect(ack2.ack_seq).toBe(2);
