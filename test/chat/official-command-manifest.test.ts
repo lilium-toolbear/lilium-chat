@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  isOfficialCommandBlocked,
   mergeOfficialIntoBindingRows,
   officialCommandToSnapshot,
   type OfficialCommandCatalogItem,
@@ -62,5 +63,23 @@ describe("mergeOfficialIntoBindingRows", () => {
     );
     const manifest = projectCommandManifest(1, merged);
     expect(manifest.items[0]?.effective_member_permission).toBe("owner");
+  });
+
+  it("detects blocked official commands", () => {
+    expect(
+      isOfficialCommandBlocked(
+        [
+          {
+            bot_command_id: "official-cmd-1",
+            bot_id: "official-bot",
+            status: "blocked",
+            command_snapshot_json: "{}",
+            permission_override: null,
+          },
+        ],
+        "official-cmd-1",
+      ),
+    ).toBe(true);
+    expect(isOfficialCommandBlocked([], "official-cmd-1")).toBe(false);
   });
 });

@@ -82,3 +82,12 @@ export function isOfficialCommandId(
 ): boolean {
   return officialCatalog.some((item) => item.bot_command_id === botCommandId);
 }
+
+export function isOfficialCommandBlocked(
+  bindingRows: readonly ChannelBindingRow[],
+  botCommandId: string,
+): boolean {
+  return bindingRows.some(
+    (row) => row.bot_command_id === botCommandId && row.status === "blocked",
+  );
+}

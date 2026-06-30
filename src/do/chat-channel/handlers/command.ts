@@ -35,6 +35,7 @@ import { parseCommandBindingSnapshot } from "../../../chat/command-snapshot";
 import type { CommandOption } from "../../../chat/command-options";
 import {
   mergeOfficialIntoBindingRows,
+  isOfficialCommandBlocked,
   isOfficialCommandId,
   officialCommandToSnapshot,
   type ChannelBindingRow,
@@ -853,7 +854,11 @@ async function handleCommandInvoke(channel: ChatChannelHandlerRef, input: Invoke
         const resolved = resolveManageableCommandName(manageableCommands, commandOption);
         if (!resolved) {
           replyText = `未知命令: ${commandOption}`;
-        } else if (actionOption === "on" && isOfficialCommandId(resolved.bot_command_id, officialCatalog)) {
+        } else if (
+          actionOption === "on"
+          && isOfficialCommandId(resolved.bot_command_id, officialCatalog)
+          && !isOfficialCommandBlocked(bindingRows, resolved.bot_command_id)
+        ) {
           throw new ApiError(
             "OFFICIAL_COMMAND_AUTO_ALLOWED",
             "official commands are auto-allowed in every channel",
@@ -925,6 +930,31 @@ async function handleCommandInvoke(channel: ChatChannelHandlerRef, input: Invoke
         let manifestDelta = buildManifestRemoveDelta(nextManifestVersion);
 
         if (mutation.status === "allowed") {
+          const officialItem = officialCatalog.find((item) => item.bot_command_id === mutation.botCommandId);
+          if (officialItem && isOfficialCommandBlocked(bindingRows, mutation.botCommandId)) {
+            channel.ctx.storage.sql.exec(
+              "DELETE FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?",
+              input.channelId,
+              mutation.botCommandId,
+            );
+            bindingBotId = officialItem.bot.bot_id;
+            snapshotJson = JSON.stringify(officialCommandToSnapshot(officialItem));
+            const projected = projectCommandManifest(nextManifestVersion, [
+              {
+                status: "allowed",
+                command_snapshot_json: snapshotJson,
+                permission_override: beforePermission,
+              },
+            ]);
+            const item = projected.items[0];
+            if (!item) {
+              return {
+                kind: "error" as const,
+                j: JSON.stringify({ error: { code: "INVALID_COMMAND_OPTIONS", message: "invalid command snapshot" } }),
+              };
+            }
+            manifestDelta = buildManifestUpsertDelta(nextManifestVersion, item);
+          } else {
           const commandSnapshot = binding
             ? parseCommandBindingSnapshot(binding.command_snapshot_json)
             : null;
@@ -969,6 +999,7 @@ async function handleCommandInvoke(channel: ChatChannelHandlerRef, input: Invoke
             };
           }
           manifestDelta = buildManifestUpsertDelta(nextManifestVersion, item);
+          }
         } else {
           if (!binding) {
             const officialItem = officialCatalog.find((item) => item.bot_command_id === mutation!.botCommandId);
@@ -1256,7 +1287,18 @@ export function CommandMixin<T extends Constructor<ChatChannelCore>>(Base: T) {
   }
 
   const officialCatalog = await fetchOfficialCatalog(asHandlerRef(this));
-  if (status === "allowed" && isOfficialCommandId(botCommandId, officialCatalog)) {
+  const existingBinding = this.ctx.storage.sql
+    .exec(
+      "SELECT status FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?",
+      channelId,
+      botCommandId,
+    )
+    .toArray()[0] as { status: string } | undefined;
+  if (
+    status === "allowed"
+    && isOfficialCommandId(botCommandId, officialCatalog)
+    && existingBinding?.status !== "blocked"
+  ) {
     throw new ApiError("OFFICIAL_COMMAND_AUTO_ALLOWED", "official commands are auto-allowed in every channel");
   }
 
@@ -1323,6 +1365,31 @@ const txResult = this.ctx.storage.transactionSync(() => {
   let snapshotJson = binding?.command_snapshot_json ?? "{}";
   let manifestDelta = buildManifestRemoveDelta(nextManifestVersion);
    if (status === "allowed") {
+    const officialItem = officialCatalog.find((item) => item.bot_command_id === botCommandId);
+    if (officialItem && beforeStatus === "blocked") {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM channel_command_bindings WHERE channel_id=? AND bot_command_id=?",
+        channelId,
+        botCommandId,
+      );
+      bindingBotId = officialItem.bot.bot_id;
+      snapshotJson = JSON.stringify(officialCommandToSnapshot(officialItem));
+      const projected = projectCommandManifest(nextManifestVersion, [
+        {
+          status: "allowed",
+          command_snapshot_json: snapshotJson,
+          permission_override: permissionOverride,
+        },
+      ]);
+      const item = projected.items[0];
+      if (!item) {
+        return {
+          kind: "error" as const,
+          j: JSON.stringify({ error: { code: "INVALID_COMMAND_OPTIONS", message: "invalid command snapshot" } }),
+        };
+      }
+      manifestDelta = buildManifestUpsertDelta(nextManifestVersion, item);
+    } else {
     if (!commandSnapshot) {
       return {
         kind: "error" as const,
@@ -1364,6 +1431,7 @@ const txResult = this.ctx.storage.transactionSync(() => {
       };
     }
     manifestDelta = buildManifestUpsertDelta(nextManifestVersion, item);
+    }
   } else {
     if (!binding) {
       const officialItem = officialCatalog.find((item) => item.bot_command_id === botCommandId);
