@@ -1,5 +1,8 @@
+import { rejectNonEmptyStreamComponents } from "./components";
 import { sha256Hex } from "./command-options";
 import { logSwallowedError } from "../errors";
+
+export { rejectNonEmptyStreamComponents };
 
 export const STREAM_DEFAULT_TTL_SECONDS = 300;
 

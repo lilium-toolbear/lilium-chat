@@ -3,6 +3,12 @@ import type { StartStreamEffectResponse } from "./stream-registry";
 import type { MessageRow } from "../contract/persisted";
 import type { WireChatMessage } from "../contract/message";
 import { isAllowedBotMessageFormat } from "./bot-message-format";
+import {
+  ComponentValidationError,
+  rejectNonEmptyStreamComponents,
+  validateComponents,
+  type WireComponent,
+} from "./components";
 import { isRecord } from "../contract/utils";
 import { logSwallowedError } from "../errors";
 
@@ -15,7 +21,7 @@ export interface BotEffectMessageBody {
   text: string;
   reply_to_message_id: string | null;
   attachment_ids: string[];
-  components: unknown[];
+  components: WireComponent[];
 }
 
 export interface ParsedSendMessageEffect {
@@ -31,7 +37,7 @@ export interface ParsedUpdateMessageEffect {
   message: {
     text?: string;
     attachment_ids?: string[];
-    components?: unknown[];
+    components?: WireComponent[];
   };
 }
 
@@ -60,6 +66,17 @@ export class BotEffectValidationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "BotEffectValidationError";
+  }
+}
+
+function wrapComponentValidation<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof ComponentValidationError) {
+      throw new BotEffectValidationError(err.message);
+    }
+    throw err;
   }
 }
 
@@ -105,7 +122,11 @@ function parseStartStreamMessageBody(raw: unknown): BotEffectMessageBody {
   const attachmentIds = Array.isArray(raw.attachment_ids)
     ? raw.attachment_ids.filter((id): id is string => typeof id === "string")
     : [];
-  const components = Array.isArray(raw.components) ? raw.components : [];
+  const components = wrapComponentValidation(() => {
+    const parsed = Array.isArray(raw.components) ? raw.components : [];
+    rejectNonEmptyStreamComponents(parsed);
+    return validateComponents(parsed);
+  });
   return {
     type,
     format,
@@ -152,7 +173,9 @@ function parseMessageBody(raw: unknown): BotEffectMessageBody {
   if (attachmentIds.length > 0) {
     throw new BotEffectValidationError("attachment_ids are not supported yet");
   }
-  const components = Array.isArray(raw.components) ? raw.components : [];
+  const components = wrapComponentValidation(() =>
+    validateComponents(Array.isArray(raw.components) ? raw.components : []),
+  );
   return {
     type,
     format,
@@ -267,8 +290,14 @@ export function validateEffectsForApply(
     seen.add(raw.client_effect_id);
     const effect = parseBotEffect(raw);
     if (effect.type === "start_stream") {
+      wrapComponentValidation(() => rejectNonEmptyStreamComponents(effect.message.components));
       parsed.push(effect);
       continue;
+    }
+    if (effect.type === "send_message") {
+      // components validated in parseMessageBody
+    } else if (effect.type === "update_message" && effect.message.components !== undefined) {
+      effect.message.components = wrapComponentValidation(() => validateComponents(effect.message.components));
     }
     if (effect.type === "update_message" || effect.type === "disable_components") {
       const row = ctx.loadMessage(effect.message_id);

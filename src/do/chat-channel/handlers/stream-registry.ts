@@ -27,6 +27,7 @@ import {
   computeFinalizeRequestHash,
   computeTextHash,
   isStreamRegistryExpired,
+  rejectNonEmptyStreamComponents,
   parseStreamRegistryMessageJson,
   sanitizeStreamMessageMetadata,
   streamExpiresAtIso,
@@ -417,6 +418,12 @@ export function StreamRegistryMixin<T extends Constructor<ChatChannelCore>>(Base
       if (registry.bot_id !== input.bot_id) throwRegistryNotFound();
 
       const components = Array.isArray(input.components) ? input.components : [];
+      try {
+        rejectNonEmptyStreamComponents(components);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "stream messages must not include components";
+        throw new ApiError("BOT_EFFECT_INVALID", message, { httpStatus: 422 });
+      }
       const attachmentIds = Array.isArray(input.attachment_ids)
         ? input.attachment_ids.filter((id): id is string => typeof id === "string")
         : [];
