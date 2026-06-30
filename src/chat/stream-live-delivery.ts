@@ -20,6 +20,19 @@ export function buildStreamStartedFrame(input: {
   });
 }
 
+export function buildStreamAbandonCleanupFrame(input: {
+  channelId: string;
+  messageId: string;
+  occurredAt: string;
+}): WireStreamEventFrame<"message.stream_abandon_cleanup"> {
+  return buildWireStreamEventFrame({
+    type: "message.stream_abandon_cleanup",
+    channel_id: input.channelId,
+    payload: { channel_id: input.channelId, message_id: input.messageId },
+    occurred_at: input.occurredAt,
+  });
+}
+
 export async function deliverLiveStreamFrame(
   env: Env,
   input: {

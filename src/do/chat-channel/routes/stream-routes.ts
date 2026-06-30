@@ -3,6 +3,7 @@ import {
   handleStreamAbandon,
   handleStreamFinalize,
   handleStreamRegistryCheck,
+  handleStreamRegistryPeek,
   handleStreamRegistryRegister,
 } from "../stream-registry-handlers";
 
@@ -15,6 +16,12 @@ export async function dispatchStreamRoutes(
     const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
     if (!body) return new Response("invalid payload", { status: 400 });
     return handleStreamRegistryCheck(host, body);
+  }
+
+  if (url.pathname === "/internal/stream-registry-peek" && request.method === "POST") {
+    const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body) return new Response("invalid payload", { status: 400 });
+    return handleStreamRegistryPeek(host, body);
   }
 
   if (url.pathname === "/internal/stream-registry-register" && request.method === "POST") {

@@ -50,6 +50,7 @@ import { bumpQueueRetry } from "./retry-backoff";
 import { idempotencyConflictResponse, requireTestOnly } from "./do-errors";
 import { isoDueTable, runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "./scheduler";
 import { archiveOutboxDueTable, flushArchiveOutboxToQueue } from "../archive/queue-flush";
+import { botStreamDoName } from "./bot-stream-connection";
 import {
   appendChatChannelArchive,
   collectDefinedChanges,
@@ -750,6 +751,7 @@ export class ChatChannel extends DurableObject<Env> {
       [
         ...this.outboxDueTables(async () => Promise.resolve()),
         ...this.statefulSessionDueTables(),
+        ...this.streamRegistryDueTables(),
         archiveOutboxDueTable(),
       ],
       { respectExistingAlarm: true },
@@ -775,6 +777,33 @@ export class ChatChannel extends DurableObject<Env> {
     return [
       isoDueTable("stateful_command_sessions", "expires_at", "status", "active", flush),
       isoDueTable("stateful_command_sessions", "started_at", "status", "starting", flush),
+    ];
+  }
+
+  private streamRegistryDueTables(): DueTable[] {
+    return [
+      isoDueTable("message_stream_registry", "expires_at", "status", "streaming", async (rows) => {
+        for (const row of rows) {
+          const channelId = row.channel_id;
+          const messageId = row.message_id;
+          const botId = row.bot_id;
+          if (typeof channelId !== "string" || typeof messageId !== "string" || typeof botId !== "string") {
+            continue;
+          }
+          const streamDo = this.env.BOT_STREAM_CONNECTION.getByName(botStreamDoName(channelId, messageId));
+          await streamDo.fetch(
+            new Request("https://x/internal/expire-stream", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                channel_id: channelId,
+                message_id: messageId,
+                bot_id: botId,
+              }),
+            }),
+          );
+        }
+      }),
     ];
   }
 
@@ -2267,7 +2296,8 @@ export class ChatChannel extends DurableObject<Env> {
   async alarm(): Promise<void> {
     const nowIso = this.nowIso();
     await flushStatefulSessionTimeouts(this as unknown as StatefulSessionHost, nowIso);
-    await runDueJobs(this.ctx, nowIso, this.outboxDueTables(async (rows) => {
+    await runDueJobs(this.ctx, nowIso, [
+      ...this.outboxDueTables(async (rows) => {
       const projectionRows: OutboxRow[] = [];
       const botRows: BotDeliveryOutboxRow[] = [];
       for (const row of rows as unknown as Array<Record<string, unknown>>) {
@@ -2283,7 +2313,9 @@ export class ChatChannel extends DurableObject<Env> {
       if (botRows.length > 0) {
         await this.flushBotDeliveryOutboxRows(botRows, nowIso);
       }
-    }));
+    }),
+      ...this.streamRegistryDueTables(),
+    ]);
     try {
       await flushArchiveOutboxToQueue(this.ctx, this.env.CHAT_ARCHIVE_QUEUE, { now: nowIso });
     } catch {

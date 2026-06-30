@@ -12,6 +12,7 @@ import {
   parseBotStreamHello,
   parseBotStreamPing,
 } from "../chat/bot-stream-protocol";
+import { callChatChannelStreamAbandon, parseStreamAbandonResponse } from "../chat/stream-abandon-client";
 import { callChatChannelStreamFinalize, parseStreamFinalizeResponse } from "../chat/stream-finalize-client";
 import { computeFinalizeRequestHash } from "../chat/stream-registry";
 import {
@@ -21,7 +22,7 @@ import {
   STREAM_PENDING_FLUSH_THRESHOLD_BYTES,
   WS_ATTACHMENT_MAX_BYTES,
 } from "../chat/stream-constants";
-import { deliverLiveStreamFrame } from "../chat/stream-live-delivery";
+import { buildStreamAbandonCleanupFrame, deliverLiveStreamFrame } from "../chat/stream-live-delivery";
 import { hashStreamDelta, validateAppendSeq } from "../chat/stream-seq";
 import { buildWireStreamEventFrame } from "../contract/wire-frames";
 import { handleSchemaVersionRequest } from "./sql-migrations";
@@ -59,7 +60,7 @@ interface StreamStateRow {
   updated_at: string;
 }
 
-type StreamDueJobKind = "flush" | "fanout";
+type StreamDueJobKind = "flush" | "fanout" | "expiry";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -93,6 +94,24 @@ export class BotStreamConnection extends DurableObject<Env> {
       const dueJobs = this.ctx.storage.sql.exec("SELECT * FROM stream_due_jobs").toArray();
       const sockets = this.ctx.getWebSockets();
       return Response.json({ stream_state: rows, stream_due_jobs: dueJobs, websocket_count: sockets.length });
+    }
+
+    if (url.pathname === "/internal/expire-stream" && request.method === "POST") {
+      let body: { channel_id?: string; message_id?: string; bot_id?: string };
+      try {
+        body = (await request.json()) as typeof body;
+      } catch {
+        return new Response("invalid payload", { status: 400 });
+      }
+      if (
+        typeof body.channel_id !== "string" ||
+        typeof body.message_id !== "string" ||
+        typeof body.bot_id !== "string"
+      ) {
+        return new Response("missing channel_id/message_id/bot_id", { status: 400 });
+      }
+      await this.expireStream(body.channel_id, body.message_id, body.bot_id);
+      return Response.json({ ok: true });
     }
 
     if (url.pathname === "/internal/seed-stream-state" && request.method === "POST") {
@@ -144,6 +163,11 @@ export class BotStreamConnection extends DurableObject<Env> {
         now,
         now,
       );
+      const seeded = this.loadStreamState(body.channel_id, body.message_id);
+      if (seeded) {
+        this.scheduleStreamExpiry(seeded.expires_at);
+        await scheduleNextAlarm(this.ctx, this.streamDueTables());
+      }
       return Response.json({ ok: true });
     }
 
@@ -166,8 +190,13 @@ export class BotStreamConnection extends DurableObject<Env> {
     if (row.status !== "streaming" && row.status !== "finalized") {
       return new Response("stream not active", { status: 409 });
     }
+    if (row.expires_at <= nowIso()) {
+      return new Response("stream expired", { status: 410 });
+    }
 
     const attachment = this.attachmentFromState(row, botId);
+    this.scheduleStreamExpiry(row.expires_at);
+    await scheduleNextAlarm(this.ctx, this.streamDueTables());
     const pair = new WebSocketPair();
     const [client, server] = pair as unknown as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server, [botStreamDoName(channelId, messageId)]);
@@ -254,13 +283,32 @@ export class BotStreamConnection extends DurableObject<Env> {
         statusColumn: "status",
         pendingStatus: "pending",
         dueValueKind: "epoch_ms",
-        handler: async (_rows: DueRow[]) => {
-          const nowMs = Date.now();
-          for (const ws of this.ctx.getWebSockets()) {
-            const attachment = ws.deserializeAttachment() as BotStreamConnectionAttachment | null;
-            if (!attachment) continue;
-            const updated = await this.processPendingWork(ws, attachment, nowMs);
-            ws.serializeAttachment(updated);
+        handler: async (rows: DueRow[]) => {
+          const kinds = new Set(rows.map((row) => row.job_kind as string));
+          if (kinds.has("expiry")) {
+            const stateRows = this.ctx.storage.sql.exec("SELECT channel_id, message_id, bot_id, status, expires_at FROM stream_state").toArray() as Array<{
+              channel_id: string;
+              message_id: string;
+              bot_id: string;
+              status: string;
+              expires_at: string;
+            }>;
+            const now = nowIso();
+            for (const state of stateRows) {
+              if (state.status !== "streaming") continue;
+              if (state.expires_at > now) continue;
+              await this.expireStream(state.channel_id, state.message_id, state.bot_id);
+            }
+          }
+
+          if (kinds.has("flush") || kinds.has("fanout")) {
+            const nowMs = Date.now();
+            for (const ws of this.ctx.getWebSockets()) {
+              const attachment = ws.deserializeAttachment() as BotStreamConnectionAttachment | null;
+              if (!attachment) continue;
+              const updated = await this.processPendingWork(ws, attachment, nowMs);
+              ws.serializeAttachment(updated);
+            }
           }
         },
       },
@@ -286,7 +334,7 @@ export class BotStreamConnection extends DurableObject<Env> {
       return;
     }
     if (row.status !== "streaming") {
-      this.sendStreamError(ws, "BOT_STREAM_NOT_FOUND", "stream not active", false);
+      this.sendStreamError(ws, "BOT_STREAM_EXPIRED", "stream expired", false);
       return;
     }
     if (row.expires_at <= nowIso()) {
@@ -440,6 +488,110 @@ export class BotStreamConnection extends DurableObject<Env> {
       channelId,
       messageId,
     );
+    this.clearStreamDueJob("expiry");
+  }
+
+  private markStreamAbandoned(channelId: string, messageId: string): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE stream_state SET status='abandoned', updated_at=? WHERE channel_id=? AND message_id=?",
+      nowIso(),
+      channelId,
+      messageId,
+    );
+    this.clearStreamDueJob("flush");
+    this.clearStreamDueJob("fanout");
+    this.clearStreamDueJob("expiry");
+  }
+
+  private scheduleStreamExpiry(expiresAt: string): void {
+    const dueAtMs = Date.parse(expiresAt);
+    if (!Number.isFinite(dueAtMs)) return;
+    this.upsertStreamDueJob("expiry", dueAtMs);
+  }
+
+  private async isRegistryStillStreaming(
+    channelId: string,
+    messageId: string,
+    botId: string,
+  ): Promise<boolean> {
+    const res = await this.env.CHAT_CHANNEL.getByName(channelId).fetch(
+      new Request("https://x/internal/stream-registry-peek", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channel_id: channelId,
+          message_id: messageId,
+          bot_id: botId,
+        }),
+      }),
+    );
+    if (!res.ok) return false;
+    const body = (await res.json()) as { status?: string };
+    return body.status === "streaming";
+  }
+
+  private async expireStream(channelId: string, messageId: string, botId: string): Promise<void> {
+    const row = this.loadStreamState(channelId, messageId);
+    if (row && row.status !== "streaming") return;
+
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() as BotStreamConnectionAttachment | null;
+      if (!attachment) continue;
+      if (attachment.channel_id !== channelId || attachment.message_id !== messageId) continue;
+      let next = attachment;
+      while (next.pending_text) {
+        next = await this.flushPending(ws, next);
+      }
+      if (next.fanout_pending_text) {
+        next = await this.fanoutPending(next);
+      }
+      ws.serializeAttachment(next);
+    }
+
+    const freshRow = this.loadStreamState(channelId, messageId);
+    const resolvedPartial = freshRow?.flushed_text ?? "";
+
+    if (resolvedPartial.length === 0) {
+      const stillStreaming = await this.isRegistryStillStreaming(channelId, messageId, botId);
+      if (stillStreaming) {
+        await deliverLiveStreamFrame(this.env, {
+          channel_id: channelId,
+          frame: buildStreamAbandonCleanupFrame({
+            channelId,
+            messageId,
+            occurredAt: nowIso(),
+          }),
+        });
+      }
+    }
+
+    const abandonRes = await callChatChannelStreamAbandon(this.env, {
+      channel_id: channelId,
+      message_id: messageId,
+      bot_id: botId,
+      resolved_partial: resolvedPartial,
+    });
+    const parsed = await parseStreamAbandonResponse(abandonRes);
+    if (!parsed.ok && parsed.code !== "BOT_STREAM_CONFLICT") {
+      return;
+    }
+
+    if (freshRow && freshRow.status === "streaming") {
+      this.markStreamAbandoned(channelId, messageId);
+    } else if (!freshRow) {
+      this.clearStreamDueJob("expiry");
+    }
+
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() as BotStreamConnectionAttachment | null;
+      if (!attachment) continue;
+      if (attachment.channel_id !== channelId || attachment.message_id !== messageId) continue;
+      try {
+        ws.close(1000, "stream expired");
+      } catch {
+        // socket may already be closed
+      }
+    }
   }
 
   private async handleAppend(
@@ -450,7 +602,7 @@ export class BotStreamConnection extends DurableObject<Env> {
   ): Promise<void> {
     const row = this.loadStreamState(attachment.channel_id, attachment.message_id);
     if (!row || row.status !== "streaming") {
-      this.sendStreamError(ws, "BOT_STREAM_NOT_FOUND", "stream not active", false);
+      this.sendStreamError(ws, row?.status === "abandoned" || row?.status === "expired" ? "BOT_STREAM_EXPIRED" : "BOT_STREAM_NOT_FOUND", row?.status === "abandoned" || row?.status === "expired" ? "stream expired" : "stream not active", false);
       return;
     }
     if (row.expires_at <= nowIso()) {
@@ -674,7 +826,11 @@ export class BotStreamConnection extends DurableObject<Env> {
       now,
       now,
     );
-    return this.loadStreamState(channelId, messageId);
+    const created = this.loadStreamState(channelId, messageId);
+    if (created) {
+      this.scheduleStreamExpiry(created.expires_at);
+    }
+    return created;
   }
 
   private loadStreamState(channelId: string, messageId: string): StreamStateRow | null {

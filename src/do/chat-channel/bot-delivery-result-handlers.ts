@@ -712,7 +712,7 @@ export async function handleBotDeliveryResult(
     });
   }
 
-  if (effectResults.some((result) => result.type !== "start_stream")) {
+  if (streamStartedEmits.length > 0 || effectResults.some((result) => result.type !== "start_stream")) {
     await host.scheduleOutboxAlarm(now);
   }
   return Response.json({ status: "applied", effect_results: effectResults });

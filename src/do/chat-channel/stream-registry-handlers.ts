@@ -338,6 +338,24 @@ export async function handleStreamRegistryCheck(host: ChatChannelHost, body: {
   });
 }
 
+export async function handleStreamRegistryPeek(host: ChatChannelHost, body: {
+  channel_id?: unknown;
+  message_id?: unknown;
+  bot_id?: unknown;
+}): Promise<Response> {
+  if (
+    typeof body.channel_id !== "string" ||
+    typeof body.message_id !== "string" ||
+    typeof body.bot_id !== "string"
+  ) {
+    return new Response("invalid payload", { status: 400 });
+  }
+
+  const registry = loadRegistryRow(host, body.channel_id, body.message_id);
+  if (!registry || registry.bot_id !== body.bot_id) return registryNotFoundError();
+  return Response.json({ status: registry.status });
+}
+
 export async function handleStreamRegistryRegister(host: ChatChannelHost, body: {
   channel_id?: unknown;
   bot_id?: unknown;
