@@ -325,8 +325,7 @@ describe("ChatChannel stream registry RPC", () => {
       resolved_partial: "",
       abandoned_text_hash: emptyHash,
     });
-    expect("ok" in payload && payload.ok).toBe(true);
-    expect("canonical" in payload && payload.canonical).toBe(false);
+    expect(payload).toEqual({ canonical: false });
 
     await withDoState(stub, (ctx) => {
       const registry = ctx.storage.sql

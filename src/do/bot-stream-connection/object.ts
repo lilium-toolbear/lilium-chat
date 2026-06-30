@@ -12,8 +12,8 @@ import {
   parseBotStreamHello,
   parseBotStreamPing,
 } from "../../chat/bot-stream-protocol";
-import { callChatChannelStreamAbandon, parseStreamAbandonResponse, streamAbandonErrorFromThrown } from "../../chat/stream-abandon-client";
-import { callChatChannelStreamFinalize, parseStreamFinalizeResponse, streamFinalizeErrorFromThrown } from "../../chat/stream-finalize-client";
+import { callChatChannelStreamAbandon, streamAbandonErrorFromThrown } from "../../chat/stream-abandon-client";
+import { callChatChannelStreamFinalize, streamFinalizeErrorFromThrown } from "../../chat/stream-finalize-client";
 import { logSwallowedError } from "../../errors";
 import { computeFinalizeRequestHash } from "../../chat/stream-registry";
 import {
@@ -418,11 +418,6 @@ export class BotStreamConnection extends DurableObject<Env> {
         components,
         attachment_ids: attachmentIds,
       });
-      const parsed = await parseStreamFinalizeResponse(body);
-      if (!parsed.ok) {
-        this.sendStreamError(ws, parsed.code, parsed.message, parsed.retryable);
-        return;
-      }
 
       this.markStreamFinalized(attachment.channel_id, attachment.message_id);
       this.clearStreamDueJob("flush");
@@ -430,8 +425,8 @@ export class BotStreamConnection extends DurableObject<Env> {
       ws.send(
         JSON.stringify(
           buildBotStreamFinalizedAck({
-            message_id: parsed.body.message_id,
-            event_id: parsed.body.event_id,
+            message_id: body.message_id,
+            event_id: body.event_id,
           }),
         ),
       );
@@ -484,17 +479,12 @@ export class BotStreamConnection extends DurableObject<Env> {
         components,
         attachment_ids: attachmentIds,
       });
-      const parsed = await parseStreamFinalizeResponse(body);
-      if (!parsed.ok) {
-        this.sendStreamError(ws, parsed.code, parsed.message, parsed.retryable);
-        return;
-      }
 
       ws.send(
         JSON.stringify(
           buildBotStreamFinalizedAck({
-            message_id: parsed.body.message_id,
-            event_id: parsed.body.event_id,
+            message_id: body.message_id,
+            event_id: body.event_id,
           }),
         ),
       );
@@ -599,16 +589,12 @@ export class BotStreamConnection extends DurableObject<Env> {
     }
 
     try {
-      const abandonBody = await callChatChannelStreamAbandon(this.env, {
+      await callChatChannelStreamAbandon(this.env, {
         channel_id: channelId,
         message_id: messageId,
         bot_id: botId,
         resolved_partial: resolvedPartial,
       });
-      const parsed = await parseStreamAbandonResponse(abandonBody);
-      if (!parsed.ok && parsed.code !== "BOT_STREAM_CONFLICT") {
-        return;
-      }
     } catch (err) {
       const parsed = streamAbandonErrorFromThrown(err);
       if (parsed.code !== "BOT_STREAM_CONFLICT") {
