@@ -33,6 +33,51 @@ const STATEFUL_EXECUTION = {
   },
 };
 
+const STATEFUL_EXECUTION_WITH_BOT_MESSAGES = {
+  ...STATEFUL_EXECUTION,
+  stateful: {
+    ...STATEFUL_EXECUTION.stateful,
+    listen_capability: {
+      ...STATEFUL_EXECUTION.stateful.listen_capability,
+      include_bot_messages: true,
+    },
+  },
+};
+
+const REGISTRY = () =>
+  getNamedDo(env.BOT_REGISTRY as unknown as DurableObjectNamespace, "registry");
+
+const seededBots = new Set<string>();
+
+async function withRegistry(
+  fn: (ctx: DurableObjectState) => void | Promise<void>,
+): Promise<void> {
+  const { runInDurableObject } = await import("cloudflare:test");
+  await runInDurableObject(REGISTRY(), async (instance: unknown) => {
+    const ctx = (instance as { ctx: DurableObjectState }).ctx;
+    await fn(ctx);
+  });
+}
+
+async function seedBot(botId: string, displayName = "Game Bot"): Promise<void> {
+  await withRegistry((ctx) => {
+    ctx.storage.sql.exec(
+      `INSERT INTO bot_apps (bot_id, owner_user_id, display_name, avatar_url, description, visibility, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      botId,
+      "owner-1",
+      displayName,
+      null,
+      null,
+      "private",
+      "active",
+      "2026-06-30T00:00:00.000Z",
+      "2026-06-30T00:00:00.000Z",
+    );
+  });
+  seededBots.add(botId);
+}
+
 async function seedStatefulBinding(input: {
   channelId: string;
   userId: string;
@@ -40,7 +85,9 @@ async function seedStatefulBinding(input: {
   botCommandId: string;
   manifestVersion: number;
   commandName?: string;
+  execution?: typeof STATEFUL_EXECUTION | typeof STATEFUL_EXECUTION_WITH_BOT_MESSAGES;
 }): Promise<void> {
+  const execution = input.execution ?? STATEFUL_EXECUTION;
   await withChannel(input.channelId, (ctx) => {
     const now = new Date().toISOString();
     ctx.storage.sql.exec(
@@ -59,7 +106,7 @@ async function seedStatefulBinding(input: {
         bot: { bot_id: input.botId, display_name: "Game Bot", avatar_url: null },
         options: [],
         default_member_permission: "member",
-        execution: STATEFUL_EXECUTION,
+        execution,
       }),
       input.userId,
       now,
@@ -170,6 +217,12 @@ afterEach(() => {
   for (const ws of openedBotSockets.splice(0)) {
     ws.close();
   }
+  for (const botId of seededBots) {
+    void withRegistry((ctx) => {
+      ctx.storage.sql.exec("DELETE FROM bot_apps WHERE bot_id=?", botId);
+    });
+  }
+  seededBots.clear();
 });
 
 describe("stateful command sessions", () => {
@@ -507,5 +560,121 @@ describe("stateful command sessions", () => {
     const resumed = await secondGateway.waitForType("session.input");
     expect(resumed.type).toBe("session.input");
     expect(resumed.seq).toBe(1);
+  });
+
+  it("enqueues session.input when bot send_message fires and include_bot_messages is true", async () => {
+    const userId = `stateful-user-${crypto.randomUUID()}`;
+    const channelId = crypto.randomUUID();
+    const botId = `stateful-bot-${crypto.randomUUID()}`;
+    const botCommandId = `stateful-cmd-${crypto.randomUUID()}`;
+
+    await seedBot(botId);
+    await createOwnedTestChannel(
+      env as unknown as Pick<import("../../src/env").Env, "CHAT_CHANNEL">,
+      userId,
+      { channelId, title: "Bot Message Input" },
+    );
+    await seedStatefulBinding({
+      channelId,
+      userId,
+      botId,
+      botCommandId,
+      manifestVersion: 1,
+      execution: STATEFUL_EXECUTION_WITH_BOT_MESSAGES,
+    });
+
+    const botGateway = await openBotGateway(botId);
+    openedBotSockets.push(botGateway.ws);
+
+    const sessionStartPromise = botGateway.waitForType("session.start");
+    const { ws, ack } = await invokeStatefulCommand({ userId, channelId, botCommandId });
+    const sessionId = ack.payload?.session_id as string;
+    expect(sessionId).toBeTruthy();
+
+    const sessionStart = await sessionStartPromise;
+    expect(sessionStart.session_id).toBe(sessionId);
+
+    botGateway.ws.send(JSON.stringify({
+      type: "session.start_ack",
+      api_version: BOT_GATEWAY_API_VERSION,
+      session_id: sessionId,
+    }));
+
+    for (let i = 0; i < 40; i++) {
+      let active = false;
+      await withChannel(channelId, (ctx) => {
+        const row = ctx.storage.sql
+          .exec("SELECT status FROM stateful_command_sessions WHERE session_id=?", sessionId)
+          .toArray()[0] as { status: string } | undefined;
+        active = row?.status === "active";
+      });
+      if (active) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    const channelStub = getNamedDo<ChatChannel>(env.CHAT_CHANNEL, channelId);
+    const botText = "bot fan-in message";
+    const deliveryResult = await channelStub.botDeliveryResult({
+      delivery_id: `del-${crypto.randomUUID()}`,
+      outbox_id: `out-${crypto.randomUUID()}`,
+      bot_id: botId,
+      channel_id: channelId,
+      effects: [{
+        type: "send_message",
+        client_effect_id: `eff-${crypto.randomUUID()}`,
+        message: {
+          type: "text",
+          format: "plain",
+          text: botText,
+          reply_to_message_id: null,
+          attachment_ids: [],
+          components: [],
+        },
+      }],
+    });
+    expect(deliveryResult.status).toBe("applied");
+
+    for (let i = 0; i < 40; i++) {
+      let inputCount = 0;
+      await withChannel(channelId, (ctx) => {
+        const row = ctx.storage.sql
+          .exec("SELECT COUNT(*) AS c FROM stateful_session_inputs WHERE session_id=?", sessionId)
+          .toArray()[0] as { c: number };
+        inputCount = Number(row.c);
+      });
+      if (inputCount > 0) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    await withChannel(channelId, (ctx) => {
+      const row = ctx.storage.sql
+        .exec("SELECT COUNT(*) AS c FROM stateful_session_inputs WHERE session_id=?", sessionId)
+        .toArray()[0] as { c: number };
+      expect(Number(row.c)).toBeGreaterThan(0);
+    });
+
+    const { runDurableObjectAlarm } = await import("cloudflare:test") as {
+      runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void>;
+    };
+    await runDurableObjectAlarm(channelStub);
+
+    const sessionInput = await botGateway.waitForType("session.input");
+    expect(sessionInput.type).toBe("session.input");
+    expect(sessionInput.session_id).toBe(sessionId);
+    expect(sessionInput.seq).toBe(1);
+    const inputMessage = sessionInput.message as { text?: string } | undefined;
+    expect(inputMessage?.text).toBe(botText);
+
+    await withChannel(channelId, (ctx) => {
+      const row = ctx.storage.sql
+        .exec(
+          "SELECT status FROM stateful_session_inputs WHERE session_id=? AND seq=1",
+          sessionId,
+        )
+        .toArray()[0] as { status: string } | undefined;
+      expect(["pending", "sent"]).toContain(row?.status);
+    });
+
+    ws.close();
   });
 });

@@ -41,6 +41,7 @@ import {
 import type { Constructor } from "../mixin";
 import { ChatChannelCore } from "../core";
 import { asHandlerRef, type ChatChannelHandlerRef } from "../handler-ref";
+import { enqueueStatefulInputForBotMessageCreated } from "./stateful-session";
 
 interface RegistryRow {
   channel_id: string;
@@ -549,6 +550,15 @@ export function StreamRegistryMixin<T extends Constructor<ChatChannelCore>>(Base
 
       if (txResult.kind === "conflict") throwRegistryConflict("stream already finalized with different request");
       if (txResult.kind === "expired") throwRegistryExpired();
+
+      await enqueueStatefulInputForBotMessageCreated(asHandlerRef(this), {
+        channelId: input.channel_id,
+        messageId: messageRow.message_id,
+        eventId,
+        occurredAt: now,
+        messageRow,
+        components: components as WireChatMessage["components"],
+      });
 
       await this.scheduleOutboxAlarm(now);
       await this.scheduleArchiveAlarm(now);

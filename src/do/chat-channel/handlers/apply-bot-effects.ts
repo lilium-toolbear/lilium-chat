@@ -50,6 +50,10 @@ import {
   resolveBotAttachmentIds,
 } from "./bot-attachment-resolve";
 import type { MessageImageAttachment } from "../../../contract/message";
+import {
+  enqueueStatefulInputForMessageCreated,
+  type MessageCreatedStatefulInput,
+} from "./stateful-session";
 
 interface BotSummary {
   display_name: string;
@@ -80,6 +84,7 @@ export type ApplyValidatedEffectsResult =
       status: "applied";
       effect_results: EffectResult[];
       streamStartedEmits: StreamStartedEmit[];
+      messageCreatedEnqueues: MessageCreatedStatefulInput[];
       scheduleOutbox: boolean;
     }
   | { status: "failed"; error: { code: string; message: string } };
@@ -225,7 +230,7 @@ function applySendMessageEffect(
     outboxId: string;
     requestHash: string;
   },
-): { message_id: string; event_id: string; effectResult: EffectResult } {
+): { message_id: string; event_id: string; effectResult: EffectResult; messageCreatedEnqueue: MessageCreatedStatefulInput } {
   const messageId = uuidv7(input.nowMs);
   const eventId = channel.nextEventId(input.nowMs + 1);
   const componentsJson = JSON.stringify(input.effect.message.components);
@@ -299,6 +304,11 @@ function applySendMessageEffect(
     membershipVersion: input.membershipVersion,
   });
 
+  const messageProjection = projectMessageForBrowser(messageRow, {
+    components: input.effect.message.components as WireChatMessage["components"],
+    attachments: attachmentProjections,
+  });
+
   const responseJson = JSON.stringify({ message_id: messageId, event_id: eventId });
   channel.ctx.storage.sql.exec(
     `INSERT INTO bot_effects_applied (
@@ -334,6 +344,14 @@ function applySendMessageEffect(
       message_id: messageId,
       event_id: eventId,
     }),
+    messageCreatedEnqueue: {
+      channelId: input.channelId,
+      messageId,
+      eventId,
+      occurredAt: input.now,
+      messageRow,
+      messageProjection,
+    },
   };
 }
 
@@ -644,6 +662,7 @@ export async function applyValidatedEffects(
   const nowMs = Date.parse(now);
   const effectResults: EffectResult[] = [];
   const streamStartedEmits: StreamStartedEmit[] = [];
+  const messageCreatedEnqueues: MessageCreatedStatefulInput[] = [];
 
   try {
     await channel.ctx.storage.transaction(async () => {
@@ -730,19 +749,19 @@ export async function applyValidatedEffects(
           if (!botSummary) {
             throw new BotEffectValidationError("bot summary unavailable");
           }
-          effectResults.push(
-            applySendMessageEffect(channel, {
-              channelId,
-              botId,
-              botSummary,
-              effect,
-              now,
-              nowMs: nowMs + effectResults.length,
-              membershipVersion,
-              outboxId,
-              requestHash,
-            }).effectResult,
-          );
+          const sendResult = applySendMessageEffect(channel, {
+            channelId,
+            botId,
+            botSummary,
+            effect,
+            now,
+            nowMs: nowMs + effectResults.length,
+            membershipVersion,
+            outboxId,
+            requestHash,
+          });
+          effectResults.push(sendResult.effectResult);
+          messageCreatedEnqueues.push(sendResult.messageCreatedEnqueue);
           continue;
         }
 
@@ -818,6 +837,7 @@ export async function applyValidatedEffects(
     status: "applied",
     effect_results: effectResults,
     streamStartedEmits,
+    messageCreatedEnqueues,
     scheduleOutbox,
   };
 }
@@ -828,6 +848,9 @@ export async function finalizeAppliedEffects(
   result: Extract<ApplyValidatedEffectsResult, { status: "applied" }>,
   now: string,
 ): Promise<void> {
+  for (const enqueue of result.messageCreatedEnqueues) {
+    await enqueueStatefulInputForMessageCreated(channel, enqueue);
+  }
   for (const emit of result.streamStartedEmits) {
     await deliverLiveStreamFrame(env, {
       channel_id: emit.channelId,
