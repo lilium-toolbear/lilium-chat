@@ -12,6 +12,11 @@ import {
   validateInteractionValue,
 } from "../../chat/interaction-policy";
 import { buildEventFrame, buildMessageLifecyclePayload } from "../../chat/event-broadcast";
+import {
+  buildInteractionCreatedPersistedPayload,
+  projectInteractionCreatedWirePayload,
+  resolveComponentLabelFromJson,
+} from "../../chat/bot-lifecycle-events";
 import { projectMessageForBrowser } from "../../chat/message-projection";
 import { idempotencyExpiresAt } from "../../contract/idempotency";
 import { fallbackUserDisplayName } from "../../contract/primitives";
@@ -478,9 +483,14 @@ export async function handleInteractionSubmitRequest(
     }
 
     const eventId = host.nextEventId(nowMs + nextEventOffset);
-    const persistedPayload = {
-      interaction: { interaction_id: interactionId, status: "pending", created_at: now },
-    };
+    const persistedPayload = buildInteractionCreatedPersistedPayload({
+      interactionId,
+      createdAt: now,
+      commandId: operationId,
+      actorUserId: userId,
+      messageId,
+      componentId,
+    });
     host.ctx.storage.sql.exec(
       "INSERT INTO events (event_id, event_type, channel_id, actor_kind, actor_id, payload_json, membership_version_at_event, occurred_at) VALUES (?, 'interaction.created', ?, 'user', ?, ?, ?, ?)",
       eventId,
@@ -490,12 +500,16 @@ export async function handleInteractionSubmitRequest(
       currentMeta.membership_version,
       now,
     );
+    const componentLabel = resolveComponentLabelFromJson(
+      currentMessage.components_json ?? "[]",
+      componentId,
+    );
     const liveEventFrame = buildEventFrame({
       event_id: eventId,
       type: "interaction.created",
       channel_id: channelId,
       occurred_at: now,
-      payload: persistedPayload,
+      payload: projectInteractionCreatedWirePayload(persistedPayload, actor, componentLabel),
     });
     host.insertOutboxRowForFanout(
       channelId,

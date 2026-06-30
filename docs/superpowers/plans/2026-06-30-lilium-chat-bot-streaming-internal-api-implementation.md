@@ -461,6 +461,60 @@
 
 ---
 
+## Task 12: `message_interaction` delivery-complete lifecycle
+
+- [x] **Task 12 complete**
+
+**目标：** Bot `delivery_result` 应用后（或失败时）完成 interaction 生命周期：`interactions.status=completed|failed`，emit `interaction.completed` / `interaction.failed`。对齐 Phase 7 Task `7d-interaction-delivery`。
+
+**可能修改的文件：**
+
+- `src/do/chat-channel/interaction-delivery-completion.ts`（新建）
+- `src/do/chat-channel/bot-delivery-result-handlers.ts` — `kind=message_interaction` 分支
+- `test/do/interaction-delivery-complete.test.ts`
+
+**实现要点：**
+
+- 从 `bot_delivery_outbox` 按 `outbox_id` 读取 `kind` / `interaction_id`。
+- 成功（含空 `effects: []`）→ `interaction.completed`（content-bearing，含 message 投影）。
+- 422 `BOT_EFFECT_INVALID` → `interaction.failed`。
+- 幂等：已 `completed`/`failed` 的 interaction 不重复 emit。
+
+**测试要求：**
+
+- 空 effects delivery → interaction completed + `interaction.completed` event。
+- 非法 effect → interaction failed + `interaction.failed` event。
+
+---
+
+## Task 13: Bot lifecycle event Browser wire projection
+
+- [x] **Task 13 complete**
+
+**目标：** `command.invoked` / `interaction.created` live + HTTP replay 回填 `actor`、`command_name`/`component_label`；storage 保持最小引用（对齐 `system.notice` 模式）。
+
+**可能修改的文件：**
+
+- `src/chat/bot-lifecycle-events.ts`（新建）
+- `src/do/chat-channel.ts` — `command.invoked` live frame
+- `src/do/chat-channel/interaction-submit-handlers.ts` — `interaction.created` live frame
+- `src/chat/replay-projection.ts` — replay enrichment
+- `src/contract/events.ts` — wire 可选字段 + `REPLAY_BOT_LIFECYCLE_EVENT_TYPES`
+- `test/chat/bot-lifecycle-events.test.ts`
+
+**实现要点：**
+
+- Persisted：`actor_user_id`、`command_name`/`invoked_name`（command）；`message_id`+`component_id`（interaction）。
+- Wire：live broadcast 与 replay 均投影 UserSummary + display fields。
+- `interaction.completed` 加入 `REPLAY_MESSAGE_EVENT_TYPES`。
+
+**测试要求：**
+
+- Unit：projection helpers。
+- Integration：`interaction.created` fanout payload 含 `actor` + `component_label`（通过 submit + outbox 或 replay 断言）。
+
+---
+
 ## Deferred tasks (document only — do not implement)
 
 | Item | Reason |
@@ -469,7 +523,6 @@
 | Bot read API | §9.17 D8 — needs read grant design |
 | Bot attachment upload | §9.17 — optional; channel-scoped v1 spec exists but not streaming blocker |
 | Public Bot developer docs | After deploy verification |
-| `docs/bot-developer-guide.md` major update | After public API extraction |
 
 ---
 
@@ -496,6 +549,7 @@ Manual review:
 Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6 → Task 7 → Task 8 → Task 9
                                     ↘ Task 10 (parallel after Task 4)
                                     ↘ Task 11 (optional parallel track)
+Task 11 → Task 12 → Task 13
 ```
 
 Tasks 1–3 can partially parallelize after Task 1 types land. Task 4 blocks Task 5. Tasks 6–9 are sequential on stream path.

@@ -25,6 +25,10 @@ import type { Env } from "../../env";
 import { doErrorResponse } from "../../errors";
 import type { ChatChannelHost } from "./host";
 import {
+  finalizeInteractionDelivery,
+  loadBotDeliveryOutboxMeta,
+} from "./interaction-delivery-completion";
+import {
   registerStartStreamEffectInTransaction,
   type StartStreamRegistrationResult,
 } from "./stream-registry-handlers";
@@ -35,6 +39,35 @@ import {
   upsertEventChange,
   upsertMessageChange,
 } from "../../archive/chat-channel-record";
+
+function maybeFinalizeInteractionDelivery(
+  host: ChatChannelHost,
+  context: { interactionId: string; membershipVersion: number } | null,
+  input: {
+    channelId: string;
+    botId: string;
+    success: boolean;
+    errorCode?: string;
+    errorMessage?: string;
+  },
+): void {
+  if (!context) return;
+  const finalizeNow = host.nowIso();
+  const finalizeNowMs = Date.parse(finalizeNow);
+  host.ctx.storage.transactionSync(() => {
+    finalizeInteractionDelivery(host, {
+      interactionId: context.interactionId,
+      channelId: input.channelId,
+      botId: input.botId,
+      membershipVersion: context.membershipVersion,
+      now: finalizeNow,
+      nowMs: finalizeNowMs,
+      success: input.success,
+      errorCode: input.errorCode,
+      errorMessage: input.errorMessage,
+    });
+  });
+}
 
 interface BotDeliveryResultBody {
   delivery_id?: unknown;
@@ -513,6 +546,15 @@ export async function handleBotDeliveryResult(
     return doErrorResponse(dissolved.code, dissolved.message, { httpStatus: 409 });
   }
 
+  const outboxMeta = loadBotDeliveryOutboxMeta(host, outboxId);
+  const interactionDeliveryContext =
+    outboxMeta?.kind === "message_interaction" && outboxMeta.interaction_id
+      ? {
+          interactionId: outboxMeta.interaction_id,
+          membershipVersion: meta.membership_version,
+        }
+      : null;
+
   const effects = body.effects as BotEffectWire[];
   let parsedEffects: ParsedBotEffect[];
   try {
@@ -522,6 +564,13 @@ export async function handleBotDeliveryResult(
     });
   } catch (err) {
     const message = err instanceof BotEffectValidationError ? err.message : "invalid effect";
+    maybeFinalizeInteractionDelivery(host, interactionDeliveryContext, {
+      channelId,
+      botId,
+      success: false,
+      errorCode: "BOT_EFFECT_INVALID",
+      errorMessage: message,
+    });
     return Response.json(
       { status: "failed", error: { code: "BOT_EFFECT_INVALID", message } },
       { status: 422 },
@@ -532,6 +581,13 @@ export async function handleBotDeliveryResult(
   if (parsedEffects.some((effect) => effect.type === "send_message" || effect.type === "start_stream")) {
     botSummary = await fetchBotSummary(env, botId);
     if (!botSummary) {
+      maybeFinalizeInteractionDelivery(host, interactionDeliveryContext, {
+        channelId,
+        botId,
+        success: false,
+        errorCode: "BOT_NOT_FOUND",
+        errorMessage: "bot not found",
+      });
       return Response.json(
         { status: "failed", error: { code: "BOT_NOT_FOUND", message: "bot not found" } },
         { status: 404 },
@@ -694,10 +750,25 @@ export async function handleBotDeliveryResult(
       });
     }
     const message = err instanceof BotEffectValidationError ? err.message : "invalid effect";
+    maybeFinalizeInteractionDelivery(host, interactionDeliveryContext, {
+      channelId,
+      botId,
+      success: false,
+      errorCode: "BOT_EFFECT_INVALID",
+      errorMessage: message,
+    });
     return Response.json(
       { status: "failed", error: { code: "BOT_EFFECT_INVALID", message } },
       { status: 422 },
     );
+  }
+
+  if (interactionDeliveryContext) {
+    maybeFinalizeInteractionDelivery(host, interactionDeliveryContext, {
+      channelId,
+      botId,
+      success: true,
+    });
   }
 
   for (const emit of streamStartedEmits) {
@@ -712,7 +783,11 @@ export async function handleBotDeliveryResult(
     });
   }
 
-  if (streamStartedEmits.length > 0 || effectResults.some((result) => result.type !== "start_stream")) {
+  if (
+    streamStartedEmits.length > 0 ||
+    effectResults.some((result) => result.type !== "start_stream") ||
+    interactionDeliveryContext
+  ) {
     await host.scheduleOutboxAlarm(now);
   }
   return Response.json({ status: "applied", effect_results: effectResults });

@@ -104,6 +104,14 @@ export const REPLAY_MESSAGE_EVENT_TYPES: ReadonlySet<string> = new Set([
   "message.deleted",
   "message.stream_finalized",
   "message.stream_abandoned",
+  "interaction.completed",
+  "command.completed",
+]);
+
+/** Bot lifecycle events replay resolves actor refs and enriches display fields. */
+export const REPLAY_BOT_LIFECYCLE_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "command.invoked",
+  "interaction.created",
 ]);
 
 /** Management events replay resolves actor refs to live UserSummary. */
@@ -304,6 +312,8 @@ export interface CommandInvokedEventPayload {
     created_at: IsoDateTimeString;
   };
   command_id?: ChatId;
+  command_name?: string;
+  actor?: UserSummary;
 }
 
 export interface CommandCompletedEventPayload {
@@ -327,6 +337,8 @@ export interface InteractionCreatedEventPayload {
     created_at: IsoDateTimeString;
   };
   command_id?: ChatId;
+  component_label?: string;
+  actor?: UserSummary;
 }
 
 export interface InteractionCompletedEventPayload {
