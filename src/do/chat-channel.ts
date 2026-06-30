@@ -75,6 +75,7 @@ import { dispatchMessageRoutes } from "./chat-channel/routes/message-routes";
 import { dispatchMembershipRoutes } from "./chat-channel/routes/membership-routes";
 import { dispatchChannelRoutes } from "./chat-channel/routes/channel-routes";
 import { dispatchBotRoutes } from "./chat-channel/routes/bot-routes";
+import { dispatchStreamRoutes } from "./chat-channel/routes/stream-routes";
 import {
   handleStatefulCommandInvoke,
   flushStatefulSessionTimeouts,
@@ -941,6 +942,9 @@ export class ChatChannel extends DurableObject<Env> {
 
     const botResponse = await dispatchBotRoutes(host, request, url);
     if (botResponse !== null) return botResponse;
+
+    const streamResponse = await dispatchStreamRoutes(host, request, url);
+    if (streamResponse !== null) return streamResponse;
 
     return new Response("not found", { status: 404 });
   }
