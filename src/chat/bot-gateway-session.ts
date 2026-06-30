@@ -1,4 +1,5 @@
 import { BOT_GATEWAY_API_VERSION } from "../contract/bot-gateway";
+import type { EffectResult } from "../contract/bot-gateway";
 import type { CommandInvocationReplyContext, WireChatMessage } from "../contract/message";
 import { isRecord } from "../contract/utils";
 
@@ -131,4 +132,65 @@ export interface SessionClosedFrame {
 
 export function buildSessionClosed(input: Omit<SessionClosedFrame, "type" | "api_version">): SessionClosedFrame {
   return { type: "session.closed", api_version: BOT_GATEWAY_API_VERSION, ...input };
+}
+
+export interface ParsedSessionEffects {
+  type: "session.effects";
+  api_version: string;
+  session_id: string;
+  effect_seq: number;
+  effects: unknown[];
+}
+
+export interface SessionEffectsAckFrame {
+  type: "session.effects_ack";
+  api_version: typeof BOT_GATEWAY_API_VERSION;
+  session_id: string;
+  effect_seq: number;
+  status: "applied" | "rejected";
+  effect_results?: EffectResult[];
+  error?: { code: string; message: string };
+}
+
+export function parseSessionEffects(raw: string): ParsedSessionEffects {
+  const obj = asObject(raw);
+  if (obj.type !== "session.effects" || obj.api_version !== BOT_GATEWAY_API_VERSION) {
+    throw new Error("not session.effects");
+  }
+  if (typeof obj.session_id !== "string" || obj.session_id.length === 0) {
+    throw new Error("invalid session_id");
+  }
+  if (typeof obj.effect_seq !== "number" || !Number.isInteger(obj.effect_seq) || obj.effect_seq < 1) {
+    throw new Error("invalid effect_seq");
+  }
+  if (!Array.isArray(obj.effects)) {
+    throw new Error("invalid effects");
+  }
+  return {
+    type: "session.effects",
+    api_version: obj.api_version,
+    session_id: obj.session_id,
+    effect_seq: obj.effect_seq,
+    effects: obj.effects,
+  };
+}
+
+export function buildSessionEffectsAck(
+  sessionId: string,
+  effectSeq: number,
+  status: "applied" | "rejected",
+  opts?: {
+    effect_results?: EffectResult[];
+    error?: { code: string; message: string };
+  },
+): SessionEffectsAckFrame {
+  return {
+    type: "session.effects_ack",
+    api_version: BOT_GATEWAY_API_VERSION,
+    session_id: sessionId,
+    effect_seq: effectSeq,
+    status,
+    ...(opts?.effect_results !== undefined ? { effect_results: opts.effect_results } : {}),
+    ...(opts?.error ? { error: opts.error } : {}),
+  };
 }

@@ -23,6 +23,7 @@ import { runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "../sh
 import {
   deleteStatefulSessionRef,
   notifyBotSessionClose,
+  notifyBotSessionEffects,
   notifyBotSessionInputAck,
   notifyBotSessionStarted,
   resumeStatefulSessions,
@@ -30,8 +31,10 @@ import {
 } from "./stateful";
 import {
   parseSessionClose,
+  parseSessionEffects,
   parseSessionInputAck,
   parseSessionStartAck,
+  buildSessionEffectsAck,
   type SessionInputFrame,
 } from "../../chat/bot-gateway-session";
 
@@ -587,6 +590,11 @@ export class BotConnection extends DurableObject<Env> {
         return;
       }
 
+      if (frame.type === "session.effects") {
+        await this.handleSessionEffects(ws, message, attachment);
+        return;
+      }
+
       if (frame.type === "session.close") {
         const parsed = parseSessionClose(message);
         this.touchConnected(attachment.bot_id, attachment.session_id);
@@ -652,6 +660,119 @@ export class BotConnection extends DurableObject<Env> {
       now,
       attachment.bot_id,
       attachment.session_id,
+    );
+  }
+
+  async handleSessionEffects(
+    ws: WebSocket,
+    message: string,
+    attachment: BotConnectionAttachment,
+  ): Promise<void> {
+    let parsed;
+    try {
+      parsed = parseSessionEffects(message);
+    } catch (err) {
+      logSwallowedError("bot_session_effects_parse_failed", err);
+      return;
+    }
+
+    this.touchConnected(attachment.bot_id, attachment.session_id);
+
+    const ref = this.ctx.storage.sql
+      .exec(
+        "SELECT channel_id FROM active_stateful_session_refs WHERE session_id=?",
+        parsed.session_id,
+      )
+      .toArray()[0] as { channel_id: string } | undefined;
+
+    if (!ref) {
+      ws.send(
+        JSON.stringify(
+          buildSessionEffectsAck(parsed.session_id, parsed.effect_seq, "rejected", {
+            error: { code: "STATEFUL_SESSION_NOT_FOUND", message: "session not active" },
+          }),
+        ),
+      );
+      return;
+    }
+
+    let validatedEffects;
+    try {
+      validatedEffects = validateMainGatewayEffects(parsed.effects);
+      const connectionState = this.ctx.storage.sql
+        .exec("SELECT is_official FROM bot_connection_state WHERE bot_id=?", attachment.bot_id)
+        .toArray()[0] as { is_official: number } | undefined;
+      const isOfficial = connectionState?.is_official === 1;
+      for (const effect of validatedEffects) {
+        if (effectUsesUnsafeMarkdown(effect) && !isOfficial) {
+          throw new MainGatewayEffectValidationError(
+            "unsafe-markdown format is only allowed for official bots",
+          );
+        }
+      }
+    } catch (err) {
+      const errMessage =
+        err instanceof MainGatewayEffectValidationError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "invalid effects";
+      ws.send(
+        JSON.stringify(
+          buildSessionEffectsAck(parsed.session_id, parsed.effect_seq, "rejected", {
+            error: { code: "BOT_EFFECT_INVALID", message: errMessage },
+          }),
+        ),
+      );
+      return;
+    }
+
+    let applyBody: {
+      status: "applied" | "rejected";
+      effect_results?: EffectResult[];
+      error?: { code: string; message: string };
+    };
+    try {
+      applyBody = await notifyBotSessionEffects(this.env, ref.channel_id, {
+        session_id: parsed.session_id,
+        bot_id: attachment.bot_id,
+        effect_seq: parsed.effect_seq,
+        effects: validatedEffects,
+      });
+    } catch (err) {
+      const errMessage = err instanceof Error ? err.message : "effect application failed";
+      ws.send(
+        JSON.stringify(
+          buildSessionEffectsAck(parsed.session_id, parsed.effect_seq, "rejected", {
+            error: { code: "CHAT_WORKER_UNAVAILABLE", message: errMessage },
+          }),
+        ),
+      );
+      return;
+    }
+
+    if (applyBody.status === "applied") {
+      ws.send(
+        JSON.stringify(
+          buildSessionEffectsAck(parsed.session_id, parsed.effect_seq, "applied", {
+            ...(Array.isArray(applyBody.effect_results)
+              ? { effect_results: applyBody.effect_results }
+              : {}),
+          }),
+        ),
+      );
+      return;
+    }
+
+    ws.send(
+      JSON.stringify(
+        buildSessionEffectsAck(parsed.session_id, parsed.effect_seq, "rejected", {
+          error: {
+            code: applyBody.error?.code ?? "BOT_EFFECT_INVALID",
+            message: applyBody.error?.message ?? "effect application failed",
+          },
+        }),
+      ),
     );
   }
 

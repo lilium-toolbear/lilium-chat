@@ -31,6 +31,17 @@ export type BotDeliveryResultResponse =
   | { status: "applied"; effect_results: EffectResult[] }
   | { status: "failed"; error: { code: string; message: string } };
 
+export interface BotSessionEffectsInput {
+  session_id: string;
+  bot_id: string;
+  effect_seq: number;
+  effects: unknown[];
+}
+
+export type BotSessionEffectsResponse =
+  | { status: "applied"; effect_results: EffectResult[] }
+  | { status: "rejected"; error: { code: string; message: string } };
+
 export interface BotCommandCatalogEntry {
   bot_command_id: string;
   name: string;

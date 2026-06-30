@@ -9,6 +9,7 @@ import { InteractionSubmitMixin } from "./handlers/interaction-submit";
 import { StatefulSessionMixin } from "./handlers/stateful-session";
 import { StreamRegistryMixin } from "./handlers/stream-registry";
 import { BotDeliveryMixin } from "./handlers/bot-delivery-result";
+import { BotSessionEffectsMixin } from "./handlers/bot-session-effects-handlers";
 
 const WithChannelRead = ChannelReadMixin(ChatChannelCore);
 const WithChannel = ChannelMixin(WithChannelRead);
@@ -19,6 +20,7 @@ const WithCommand = CommandMixin(WithMessageMutation);
 const WithStatefulSession = StatefulSessionMixin(WithCommand);
 const WithStreamRegistry = StreamRegistryMixin(WithStatefulSession);
 const WithInteractionSubmit = InteractionSubmitMixin(WithStreamRegistry);
-const ChatChannelComposed = BotDeliveryMixin(WithInteractionSubmit);
+const WithBotDelivery = BotDeliveryMixin(WithInteractionSubmit);
+const ChatChannelComposed = BotSessionEffectsMixin(WithBotDelivery);
 
 export class ChatChannel extends ChatChannelComposed {}
