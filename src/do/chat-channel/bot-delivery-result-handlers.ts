@@ -6,12 +6,16 @@ import {
   disableComponentsInJson,
   parseStoredComponents,
   toGenericEffectResult,
-  validateNonStreamEffectsForApply,
+  toStartStreamEffectResult,
+  validateEffectsForApply,
   type BotEffectMessageContextRow,
+  type ParsedBotEffect,
   type ParsedNonStreamEffect,
 } from "../../chat/bot-effects";
 import { projectMessageForBrowser } from "../../chat/message-projection";
+import { buildStreamStartedFrame, deliverLiveStreamFrame } from "../../chat/stream-live-delivery";
 import { botDedupePrincipalKey } from "../../chat/stream-registry";
+import type { StartStreamEffectResponse } from "../../chat/stream-registry";
 import type { EffectResult } from "../../contract/bot-gateway";
 import type { BotEffectWire } from "../../contract/bot-gateway";
 import type { MessageRow } from "../../contract/persisted";
@@ -20,6 +24,10 @@ import { isRecord } from "../../contract/utils";
 import type { Env } from "../../env";
 import { doErrorResponse } from "../../errors";
 import type { ChatChannelHost } from "./host";
+import {
+  registerStartStreamEffectInTransaction,
+  type StartStreamRegistrationResult,
+} from "./stream-registry-handlers";
 import {
   appendChatChannelArchive,
   collectDefinedChanges,
@@ -418,6 +426,12 @@ function cachedEffectResult(
   effectType: string,
   responseJson: string,
 ): EffectResult {
+  if (effectType === "start_stream") {
+    return toStartStreamEffectResult({
+      client_effect_id: clientEffectId,
+      response: JSON.parse(responseJson) as StartStreamEffectResponse,
+    });
+  }
   const cached = JSON.parse(responseJson) as { message_id?: string; event_id?: string };
   return toGenericEffectResult({
     client_effect_id: clientEffectId,
@@ -425,6 +439,40 @@ function cachedEffectResult(
     message_id: cached.message_id,
     event_id: cached.event_id,
   });
+}
+
+function buildStreamingMessageRow(input: {
+  messageId: string;
+  clientEffectId: string;
+  channelId: string;
+  botId: string;
+  botSummary: BotSummary;
+  message: Extract<ParsedBotEffect, { type: "start_stream" }>["message"];
+  createdAt: string;
+}): MessageRow {
+  return {
+    message_id: input.messageId,
+    command_id: input.clientEffectId,
+    channel_id: input.channelId,
+    sender_kind: "bot",
+    sender_user_id: null,
+    sender_bot_id: input.botId,
+    sender_bot_display_name: input.botSummary.display_name,
+    sender_bot_avatar_url: input.botSummary.avatar_url,
+    type: input.message.type,
+    format: input.message.format,
+    status: "normal",
+    text: "",
+    reply_to: input.message.reply_to_message_id,
+    reply_snapshot_json: null,
+    stream_state: "streaming",
+    created_at: input.createdAt,
+    updated_at: input.createdAt,
+    edited_at: null,
+    deleted_at: null,
+    deleted_by: null,
+    recalled_at: null,
+  };
 }
 
 export async function handleBotDeliveryResult(
@@ -466,9 +514,9 @@ export async function handleBotDeliveryResult(
   }
 
   const effects = body.effects as BotEffectWire[];
-  let parsedEffects: ParsedNonStreamEffect[];
+  let parsedEffects: ParsedBotEffect[];
   try {
-    parsedEffects = validateNonStreamEffectsForApply(effects, {
+    parsedEffects = validateEffectsForApply(effects, {
       botId,
       loadMessage: (messageId) => loadMessageRow(host, channelId, messageId),
     });
@@ -481,7 +529,7 @@ export async function handleBotDeliveryResult(
   }
 
   let botSummary: BotSummary | null = null;
-  if (parsedEffects.some((effect) => effect.type === "send_message")) {
+  if (parsedEffects.some((effect) => effect.type === "send_message" || effect.type === "start_stream")) {
     botSummary = await fetchBotSummary(env, botId);
     if (!botSummary) {
       return Response.json(
@@ -494,6 +542,12 @@ export async function handleBotDeliveryResult(
   const now = host.nowIso();
   const nowMs = Date.parse(now);
   const effectResults: EffectResult[] = [];
+  const streamStartedEmits: Array<{
+    channelId: string;
+    messageRow: MessageRow;
+    components: WireChatMessage["components"];
+    occurredAt: string;
+  }> = [];
 
   try {
     await host.ctx.storage.transaction(async () => {
@@ -525,6 +579,56 @@ export async function handleBotDeliveryResult(
 
         const effect = parsedEffects.find((item) => item.client_effect_id === raw.client_effect_id);
         if (!effect) continue;
+
+        if (effect.type === "start_stream") {
+          if (!botSummary) {
+            throw new BotEffectValidationError("bot summary unavailable");
+          }
+          const registration = registerStartStreamEffectInTransaction(host, {
+            channelId,
+            botId,
+            clientEffectId: effect.client_effect_id,
+            requestHash,
+            senderBotDisplayName: botSummary.display_name,
+            senderBotAvatarUrl: botSummary.avatar_url,
+            message: {
+              type: effect.message.type,
+              format: effect.message.format,
+              reply_to: effect.message.reply_to_message_id,
+              components: effect.message.components,
+              attachment_ids: effect.message.attachment_ids,
+            },
+            outboxId,
+          }) as StartStreamRegistrationResult;
+          if (registration.kind === "conflict") {
+            throw Object.assign(new Error("client_effect_id reused with different body"), {
+              code: "BOT_EFFECT_CONFLICT",
+            });
+          }
+          effectResults.push(
+            toStartStreamEffectResult({
+              client_effect_id: effect.client_effect_id,
+              response: registration.response,
+            }),
+          );
+          if (registration.kind === "created") {
+            streamStartedEmits.push({
+              channelId,
+              messageRow: buildStreamingMessageRow({
+                messageId: registration.messageId,
+                clientEffectId: effect.client_effect_id,
+                channelId,
+                botId,
+                botSummary,
+                message: effect.message,
+                createdAt: registration.createdAt,
+              }),
+              components: effect.message.components as WireChatMessage["components"],
+              occurredAt: registration.createdAt,
+            });
+          }
+          continue;
+        }
 
         if (effect.type === "send_message") {
           if (!botSummary) {
@@ -596,6 +700,20 @@ export async function handleBotDeliveryResult(
     );
   }
 
-  await host.scheduleOutboxAlarm(now);
+  for (const emit of streamStartedEmits) {
+    await deliverLiveStreamFrame(env, {
+      channel_id: emit.channelId,
+      frame: buildStreamStartedFrame({
+        channelId: emit.channelId,
+        messageRow: emit.messageRow,
+        components: emit.components,
+        occurredAt: emit.occurredAt,
+      }),
+    });
+  }
+
+  if (effectResults.some((result) => result.type !== "start_stream")) {
+    await host.scheduleOutboxAlarm(now);
+  }
   return Response.json({ status: "applied", effect_results: effectResults });
 }

@@ -23,6 +23,8 @@ import {
   sanitizeStreamMessageMetadata,
   streamExpiresAtIso,
   type StreamRegistryStatus,
+  type StreamRegistryMessageJson,
+  type StartStreamEffectResponse,
   type StreamAbandonResponse,
   type StreamFinalizeResponse,
 } from "../../chat/stream-registry";
@@ -95,6 +97,110 @@ function registryNotFoundError(): Response {
 
 function registryConflictError(message: string): Response {
   return doErrorResponse("BOT_STREAM_CONFLICT", message, { httpStatus: 409 });
+}
+
+export type StartStreamRegistrationResult =
+  | {
+      kind: "created";
+      response: StartStreamEffectResponse;
+      messageId: string;
+      messageMetadata: StreamRegistryMessageJson;
+      createdAt: string;
+      expiresAt: string;
+    }
+  | { kind: "cached"; response: StartStreamEffectResponse }
+  | { kind: "conflict" };
+
+export function registerStartStreamEffectInTransaction(
+  host: ChatChannelHost,
+  input: {
+    channelId: string;
+    botId: string;
+    clientEffectId: string;
+    requestHash: string;
+    senderBotDisplayName: string;
+    senderBotAvatarUrl: string | null;
+    message: Record<string, unknown>;
+    outboxId?: string | null;
+  },
+): StartStreamRegistrationResult {
+  const messageMetadata = sanitizeStreamMessageMetadata(input.message);
+  const now = host.nowIso();
+  const nowMs = Date.parse(now);
+  const expiresAt = streamExpiresAtIso(nowMs);
+
+  const existing = host.ctx.storage.sql
+    .exec(
+      "SELECT request_hash, response_json, message_id FROM bot_effects_applied WHERE channel_id=? AND bot_id=? AND client_effect_id=?",
+      input.channelId,
+      input.botId,
+      input.clientEffectId,
+    )
+    .toArray()[0] as { request_hash: string; response_json: string | null; message_id: string | null } | undefined;
+
+  if (existing) {
+    if (existing.request_hash !== input.requestHash) return { kind: "conflict" };
+    if (existing.response_json) {
+      return { kind: "cached", response: JSON.parse(existing.response_json) as StartStreamEffectResponse };
+    }
+  }
+
+  const messageId = existing?.message_id ?? uuidv7(nowMs);
+  const startResponse = buildStartStreamEffectResponse({
+    channelId: input.channelId,
+    messageId,
+    expiresAt,
+  });
+  const responseJson = JSON.stringify(startResponse);
+
+  if (!existing) {
+    host.ctx.storage.sql.exec(
+      `INSERT INTO message_stream_registry (
+        channel_id, message_id, bot_id, client_effect_id, status,
+        sender_bot_display_name, sender_bot_avatar_url, message_json,
+        created_at, expires_at
+      ) VALUES (?, ?, ?, ?, 'streaming', ?, ?, ?, ?, ?)`,
+      input.channelId,
+      messageId,
+      input.botId,
+      input.clientEffectId,
+      input.senderBotDisplayName,
+      input.senderBotAvatarUrl,
+      JSON.stringify(messageMetadata),
+      now,
+      expiresAt,
+    );
+  }
+
+  host.ctx.storage.sql.exec(
+    `INSERT INTO bot_effects_applied (
+      channel_id, bot_id, client_effect_id, effect_type, request_hash,
+      message_id, response_json, applied_at, outbox_id
+    ) VALUES (?, ?, ?, 'start_stream', ?, ?, ?, ?, ?)
+    ON CONFLICT(channel_id, bot_id, client_effect_id) DO UPDATE SET
+      request_hash=excluded.request_hash,
+      message_id=excluded.message_id,
+      response_json=excluded.response_json,
+      applied_at=excluded.applied_at,
+      outbox_id=COALESCE(excluded.outbox_id, bot_effects_applied.outbox_id)`,
+    input.channelId,
+    input.botId,
+    input.clientEffectId,
+    input.requestHash,
+    messageId,
+    responseJson,
+    now,
+    input.outboxId ?? null,
+  );
+
+  return {
+    kind: "created",
+    response: startResponse,
+    messageId,
+    messageMetadata,
+    createdAt: now,
+    expiresAt,
+  };
 }
 
 function buildBotMessageRow(input: {
@@ -259,89 +365,27 @@ export async function handleStreamRegistryRegister(host: ChatChannelHost, body: 
     return doErrorResponse("CHANNEL_NOT_FOUND", "channel_id mismatch", { httpStatus: 404 });
   }
 
-  const messageMetadata = sanitizeStreamMessageMetadata(
-    typeof body.message === "object" && body.message !== null
-      ? (body.message as Record<string, unknown>)
-      : {},
-  );
   const avatarUrl = typeof body.sender_bot_avatar_url === "string" ? body.sender_bot_avatar_url : null;
-  const now = host.nowIso();
-  const nowMs = Date.parse(now);
-  const expiresAt = streamExpiresAtIso(nowMs);
 
-  type RegisterResult =
-    | { kind: "created"; responseJson: string }
-    | { kind: "cached"; responseJson: string }
-    | { kind: "conflict" };
-
-  const txResult = await host.ctx.storage.transaction(async (): Promise<RegisterResult> => {
-    const existing = host.ctx.storage.sql
-      .exec(
-        "SELECT request_hash, response_json, message_id FROM bot_effects_applied WHERE channel_id=? AND bot_id=? AND client_effect_id=?",
-        body.channel_id,
-        body.bot_id,
-        body.client_effect_id,
-      )
-      .toArray()[0] as { request_hash: string; response_json: string | null; message_id: string | null } | undefined;
-
-    if (existing) {
-      if (existing.request_hash !== body.request_hash) return { kind: "conflict" };
-      if (existing.response_json) return { kind: "cached", responseJson: existing.response_json };
-    }
-
-    const messageId = existing?.message_id ?? uuidv7(nowMs);
-    const startResponse = buildStartStreamEffectResponse({
+  const txResult = await host.ctx.storage.transaction(async (): Promise<StartStreamRegistrationResult> =>
+    registerStartStreamEffectInTransaction(host, {
       channelId: body.channel_id as string,
-      messageId,
-      expiresAt,
-    });
-    const responseJson = JSON.stringify(startResponse);
-
-    if (!existing) {
-      host.ctx.storage.sql.exec(
-        `INSERT INTO message_stream_registry (
-          channel_id, message_id, bot_id, client_effect_id, status,
-          sender_bot_display_name, sender_bot_avatar_url, message_json,
-          created_at, expires_at
-        ) VALUES (?, ?, ?, ?, 'streaming', ?, ?, ?, ?, ?)`,
-        body.channel_id,
-        messageId,
-        body.bot_id,
-        body.client_effect_id,
-        body.sender_bot_display_name,
-        avatarUrl,
-        JSON.stringify(messageMetadata),
-        now,
-        expiresAt,
-      );
-    }
-
-    host.ctx.storage.sql.exec(
-      `INSERT INTO bot_effects_applied (
-        channel_id, bot_id, client_effect_id, effect_type, request_hash,
-        message_id, response_json, applied_at
-      ) VALUES (?, ?, ?, 'start_stream', ?, ?, ?, ?)
-      ON CONFLICT(channel_id, bot_id, client_effect_id) DO UPDATE SET
-        request_hash=excluded.request_hash,
-        message_id=excluded.message_id,
-        response_json=excluded.response_json,
-        applied_at=excluded.applied_at`,
-      body.channel_id,
-      body.bot_id,
-      body.client_effect_id,
-      body.request_hash,
-      messageId,
-      responseJson,
-      now,
-    );
-
-    return { kind: "created", responseJson };
-  });
+      botId: body.bot_id as string,
+      clientEffectId: body.client_effect_id as string,
+      requestHash: body.request_hash as string,
+      senderBotDisplayName: body.sender_bot_display_name as string,
+      senderBotAvatarUrl: avatarUrl,
+      message:
+        typeof body.message === "object" && body.message !== null
+          ? (body.message as Record<string, unknown>)
+          : {},
+    }),
+  );
 
   if (txResult.kind === "conflict") {
     return doErrorResponse("BOT_EFFECT_CONFLICT", "client_effect_id reused with different body", { httpStatus: 409 });
   }
-  return Response.json(JSON.parse(txResult.responseJson));
+  return Response.json(txResult.response);
 }
 
 export async function handleStreamFinalize(host: ChatChannelHost, body: {

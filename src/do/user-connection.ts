@@ -176,6 +176,18 @@ export class UserConnection extends DurableObject<Env> {
       return Response.json(result);
     }
 
+    if (url.pathname === "/deliver-stream-frame") {
+      if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+      const body = (await request.json()) as {
+        lease_id?: string;
+        channel_id?: string;
+        session_id?: string;
+        frame_json?: string;
+      };
+      const result = await this.handleDeliverStreamFrame(body);
+      return Response.json(result);
+    }
+
     if (url.pathname === "/internal/live-memberships-changed") {
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       const body = (await request.json()) as {
@@ -938,6 +950,54 @@ export class UserConnection extends DurableObject<Env> {
         const att = ws.deserializeAttachment() as ConnectionAttachment | null;
         if (att) {
           ws.serializeAttachment({ ...att, last_deliver: eventJson });
+        }
+      }
+      return { delivered: true };
+    } catch {
+      return { delivered: false, reason: "socket_send_failed" };
+    }
+  }
+
+  private async handleDeliverStreamFrame(body: {
+    lease_id?: string;
+    channel_id?: string;
+    session_id?: string;
+    frame_json?: string;
+  }): Promise<DeliverResult> {
+    const sessionId = body.session_id ?? "";
+    const channelId = body.channel_id ?? "";
+    const leaseId = body.lease_id ?? "";
+    const frameJson = body.frame_json ?? "";
+
+    if (!sessionId || !channelId || !frameJson) {
+      return { delivered: false, reason: "invalid_frame" };
+    }
+
+    const session = this.getSessionRow(sessionId);
+    if (!session) return { delivered: false, reason: "session_not_found" };
+    if (session.status === "closed") return { delivered: false, reason: "session_closed" };
+
+    const lease = this.getLeaseRow(sessionId, channelId);
+    if (!lease) return { delivered: false, reason: "lease_not_found" };
+    if (lease.status !== "active") return { delivered: false, reason: "lease_closed" };
+    if (leaseId && lease.lease_id !== leaseId) return { delivered: false, reason: "lease_not_found" };
+    if (lease.expires_at <= nowIso()) return { delivered: false, reason: "lease_closed" };
+
+    const ws = this.findSocketBySession(sessionId);
+    if (!ws) return { delivered: false, reason: "socket_not_found" };
+
+    const membership = await this.confirmActiveMembership(session.user_id, channelId);
+    if (!membership.active) {
+      await this.closeLocalLease(sessionId, channelId, lease.lease_id);
+      return { delivered: false, reason: "membership_not_active" };
+    }
+
+    try {
+      ws.send(frameJson);
+      if (this.env.ALLOW_INTERNAL_TEST_ROUTES === "1") {
+        const att = ws.deserializeAttachment() as ConnectionAttachment | null;
+        if (att) {
+          ws.serializeAttachment({ ...att, last_deliver: frameJson });
         }
       }
       return { delivered: true };

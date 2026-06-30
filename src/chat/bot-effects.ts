@@ -1,9 +1,11 @@
 import type { BotEffectWire, EffectResult } from "../contract/bot-gateway";
+import type { StartStreamEffectResponse } from "./stream-registry";
 import type { MessageRow } from "../contract/persisted";
 import type { WireChatMessage } from "../contract/message";
 import { isRecord } from "../contract/utils";
 
 export type NonStreamBotEffectType = "send_message" | "update_message" | "disable_components";
+export type BotEffectType = NonStreamBotEffectType | "start_stream";
 
 export interface BotEffectMessageBody {
   type: string;
@@ -38,10 +40,18 @@ export interface ParsedDisableComponentsEffect {
   component_ids: string[];
 }
 
+export interface ParsedStartStreamEffect {
+  type: "start_stream";
+  client_effect_id: string;
+  message: BotEffectMessageBody;
+}
+
 export type ParsedNonStreamEffect =
   | ParsedSendMessageEffect
   | ParsedUpdateMessageEffect
   | ParsedDisableComponentsEffect;
+
+export type ParsedBotEffect = ParsedNonStreamEffect | ParsedStartStreamEffect;
 
 export class BotEffectValidationError extends Error {
   readonly code = "BOT_EFFECT_INVALID" as const;
@@ -53,6 +63,44 @@ export class BotEffectValidationError extends Error {
 
 export function computeEffectRequestHash(effect: BotEffectWire): string {
   return JSON.stringify(effect);
+}
+
+function parseStartStreamMessageBody(raw: unknown): BotEffectMessageBody {
+  if (!isRecord(raw)) {
+    throw new BotEffectValidationError("start_stream.message must be an object");
+  }
+  const type = raw.type;
+  const format = raw.format;
+  if (typeof type !== "string" || type.length === 0) {
+    throw new BotEffectValidationError("start_stream.message.type required");
+  }
+  if (type !== "text") {
+    throw new BotEffectValidationError("only text messages are supported");
+  }
+  if (typeof format !== "string" || (format !== "plain" && format !== "markdown")) {
+    throw new BotEffectValidationError("start_stream.message.format must be plain or markdown");
+  }
+  const replyTo = raw.reply_to_message_id;
+  const replyToMessageId =
+    replyTo === null || replyTo === undefined
+      ? null
+      : typeof replyTo === "string"
+        ? replyTo
+        : (() => {
+            throw new BotEffectValidationError("start_stream.message.reply_to_message_id invalid");
+          })();
+  const attachmentIds = Array.isArray(raw.attachment_ids)
+    ? raw.attachment_ids.filter((id): id is string => typeof id === "string")
+    : [];
+  const components = Array.isArray(raw.components) ? raw.components : [];
+  return {
+    type,
+    format,
+    text: "",
+    reply_to_message_id: replyToMessageId,
+    attachment_ids: attachmentIds,
+    components,
+  };
 }
 
 function parseMessageBody(raw: unknown): BotEffectMessageBody {
@@ -104,6 +152,19 @@ function assertBotOwnsMessage(row: MessageRow, botId: string): void {
   if (row.sender_kind !== "bot" || row.sender_bot_id !== botId) {
     throw new BotEffectValidationError("bot may only mutate its own messages");
   }
+}
+
+export function parseBotEffect(raw: BotEffectWire): ParsedBotEffect {
+  const type = raw.type;
+  const clientEffectId = raw.client_effect_id;
+  if (type === "start_stream") {
+    return {
+      type,
+      client_effect_id: clientEffectId,
+      message: parseStartStreamMessageBody(raw.message),
+    };
+  }
+  return parseNonStreamEffect(raw);
 }
 
 export function parseNonStreamEffect(raw: BotEffectWire): ParsedNonStreamEffect {
@@ -168,9 +229,6 @@ export function parseNonStreamEffect(raw: BotEffectWire): ParsedNonStreamEffect 
     }
     return { type, client_effect_id: clientEffectId, message_id: messageId, component_ids: componentIds };
   }
-  if (type === "start_stream") {
-    throw new BotEffectValidationError("start_stream is not supported on this path yet");
-  }
   throw new BotEffectValidationError(`unsupported effect type: ${type}`);
 }
 
@@ -178,21 +236,25 @@ export interface BotEffectMessageContextRow extends MessageRow {
   components_json?: string | null;
 }
 
-export function validateNonStreamEffectsForApply(
+export function validateEffectsForApply(
   effects: BotEffectWire[],
   ctx: {
     botId: string;
     loadMessage: (messageId: string) => BotEffectMessageContextRow | null;
   },
-): ParsedNonStreamEffect[] {
+): ParsedBotEffect[] {
   const seen = new Set<string>();
-  const parsed: ParsedNonStreamEffect[] = [];
+  const parsed: ParsedBotEffect[] = [];
   for (const raw of effects) {
     if (seen.has(raw.client_effect_id)) {
       throw new BotEffectValidationError("duplicate client_effect_id in batch");
     }
     seen.add(raw.client_effect_id);
-    const effect = parseNonStreamEffect(raw);
+    const effect = parseBotEffect(raw);
+    if (effect.type === "start_stream") {
+      parsed.push(effect);
+      continue;
+    }
     if (effect.type === "update_message" || effect.type === "disable_components") {
       const row = ctx.loadMessage(effect.message_id);
       if (!row) {
@@ -219,6 +281,9 @@ export function validateNonStreamEffectsForApply(
   }
   return parsed;
 }
+
+/** @deprecated Use validateEffectsForApply */
+export const validateNonStreamEffectsForApply = validateEffectsForApply;
 
 export function parseStoredComponents(raw: string | null | undefined): WireChatMessage["components"] {
   if (!raw) return [];
@@ -266,5 +331,18 @@ export function toGenericEffectResult(input: {
     status: "applied",
     ...(input.message_id ? { message_id: input.message_id } : {}),
     ...(input.event_id ? { event_id: input.event_id } : {}),
+  };
+}
+
+export function toStartStreamEffectResult(input: {
+  client_effect_id: string;
+  response: StartStreamEffectResponse;
+}): EffectResult {
+  return {
+    client_effect_id: input.client_effect_id,
+    type: "start_stream",
+    status: "applied",
+    message_id: input.response.message_id,
+    stream: input.response.stream,
   };
 }

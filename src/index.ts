@@ -10,6 +10,7 @@ import { listChannelsHandler, channelDetailHandler } from "./routes/channels";
 import { listMessagesHandler } from "./routes/messages";
 import { eventsHandler } from "./routes/events";
 import { botWsUpgradeHandler } from "./routes/bot-ws";
+import { botStreamWsPlaceholderHandler } from "./routes/bot-stream";
 import { presignUploadHandler, finalizeUploadHandler, presignAvatarUploadHandler, finalizeAvatarUploadHandler } from "./routes/uploads";
 import {
   createInviteHandler,
@@ -116,6 +117,7 @@ app.post("/api/chat/stickers", (c) => saveStickerHandler(c));
 app.delete("/api/chat/stickers/:sticker_id", (c) => deleteStickerHandler(c));
 app.get("/api/chat/events", (c) => eventsHandler(c));
 app.get("/api/chat/bot/ws", (c) => botWsUpgradeHandler(c));
+app.get("/api/chat/bot/channels/:channel_id/streams/:message_id/ws", (c) => botStreamWsPlaceholderHandler(c));
 app.put("/api/chat/bot/commands", (c) => putBotCommandsHandler(c));
 app.post("/api/chat/bots", (c) => createBotHandler(c));
 app.get("/api/chat/bots", (c) => listBotsHandler(c));
