@@ -754,7 +754,7 @@ export function MembershipMixin<T extends Constructor<ChatChannelCore>>(Base: T)
       };
     }
 
-    async debugLeaveMember(input: DebugLeaveMemberRpcInput): Promise<{ ok: true }> {
+    async debugLeaveMember(input: DebugLeaveMemberRpcInput): Promise<void> {
       assertTestRoutesEnabled(this.env);
       const meta = this.repo.soleChannelMetaKind();
       if (meta === undefined) throw new Error("channel not found");
@@ -768,7 +768,6 @@ export function MembershipMixin<T extends Constructor<ChatChannelCore>>(Base: T)
         `user_directory:leave:${meta.channel_id}:${input.user_id}:${now}`,
       );
       await this.scheduleOutboxAlarm(now);
-      return { ok: true };
     }
   };
 }

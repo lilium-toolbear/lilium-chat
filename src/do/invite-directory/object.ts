@@ -24,7 +24,7 @@ export class InviteDirectory extends DurableObject<Env> {
     status?: string;
     expires_at?: string;
     revoked_at?: string | null;
-  }): Promise<{ ok: true }> {
+  }): Promise<void> {
     const status = body.status ?? "active";
     const expiresAt = body.expires_at ?? "2999-01-01T00:00:00Z";
     this.ctx.storage.sql.exec(
@@ -36,7 +36,6 @@ export class InviteDirectory extends DurableObject<Env> {
       body.revoked_at ?? null,
       new Date().toISOString(),
     );
-    return { ok: true };
   }
 
   previewInvite(inviteCode: string): InvitePreview | null {

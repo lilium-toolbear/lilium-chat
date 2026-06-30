@@ -120,7 +120,7 @@ export class ChannelFanout extends DurableObject<Env> {
     return { ok: true, expires_at: expiresAt };
   }
 
-  async leaseRevoke(input: { channel_id: string; lease_id: string }): Promise<{ ok: true }> {
+  async leaseRevoke(input: { channel_id: string; lease_id: string }): Promise<void> {
     if (!input.channel_id) throw new Error("missing channel_id");
     this.ctx.storage.sql.exec(
       "DELETE FROM fanout_leases WHERE channel_id=? AND lease_id=?",
@@ -128,7 +128,6 @@ export class ChannelFanout extends DurableObject<Env> {
       input.lease_id ?? "",
     );
     console.log("fanout_lease_deleted", { channel_id: input.channel_id, lease_id: input.lease_id, reason: "lease_revoke" });
-    return { ok: true };
   }
 
   async leaseRevokeSession(input: { channel_id: string; session_id: string }): Promise<{ ok: true; revoked: number }> {
@@ -148,7 +147,7 @@ export class ChannelFanout extends DurableObject<Env> {
     return { ok: true, revoked: rows.length };
   }
 
-  async unregisterUser(input: { channel_id: string; user_id: string }): Promise<{ ok: true }> {
+  async unregisterUser(input: { channel_id: string; user_id: string }): Promise<void> {
     if (!input.channel_id) throw new Error("missing channel_id");
     const userId = input.user_id ?? "";
     this.ctx.storage.sql.exec(
@@ -166,7 +165,6 @@ export class ChannelFanout extends DurableObject<Env> {
       input.channel_id,
       userId,
     );
-    return { ok: true };
   }
 
   async fanoutEnqueue(input: {

@@ -49,13 +49,13 @@ export class ChannelDirectory extends DurableObject<Env> {
       status?: string;
     };
     fields_present?: string[];
-  }): Promise<{ ok: true }> {
+  }): Promise<void> {
     const channelId = body.channel_id ?? "";
     if (!channelId) throw new Error("missing channel_id");
 
     if (body.action === "delete") {
       this.ctx.storage.sql.exec("DELETE FROM public_channels WHERE channel_id=?", channelId);
-      return { ok: true };
+      return;
     }
 
     const f = body.fields ?? {};
@@ -78,7 +78,6 @@ export class ChannelDirectory extends DurableObject<Env> {
       channelId, title, avatarUrl, memberCount, lastMessageAt, status, now,
     );
     void body.fields_present;
-    return { ok: true };
   }
 
   listPublicChannels(input: { q: string; limit: number; cursor: string | null }): { items: PublicChannelRow[]; next_cursor: string | null } {

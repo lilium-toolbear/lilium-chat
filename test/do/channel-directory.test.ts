@@ -57,14 +57,13 @@ function del(channelId: string) {
 describe("ChannelDirectory applyProjection", () => {
   it("upsert with a full snapshot inserts a new row (all NOT NULL fields present)", async () => {
     const id = "0199cd00-0000-7000-8000-00000000a001";
-    const res = await upsert(id, {
+    await upsert(id, {
       title: "Public One",
       avatar_url: null,
       member_count: 3,
       last_message_at: null,
       status: "active",
     }, ["title", "avatar_url", "member_count", "last_message_at", "status"]);
-    expect(res).toEqual({ ok: true });
     const rows = await rawRows();
     const r = rows.find((x) => x.channel_id === id);
     expect(r).toBeDefined();
@@ -120,10 +119,8 @@ describe("ChannelDirectory applyProjection", () => {
     await upsert(id, {
       title: "Del", avatar_url: null, member_count: 1, last_message_at: null, status: "active",
     }, ["title", "avatar_url", "member_count", "last_message_at", "status"]);
-    const r1 = await del(id);
-    expect(r1).toEqual({ ok: true });
-    const r2 = await del(id);
-    expect(r2).toEqual({ ok: true });
+    await del(id);
+    await del(id);
     const rows = await rawRows();
     expect(rows.find((x) => x.channel_id === id)).toBeUndefined();
   });
@@ -136,11 +133,10 @@ describe("ChannelDirectory applyProjection", () => {
     // simulate a missing row (dead-letter/reorder loss)
     await deleteRow(id);
     // a message.send upsert still carries the full snapshot (title/avatar/member_count/status + last_message_at)
-    const r = await upsert(id, {
+    await upsert(id, {
       title: "Repair", avatar_url: null, member_count: 2,
       last_message_at: "2026-06-26T00:00:01.000Z", status: "active",
     }, ["title", "avatar_url", "member_count", "last_message_at", "status"]);
-    expect(r).toEqual({ ok: true });
     const rows = await rawRows();
     const row = rows.find((x) => x.channel_id === id);
     expect(row).toBeDefined();

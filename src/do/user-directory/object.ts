@@ -246,9 +246,9 @@ export class UserDirectory extends DurableObject<Env> {
       kind: string;
       membership_version: number;
     },
-  ): Promise<{ ok: true }> {
+  ): Promise<void> {
     const now = new Date().toISOString();
-    return await this.ctx.storage.transaction(async () => {
+    await this.ctx.storage.transaction(async () => {
       const existing = this.ctx.storage.sql
         .exec(
           "SELECT status, left_at, membership_version FROM my_channels WHERE user_id = ? AND channel_id = ?",
@@ -260,7 +260,7 @@ export class UserDirectory extends DurableObject<Env> {
         | undefined;
 
       if (existing && existing.membership_version >= body.membership_version) {
-        return { ok: true };
+        return;
       }
 
       if (body.action === "join") {
@@ -273,7 +273,7 @@ export class UserDirectory extends DurableObject<Env> {
             now,
             body.membership_version,
           );
-          return { ok: true };
+          return;
         }
 
         this.ctx.storage.sql.exec(
@@ -284,7 +284,7 @@ export class UserDirectory extends DurableObject<Env> {
           userId,
           body.channel_id,
         );
-        return { ok: true };
+        return;
       }
 
       if (body.action === "dissolve") {
@@ -297,7 +297,7 @@ export class UserDirectory extends DurableObject<Env> {
             now,
             body.membership_version,
           );
-          return { ok: true };
+          return;
         }
 
         this.ctx.storage.sql.exec(
@@ -307,7 +307,7 @@ export class UserDirectory extends DurableObject<Env> {
           userId,
           body.channel_id,
         );
-        return { ok: true };
+        return;
       }
 
       if (existing) {
@@ -319,7 +319,6 @@ export class UserDirectory extends DurableObject<Env> {
           body.channel_id,
         );
       }
-      return { ok: true };
     });
   }
 
@@ -345,14 +344,13 @@ export class UserDirectory extends DurableObject<Env> {
     return { items: rows };
   }
 
-  async debugSetMyChannelsFailure(enabled: boolean): Promise<{ ok: true }> {
+  async debugSetMyChannelsFailure(enabled: boolean): Promise<void> {
     assertTestRoutesEnabled(this.env);
     if (enabled) {
       await this.ctx.storage.put("test:my-channels-failure", true);
     } else {
       await this.ctx.storage.delete("test:my-channels-failure");
     }
-    return { ok: true };
   }
 
   async updateReadState(
@@ -473,7 +471,7 @@ export class UserDirectory extends DurableObject<Env> {
     };
   }
 
-  async completeOpenDm(_currentUserId: string, b: { idempotency_key: string; response_json: string }): Promise<{ ok: true }> {
+  async completeOpenDm(_currentUserId: string, b: { idempotency_key: string; response_json: string }): Promise<void> {
     const now = new Date().toISOString();
     await this.ctx.storage.transaction(async () => {
       this.ctx.storage.sql.exec(
@@ -481,7 +479,6 @@ export class UserDirectory extends DurableObject<Env> {
         b.response_json, now, b.idempotency_key,
       );
     });
-    return { ok: true };
   }
 
   async channelCreateCoordinate(currentUserId: string, body: {

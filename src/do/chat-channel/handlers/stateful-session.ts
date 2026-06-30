@@ -10,7 +10,6 @@ import type {
   StopStatefulSessionRpcInput,
 } from "../../../contract/chat-channel-rpc";
 import type {
-  BotSessionAckResponse,
   GetStatefulSessionResponse,
   StatefulSessionInputsResponse,
   StopStatefulSessionResponse,
@@ -560,7 +559,7 @@ export function getActiveStatefulSessionSummary(
 
 export function StatefulSessionMixin<T extends Constructor<ChatChannelCore>>(Base: T) {
   return class extends Base {
-    async botSessionStarted(input: BotSessionStartedRpcInput): Promise<BotSessionAckResponse> {
+    async botSessionStarted(input: BotSessionStartedRpcInput): Promise<void> {
       if (typeof input.session_id !== "string") throw new ApiError("INVALID_MESSAGE", "invalid payload");
       const row = this.ctx.storage.sql
         .exec(
@@ -653,10 +652,9 @@ export function StatefulSessionMixin<T extends Constructor<ChatChannelCore>>(Bas
 
       await this.scheduleOutboxAlarm(now);
       await this.scheduleArchiveAlarm(now);
-      return { ok: true };
     }
 
-    async botSessionInputAck(input: BotSessionInputAckRpcInput): Promise<BotSessionAckResponse> {
+    async botSessionInputAck(input: BotSessionInputAckRpcInput): Promise<void> {
       if (typeof input.session_id !== "string" || typeof input.last_received_seq !== "number") {
         throw new ApiError("INVALID_MESSAGE", "invalid payload");
       }
@@ -675,7 +673,6 @@ export function StatefulSessionMixin<T extends Constructor<ChatChannelCore>>(Bas
           input.last_received_seq,
         );
       });
-      return { ok: true };
     }
 
     statefulSessionInputs(input: StatefulSessionInputsRpcInput): StatefulSessionInputsResponse {
@@ -745,10 +742,9 @@ export function StatefulSessionMixin<T extends Constructor<ChatChannelCore>>(Bas
       };
     }
 
-    async botSessionClose(input: BotSessionCloseRpcInput): Promise<BotSessionAckResponse> {
+    async botSessionClose(input: BotSessionCloseRpcInput): Promise<void> {
       if (typeof input.session_id !== "string") throw new ApiError("INVALID_MESSAGE", "invalid payload");
       await closeStatefulSession(asHandlerRef(this), input.session_id, input.reason ?? "bot_closed");
-      return { ok: true };
     }
 
     async getStatefulSession(input: GetStatefulSessionRpcInput): Promise<GetStatefulSessionResponse> {

@@ -195,14 +195,12 @@ export class BotConnection extends DurableObject<Env> {
     bot_id: string;
     status: string;
     updated_at: string;
-  }): Promise<{ ok: true }> {
+  }): Promise<void> {
     upsertStatefulSessionRef(this.ctx, input);
-    return { ok: true };
   }
 
-  async deleteStatefulSessionRef(input: { session_id: string }): Promise<{ ok: true }> {
+  async deleteStatefulSessionRef(input: { session_id: string }): Promise<void> {
     deleteStatefulSessionRef(this.ctx, input.session_id);
-    return { ok: true };
   }
 
   async pushSessionFrame(botId: string, frame: unknown): Promise<{ ok: true; delivered: boolean }> {

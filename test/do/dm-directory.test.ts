@@ -39,11 +39,11 @@ describe("DMDirectory RPC", () => {
     const { body, stub, pair_key } = await getOrCreateDm(USER_A, USER_B, USER_A);
     expect(body.status).toBe("creating");
 
-    await expect(stub.completeDm({ pair_key, channel_id: body.channel_id })).resolves.toEqual({ ok: true });
+    await expect(stub.completeDm({ pair_key, channel_id: body.channel_id })).resolves.toBeUndefined();
 
     const after = await getOrCreateDm(USER_A, USER_B, USER_A);
     expect(after.body.status).toBe("active");
 
-    await expect(stub.completeDm({ pair_key, channel_id: body.channel_id })).resolves.toEqual({ ok: true });
+    await expect(stub.completeDm({ pair_key, channel_id: body.channel_id })).resolves.toBeUndefined();
   });
 });

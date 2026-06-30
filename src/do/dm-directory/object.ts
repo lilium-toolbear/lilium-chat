@@ -78,7 +78,7 @@ export class DMDirectory extends DurableObject<Env> {
     return result;
   }
 
-  async completeDm(body: { pair_key: string; channel_id: string }): Promise<{ ok: true }> {
+  async completeDm(body: { pair_key: string; channel_id: string }): Promise<void> {
     const now = new Date().toISOString();
 
     const archived = await this.ctx.storage.transaction(async () => {
@@ -143,7 +143,6 @@ export class DMDirectory extends DurableObject<Env> {
       await this.scheduleArchiveAlarm();
     }
 
-    return { ok: true };
   }
 
   async scheduleArchiveAlarm(): Promise<void> {

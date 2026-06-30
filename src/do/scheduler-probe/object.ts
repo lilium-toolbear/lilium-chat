@@ -18,12 +18,11 @@ export class SchedulerProbe extends DurableObject<Env> {
     ]);
   }
 
-  setup(rows: number[]): { ok: true } {
+  setup(rows: number[]): void {
     this.ctx.storage.sql.exec("DELETE FROM due_rows");
     for (const dueAt of rows) {
       this.ctx.storage.sql.exec("INSERT INTO due_rows (due_at, status) VALUES (?, 'pending')", dueAt);
     }
-    return { ok: true };
   }
 
   async run(now: number): Promise<{ processed: number[]; nextAlarm: number | null }> {
