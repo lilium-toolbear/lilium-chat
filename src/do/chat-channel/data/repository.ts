@@ -568,4 +568,17 @@ export class ChatChannelRepository {
       blurhash: visibleRow.blurhash,
     };
   }
+
+  /** Bot has at least one allowed command binding in this channel (installed proxy). */
+  isBotInstalledInChannel(channelId: string, botId: string): boolean {
+    const row = sqlRows<{ ok: number }>(
+      this.sql.exec(
+        `SELECT 1 AS ok FROM channel_command_bindings
+         WHERE channel_id=? AND bot_id=? AND status='allowed' LIMIT 1`,
+        channelId,
+        botId,
+      ).toArray(),
+    )[0];
+    return row?.ok === 1;
+  }
 }

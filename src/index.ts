@@ -34,6 +34,7 @@ import {
   deleteStickerHandler,
 } from "./routes/channel-mutations";
 import { putBotCommandsHandler } from "./routes/bot";
+import { botPresignUploadHandler, botFinalizeUploadHandler } from "./routes/bot-uploads";
 import {
   createBotHandler,
   createBotTokenHandler,
@@ -123,6 +124,8 @@ app.get("/api/chat/events", (c) => eventsHandler(c));
 app.get("/api/chat/bot/ws", (c) => botWsUpgradeHandler(c));
 app.get("/api/chat/bot/channels/:channel_id/streams/:message_id/ws", (c) => botStreamWsUpgradeHandler(c));
 app.put("/api/chat/bot/commands", (c) => putBotCommandsHandler(c));
+app.post("/api/chat/bot/channels/:channel_id/uploads/images/presign", (c) => botPresignUploadHandler(c));
+app.post("/api/chat/bot/channels/:channel_id/uploads/images/:attachment_id/finalize", (c) => botFinalizeUploadHandler(c));
 app.post("/api/chat/bots", (c) => createBotHandler(c));
 app.get("/api/chat/bots", (c) => listBotsHandler(c));
 app.get("/api/chat/bots/:bot_id", (c) => getBotHandler(c));

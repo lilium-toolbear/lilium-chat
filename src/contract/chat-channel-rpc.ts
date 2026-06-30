@@ -287,3 +287,36 @@ export interface StreamAbandonRpcInput {
   resolved_partial: string;
   abandoned_text_hash: string;
 }
+
+// --- Bot attachments ---
+
+export interface BotAttachmentPresignRpcInput {
+  channel_id: string;
+  bot_id: string;
+  idempotency_key: string;
+  filename?: string;
+  mime_type?: string;
+  size_bytes?: number;
+  width?: number | null;
+  height?: number | null;
+  blurhash?: string;
+}
+
+export interface BotAttachmentPresignResponse {
+  attachment_id: string;
+  upload_url: string;
+  upload_method: "PUT";
+  upload_headers: Record<string, string>;
+  expires_at: string;
+}
+
+export interface BotAttachmentFinalizeRpcInput {
+  channel_id: string;
+  bot_id: string;
+  attachment_id: string;
+  etag?: string;
+}
+
+export interface BotAttachmentFinalizeResponse {
+  attachment: import("./message").FinalizedAttachmentProjection;
+}

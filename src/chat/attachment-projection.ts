@@ -2,7 +2,9 @@ import type { FinalizedAttachmentProjection, MessageImageAttachment } from "../c
 
 export interface AttachmentRow {
   attachment_id: string;
-  owner_user_id: string;
+  owner_user_id: string | null;
+  owner_bot_id?: string | null;
+  channel_id?: string | null;
   kind: string;
   filename: string;
   mime_type: string;
