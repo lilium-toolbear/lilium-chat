@@ -41,6 +41,7 @@ describe("BotStreamConnection baseline migrations", () => {
 
     await withDoState(stub, (ctx) => {
       expect(tableExists(ctx, "stream_state")).toBe(true);
+      expect(tableExists(ctx, "stream_due_jobs")).toBe(true);
       const cols = ctx.storage.sql
         .exec("PRAGMA table_info(stream_state)")
         .toArray() as Array<{ name: string }>;

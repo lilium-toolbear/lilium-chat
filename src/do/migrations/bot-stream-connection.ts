@@ -1,11 +1,12 @@
 import {
   applyBaselineSchema,
   migrateSqlite,
+  tableExists,
   type BaselineDetector,
   type SqlMigration,
 } from "../sql-migrations";
 
-export const BOT_STREAM_CONNECTION_CURRENT_SCHEMA_VERSION = 1;
+export const BOT_STREAM_CONNECTION_CURRENT_SCHEMA_VERSION = 2;
 
 export const BOT_STREAM_CONNECTION_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS stream_state (
@@ -21,7 +22,27 @@ export const BOT_STREAM_CONNECTION_BASELINE_SCHEMA: string[] = [
     updated_at       TEXT NOT NULL,
     PRIMARY KEY (channel_id, message_id)
   )`,
+  `CREATE TABLE IF NOT EXISTS stream_due_jobs (
+    job_kind         TEXT NOT NULL PRIMARY KEY,
+    due_at_ms        INTEGER NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending'
+  )`,
 ];
+
+const migrationV2StreamDueJobs: SqlMigration = {
+  version: 2,
+  name: "stream due jobs for flush/fanout alarms",
+  up(ctx) {
+    if (tableExists(ctx, "stream_due_jobs")) return;
+    ctx.storage.sql.exec(
+      `CREATE TABLE stream_due_jobs (
+        job_kind TEXT NOT NULL PRIMARY KEY,
+        due_at_ms INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+      )`,
+    );
+  },
+};
 
 export const botStreamConnectionBaseline: BaselineDetector = {
   version: BOT_STREAM_CONNECTION_CURRENT_SCHEMA_VERSION,
@@ -31,7 +52,7 @@ export const botStreamConnectionBaseline: BaselineDetector = {
   },
 };
 
-export const botStreamConnectionMigrations: SqlMigration[] = [];
+export const botStreamConnectionMigrations: SqlMigration[] = [migrationV2StreamDueJobs];
 
 export function migrateBotStreamConnectionSchema(ctx: DurableObjectState): void {
   migrateSqlite(
