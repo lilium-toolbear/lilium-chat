@@ -869,7 +869,7 @@ export class UserConnection extends DurableObject<Env> {
     reason?: string;
     changed_channel_id?: string;
     membership_version?: number;
-  }): Promise<LeaseSyncResult & { ok: true; live_session_count: number }> {
+  }): Promise<LeaseSyncResult & { live_session_count: number }> {
     const affectedUserId = body.affected_user_id ?? "";
     if (!affectedUserId) throw new Error("affected_user_id required");
     const name = this.durableObjectName();
@@ -913,7 +913,6 @@ export class UserConnection extends DurableObject<Env> {
     }
 
     return {
-      ok: true,
       live_session_count: sessions.length,
       active_count: activeChannels.length,
       upserted_count: upserted,

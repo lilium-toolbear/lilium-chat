@@ -40,6 +40,10 @@ export interface StreamAbandonResponse {
   event_id: string;
 }
 
+export interface StreamAbandonNonCanonical {
+  canonical: false;
+}
+
 export function buildBotStreamWsUrl(channelId: string, messageId: string): string {
   return `/api/chat/bot/channels/${channelId}/streams/${messageId}/ws`;
 }

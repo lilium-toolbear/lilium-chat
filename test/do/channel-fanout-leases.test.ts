@@ -16,7 +16,7 @@ describe("ChannelFanout leases", () => {
       session_id: "s-rpc",
       membership_version: 2,
     });
-    expect(upsert.ok).toBe(true);
+    expect(upsert.expires_at).toBeTruthy();
 
     const dump = await dumpChannelFanout(fanout, channelId);
     expect(dump.leases).toContainEqual(expect.objectContaining({ lease_id: "lease-rpc", user_id: userId }));

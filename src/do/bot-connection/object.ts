@@ -203,15 +203,15 @@ export class BotConnection extends DurableObject<Env> {
     deleteStatefulSessionRef(this.ctx, input.session_id);
   }
 
-  async pushSessionFrame(botId: string, frame: unknown): Promise<{ ok: true; delivered: boolean }> {
+  async pushSessionFrame(botId: string, frame: unknown): Promise<boolean> {
     const connection = this.healthyConnectedState(botId);
-    if (!connection) return { ok: true, delivered: false };
+    if (!connection) return false;
     try {
       connection.socket.send(JSON.stringify(frame));
-      return { ok: true, delivered: true };
+      return true;
     } catch (err) {
       logSwallowedError("bot_session_frame_send_failed", err, { bot_id: botId });
-      return { ok: true, delivered: false };
+      return false;
     }
   }
 

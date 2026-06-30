@@ -34,6 +34,7 @@ import {
   type StreamRegistryMessageJson,
   type StartStreamEffectResponse,
   type StreamAbandonResponse,
+  type StreamAbandonNonCanonical,
   type StreamFinalizeResponse,
 } from "../../../chat/stream-registry";
 import type { Constructor } from "../mixin";
@@ -333,7 +334,6 @@ export function StreamRegistryMixin<T extends Constructor<ChatChannelCore>>(Base
       }
 
       return {
-        ok: true,
         channel_id: registry.channel_id,
         message_id: registry.message_id,
         bot_id: registry.bot_id,
@@ -548,7 +548,7 @@ export function StreamRegistryMixin<T extends Constructor<ChatChannelCore>>(Base
       return JSON.parse(txResult.responseJson) as StreamFinalizeResponse;
     }
 
-    async streamAbandon(input: StreamAbandonRpcInput): Promise<StreamAbandonResponse | { ok: true; canonical: false }> {
+    async streamAbandon(input: StreamAbandonRpcInput): Promise<StreamAbandonResponse | StreamAbandonNonCanonical> {
       if (
         typeof input.channel_id !== "string" ||
         typeof input.message_id !== "string" ||
@@ -574,7 +574,7 @@ export function StreamRegistryMixin<T extends Constructor<ChatChannelCore>>(Base
 
       if (registry.status === "abandoned") {
         if (input.resolved_partial.length === 0) {
-          return { ok: true, canonical: false };
+          return { canonical: false };
         }
         if (registry.abandoned_text_hash === input.abandoned_text_hash && registry.abandoned_response_json) {
           return JSON.parse(registry.abandoned_response_json) as StreamAbandonResponse;
@@ -582,7 +582,7 @@ export function StreamRegistryMixin<T extends Constructor<ChatChannelCore>>(Base
         if (registry.abandoned_text_hash && registry.abandoned_text_hash !== input.abandoned_text_hash) {
           throwRegistryConflict("stream already abandoned with different partial");
         }
-        return { ok: true, canonical: false };
+        return { canonical: false };
       }
 
       if (registry.status === "expired") {
@@ -600,7 +600,7 @@ export function StreamRegistryMixin<T extends Constructor<ChatChannelCore>>(Base
             input.message_id,
           );
         });
-        return { ok: true, canonical: false };
+        return { canonical: false };
       }
 
       const meta = channelMeta(asHandlerRef(this));

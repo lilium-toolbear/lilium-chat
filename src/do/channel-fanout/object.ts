@@ -90,7 +90,7 @@ export class ChannelFanout extends DurableObject<Env> {
     session_id: string;
     membership_version?: number;
     expires_at?: string;
-  }): Promise<{ ok: true; expires_at: string }> {
+  }): Promise<{ expires_at: string }> {
     if (!input.channel_id || !input.lease_id || !input.user_id || !input.session_id) {
       throw new Error("missing lease_id/user_id/session_id");
     }
@@ -117,7 +117,7 @@ export class ChannelFanout extends DurableObject<Env> {
       ts,
       ts,
     );
-    return { ok: true, expires_at: expiresAt };
+    return { expires_at: expiresAt };
   }
 
   async leaseRevoke(input: { channel_id: string; lease_id: string }): Promise<void> {
@@ -130,7 +130,7 @@ export class ChannelFanout extends DurableObject<Env> {
     console.log("fanout_lease_deleted", { channel_id: input.channel_id, lease_id: input.lease_id, reason: "lease_revoke" });
   }
 
-  async leaseRevokeSession(input: { channel_id: string; session_id: string }): Promise<{ ok: true; revoked: number }> {
+  async leaseRevokeSession(input: { channel_id: string; session_id: string }): Promise<{ revoked: number }> {
     if (!input.channel_id) throw new Error("missing channel_id");
     const sessionId = input.session_id ?? "";
     const rows = this.ctx.storage.sql
@@ -144,7 +144,7 @@ export class ChannelFanout extends DurableObject<Env> {
     for (const row of rows) {
       console.log("fanout_lease_deleted", { channel_id: input.channel_id, lease_id: row.lease_id, reason: "session_revoke" });
     }
-    return { ok: true, revoked: rows.length };
+    return { revoked: rows.length };
   }
 
   async unregisterUser(input: { channel_id: string; user_id: string }): Promise<void> {
@@ -172,7 +172,7 @@ export class ChannelFanout extends DurableObject<Env> {
     event_id: string;
     event_json: string;
     membership_version_at_event?: number;
-  }): Promise<{ ok: true; delivered_to: number }> {
+  }): Promise<{ delivered_to: number }> {
     if (!input.channel_id) throw new Error("missing channel_id");
     if (!input.event_id || !input.event_json) throw new Error("missing event_id/event_json");
     const ts = nowIso();
@@ -207,13 +207,13 @@ export class ChannelFanout extends DurableObject<Env> {
     }
 
     if (queued) await scheduleFanoutAlarm(this.ctx, ts);
-    return { ok: true, delivered_to: sessions.length };
+    return { delivered_to: sessions.length };
   }
 
   async fanoutDeliverStreamFrame(input: {
     channel_id: string;
     frame: unknown;
-  }): Promise<{ ok: true; delivered_to: number; lease_count: number }> {
+  }): Promise<{ delivered_to: number; lease_count: number }> {
     if (!input.channel_id) throw new Error("missing channel_id");
     if (input.frame === undefined || input.frame === null) throw new Error("missing frame");
     const frameJson = JSON.stringify(input.frame);
@@ -241,7 +241,7 @@ export class ChannelFanout extends DurableObject<Env> {
       }
     }
 
-    return { ok: true, delivered_to: deliveredCount, lease_count: sessions.length };
+    return { delivered_to: deliveredCount, lease_count: sessions.length };
   }
 
   /** Test-only RPC inspection; production paths do not call this method. */

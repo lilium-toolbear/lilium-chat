@@ -108,7 +108,6 @@ describe("ChatChannel stream registry RPC", () => {
       message_id: messageId,
       bot_id: BOT_ID,
     });
-    expect(checkBody.ok).toBe(true);
     expect(checkBody.status).toBe("streaming");
   });
 
