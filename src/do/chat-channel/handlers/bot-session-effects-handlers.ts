@@ -1,5 +1,7 @@
 import type { BotEffectWire } from "../../../contract/bot-gateway";
+import type { EffectResult } from "../../../contract/bot-gateway";
 import type { BotSessionEffectsInput, BotSessionEffectsResponse } from "../../../contract/bot-api";
+import { computeSessionEffectsRequestHash } from "../../../chat/bot-effects";
 import { ApiError } from "../../../errors";
 import {
   applyValidatedEffects,
@@ -12,6 +14,31 @@ import { asHandlerRef } from "../handler-ref";
 
 function sessionEffectsRejected(code: string, message: string): BotSessionEffectsResponse {
   return { status: "rejected", error: { code, message } };
+}
+
+function loadStoredSessionEffectAck(
+  sql: DurableObjectStorage["sql"],
+  sessionId: string,
+  effectSeq: number,
+): { effects_request_hash: string; effect_results_json: string } | undefined {
+  return sql
+    .exec(
+      `SELECT effects_request_hash, effect_results_json
+       FROM stateful_session_effects_applied
+       WHERE session_id=? AND effect_seq=?`,
+      sessionId,
+      effectSeq,
+    )
+    .toArray()[0] as { effects_request_hash: string; effect_results_json: string } | undefined;
+}
+
+function parseStoredEffectResults(raw: string): EffectResult[] | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as EffectResult[]) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function BotSessionEffectsMixin<T extends Constructor<ChatChannelCore>>(Base: T) {
@@ -73,6 +100,30 @@ export function BotSessionEffectsMixin<T extends Constructor<ChatChannelCore>>(B
         return sessionEffectsRejected("BOT_EFFECT_INVALID", "effect sequence gap");
       }
 
+      const effectsRequestHash = computeSessionEffectsRequestHash(body.effects as BotEffectWire[]);
+
+      if (isReplay) {
+        const stored = loadStoredSessionEffectAck(
+          this.ctx.storage.sql,
+          body.session_id,
+          body.effect_seq,
+        );
+        if (!stored) {
+          return sessionEffectsRejected("BOT_EFFECT_INVALID", "effect ack not found");
+        }
+        if (stored.effects_request_hash !== effectsRequestHash) {
+          return sessionEffectsRejected(
+            "BOT_EFFECT_CONFLICT",
+            "effect_seq reused with different body",
+          );
+        }
+        const effectResults = parseStoredEffectResults(stored.effect_results_json);
+        if (!effectResults) {
+          return sessionEffectsRejected("BOT_EFFECT_INVALID", "stored effect ack invalid");
+        }
+        return { status: "applied", effect_results: effectResults };
+      }
+
       const outboxId = statefulSessionEffectOutboxId(body.session_id, body.effect_seq);
       const applyResult = await applyValidatedEffects({
         channel: asHandlerRef(this),
@@ -89,16 +140,24 @@ export function BotSessionEffectsMixin<T extends Constructor<ChatChannelCore>>(B
       }
 
       const now = this.nowIso();
-      if (!isReplay) {
-        this.ctx.storage.transactionSync(() => {
-          this.ctx.storage.sql.exec(
-            "UPDATE stateful_command_sessions SET effect_last_acked_seq=? WHERE session_id=? AND effect_last_acked_seq=?",
-            body.effect_seq,
-            body.session_id,
-            lastAcked,
-          );
-        });
-      }
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          "UPDATE stateful_command_sessions SET effect_last_acked_seq=? WHERE session_id=? AND effect_last_acked_seq=?",
+          body.effect_seq,
+          body.session_id,
+          lastAcked,
+        );
+        this.ctx.storage.sql.exec(
+          `INSERT INTO stateful_session_effects_applied (
+             session_id, effect_seq, effects_request_hash, effect_results_json, applied_at
+           ) VALUES (?, ?, ?, ?, ?)`,
+          body.session_id,
+          body.effect_seq,
+          effectsRequestHash,
+          JSON.stringify(applyResult.effect_results),
+          now,
+        );
+      });
 
       await finalizeAppliedEffects(asHandlerRef(this), this.env, applyResult, now);
       return { status: "applied", effect_results: applyResult.effect_results };

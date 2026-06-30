@@ -67,6 +67,15 @@ export function computeEffectRequestHash(effect: BotEffectWire): string {
   return JSON.stringify(effect);
 }
 
+export function computeSessionEffectsRequestHash(effects: BotEffectWire[]): string {
+  return JSON.stringify(
+    effects.map((effect) => {
+      const { client_effect_id: _clientEffectId, ...rest } = effect;
+      return rest;
+    }),
+  );
+}
+
 function parseStartStreamMessageBody(raw: unknown): BotEffectMessageBody {
   if (!isRecord(raw)) {
     throw new BotEffectValidationError("start_stream.message must be an object");

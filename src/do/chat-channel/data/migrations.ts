@@ -9,7 +9,7 @@ import {
 } from "../../shared/sql-migrations";
 import { applyArchiveOutboxMigration } from "../../../archive/apply-archive-migration";
 
-export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026063001;
+export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026070101;
 
 export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS channel_meta (
@@ -138,6 +138,14 @@ export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
     sent_at TEXT,
     acked_at TEXT,
     PRIMARY KEY (session_id, seq)
+  )`,
+  `CREATE TABLE IF NOT EXISTS stateful_session_effects_applied (
+    session_id TEXT NOT NULL,
+    effect_seq INTEGER NOT NULL,
+    effects_request_hash TEXT NOT NULL,
+    effect_results_json TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, effect_seq)
   )`,
   `CREATE TABLE IF NOT EXISTS interactions (
     interaction_id TEXT PRIMARY KEY, message_id TEXT NOT NULL, component_id TEXT NOT NULL,
@@ -445,6 +453,16 @@ export const chatChannelMigrations: SqlMigration[] = [
           PRIMARY KEY (session_id, seq)
         )`);
       }
+      if (!tableExists(ctx, "stateful_session_effects_applied")) {
+        ctx.storage.sql.exec(`CREATE TABLE stateful_session_effects_applied (
+          session_id TEXT NOT NULL,
+          effect_seq INTEGER NOT NULL,
+          effects_request_hash TEXT NOT NULL,
+          effect_results_json TEXT NOT NULL,
+          applied_at TEXT NOT NULL,
+          PRIMARY KEY (session_id, effect_seq)
+        )`);
+      }
 
       if (tableExists(ctx, "interactions") && !columnExists(ctx, "interactions", "updated_at")) {
         ctx.storage.sql.exec("ALTER TABLE interactions ADD COLUMN updated_at TEXT");
@@ -516,7 +534,7 @@ export const chatChannelMigrations: SqlMigration[] = [
     },
   },
   {
-    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    version: 2026063001,
     name: "message_stream_registry for bot streaming",
     up(ctx) {
       if (!tableExists(ctx, "message_stream_registry")) {
@@ -552,6 +570,22 @@ export const chatChannelMigrations: SqlMigration[] = [
         ctx.storage.sql.exec(
           "CREATE INDEX idx_message_stream_registry_expiry ON message_stream_registry(status, expires_at)",
         );
+      }
+    },
+  },
+  {
+    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    name: "stateful_session_effects_applied for session.effects replay",
+    up(ctx) {
+      if (!tableExists(ctx, "stateful_session_effects_applied")) {
+        ctx.storage.sql.exec(`CREATE TABLE stateful_session_effects_applied (
+          session_id TEXT NOT NULL,
+          effect_seq INTEGER NOT NULL,
+          effects_request_hash TEXT NOT NULL,
+          effect_results_json TEXT NOT NULL,
+          applied_at TEXT NOT NULL,
+          PRIMARY KEY (session_id, effect_seq)
+        )`);
       }
     },
   },

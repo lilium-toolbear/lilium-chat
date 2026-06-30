@@ -150,7 +150,7 @@ describe("ChatChannel botSessionEffects RPC", () => {
       session_id: sessionId,
       bot_id: botId,
       effect_seq: 1,
-      effects: [effect],
+      effects: [sendMessageEffect("eff-idem-replay", "once")],
     });
     expect(second.status).toBe("applied");
     if (first.status !== "applied" || second.status !== "applied") return;
@@ -167,6 +167,33 @@ describe("ChatChannel botSessionEffects RPC", () => {
         .toArray()[0] as { c: number };
       expect(Number(count.c)).toBe(1);
     });
+  });
+
+  it("rejects replay when effect_seq body differs from stored snapshot", async () => {
+    const botId = `bot-session-replay-conflict-${crypto.randomUUID()}`;
+    await seedBot(botId);
+    const channelId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const stub = await createTestChannel(env, { channelId, ownerId: "owner-1" });
+    await seedActiveSession({ stub, channelId, botId, sessionId, effectLastAckedSeq: 0 });
+
+    const first = await stub.botSessionEffects({
+      session_id: sessionId,
+      bot_id: botId,
+      effect_seq: 1,
+      effects: [sendMessageEffect("eff-conflict-a", "original")],
+    });
+    expect(first.status).toBe("applied");
+
+    const second = await stub.botSessionEffects({
+      session_id: sessionId,
+      bot_id: botId,
+      effect_seq: 1,
+      effects: [sendMessageEffect("eff-conflict-b", "different text")],
+    });
+    expect(second.status).toBe("rejected");
+    if (second.status !== "rejected") return;
+    expect(second.error.code).toBe("BOT_EFFECT_CONFLICT");
   });
 
   it("rejects effect sequence gap with BOT_EFFECT_INVALID", async () => {
