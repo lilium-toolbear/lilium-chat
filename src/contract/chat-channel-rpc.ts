@@ -175,6 +175,12 @@ export interface GetMessagesRpcInput {
   limit: number;
 }
 
+export interface GetMessageContextRpcInput {
+  message_id: string;
+  before: number;
+  after: number;
+}
+
 // --- Command ---
 
 export interface CommandBindingUpdateRpcInput {

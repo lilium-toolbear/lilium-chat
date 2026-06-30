@@ -15,6 +15,7 @@ import type {
   ManagementPersistedPayloadByType,
 } from "../../contract/persisted";
 import { buildReplayEventsPage, type ReplayEnvelope, type ReplayEventsPage } from "../../chat/replay-projection";
+import { buildMessageContextPage, type MessageContextPage } from "../../chat/message-context";
 import { buildTimelineHistoryPage, type TimelineHistoryPage } from "../../chat/timeline-history";
 import type { ChatEventPayloadByType } from "../../contract/events";
 import type {
@@ -39,6 +40,7 @@ import type {
   DissolveChannelApiResponse,
   DissolveChannelRpcInput,
   GetInviteRpcInput,
+  GetMessageContextRpcInput,
   GetMessagesRpcInput,
   GetStatefulSessionResponse,
   InteractionSubmitResponse,
@@ -161,6 +163,17 @@ export class ChatChannelCore extends DurableObject<Env> {
       before: input.before,
       after: input.after,
       limit: Math.max(1, Math.min(100, Math.floor(input.limit))),
+    });
+  }
+
+  async getMessageContext(userId: string, input: GetMessageContextRpcInput): Promise<MessageContextPage> {
+    return buildMessageContextPage({
+      sql: this.ctx.storage.sql,
+      env: this.env,
+      userId,
+      messageId: input.message_id,
+      beforeCount: input.before,
+      afterCount: input.after,
     });
   }
 
