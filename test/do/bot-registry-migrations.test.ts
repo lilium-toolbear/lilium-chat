@@ -3,14 +3,15 @@ import { env } from "cloudflare:workers";
 import { getNamedDo, readDoSchemaVersion } from "../helpers";
 import {
   indexExists,
+  applyDoSchemaMigrations,
   migrateSqlite,
   tableExists,
 } from "../../src/do/shared/sql-migrations";
 import {
   BOT_REGISTRY_CURRENT_SCHEMA_VERSION,
+  BOT_REGISTRY_DO_SCHEMA,
   botRegistryBaseline,
   botRegistryMigrations,
-  migrateBotRegistrySchema,
 } from "../../src/do/bot-registry/migrations";
 
 function registryStub() {
@@ -156,7 +157,7 @@ describe("BotRegistry v4 migrations (slash command baseline)", () => {
         PRIMARY KEY(bot_id, event_type)
       )`);
 
-      migrateBotRegistrySchema(ctx);
+      applyDoSchemaMigrations(ctx, BOT_REGISTRY_DO_SCHEMA);
 
       const app = ctx.storage.sql
         .exec("SELECT bot_id, display_name, visibility FROM bot_apps WHERE bot_id=?", botId)

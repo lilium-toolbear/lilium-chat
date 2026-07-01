@@ -1,11 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
 import { getNamedDo, readDoSchemaVersion } from "../helpers";
-import { applyBaselineSchema, columnExists, tableExists } from "../../src/do/shared/sql-migrations";
+import { applyBaselineSchema, columnExists, applyDoSchemaMigrations, tableExists } from "../../src/do/shared/sql-migrations";
 import {
   USER_DIRECTORY_CURRENT_SCHEMA_VERSION,
+  USER_DIRECTORY_DO_SCHEMA,
   USER_DIRECTORY_LEGACY_BASELINE_SCHEMA,
-  migrateUserDirectorySchema,
 } from "../../src/do/user-directory/migrations";
 
 function udStub(userId: string) {
@@ -51,7 +51,7 @@ describe("UserDirectory migrations", () => {
         "2026-01-01T00:00:00.000Z",
       );
 
-      migrateUserDirectorySchema(ctx);
+      applyDoSchemaMigrations(ctx, USER_DIRECTORY_DO_SCHEMA);
 
       expect(columnExists(ctx, "pending_attachments", "blurhash")).toBe(true);
       expect(columnExists(ctx, "personal_stickers", "blurhash")).toBe(true);
@@ -104,7 +104,7 @@ describe("UserDirectory migrations", () => {
 
       expect(tableExists(ctx, "personal_stickers")).toBe(false);
 
-      migrateUserDirectorySchema(ctx);
+      applyDoSchemaMigrations(ctx, USER_DIRECTORY_DO_SCHEMA);
 
       expect(tableExists(ctx, "personal_stickers")).toBe(true);
       expect(columnExists(ctx, "personal_stickers", "blurhash")).toBe(true);

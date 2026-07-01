@@ -3,14 +3,15 @@ import { env } from "cloudflare:workers";
 import {
   CHAT_CHANNEL_BASELINE_SCHEMA,
   CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+  CHAT_CHANNEL_DO_SCHEMA,
   CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA,
   chatChannelBaseline,
   chatChannelMigrations,
-  migrateChatChannelSchema,
 } from "../../src/do/chat-channel/data/migrations";
 import {
   applyBaselineSchema,
   columnExists,
+  applyDoSchemaMigrations,
   migrateSqlite,
   tableExists,
 } from "../../src/do/shared/sql-migrations";
@@ -118,7 +119,7 @@ describe("ChatChannel bot attachment RPC", () => {
         "2026-01-01T00:00:00.000Z",
       );
 
-      migrateChatChannelSchema(ctx);
+      applyDoSchemaMigrations(ctx, CHAT_CHANNEL_DO_SCHEMA);
 
       expect(columnExists(ctx, "attachments", "owner_bot_id")).toBe(true);
       expect(columnExists(ctx, "attachments", "channel_id")).toBe(true);

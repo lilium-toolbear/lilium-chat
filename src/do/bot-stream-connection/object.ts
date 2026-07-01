@@ -27,7 +27,8 @@ import { buildStreamAbandonCleanupFrame, deliverLiveStreamFrame } from "../../ch
 import { hashStreamDelta, validateAppendSeq } from "../../chat/stream-seq";
 import { buildWireStreamEventFrame } from "../../contract/wire-frames";
 import { handleSchemaVersionRequest } from "../shared/sql-migrations";
-import { migrateBotStreamConnectionSchema } from "./migrations";
+import { BOT_STREAM_CONNECTION_DO_SCHEMA } from "./migrations";
+import { migrateDoSchema } from "../shared/sql-migrations";
 import { requireTestOnly } from "../shared/do-errors";
 import { runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "../shared/scheduler";
 
@@ -74,7 +75,7 @@ export function botStreamDoName(channelId: string, messageId: string): string {
 export class BotStreamConnection extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    migrateBotStreamConnectionSchema(this.ctx);
+    migrateDoSchema(this.ctx, BOT_STREAM_CONNECTION_DO_SCHEMA);
   }
 
   async fetch(request: Request): Promise<Response> {

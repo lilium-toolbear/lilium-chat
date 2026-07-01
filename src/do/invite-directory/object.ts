@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env";
-import { migrateInviteDirectorySchema } from "./migrations";
+import { INVITE_DIRECTORY_DO_SCHEMA } from "./migrations";
+import { migrateDoSchema } from "../shared/sql-migrations";
 
 type InvitePreview = {
   invite_code: string;
@@ -13,9 +14,7 @@ type InvitePreview = {
 export class InviteDirectory extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.ctx.blockConcurrencyWhile(async () => {
-      migrateInviteDirectorySchema(this.ctx);
-    });
+    migrateDoSchema(this.ctx, INVITE_DIRECTORY_DO_SCHEMA);
   }
 
   async upsertInvite(body: {

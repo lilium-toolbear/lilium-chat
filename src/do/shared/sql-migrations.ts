@@ -12,6 +12,14 @@ export interface BaselineDetector {
   applyFresh(ctx: DurableObjectState): void;
 }
 
+/** Per-DO schema bundle; export one `*_DO_SCHEMA` constant from each migrations module. */
+export interface DoSchemaDefinition {
+  doClassName: string;
+  targetVersion: number;
+  baseline: BaselineDetector;
+  migrations: SqlMigration[];
+}
+
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export function quoteIdent(identifier: string): string {
@@ -42,12 +50,56 @@ export function indexExists(ctx: DurableObjectState, indexName: string): boolean
   return rows.length > 0;
 }
 
+/** Highest applied schema_migrations.version, or null when the table is missing/empty. */
+export function readAppliedSchemaVersion(ctx: DurableObjectState): number | null {
+  if (!tableExists(ctx, "schema_migrations")) {
+    return null;
+  }
+  const maxRow = ctx.storage.sql.exec("SELECT MAX(version) AS v FROM schema_migrations").toArray()[0] as
+    | { v: number | null }
+    | undefined;
+  const v = maxRow?.v;
+  if (v === null || v === undefined) return null;
+  return Number(v);
+}
+
+/** True when constructor migration work may still be required for targetVersion. */
+export function schemaMigrationPending(ctx: DurableObjectState, targetVersion: number): boolean {
+  const applied = readAppliedSchemaVersion(ctx);
+  if (applied === null) return true;
+  return applied < targetVersion;
+}
+
+/**
+ * Single constructor entry for all SQLite-backed DOs. Skips blockConcurrencyWhile when
+ * schema is current; when pending, blocks per CF DO guidance and re-checks version
+ * inside the block before running applyDoSchemaMigrations.
+ */
+export function migrateDoSchema(ctx: DurableObjectState, schema: DoSchemaDefinition): void {
+  if (!schemaMigrationPending(ctx, schema.targetVersion)) {
+    return;
+  }
+  ctx.blockConcurrencyWhile(async () => {
+    if (!schemaMigrationPending(ctx, schema.targetVersion)) {
+      return;
+    }
+    applyDoSchemaMigrations(ctx, schema);
+  });
+}
+
+/** Synchronous migration body (transactionSync). Use in tests; migrateDoSchema wraps this. */
+export function applyDoSchemaMigrations(ctx: DurableObjectState, schema: DoSchemaDefinition): void {
+  migrateSqlite(ctx, schema.doClassName, schema.baseline, schema.migrations);
+}
+
 export function migrateSqlite(
   ctx: DurableObjectState,
   doClassName: string,
   baseline: BaselineDetector,
   migrations: SqlMigration[],
 ): void {
+  // Runs inside transactionSync; migrateDoSchema gates blockConcurrencyWhile to
+  // pending versions only (see DO constructors).
   ctx.storage.transactionSync(() => {
       ctx.storage.sql.exec(`
         CREATE TABLE IF NOT EXISTS schema_migrations (

@@ -5,6 +5,7 @@ import {
   migrateSqlite,
   tableExists,
   type BaselineDetector,
+  type DoSchemaDefinition,
   type SqlMigration,
 } from "../../shared/sql-migrations";
 import { applyArchiveOutboxMigration } from "../../../archive/apply-archive-migration";
@@ -661,6 +662,9 @@ export const chatChannelMigrations: SqlMigration[] = [
   },
 ];
 
-export function migrateChatChannelSchema(ctx: DurableObjectState): void {
-  migrateSqlite(ctx, "ChatChannel", chatChannelBaseline, chatChannelMigrations);
-}
+export const CHAT_CHANNEL_DO_SCHEMA = {
+  doClassName: "ChatChannel",
+  targetVersion: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+  baseline: chatChannelBaseline,
+  migrations: chatChannelMigrations,
+} satisfies DoSchemaDefinition;

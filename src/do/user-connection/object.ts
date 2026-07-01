@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env";
-import { migrateUserConnectionSchema } from "./migrations";
+import { USER_CONNECTION_DO_SCHEMA } from "./migrations";
+import { migrateDoSchema } from "../shared/sql-migrations";
 import { parseFrame, type CommandAckFrame, type CommandErrorFrame, type EventFrame, type UserEventFrame } from "../../ws/frames";
 import { dedupePrincipalKeyForUser, parseMessageDeleteCommand, parseMessageEditCommand, parseMessageRecallCommand, parseMessageSendCommand } from "../../chat/command";
 import { parseCommandInvokePayload } from "../../chat/command-invoke";
@@ -192,9 +193,7 @@ function normalizeEventError(payload: unknown): SendError {
 export class UserConnection extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.ctx.blockConcurrencyWhile(async () => {
-      migrateUserConnectionSchema(this.ctx);
-    });
+    migrateDoSchema(this.ctx, USER_CONNECTION_DO_SCHEMA);
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 

@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env";
-import { migrateChannelDirectorySchema } from "./migrations";
+import { CHANNEL_DIRECTORY_DO_SCHEMA } from "./migrations";
+import { migrateDoSchema } from "../shared/sql-migrations";
 import { logSwallowedError } from "../../errors";
 import { sqlRows } from "../shared/sql";
 
@@ -33,9 +34,7 @@ function base64urlDecode(s: string): string {
 export class ChannelDirectory extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.ctx.blockConcurrencyWhile(async () => {
-      migrateChannelDirectorySchema(this.ctx);
-    });
+    migrateDoSchema(this.ctx, CHANNEL_DIRECTORY_DO_SCHEMA);
   }
 
   async applyProjection(body: {

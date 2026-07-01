@@ -1,7 +1,7 @@
 import {
   applyBaselineSchema,
-  migrateSqlite,
   type BaselineDetector,
+  type DoSchemaDefinition,
   type SqlMigration,
 } from "../shared/sql-migrations";
 import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
@@ -40,6 +40,9 @@ export const dmDirectoryMigrations: SqlMigration[] = [
   },
 ];
 
-export function migrateDmDirectorySchema(ctx: DurableObjectState): void {
-  migrateSqlite(ctx, "DMDirectory", dmDirectoryBaseline, dmDirectoryMigrations);
-}
+export const DM_DIRECTORY_DO_SCHEMA = {
+  doClassName: "DMDirectory",
+  targetVersion: DM_DIRECTORY_CURRENT_SCHEMA_VERSION,
+  baseline: dmDirectoryBaseline,
+  migrations: dmDirectoryMigrations,
+} satisfies DoSchemaDefinition;
