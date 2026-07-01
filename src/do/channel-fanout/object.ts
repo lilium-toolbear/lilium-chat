@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env";
-import { migrateChannelFanoutSchema } from "./migrations";
+import { CHANNEL_FANOUT_DO_SCHEMA } from "./migrations";
+import { migrateDoSchema } from "../shared/sql-migrations";
 import { bumpFanoutRetry, scheduleFanoutAlarm } from "./fanout-scheduler";
 import { rpcErrorMessage, shouldRetryRpcError } from "../shared/rpc-errors";
 import { logSwallowedError } from "../../errors";
@@ -78,9 +79,7 @@ export interface ChannelFanoutDebugDump {
 export class ChannelFanout extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.ctx.blockConcurrencyWhile(async () => {
-      migrateChannelFanoutSchema(this.ctx);
-    });
+    migrateDoSchema(this.ctx, CHANNEL_FANOUT_DO_SCHEMA);
   }
 
   async leaseUpsert(input: {

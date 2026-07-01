@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env";
-import { migrateChatChannelSchema } from "./data/migrations";
+import { CHAT_CHANNEL_DO_SCHEMA } from "./data/migrations";
+import { migrateDoSchema } from "../shared/sql-migrations";
 import { uuidv7, monotonicUuidV7, type EventSeq } from "../../ids/uuidv7";
 import {
   buildEventFrame,
@@ -140,9 +141,7 @@ interface InviteDirectoryUpsertPayload {
 export class ChatChannelCore extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.ctx.blockConcurrencyWhile(async () => {
-      migrateChatChannelSchema(this.ctx);
-    });
+    migrateDoSchema(this.ctx, CHAT_CHANNEL_DO_SCHEMA);
   }
 
   get repo(): ChatChannelRepository {

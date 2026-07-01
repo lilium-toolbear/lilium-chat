@@ -9,7 +9,7 @@ Runtime code lives in `src/`: routes in `src/routes/`, Durable Objects in `src/d
 ## Build, Test, and Development Commands
 
 ```bash
-npm run typecheck   # tsc --noEmit — run after wrangler.jsonc binding/vars changes
+npm run typecheck   # tsc --noEmit — required before claiming TS/contract changes done; also after wrangler.jsonc binding/vars changes
 npm test            # vitest watch
 npm run test:once   # vitest run once
 npm run cf-typegen  # wrangler types → regenerates gitignored worker-configuration.d.ts
@@ -80,7 +80,7 @@ Internal test routes need `ALLOW_INTERNAL_TEST_ROUTES=1` + `X-Test-Only: 1` (tes
 - Application-level DO RPC methods are not external HTTP APIs: return typed domain data, not `Response`; throw typed errors for failures. Only Hono handlers, real `fetch()` entrypoints, and WS upgrade paths return `Response`.
 - Public RPC methods should carry the real typed contract. Do not add one-line compatibility proxy methods that only translate to a private HTTP route.
 - Test/debug inspection without a real HTTP boundary should be a test-gated RPC method.
-- Wrap constructor schema migration in `ctx.blockConcurrencyWhile(async () => { ... })`.
+- Call `migrateDoSchema(ctx, XXX_DO_SCHEMA)` in the constructor. Each DO exports a `*_DO_SCHEMA` bundle from its migrations module; `migrateDoSchema` skips `blockConcurrencyWhile` when schema is current and blocks with a second version check when migration is pending (per [CF DO guidance](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/#initialize-storage-and-run-migrations-in-the-constructor)).
 - When handling DO RPC exceptions, retry only platform/transport failures: `err.remote === false && err.retryable === true && err.overloaded !== true`. Remote user-code exceptions (`err.remote === true`) are business results; do not retry them. Business `ApiError.retryable` is client-facing API semantics only, not an internal DO retry trigger.
 - Before using subagents or editing a worktree, verify `pwd && git branch --show-current`. Stop if the cwd is not the intended worktree or the branch is not the intended branch.
 
@@ -120,6 +120,33 @@ Operator apply: `DATABASE_URL=... npm run archive:migrate` (see archive runbook)
 ## Workflow
 
 Phase plans in `docs/superpowers/plans/`. Follow task order, write failing tests first, run typecheck + load-adjusted vitest after each task, update plan checkboxes. `.superpowers/sdd/` (gitignored) holds execution ledgers.
+
+### Verification before completion
+
+Do **not** mark a code change done after a partial test run. A green subset of vitest does **not** replace typecheck — e.g. changing a DO RPC return type from `{ ok: true }` to `void` breaks `*.test.ts` callers that `tsc` catches even when unrelated runtime tests pass.
+
+**Required before claiming done** (unless the user scoped verification differently):
+
+```bash
+npm run typecheck
+npx vitest run <affected test files or paths> --no-file-parallelism --test-timeout=60000 --hook-timeout=60000
+```
+
+Run `npm run typecheck` after **any** TypeScript signature / contract / export change — not only after `wrangler.jsonc` edits. When return types or shared contracts change, grep for old shapes (`.ok`, removed fields, renamed types) in `src/**/*.test.ts` and `test/**/*.ts`.
+
+For larger or cross-DO refactors, prefer the load-adjusted full suite:
+
+```bash
+npm run typecheck && npx vitest run --no-file-parallelism --test-timeout=60000 --hook-timeout=60000
+```
+
+### Git discipline
+
+When committing:
+
+1. `git add` **only** files you changed for the task.
+2. Never `git checkout -- <path>` / `git restore <path>` to “clean up” unrelated modified files — that discards another session’s uncommitted work with no recovery.
+3. If the working tree has unrelated modifications, leave them alone; commit your paths explicitly.
 
 ## Testing Guidelines
 

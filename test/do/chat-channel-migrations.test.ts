@@ -1,13 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:workers";
 import { getNamedDo, readDoSchemaVersion } from "../helpers";
-import { applyBaselineSchema, columnExists, migrateSqlite, tableExists } from "../../src/do/shared/sql-migrations";
+import { applyBaselineSchema, columnExists, applyDoSchemaMigrations, migrateSqlite, tableExists } from "../../src/do/shared/sql-migrations";
 import {
   CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+  CHAT_CHANNEL_DO_SCHEMA,
   CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA,
   chatChannelBaseline,
   chatChannelMigrations,
-  migrateChatChannelSchema,
 } from "../../src/do/chat-channel/data/migrations";
 
 function chatStub(channelId: string) {
@@ -70,7 +70,7 @@ describe("ChatChannel migrations", () => {
         "2026-01-01T00:00:00.000Z",
       );
 
-      migrateChatChannelSchema(ctx);
+      applyDoSchemaMigrations(ctx, CHAT_CHANNEL_DO_SCHEMA);
 
       expect(columnExists(ctx, "attachments", "blurhash")).toBe(true);
       expect(columnExists(ctx, "message_stickers", "blurhash")).toBe(true);
@@ -156,7 +156,7 @@ describe("ChatChannel migrations", () => {
 
       expect(tableExists(ctx, "message_stickers")).toBe(false);
 
-      migrateChatChannelSchema(ctx);
+      applyDoSchemaMigrations(ctx, CHAT_CHANNEL_DO_SCHEMA);
 
       expect(tableExists(ctx, "message_stickers")).toBe(true);
       expect(columnExists(ctx, "message_stickers", "blurhash")).toBe(true);

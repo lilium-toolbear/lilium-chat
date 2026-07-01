@@ -1,8 +1,8 @@
 import {
   applyBaselineSchema,
-  migrateSqlite,
   tableExists,
   type BaselineDetector,
+  type DoSchemaDefinition,
   type SqlMigration,
 } from "../shared/sql-migrations";
 
@@ -54,11 +54,9 @@ export const botStreamConnectionBaseline: BaselineDetector = {
 
 export const botStreamConnectionMigrations: SqlMigration[] = [migrationV2StreamDueJobs];
 
-export function migrateBotStreamConnectionSchema(ctx: DurableObjectState): void {
-  migrateSqlite(
-    ctx,
-    "BotStreamConnection",
-    botStreamConnectionBaseline,
-    botStreamConnectionMigrations,
-  );
-}
+export const BOT_STREAM_CONNECTION_DO_SCHEMA = {
+  doClassName: "BotStreamConnection",
+  targetVersion: BOT_STREAM_CONNECTION_CURRENT_SCHEMA_VERSION,
+  baseline: botStreamConnectionBaseline,
+  migrations: botStreamConnectionMigrations,
+} satisfies DoSchemaDefinition;

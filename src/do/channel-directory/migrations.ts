@@ -1,7 +1,7 @@
 import {
   applyBaselineSchema,
-  migrateSqlite,
   type BaselineDetector,
+  type DoSchemaDefinition,
   type SqlMigration,
 } from "../shared/sql-migrations";
 
@@ -25,6 +25,9 @@ export const channelDirectoryBaseline: BaselineDetector = {
 
 export const channelDirectoryMigrations: SqlMigration[] = [];
 
-export function migrateChannelDirectorySchema(ctx: DurableObjectState): void {
-  migrateSqlite(ctx, "ChannelDirectory", channelDirectoryBaseline, channelDirectoryMigrations);
-}
+export const CHANNEL_DIRECTORY_DO_SCHEMA = {
+  doClassName: "ChannelDirectory",
+  targetVersion: CHANNEL_DIRECTORY_CURRENT_SCHEMA_VERSION,
+  baseline: channelDirectoryBaseline,
+  migrations: channelDirectoryMigrations,
+} satisfies DoSchemaDefinition;

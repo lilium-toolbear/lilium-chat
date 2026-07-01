@@ -2,7 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env";
 import { uuidv7 } from "../../ids/uuidv7";
 import { canonicalDmPairKey } from "../../chat/dm-pair";
-import { migrateDmDirectorySchema } from "./migrations";
+import { DM_DIRECTORY_DO_SCHEMA } from "./migrations";
+import { migrateDoSchema } from "../shared/sql-migrations";
 import { archiveOutboxDueTable, flushArchiveOutboxToQueue } from "../../archive/queue-flush";
 import { appendArchiveRecordSync } from "../../archive/source-outbox";
 import { archiveUpsert, rowVersionFromSeq } from "../../archive/changes";
@@ -13,9 +14,7 @@ import { logSwallowedError } from "../../errors";
 export class DMDirectory extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.ctx.blockConcurrencyWhile(async () => {
-      migrateDmDirectorySchema(this.ctx);
-    });
+    migrateDoSchema(this.ctx, DM_DIRECTORY_DO_SCHEMA);
   }
 
   async getOrCreateDm(body: { user_a: string; user_b: string; created_by: string }): Promise<{ channel_id: string; status: "active" | "creating"; created: boolean }> {

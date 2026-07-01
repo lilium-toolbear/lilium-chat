@@ -5,16 +5,17 @@ import {
   applyBaselineSchema,
   columnExists,
   indexExists,
+  applyDoSchemaMigrations,
   migrateSqlite,
   quoteIdent,
   tableExists,
 } from "../../src/do/shared/sql-migrations";
 import {
   CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+  CHAT_CHANNEL_DO_SCHEMA,
   CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA,
   chatChannelBaseline,
   chatChannelMigrations,
-  migrateChatChannelSchema,
 } from "../../src/do/chat-channel/data/migrations";
 
 function chatStub(channelId: string) {
@@ -115,7 +116,7 @@ describe("ChatChannel v2 migrations (Task 7 baseline reset)", () => {
       expect(columnExists(ctx, "channel_command_bindings", "command_snapshot_json")).toBe(false);
       expect(tableExists(ctx, "stateful_command_sessions")).toBe(false);
 
-      migrateChatChannelSchema(ctx);
+      applyDoSchemaMigrations(ctx, CHAT_CHANNEL_DO_SCHEMA);
 
       expect(tableExists(ctx, "commands")).toBe(false);
       expect(tableExists(ctx, "invocations")).toBe(false);
@@ -157,7 +158,7 @@ describe("ChatChannel v2 migrations (Task 7 baseline reset)", () => {
     await withDoState(legacyStub, (ctx) => {
       applyBaselineSchema(ctx, CHAT_CHANNEL_LEGACY_BASELINE_SCHEMA);
       stampSchemaVersion(ctx, 2026062803, "legacy-phase7");
-      migrateChatChannelSchema(ctx);
+      applyDoSchemaMigrations(ctx, CHAT_CHANNEL_DO_SCHEMA);
     });
 
     await withDoState(freshStub, (ctx) => expectPhase7Tables(ctx));

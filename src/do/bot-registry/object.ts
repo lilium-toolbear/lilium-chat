@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env";
 import { ApiError, logSwallowedError } from "../../errors";
-import { migrateBotRegistrySchema } from "./migrations";
+import { BOT_REGISTRY_DO_SCHEMA } from "./migrations";
+import { migrateDoSchema } from "../shared/sql-migrations";
 import { uuidv7 } from "../../ids/uuidv7";
 import { idempotencyExpiresAt } from "../../contract/idempotency";
 import type {
@@ -370,9 +371,7 @@ type CommandDirectoryResult = {
 export class BotRegistry extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.ctx.blockConcurrencyWhile(async () => {
-      migrateBotRegistrySchema(this.ctx);
-    });
+    migrateDoSchema(this.ctx, BOT_REGISTRY_DO_SCHEMA);
   }
 
   /** Resolve a token hash to {bot_id, scopes}. */

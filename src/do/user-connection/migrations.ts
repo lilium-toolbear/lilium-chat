@@ -1,7 +1,7 @@
 import {
   applyBaselineSchema,
-  migrateSqlite,
   type BaselineDetector,
+  type DoSchemaDefinition,
   type SqlMigration,
 } from "../shared/sql-migrations";
 
@@ -46,6 +46,9 @@ export const userConnectionBaseline: BaselineDetector = {
 
 export const userConnectionMigrations: SqlMigration[] = [];
 
-export function migrateUserConnectionSchema(ctx: DurableObjectState): void {
-  migrateSqlite(ctx, "UserConnection", userConnectionBaseline, userConnectionMigrations);
-}
+export const USER_CONNECTION_DO_SCHEMA = {
+  doClassName: "UserConnection",
+  targetVersion: USER_CONNECTION_CURRENT_SCHEMA_VERSION,
+  baseline: userConnectionBaseline,
+  migrations: userConnectionMigrations,
+} satisfies DoSchemaDefinition;

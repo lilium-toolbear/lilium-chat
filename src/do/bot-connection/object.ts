@@ -18,7 +18,8 @@ import { effectUsesUnsafeMarkdown } from "../../chat/bot-message-format";
 import type { EffectResult } from "../../contract/bot-gateway";
 import { logSwallowedError } from "../../errors";
 import { uuidv7 } from "../../ids/uuidv7";
-import { migrateBotConnectionSchema } from "./migrations";
+import { BOT_CONNECTION_DO_SCHEMA } from "./migrations";
+import { migrateDoSchema } from "../shared/sql-migrations";
 import { runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "../shared/scheduler";
 import {
   deleteStatefulSessionRef,
@@ -117,9 +118,7 @@ function botDeliveryFrameForWs(row: BotDeliveryRow): BotDeliveryFrame {
 export class BotConnection extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.ctx.blockConcurrencyWhile(async () => {
-      migrateBotConnectionSchema(this.ctx);
-    });
+    migrateDoSchema(this.ctx, BOT_CONNECTION_DO_SCHEMA);
   }
 
   async getConnectionState(): Promise<ConnectionStateResult> {

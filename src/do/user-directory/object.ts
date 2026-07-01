@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env";
 import { uuidv7 } from "../../ids/uuidv7";
-import { migrateUserDirectorySchema } from "./migrations";
+import { USER_DIRECTORY_DO_SCHEMA } from "./migrations";
+import { migrateDoSchema } from "../shared/sql-migrations";
 import { projectAttachmentForBrowser, projectFinalizedAttachmentForBrowser, type AttachmentRow } from "../../chat/attachment-projection";
 import { presignPutUrl, headObjectKey, deleteObject } from "../../s3/presign";
 import { attachmentObjectKey, attachmentPublicUrl, avatarObjectKey, avatarPublicUrl } from "../../s3/object-key";
@@ -233,9 +234,7 @@ function validatePresignBody(body: {
 export class UserDirectory extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.ctx.blockConcurrencyWhile(async () => {
-      migrateUserDirectorySchema(this.ctx);
-    });
+    migrateDoSchema(this.ctx, USER_DIRECTORY_DO_SCHEMA);
   }
 
   async upsertChannelProjection(

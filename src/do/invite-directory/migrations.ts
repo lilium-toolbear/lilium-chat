@@ -1,7 +1,7 @@
 import {
   applyBaselineSchema,
-  migrateSqlite,
   type BaselineDetector,
+  type DoSchemaDefinition,
   type SqlMigration,
 } from "../shared/sql-migrations";
 
@@ -24,6 +24,9 @@ export const inviteDirectoryBaseline: BaselineDetector = {
 
 export const inviteDirectoryMigrations: SqlMigration[] = [];
 
-export function migrateInviteDirectorySchema(ctx: DurableObjectState): void {
-  migrateSqlite(ctx, "InviteDirectory", inviteDirectoryBaseline, inviteDirectoryMigrations);
-}
+export const INVITE_DIRECTORY_DO_SCHEMA = {
+  doClassName: "InviteDirectory",
+  targetVersion: INVITE_DIRECTORY_CURRENT_SCHEMA_VERSION,
+  baseline: inviteDirectoryBaseline,
+  migrations: inviteDirectoryMigrations,
+} satisfies DoSchemaDefinition;

@@ -1,8 +1,8 @@
 import {
   applyBaselineSchema,
   columnExists,
-  migrateSqlite,
   type BaselineDetector,
+  type DoSchemaDefinition,
   type SqlMigration,
 } from "../shared/sql-migrations";
 import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
@@ -98,6 +98,9 @@ export const userDirectoryMigrations: SqlMigration[] = [
   },
 ];
 
-export function migrateUserDirectorySchema(ctx: DurableObjectState): void {
-  migrateSqlite(ctx, "UserDirectory", userDirectoryBaseline, userDirectoryMigrations);
-}
+export const USER_DIRECTORY_DO_SCHEMA = {
+  doClassName: "UserDirectory",
+  targetVersion: USER_DIRECTORY_CURRENT_SCHEMA_VERSION,
+  baseline: userDirectoryBaseline,
+  migrations: userDirectoryMigrations,
+} satisfies DoSchemaDefinition;

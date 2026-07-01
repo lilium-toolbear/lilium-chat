@@ -1,8 +1,8 @@
 import {
   applyBaselineSchema,
   columnExists,
-  migrateSqlite,
   type BaselineDetector,
+  type DoSchemaDefinition,
   type SqlMigration,
 } from "../shared/sql-migrations";
 import { applyArchiveOutboxMigration } from "../../archive/apply-archive-migration";
@@ -111,6 +111,9 @@ export const botRegistryMigrations: SqlMigration[] = [
   },
 ];
 
-export function migrateBotRegistrySchema(ctx: DurableObjectState): void {
-  migrateSqlite(ctx, "BotRegistry", botRegistryBaseline, botRegistryMigrations);
-}
+export const BOT_REGISTRY_DO_SCHEMA = {
+  doClassName: "BotRegistry",
+  targetVersion: BOT_REGISTRY_CURRENT_SCHEMA_VERSION,
+  baseline: botRegistryBaseline,
+  migrations: botRegistryMigrations,
+} satisfies DoSchemaDefinition;

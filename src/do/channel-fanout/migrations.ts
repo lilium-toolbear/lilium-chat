@@ -1,9 +1,9 @@
 import {
   applyBaselineSchema,
   columnExists,
-  migrateSqlite,
   tableExists,
   type BaselineDetector,
+  type DoSchemaDefinition,
   type SqlMigration,
 } from "../shared/sql-migrations";
 
@@ -94,6 +94,9 @@ export const channelFanoutMigrations: SqlMigration[] = [
   },
 ];
 
-export function migrateChannelFanoutSchema(ctx: DurableObjectState): void {
-  migrateSqlite(ctx, "ChannelFanout", channelFanoutBaseline, channelFanoutMigrations);
-}
+export const CHANNEL_FANOUT_DO_SCHEMA = {
+  doClassName: "ChannelFanout",
+  targetVersion: CHANNEL_FANOUT_CURRENT_SCHEMA_VERSION,
+  baseline: channelFanoutBaseline,
+  migrations: channelFanoutMigrations,
+} satisfies DoSchemaDefinition;
