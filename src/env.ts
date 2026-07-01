@@ -11,6 +11,8 @@ declare global {
     SENTRY_DSN: string;
     /** Set to "1" only in wrangler.test.jsonc; absent in production. */
     ALLOW_INTERNAL_TEST_ROUTES?: string;
+    /** Read-only SQL debug endpoint token (set via `wrangler secret put DEBUG_TOKEN`). */
+    DEBUG_TOKEN?: string;
     CHAT_ARCHIVE_QUEUE: Queue<import("./archive/payload").ArchiveRecord>;
   }
 }

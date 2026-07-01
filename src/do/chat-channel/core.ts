@@ -93,6 +93,7 @@ import type {
 import { OUTBOX_MAX_ATTEMPTS } from "../../contract/outbox";
 import { bumpQueueRetry } from "../shared/retry-backoff";
 import { isoDueTable, runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "../shared/scheduler";
+import { runDebugSql, type DebugSqlInput, type DebugSqlResult } from "../shared/debug-sql";
 import { flushExpiredPendingBotAttachments } from "./handlers/pending-bot-attachment-gc";
 import { rpcErrorMessage, shouldRetryRpcError } from "../shared/rpc-errors";
 import { archiveOutboxDueTable, flushArchiveOutboxToQueue } from "../../archive/queue-flush";
@@ -790,6 +791,11 @@ export class ChatChannelCore extends DurableObject<Env> {
 
       await this.bumpOutboxRetry(r.outbox_id, nowIso, `unsupported target_kind=${r.target_kind}`);
     }
+  }
+
+  /** Read-only SQL debug surface, gated by DEBUG_TOKEN at the route layer. */
+  async debugSql(input: DebugSqlInput): Promise<DebugSqlResult> {
+    return runDebugSql(this.ctx, input);
   }
 
   async alarm(): Promise<void> {

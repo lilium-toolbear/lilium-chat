@@ -4,6 +4,7 @@ import { CHANNEL_DIRECTORY_DO_SCHEMA } from "./migrations";
 import { migrateDoSchema } from "../shared/sql-migrations";
 import { logSwallowedError } from "../../errors";
 import { sqlRows } from "../shared/sql";
+import { runDebugSql, type DebugSqlInput, type DebugSqlResult } from "../shared/debug-sql";
 
 interface PublicChannelRow {
   channel_id: string;
@@ -123,5 +124,18 @@ export class ChannelDirectory extends DurableObject<Env> {
 
     const items: PublicChannelRow[] = page.map(({ last_activity: _lastActivity, ...item }) => item);
     return { items, next_cursor: nextCursor };
+  }
+
+  /** Debug enumeration: all known channel_ids regardless of status. */
+  listAllChannelIds(): { channel_ids: string[] } {
+    const rows = sqlRows<{ channel_id: string }>(
+      this.ctx.storage.sql.exec("SELECT channel_id FROM public_channels ORDER BY channel_id ASC").toArray(),
+    );
+    return { channel_ids: rows.map((r) => r.channel_id) };
+  }
+
+  /** Read-only SQL debug surface, gated by DEBUG_TOKEN at the route layer. */
+  async debugSql(input: DebugSqlInput): Promise<DebugSqlResult> {
+    return runDebugSql(this.ctx, input);
   }
 }

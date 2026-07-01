@@ -5,6 +5,7 @@ import { migrateDoSchema } from "../shared/sql-migrations";
 import { bumpFanoutRetry, scheduleFanoutAlarm } from "./fanout-scheduler";
 import { rpcErrorMessage, shouldRetryRpcError } from "../shared/rpc-errors";
 import { logSwallowedError } from "../../errors";
+import { runDebugSql, type DebugSqlInput, type DebugSqlResult } from "../shared/debug-sql";
 
 const LEASE_TTL_MS = 10 * 60 * 1000;
 // ponytail: per-event fanout cap; tune if production lease fanout still saturates.
@@ -258,6 +259,11 @@ export class ChannelFanout extends DurableObject<Env> {
     });
 
     return { delivered_to: deliveredCount, lease_count: sessions.length };
+  }
+
+  /** Read-only SQL debug surface, gated by DEBUG_TOKEN at the route layer. */
+  async debugSql(input: DebugSqlInput): Promise<DebugSqlResult> {
+    return runDebugSql(this.ctx, input);
   }
 
   /** Test-only RPC inspection; production paths do not call this method. */

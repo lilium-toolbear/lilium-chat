@@ -14,6 +14,7 @@ import { idempotencyExpiresAt } from "../../contract/idempotency";
 import type { CreateChannelApiResponse } from "../../contract/channel-api";
 import type { FinalizedAttachmentProjection } from "../../contract/message";
 import { isoDueTable, runDueJobs, scheduleNextAlarm, type DueTable } from "../shared/scheduler";
+import { runDebugSql, type DebugSqlInput, type DebugSqlResult } from "../shared/debug-sql";
 import { archiveOutboxDueTable, flushArchiveOutboxToQueue } from "../../archive/queue-flush";
 import { appendArchiveRecordSync } from "../../archive/source-outbox";
 import { archiveUpsert, rowVersionFromSeq } from "../../archive/changes";
@@ -1162,6 +1163,11 @@ export class UserDirectory extends DurableObject<Env> {
 
   async scheduleArchiveAlarm(): Promise<void> {
     await this.scheduleAlarm();
+  }
+
+  /** Read-only SQL debug surface, gated by DEBUG_TOKEN at the route layer. */
+  async debugSql(input: DebugSqlInput): Promise<DebugSqlResult> {
+    return runDebugSql(this.ctx, input);
   }
 
   async alarm(): Promise<void> {

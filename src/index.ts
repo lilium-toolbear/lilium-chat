@@ -58,6 +58,7 @@ import {
 import { openDmHandler } from "./routes/dms";
 import { commandDirectoryHandler } from "./routes/command-directory";
 import { getStatefulSessionHandler, stopStatefulSessionHandler } from "./routes/stateful-session";
+import { debugSqlHandler, debugSqlAllHandler, debugClassesHandler } from "./routes/debug-sql";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -143,6 +144,12 @@ app.patch("/api/chat/channels/:channel_id/commands/:bot_command_id", (c) => upda
 app.get("/api/chat/channels/:channel_id/commands", (c) => listChannelCommandsHandler(c));
 app.get("/api/chat/channels/:channel_id/stateful-session", (c) => getStatefulSessionHandler(c));
 app.post("/api/chat/channels/:channel_id/stateful-session/stop", (c) => stopStatefulSessionHandler(c));
+
+// Internal read-only SQL debug surface (gated by DEBUG_TOKEN secret).
+app.get("/internal/debug/classes", (c) => debugClassesHandler(c));
+app.post("/internal/debug/sql", (c) => debugSqlHandler(c));
+app.post("/internal/debug/sql-all", (c) => debugSqlAllHandler(c));
+
 app.all("/api/chat/*", (c) => {
   throw new ApiError("NOT_FOUND", "route not found", { httpStatus: 404 });
 });

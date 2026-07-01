@@ -31,6 +31,7 @@ import { BOT_STREAM_CONNECTION_DO_SCHEMA } from "./migrations";
 import { migrateDoSchema } from "../shared/sql-migrations";
 import { requireTestOnly } from "../shared/do-errors";
 import { runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "../shared/scheduler";
+import { runDebugSql, type DebugSqlInput, type DebugSqlResult } from "../shared/debug-sql";
 
 export interface BotStreamConnectionAttachment {
   channel_id: string;
@@ -276,6 +277,11 @@ export class BotStreamConnection extends DurableObject<Env> {
     } catch (err) {
       logSwallowedError("bot_stream_ws_close_failed", err);
     }
+  }
+
+  /** Read-only SQL debug surface, gated by DEBUG_TOKEN at the route layer. */
+  async debugSql(input: DebugSqlInput): Promise<DebugSqlResult> {
+    return runDebugSql(this.ctx, input);
   }
 
   async alarm(): Promise<void> {

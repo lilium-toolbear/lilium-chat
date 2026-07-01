@@ -12,6 +12,7 @@ import { apiErrorFromRemote, logSwallowedError } from "../../errors";
 import { assertTestRoutesEnabled } from "../shared/test-gates";
 import type { ChatChannel } from "../chat-channel";
 import { rpcErrorMessage, shouldRetryRpcError } from "../shared/rpc-errors";
+import { runDebugSql, type DebugSqlInput, type DebugSqlResult } from "../shared/debug-sql";
 
 export interface ConnectionAttachment {
   user_id: string;
@@ -548,6 +549,11 @@ export class UserConnection extends DurableObject<Env> {
     const session = this.getSessionRow(att.session_id);
     if (!session || session.status === "closed") return;
     await this.closeSessionCleanup(att.session_id, "ws_error");
+  }
+
+  /** Read-only SQL debug surface, gated by DEBUG_TOKEN at the route layer. */
+  async debugSql(input: DebugSqlInput): Promise<DebugSqlResult> {
+    return runDebugSql(this.ctx, input);
   }
 
   async alarm(): Promise<void> {
