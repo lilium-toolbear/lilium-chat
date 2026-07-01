@@ -18,6 +18,7 @@ import type {
 import { buildReplayEventsPage, type ReplayEnvelope, type ReplayEventsPage } from "../../chat/replay-projection";
 import { buildMessageContextPage, type MessageContextPage } from "../../chat/message-context";
 import { buildTimelineHistoryPage, type TimelineHistoryPage } from "../../chat/timeline-history";
+import { SESSION_START_TIMEOUT_MS } from "../../chat/stateful-session";
 import type { ChatEventPayloadByType } from "../../contract/events";
 import type {
   AcceptInviteApiResponse,
@@ -451,7 +452,7 @@ export class ChatChannelCore extends DurableObject<Env> {
         ...this.pendingBotAttachmentDueTables(),
         archiveOutboxDueTable(),
       ],
-      { respectExistingAlarm: true },
+      { respectExistingAlarm: true, extraDueMs: this.nextStartingSessionTimeoutMs() },
     );
   }
 
@@ -473,8 +474,15 @@ export class ChatChannelCore extends DurableObject<Env> {
     };
     return [
       isoDueTable("stateful_command_sessions", "expires_at", "status", "active", flush),
-      isoDueTable("stateful_command_sessions", "started_at", "status", "starting", flush),
     ];
+  }
+
+  private nextStartingSessionTimeoutMs(): number | null {
+    const row = this.ctx.storage.sql
+      .exec("SELECT MIN(started_at) AS started_at FROM stateful_command_sessions WHERE status='starting'")
+      .toArray()[0] as { started_at: string | null } | undefined;
+    const startedMs = typeof row?.started_at === "string" ? Date.parse(row.started_at) : NaN;
+    return Number.isFinite(startedMs) ? startedMs + SESSION_START_TIMEOUT_MS : null;
   }
 
   private streamRegistryDueTables(): DueTable[] {

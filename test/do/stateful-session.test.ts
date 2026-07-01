@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { BOT_GATEWAY_API_VERSION } from "../../src/chat/bot-gateway-protocol";
+import { SESSION_START_TIMEOUT_MS } from "../../src/chat/stateful-session";
 import { createOwnedTestChannel, getNamedDo } from "../helpers";
 import { nextAck, upgradeUserConnection } from "../ws-helpers";
 import type { ChatChannel } from "../../src/do/chat-channel";
@@ -226,6 +227,43 @@ afterEach(() => {
 });
 
 describe("stateful command sessions", () => {
+  it("schedules starting session timeout instead of immediately rearming", async () => {
+    const { runInDurableObject } = await import("cloudflare:test");
+    const channelId = crypto.randomUUID();
+    const stub = getNamedDo<ChatChannel>(env.CHAT_CHANNEL, channelId);
+    const startedMs = Date.now() + 60_000;
+    const startedAt = new Date(startedMs).toISOString();
+    const expiresAt = new Date(startedMs + 3_600_000).toISOString();
+
+    await runInDurableObject(stub, async (instance: unknown) => {
+      const chat = instance as {
+        ctx: DurableObjectState;
+        scheduleOutboxAlarm: (nowIso: string) => Promise<void>;
+      };
+      chat.ctx.storage.sql.exec(
+        `INSERT INTO stateful_command_sessions (
+           session_id, channel_id, bot_id, bot_command_id, invocation_id, started_by_user_id,
+           status, listen_rules_json, input_next_seq, input_last_acked_seq, effect_last_acked_seq,
+           started_at, expires_at, closed_at, close_reason, summary_json
+         ) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, 1, 0, 0, ?, ?, NULL, NULL, ?)`,
+        crypto.randomUUID(),
+        channelId,
+        `bot-${crypto.randomUUID()}`,
+        `cmd-${crypto.randomUUID()}`,
+        crypto.randomUUID(),
+        "user-1",
+        JSON.stringify(STATEFUL_EXECUTION.stateful.listen_capability),
+        startedAt,
+        expiresAt,
+        JSON.stringify({ command_name: "werewolf" }),
+      );
+
+      await chat.scheduleOutboxAlarm(startedAt);
+
+      expect(await chat.ctx.storage.getAlarm()).toBe(startedMs + SESSION_START_TIMEOUT_MS);
+    });
+  });
+
   it("returns BOT_OFFLINE and creates no session row when bot disconnected", async () => {
     const userId = `stateful-user-${crypto.randomUUID()}`;
     const channelId = crypto.randomUUID();

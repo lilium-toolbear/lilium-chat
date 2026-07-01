@@ -59,9 +59,10 @@ export async function runDueJobs(
 export async function scheduleNextAlarm(
   ctx: DurableObjectState,
   dueTables: DueTable[],
-  opts?: { respectExistingAlarm?: boolean },
+  opts?: { respectExistingAlarm?: boolean; extraDueMs?: number | null },
 ): Promise<void> {
-  let nextDueMs: number | null = null;
+  let nextDueMs: number | null =
+    typeof opts?.extraDueMs === "number" && Number.isFinite(opts.extraDueMs) ? opts.extraDueMs : null;
   for (const table of dueTables) {
     const kind = table.dueValueKind ?? "epoch_ms";
     const cursor = ctx.storage.sql.exec(
