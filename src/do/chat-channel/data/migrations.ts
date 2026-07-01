@@ -9,7 +9,7 @@ import {
 } from "../../shared/sql-migrations";
 import { applyArchiveOutboxMigration } from "../../../archive/apply-archive-migration";
 
-export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026070103;
+export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026070104;
 
 export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS channel_meta (
@@ -56,7 +56,7 @@ export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
     attachment_id TEXT PRIMARY KEY, owner_user_id TEXT, owner_bot_id TEXT, channel_id TEXT,
     kind TEXT NOT NULL, filename TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
     width INTEGER, height INTEGER, storage_key TEXT NOT NULL, url TEXT NOT NULL,
-    status TEXT NOT NULL, created_at TEXT NOT NULL, blurhash TEXT,
+    status TEXT NOT NULL, created_at TEXT NOT NULL, blurhash TEXT, expires_at TEXT,
     CHECK (owner_user_id IS NOT NULL OR owner_bot_id IS NOT NULL)
   )`,
   `CREATE TABLE IF NOT EXISTS message_attachments (
@@ -631,7 +631,7 @@ export const chatChannelMigrations: SqlMigration[] = [
     },
   },
   {
-    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    version: 2026070103,
     name: "stateful_session_effects_applied finalize_completed_at",
     up(ctx) {
       if (
@@ -640,6 +640,21 @@ export const chatChannelMigrations: SqlMigration[] = [
       ) {
         ctx.storage.sql.exec(
           "ALTER TABLE stateful_session_effects_applied ADD COLUMN finalize_completed_at TEXT",
+        );
+      }
+    },
+  },
+  {
+    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    name: "attachments expires_at for pending bot upload GC",
+    up(ctx) {
+      if (!tableExists(ctx, "attachments")) return;
+      if (!columnExists(ctx, "attachments", "expires_at")) {
+        ctx.storage.sql.exec("ALTER TABLE attachments ADD COLUMN expires_at TEXT");
+      }
+      if (!indexExists(ctx, "idx_attachments_pending_expires")) {
+        ctx.storage.sql.exec(
+          "CREATE INDEX idx_attachments_pending_expires ON attachments(status, expires_at)",
         );
       }
     },

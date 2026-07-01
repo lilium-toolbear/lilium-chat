@@ -140,11 +140,12 @@ export function BotAttachmentMixin<T extends Constructor<ChatChannelCore>>(Base:
         const attachmentId = uuidv7();
         const storageKey = attachmentObjectKey(attachmentId, filename, mimeType);
         const publicUrl = attachmentPublicUrl(this.env.S3_PUBLIC_BASE, attachmentId, filename, mimeType);
+        const expiresAt = idempotencyExpiresAt(Date.parse(now));
         this.ctx.storage.sql.exec(
           `INSERT INTO attachments (
             attachment_id, owner_user_id, owner_bot_id, channel_id, kind, filename, mime_type, size_bytes,
-            width, height, blurhash, storage_key, url, status, created_at
-          ) VALUES (?, NULL, ?, ?, 'image', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+            width, height, blurhash, storage_key, url, status, created_at, expires_at
+          ) VALUES (?, NULL, ?, ?, 'image', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
           attachmentId,
           botId,
           channelId,
@@ -157,9 +158,9 @@ export function BotAttachmentMixin<T extends Constructor<ChatChannelCore>>(Base:
           storageKey,
           publicUrl,
           now,
+          expiresAt,
         );
         const pendingJson = JSON.stringify({ attachment_id: attachmentId, pending: true });
-        const expiresAt = idempotencyExpiresAt(Date.parse(now));
         this.ctx.storage.sql.exec(
           `INSERT INTO idempotency_keys (
             principal_kind, principal_id, operation, operation_id, request_hash, response_json, status, created_at, expires_at
@@ -233,6 +234,8 @@ export function BotAttachmentMixin<T extends Constructor<ChatChannelCore>>(Base:
           nowIso: now,
         });
       });
+
+      await this.scheduleOutboxAlarm(now);
 
       return response;
     }

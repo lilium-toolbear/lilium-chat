@@ -67,6 +67,7 @@ describe("ChatChannel bot attachment RPC", () => {
     await withDoState(stub, (ctx) => {
       expect(columnExists(ctx, "attachments", "owner_bot_id")).toBe(true);
       expect(columnExists(ctx, "attachments", "channel_id")).toBe(true);
+      expect(columnExists(ctx, "attachments", "expires_at")).toBe(true);
     });
     expect((await readDoSchemaVersion(stub)).current_version).toBe(CHAT_CHANNEL_CURRENT_SCHEMA_VERSION);
   });
@@ -121,6 +122,7 @@ describe("ChatChannel bot attachment RPC", () => {
 
       expect(columnExists(ctx, "attachments", "owner_bot_id")).toBe(true);
       expect(columnExists(ctx, "attachments", "channel_id")).toBe(true);
+      expect(columnExists(ctx, "attachments", "expires_at")).toBe(true);
       const row = ctx.storage.sql
         .exec("SELECT owner_user_id, owner_bot_id, channel_id FROM attachments WHERE attachment_id=?", "att-legacy-user")
         .toArray()[0] as { owner_user_id: string; owner_bot_id: string | null; channel_id: string | null };
@@ -163,7 +165,7 @@ describe("ChatChannel bot attachment RPC", () => {
     await withDoState(stub, (ctx) => {
       const row = ctx.storage.sql
         .exec(
-          "SELECT owner_user_id, owner_bot_id, channel_id, status FROM attachments WHERE attachment_id=?",
+          "SELECT owner_user_id, owner_bot_id, channel_id, status, expires_at FROM attachments WHERE attachment_id=?",
           presign.attachment_id,
         )
         .toArray()[0] as {
@@ -171,12 +173,80 @@ describe("ChatChannel bot attachment RPC", () => {
         owner_bot_id: string;
         channel_id: string;
         status: string;
+        expires_at: string;
       };
       expect(row.owner_user_id).toBeNull();
       expect(row.owner_bot_id).toBe(botId);
       expect(row.channel_id).toBe(channelId);
       expect(row.status).toBe("finalized");
+      expect(row.expires_at).toBeTruthy();
     });
+  });
+
+  it("presign sets expires_at on pending bot attachments", async () => {
+    const channelId = crypto.randomUUID();
+    const ownerId = `owner-${crypto.randomUUID()}`;
+    const botId = `bot-${crypto.randomUUID()}`;
+    const stub = await createTestChannel(env, { channelId, ownerId });
+    await seedBotBinding(channelId, botId, ownerId);
+
+    const presign = await stub.botAttachmentPresign({
+      channel_id: channelId,
+      bot_id: botId,
+      idempotency_key: "idem-bot-expires-1",
+      filename: "img.png",
+      mime_type: "image/png",
+      size_bytes: 5000,
+    });
+
+    await withDoState(stub, (ctx) => {
+      const row = ctx.storage.sql
+        .exec("SELECT status, expires_at FROM attachments WHERE attachment_id=?", presign.attachment_id)
+        .toArray()[0] as { status: string; expires_at: string };
+      expect(row.status).toBe("pending");
+      expect(Date.parse(row.expires_at)).toBeGreaterThan(Date.now());
+    });
+  });
+
+  it("alarm GC deletes expired pending bot attachments", async () => {
+    const channelId = crypto.randomUUID();
+    const ownerId = `owner-${crypto.randomUUID()}`;
+    const botId = `bot-${crypto.randomUUID()}`;
+    const stub = await createTestChannel(env, { channelId, ownerId });
+    await seedBotBinding(channelId, botId, ownerId);
+
+    const presign = await stub.botAttachmentPresign({
+      channel_id: channelId,
+      bot_id: botId,
+      idempotency_key: "idem-bot-gc-1",
+      filename: "img.png",
+      mime_type: "image/png",
+      size_bytes: 5000,
+    });
+    fake.objects.set(fakeS3PublicPath(presign.attachment_id), { contentType: "image/png", contentLength: 5000 });
+
+    const { runDurableObjectAlarm } = await import("cloudflare:test") as {
+      runDurableObjectAlarm: (stub: unknown) => Promise<void>;
+    };
+
+    await withDoState(stub, (ctx) => {
+      ctx.storage.sql.exec(
+        "UPDATE attachments SET expires_at=? WHERE attachment_id=?",
+        "2000-01-01T00:00:00.000Z",
+        presign.attachment_id,
+      );
+    });
+
+    await runDurableObjectAlarm(stub);
+
+    let gone = false;
+    await withDoState(stub, (ctx) => {
+      const rows = ctx.storage.sql
+        .exec("SELECT 1 FROM attachments WHERE attachment_id=?", presign.attachment_id)
+        .toArray();
+      gone = rows.length === 0;
+    });
+    expect(gone).toBe(true);
   });
 
   it("rejects presign when bot is not installed in channel", async () => {

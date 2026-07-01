@@ -3293,7 +3293,7 @@ Content-Type: application/json
 
 - Required scope：`chat:messages:write`（`getBotIdentity` gate，同 Bot Gateway write path）。
 - Bot 须 **已安装** 于 `{channel_id}`（active `bot_installations` row）。
-- Presign 写入 `attachments`：`status=pending`，`owner_bot_id=bot_id`，`channel_id`，`kind=image`；`owner_user_id` 为空。
+- Presign 写入 `attachments`：`status=pending`，`owner_bot_id=bot_id`，`channel_id`，`kind=image`；`owner_user_id` 为空；`expires_at = now + 24h`（同 user upload idempotency TTL）。未 finalize 的 pending 行由 ChatChannel alarm GC（删除 S3 对象 + SQLite 行）。
 - Finalize：HEAD S3、mime whitelist、size cap（同 user upload §8.2）。
 - **v1 归属：** attachment 仅可在 presign 同一 `channel_id` 的非 stream effect 中引用；跨 channel 或 user-owned attachment → `BOT_EFFECT_INVALID`。
 - 消息 mutation 仍只经 WS effects；HTTP 上传仅产生可引用的 `attachment_id`。

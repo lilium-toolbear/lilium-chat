@@ -91,6 +91,7 @@ import type {
 import { OUTBOX_MAX_ATTEMPTS } from "../../contract/outbox";
 import { bumpQueueRetry } from "../shared/retry-backoff";
 import { isoDueTable, runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "../shared/scheduler";
+import { flushExpiredPendingBotAttachments } from "./handlers/pending-bot-attachment-gc";
 import { rpcErrorMessage, shouldRetryRpcError } from "../shared/rpc-errors";
 import { archiveOutboxDueTable, flushArchiveOutboxToQueue } from "../../archive/queue-flush";
 import { parseRpcCachedJson } from "../shared/do-rpc";
@@ -448,6 +449,7 @@ export class ChatChannelCore extends DurableObject<Env> {
         ...this.outboxDueTables(async () => Promise.resolve()),
         ...this.statefulSessionDueTables(),
         ...this.streamRegistryDueTables(),
+        ...this.pendingBotAttachmentDueTables(),
         archiveOutboxDueTable(),
       ],
       { respectExistingAlarm: true },
@@ -489,6 +491,14 @@ export class ChatChannelCore extends DurableObject<Env> {
           const streamDo = this.env.BOT_STREAM_CONNECTION.getByName(botStreamDoName(channelId, messageId));
           await streamDo.expireStream({ channel_id: channelId, message_id: messageId, bot_id: botId });
         }
+      }),
+    ];
+  }
+
+  private pendingBotAttachmentDueTables(): DueTable[] {
+    return [
+      isoDueTable("attachments", "expires_at", "status", "pending", async (rows) => {
+        await flushExpiredPendingBotAttachments(this.env, this.ctx.storage.sql, rows);
       }),
     ];
   }
@@ -798,6 +808,7 @@ export class ChatChannelCore extends DurableObject<Env> {
       }
     }),
       ...this.streamRegistryDueTables(),
+      ...this.pendingBotAttachmentDueTables(),
     ]);
     try {
       await flushArchiveOutboxToQueue(this.ctx, this.env.CHAT_ARCHIVE_QUEUE, { now: nowIso });
