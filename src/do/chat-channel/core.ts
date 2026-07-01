@@ -798,6 +798,49 @@ export class ChatChannelCore extends DurableObject<Env> {
     return runDebugSql(this.ctx, input);
   }
 
+  /**
+   * Ops recovery: dead-letter pending outbox rows whose next_attempt_at is in the past.
+   * Gated by DEBUG_TOKEN at the route layer.
+   */
+  async debugDeadLetterStaleOutbox(input: {
+    older_than?: string;
+    dry_run?: boolean;
+    reason?: string;
+  }): Promise<{
+    projection_outbox: number;
+    bot_delivery_outbox: number;
+    archive_outbox: number;
+    dry_run: boolean;
+  }> {
+    const { deadLetterStaleOutboxRows, failStaleArchiveOutboxRows } = await import("../shared/debug-dead-letter");
+    const nowIso = this.nowIso();
+    const olderThan = input.older_than ?? nowIso;
+    const dryRun = input.dry_run ?? false;
+    const reason = input.reason ?? "debug_admin_dead_letter";
+    const projection_outbox = deadLetterStaleOutboxRows(this.ctx.storage.sql, {
+      table: "projection_outbox",
+      olderThan,
+      nowIso,
+      reason,
+      dryRun,
+    });
+    const bot_delivery_outbox = deadLetterStaleOutboxRows(this.ctx.storage.sql, {
+      table: "bot_delivery_outbox",
+      olderThan,
+      nowIso,
+      reason,
+      dryRun,
+    });
+    const archive_outbox = failStaleArchiveOutboxRows(this.ctx.storage.sql, {
+      olderThan,
+      nowIso,
+      reason,
+      dryRun,
+    });
+    if (!dryRun) await this.scheduleOutboxAlarm(nowIso);
+    return { projection_outbox, bot_delivery_outbox, archive_outbox, dry_run: dryRun };
+  }
+
   async alarm(): Promise<void> {
     const nowIso = this.nowIso();
     const { flushStatefulSessionTimeouts } = await import("./handlers/stateful-session");

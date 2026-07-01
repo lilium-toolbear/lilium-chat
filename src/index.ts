@@ -58,7 +58,7 @@ import {
 import { openDmHandler } from "./routes/dms";
 import { commandDirectoryHandler } from "./routes/command-directory";
 import { getStatefulSessionHandler, stopStatefulSessionHandler } from "./routes/stateful-session";
-import { debugSqlHandler, debugSqlAllHandler, debugClassesHandler } from "./routes/debug-sql";
+import { debugSqlHandler, debugSqlAllHandler, debugClassesHandler, debugDeadLetterOutboxHandler } from "./routes/debug-sql";
 
 const app = new Hono<{ Bindings: Env; Variables: { requestId: string } }>();
 
@@ -149,6 +149,7 @@ app.post("/api/chat/channels/:channel_id/stateful-session/stop", (c) => stopStat
 app.get("/internal/debug/classes", (c) => debugClassesHandler(c));
 app.post("/internal/debug/sql", (c) => debugSqlHandler(c));
 app.post("/internal/debug/sql-all", (c) => debugSqlAllHandler(c));
+app.post("/internal/debug/outbox/dead-letter", (c) => debugDeadLetterOutboxHandler(c));
 
 app.all("/api/chat/*", (c) => {
   throw new ApiError("NOT_FOUND", "route not found", { httpStatus: 404 });

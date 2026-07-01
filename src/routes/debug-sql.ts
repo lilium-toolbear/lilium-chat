@@ -126,3 +126,32 @@ export function debugClassesHandler(c: AppContext): Response {
     })),
   });
 }
+
+type DeadLetterStub = {
+  debugDeadLetterStaleOutbox(input: {
+    older_than?: string;
+    dry_run?: boolean;
+    reason?: string;
+  }): Promise<{ projection_outbox: number; bot_delivery_outbox: number; archive_outbox: number; dry_run: boolean }>;
+};
+
+/** POST /internal/debug/outbox/dead-letter — dead-letter stale pending outbox rows on a ChatChannel DO. */
+export async function debugDeadLetterOutboxHandler(c: AppContext): Promise<Response> {
+  assertDebugToken(c.env, bearerToken(c));
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object") throw new ApiError("INVALID_MESSAGE", "json body required");
+  const b = body as Record<string, unknown>;
+  const className = parseClass(b.class);
+  if (className !== "ChatChannel") {
+    throw new ApiError("INVALID_MESSAGE", "only ChatChannel supports outbox dead-letter");
+  }
+  const name = typeof b.name === "string" ? b.name : undefined;
+  if (!name) throw new ApiError("INVALID_MESSAGE", "name required (channel_id)");
+  const older_than = typeof b.older_than === "string" ? b.older_than : undefined;
+  const dry_run = b.dry_run === true;
+  const reason = typeof b.reason === "string" ? b.reason : undefined;
+
+  const stub = c.env.CHAT_CHANNEL.getByName(name) as unknown as DeadLetterStub;
+  const result = await stub.debugDeadLetterStaleOutbox({ older_than, dry_run, reason });
+  return c.json({ class: className, name, ...result });
+}
