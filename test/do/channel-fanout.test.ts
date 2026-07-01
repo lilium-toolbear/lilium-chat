@@ -44,6 +44,114 @@ async function seedDeliverableLease(
 }
 
 describe("ChannelFanout DO", () => {
+  it("direct-delivers live leases concurrently without queue writes", async () => {
+    const channelId = "ch-fanout-concurrent";
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
+    const { runInDurableObject } = await import("cloudflare:test");
+
+    await runInDurableObject(fanout, async (instance: unknown, state: any) => {
+      const fanoutInstance = instance as {
+        fanoutEnqueue(input: {
+          channel_id: string;
+          event_id: string;
+          event_json: string;
+          membership_version_at_event?: number;
+        }): Promise<{ delivered_to: number }>;
+        deliverToLease?: () => Promise<{ delivered: boolean; stale: boolean }>;
+      };
+      for (let i = 0; i < 4; i++) {
+        state.storage.sql.exec(
+          `INSERT INTO fanout_leases (
+            channel_id, lease_id, user_id, session_id, membership_version,
+            expires_at, created_at, updated_at, last_error
+          ) VALUES (?, ?, ?, ?, 0, ?, datetime('now'), datetime('now'), NULL)`,
+          channelId,
+          `lease-concurrent-${i}`,
+          `u-concurrent-${i}`,
+          `s-concurrent-${i}`,
+          new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        );
+      }
+
+      let active = 0;
+      let maxActive = 0;
+      fanoutInstance.deliverToLease = async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        active -= 1;
+        return { delivered: true, stale: false };
+      };
+
+      await fanoutInstance.fanoutEnqueue({
+        channel_id: channelId,
+        event_id: "e-concurrent",
+        event_json: JSON.stringify({
+          frame_type: "event",
+          api_version: "lilium.chat.v2",
+          event_id: "e-concurrent",
+          type: "message.created",
+          channel_id: channelId,
+          occurred_at: "2026-07-01T00:00:00Z",
+          payload: {},
+        }),
+        membership_version_at_event: 0,
+      });
+
+      expect(maxActive).toBeGreaterThan(1);
+      expect(
+        state.storage.sql.exec("SELECT * FROM fanout_queue WHERE channel_id=?", channelId).toArray(),
+      ).toEqual([]);
+    });
+  });
+
+  it("direct-delivers stream frames to live leases concurrently", async () => {
+    const channelId = "ch-fanout-stream-concurrent";
+    const fanout = getNamedDo<ChannelFanout>(env.CHANNEL_FANOUT, channelId);
+    const { runInDurableObject } = await import("cloudflare:test");
+
+    await runInDurableObject(fanout, async (instance: unknown, state: any) => {
+      const fanoutInstance = instance as {
+        fanoutDeliverStreamFrame(input: {
+          channel_id: string;
+          frame: unknown;
+        }): Promise<{ delivered_to: number; lease_count: number }>;
+        deliverStreamFrameToLease?: () => Promise<{ delivered: boolean }>;
+      };
+      for (let i = 0; i < 4; i++) {
+        state.storage.sql.exec(
+          `INSERT INTO fanout_leases (
+            channel_id, lease_id, user_id, session_id, membership_version,
+            expires_at, created_at, updated_at, last_error
+          ) VALUES (?, ?, ?, ?, 0, ?, datetime('now'), datetime('now'), NULL)`,
+          channelId,
+          `lease-stream-concurrent-${i}`,
+          `u-stream-concurrent-${i}`,
+          `s-stream-concurrent-${i}`,
+          new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        );
+      }
+
+      let active = 0;
+      let maxActive = 0;
+      fanoutInstance.deliverStreamFrameToLease = async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        active -= 1;
+        return { delivered: true };
+      };
+
+      const result = await fanoutInstance.fanoutDeliverStreamFrame({
+        channel_id: channelId,
+        frame: { frame_type: "stream_event", seq: 1 },
+      });
+
+      expect(maxActive).toBeGreaterThan(1);
+      expect(result.delivered_to).toBe(result.lease_count);
+    });
+  });
+
   it("delivers to live leases without writing fanout_queue rows", async () => {
     const channelId = "ch-fanout-1";
     const userId = "u-fanout-1";

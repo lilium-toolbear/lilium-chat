@@ -7,6 +7,8 @@ import { rpcErrorMessage, shouldRetryRpcError } from "../shared/rpc-errors";
 import { logSwallowedError } from "../../errors";
 
 const LEASE_TTL_MS = 10 * 60 * 1000;
+// ponytail: per-event fanout cap; tune if production lease fanout still saturates.
+const FANOUT_DELIVERY_CONCURRENCY = 16;
 
 const STALE_LEASE_REASONS = new Set([
   "session_not_found",
@@ -27,6 +29,21 @@ function capLeaseExpires(requested: string | undefined): string {
   const cap = new Date(Date.now() + LEASE_TTL_MS).toISOString();
   if (!requested) return cap;
   return requested < cap ? requested : cap;
+}
+
+async function runBounded<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const item = items[next++];
+      if (item !== undefined) await worker(item);
+    }
+  });
+  await Promise.all(workers);
 }
 
 interface FanoutLeaseTarget {
@@ -185,7 +202,7 @@ export class ChannelFanout extends DurableObject<Env> {
       )
       .toArray() as unknown as FanoutLeaseTarget[];
     let queued = false;
-    for (const s of sessions) {
+    await runBounded(sessions, FANOUT_DELIVERY_CONCURRENCY, async (s) => {
       let result: { delivered: boolean; stale: boolean };
       try {
         result = await this.deliverToLease(input.channel_id, s, input.event_id, input.event_json, input.membership_version_at_event ?? 0);
@@ -196,14 +213,14 @@ export class ChannelFanout extends DurableObject<Env> {
             lease_id: s.lease_id,
             error: rpcErrorMessage(err),
           });
-          continue;
+          return;
         }
         result = { delivered: false, stale: false };
       }
-      if (result.delivered || result.stale) continue;
+      if (result.delivered || result.stale) return;
       this.enqueueFanoutRetry(input.channel_id, s, input.event_id, input.event_json, input.membership_version_at_event ?? 0, ts);
       queued = true;
-    }
+    });
 
     if (queued) await scheduleFanoutAlarm(this.ctx, ts);
     return { delivered_to: sessions.length };
@@ -228,7 +245,7 @@ export class ChannelFanout extends DurableObject<Env> {
       .toArray() as unknown as FanoutLeaseTarget[];
 
     let deliveredCount = 0;
-    for (const s of sessions) {
+    await runBounded(sessions, FANOUT_DELIVERY_CONCURRENCY, async (s) => {
       try {
         const result = await this.deliverStreamFrameToLease(input.channel_id, s, frameJson);
         if (result.delivered) deliveredCount += 1;
@@ -238,7 +255,7 @@ export class ChannelFanout extends DurableObject<Env> {
           lease_id: s.lease_id,
         });
       }
-    }
+    });
 
     return { delivered_to: deliveredCount, lease_count: sessions.length };
   }
