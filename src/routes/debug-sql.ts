@@ -2,7 +2,6 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { ApiError } from "../errors";
 import { assertDebugToken, type DebugSqlInput, type DebugSqlResult } from "../do/shared/debug-sql";
-import type { ChannelDirectory } from "../do/channel-directory";
 
 type AppContext = Context<{ Bindings: Env; Variables: { requestId: string } }>;
 
@@ -11,6 +10,7 @@ type DebugSqlStub = { debugSql(input: DebugSqlInput): Promise<DebugSqlResult> };
 const SUPPORTED_CLASSES = [
   "ChatChannel",
   "ChannelFanout",
+  "ChannelDirectory",
   "UserConnection",
   "BotConnection",
   "BotStreamConnection",
@@ -33,6 +33,8 @@ function stubForClass(env: Env, className: SupportedClass, name: string): DebugS
       return env.CHAT_CHANNEL.getByName(name) as unknown as DebugSqlStub;
     case "ChannelFanout":
       return env.CHANNEL_FANOUT.getByName(name) as unknown as DebugSqlStub;
+    case "ChannelDirectory":
+      return env.CHANNEL_DIRECTORY.getByName(name) as unknown as DebugSqlStub;
     case "UserConnection":
       return env.USER_CONNECTION.getByName(name) as unknown as DebugSqlStub;
     case "BotConnection":
@@ -81,8 +83,9 @@ export async function debugSqlAllHandler(c: AppContext): Promise<Response> {
 
   let targets: string[];
   if (CHANNEL_KEYED.has(className)) {
-    const dir = c.env.CHANNEL_DIRECTORY.getByName("shared") as unknown as ChannelDirectory;
-    targets = dir.listAllChannelIds().channel_ids;
+    const dir = c.env.CHANNEL_DIRECTORY.getByName("shared");
+    const listed = await dir.listAllChannelIds();
+    targets = listed.channel_ids;
   } else if (names && names.length > 0) {
     targets = names;
   } else {

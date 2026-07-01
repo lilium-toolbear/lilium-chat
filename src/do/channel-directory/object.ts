@@ -127,7 +127,7 @@ export class ChannelDirectory extends DurableObject<Env> {
   }
 
   /** Debug enumeration: all known channel_ids regardless of status. */
-  listAllChannelIds(): { channel_ids: string[] } {
+  async listAllChannelIds(): Promise<{ channel_ids: string[] }> {
     const rows = sqlRows<{ channel_id: string }>(
       this.ctx.storage.sql.exec("SELECT channel_id FROM public_channels ORDER BY channel_id ASC").toArray(),
     );
