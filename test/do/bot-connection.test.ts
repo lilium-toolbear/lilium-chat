@@ -214,6 +214,43 @@ describe("BotConnection DO (7b-connection)", () => {
     ws.close();
   });
 
+  it("disconnects active websocket when connection lease expires on alarm", async () => {
+    const botId = `bot-expired-alarm-${crypto.randomUUID()}`;
+    const { ws, stub } = await openConnection(botId);
+    ws.send(JSON.stringify({
+      type: "hello",
+      api_version: BOT_GATEWAY_API_VERSION,
+      last_received_delivery_id: null,
+    }));
+    const ready = JSON.parse(await nextMessageOfType(ws, "ready")) as { session_id: string };
+
+    await withBotConnection(stub, (ctx) => {
+      ctx.storage.sql.exec(
+        "UPDATE bot_connection_state SET expires_at=? WHERE bot_id=? AND session_id=?",
+        "2000-01-01T00:00:00.000Z",
+        botId,
+        ready.session_id,
+      );
+    });
+
+    const { runDurableObjectAlarm } = await import("cloudflare:test");
+    await runDurableObjectAlarm(stub);
+
+    const state = await stub.getConnectionState();
+    expect(state.status).toBe("disconnected");
+    expect(state.session_id).toBeNull();
+
+    await withBotConnection(stub, (ctx) => {
+      const row = ctx.storage.sql
+        .exec("SELECT status, disconnected_at FROM bot_connection_state WHERE bot_id=?", botId)
+        .toArray()[0] as { status: string; disconnected_at: string | null } | undefined;
+      expect(row?.status).toBe("disconnected");
+      expect(row?.disconnected_at).toBeTruthy();
+    });
+
+    ws.close();
+  });
+
   it("keeps the new session connected when an old socket closes", async () => {
     const botId = `bot-close-old-${crypto.randomUUID()}`;
     const first = await openConnection(botId);

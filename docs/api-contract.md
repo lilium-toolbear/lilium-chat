@@ -1301,6 +1301,7 @@ Committed ack：
 - **不得**发送历史 `message.created` / `message.updated` / `message.deleted` 等 event。
 - 部分频道 lease 瞬态失败 → `503 CHAT_WORKER_UNAVAILABLE`（除非实现可证明确定性 partial retry 路径）。
 - Connect 握手期间 **不得**执行本逻辑；仅在客户端显式 command 时执行。
+- 任一 active lease 到期时，`UserConnection` **主动关闭该 session 的 WebSocket**（close reason: `lease_expired`）；客户端应重连并走 HTTP 恢复。
 
 **v1 non-goal：** 不暴露 `channel.subscribe` / `channel.unsubscribe`。连接并在 `session.live_start` committed 后，live WS 接收全部 active 成员频道的新事件。客户端按 `event.channel_id` 更新 sidebar/unread 或 active timeline；所有 event 按 `(channel_id, event_id)` dedupe。
 
@@ -1342,6 +1343,7 @@ Committed ack：
 - **不得** replay events；**不得** gap repair；**不得**携带 cursor。
 - Session 尚未 `session.live_start` → `409 SESSION_NOT_LIVE` 或 `422 INVALID_COMMAND`（实现择一，全仓库一致）。
 - 推荐 lease TTL：10 分钟；推荐 heartbeat 间隔：4 分钟（active tab）。
+- 若在 TTL 内未心跳导致 lease 到期，server 会主动 close 当前 WS session（`lease_expired`）；此期间漏掉的事件仍按 best-effort 语义处理（见 §10.6 / §12）。
 
 ## 6. 消息
 
@@ -2894,6 +2896,7 @@ Server 应用 effects 后回 `delivery_ack`：
 - Server 可在 reconnect 后 redeliver 已发送但未完成 `delivery_result`/`delivery_ack` 的 delivery。
 - Bot 可对同一 `delivery_id` 重发 `delivery_result`。
 - 同一 `client_effect_id` 配不同 body → `BOT_EFFECT_CONFLICT`。
+- `BotConnection` lease 到期时，server **主动关闭** bot WS（close reason: `lease_expired`）；bot 需重连并从 `ready` 后继续消费 redelivery。
 
 #### 9.7.2 Bot offline policy
 

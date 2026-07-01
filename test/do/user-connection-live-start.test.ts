@@ -210,6 +210,44 @@ describe("UserConnection session.live_start", () => {
     await dir.debugSetMyChannelsFailure(false);
   });
 
+  it("closes websocket session when active lease expires", async () => {
+    const userId = "u-live-lease-expire";
+    const { channelId } = await joinTestChannel(userId);
+    const { ws, stub, sessionId } = await upgradeUserConnection(userId);
+    await liveStartAndAck(ws, "cmd-live-lease-expire-start");
+
+    const { runInDurableObject, runDurableObjectAlarm } = await import("cloudflare:test") as {
+      runInDurableObject: (stub: DurableObjectStub, fn: (instance: unknown, state: any) => void | Promise<void>) => Promise<void>;
+      runDurableObjectAlarm: (stub: DurableObjectStub) => Promise<void>;
+    };
+
+    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+      state.storage.sql.exec(
+        "UPDATE live_channel_leases SET expires_at=? WHERE session_id=? AND channel_id=?",
+        "2000-01-01T00:00:00.000Z",
+        sessionId,
+        channelId,
+      );
+    });
+
+    await runDurableObjectAlarm(stub);
+
+    await runInDurableObject(stub, async (_instance: unknown, state: any) => {
+      const session = state.storage.sql
+        .exec("SELECT status, close_reason FROM live_sessions WHERE session_id=?", sessionId)
+        .toArray()[0] as { status: string; close_reason: string } | undefined;
+      expect(session?.status).toBe("closed");
+      expect(session?.close_reason).toBe("lease_expired");
+
+      const lease = state.storage.sql
+        .exec("SELECT status FROM live_channel_leases WHERE session_id=? AND channel_id=?", sessionId, channelId)
+        .toArray()[0] as { status: string } | undefined;
+      expect(lease?.status).toBe("closed");
+    });
+
+    ws.close();
+  });
+
   it("keeps live leases after channel dissolve while my_channels retains the tombstone", async () => {
     const channelId = crypto.randomUUID();
     const ownerId = "u-live-dis-owner";

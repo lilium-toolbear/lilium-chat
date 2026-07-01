@@ -20,7 +20,7 @@ import { logSwallowedError } from "../../errors";
 import { uuidv7 } from "../../ids/uuidv7";
 import { BOT_CONNECTION_DO_SCHEMA } from "./migrations";
 import { migrateDoSchema } from "../shared/sql-migrations";
-import { runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "../shared/scheduler";
+import { isoDueTable, runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "../shared/scheduler";
 import {
   deleteStatefulSessionRef,
   notifyBotSessionClose,
@@ -184,7 +184,7 @@ export class BotConnection extends DurableObject<Env> {
       deliveryStatus = row?.status ?? deliveryStatus;
     }
 
-    await this.scheduleDeliveryAlarm();
+    await this.scheduleAlarm();
     return {
       delivery_id: deliveryId,
       status: deliveryStatus,
@@ -368,8 +368,40 @@ export class BotConnection extends DurableObject<Env> {
     );
   }
 
-  private async scheduleDeliveryAlarm(): Promise<void> {
-    await scheduleNextAlarm(this.ctx, this.deliveryDueTables(async () => Promise.resolve()));
+  private connectionLeaseDueTables(handler: (rows: DueRow[]) => Promise<void>): DueTable[] {
+    return [
+      isoDueTable("bot_connection_state", "expires_at", "status", "connected", handler),
+    ];
+  }
+
+  private async closeExpiredConnectionLeases(rows: DueRow[]): Promise<void> {
+    for (const row of rows) {
+      const botId = typeof row.bot_id === "string" ? row.bot_id : "";
+      const sessionId = typeof row.session_id === "string" ? row.session_id : "";
+      if (!botId || !sessionId) continue;
+      const socket = this.activeSocketForBot(botId, sessionId);
+      if (socket) {
+        try {
+          socket.close(4001, "lease_expired");
+        } catch (err) {
+          logSwallowedError("bot_connection_socket_close_failed", err, { bot_id: botId, session_id: sessionId });
+        }
+      }
+      this.markDisconnected(botId, sessionId);
+    }
+  }
+
+  private allDueTables(handler: (rows: DueRow[]) => Promise<void>): DueTable[] {
+    return [
+      ...this.deliveryDueTables(handler),
+      ...this.connectionLeaseDueTables(async (rows) => {
+        await this.closeExpiredConnectionLeases(rows);
+      }),
+    ];
+  }
+
+  private async scheduleAlarm(): Promise<void> {
+    await scheduleNextAlarm(this.ctx, this.allDueTables(async () => Promise.resolve()));
   }
 
   private isMessageEventExpired(row: BotDeliveryRow): boolean {
@@ -423,7 +455,7 @@ export class BotConnection extends DurableObject<Env> {
     const rows = this.pendingDeliveriesForBot(botId);
     if (rows.length === 0) return;
     await this.flushPendingAndSentDeliveries(rows, Date.now());
-    await this.scheduleDeliveryAlarm();
+    await this.scheduleAlarm();
   }
 
   private async flushPendingAndSentDeliveries(
@@ -536,6 +568,7 @@ export class BotConnection extends DurableObject<Env> {
           }
         });
         await this.flushDeliveriesForBot(attachment.bot_id);
+        await this.scheduleAlarm();
         return;
       }
 
@@ -936,14 +969,15 @@ export class BotConnection extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     const nowMs = Date.now();
-    const dueTables = this.deliveryDueTables(async (rows) => {
+    const nowIso = this.nowIso();
+    const dueTables = this.allDueTables(async (rows) => {
       await this.flushPendingAndSentDeliveries(
         rows.map((row) => this.toDeliveryRow(row)),
         nowMs,
       );
     });
 
-    await runDueJobs(this.ctx, nowMs, dueTables);
+    await runDueJobs(this.ctx, nowIso, dueTables);
     await scheduleNextAlarm(this.ctx, dueTables);
   }
 }

@@ -537,16 +537,49 @@ export class UserConnection extends DurableObject<Env> {
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
     const att = ws.deserializeAttachment() as ConnectionAttachment | null;
     if (!att) return;
+    const session = this.getSessionRow(att.session_id);
+    if (!session || session.status === "closed") return;
     await this.closeSessionCleanup(att.session_id, "ws_close");
   }
 
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     const att = ws.deserializeAttachment() as ConnectionAttachment | null;
     if (!att) return;
+    const session = this.getSessionRow(att.session_id);
+    if (!session || session.status === "closed") return;
     await this.closeSessionCleanup(att.session_id, "ws_error");
   }
 
-  async alarm(): Promise<void> {}
+  async alarm(): Promise<void> {
+    const ts = nowIso();
+    const expiredSessions = this.ctx.storage.sql
+      .exec(
+        `SELECT DISTINCT live_sessions.session_id
+         FROM live_sessions
+         JOIN live_channel_leases
+           ON live_channel_leases.session_id = live_sessions.session_id
+         WHERE live_sessions.status='live'
+           AND live_channel_leases.status='active'
+           AND live_channel_leases.expires_at <= ?`,
+        ts,
+      )
+      .toArray() as Array<{ session_id: string }>;
+
+    for (const row of expiredSessions) {
+      const sessionId = row.session_id;
+      const ws = this.findSocketBySession(sessionId);
+      if (ws) {
+        try {
+          ws.close(4001, "lease_expired");
+        } catch (err) {
+          logSwallowedError("user_connection_socket_close_failed", err, { session_id: sessionId });
+        }
+      }
+      await this.closeSessionCleanup(sessionId, "lease_expired");
+    }
+
+    await this.scheduleLeaseExpiryAlarm();
+  }
 
   private findSocketBySession(sessionId: string): WebSocket | null {
     if (!sessionId) return null;
@@ -606,6 +639,23 @@ export class UserConnection extends DurableObject<Env> {
       )
       .toArray()[0] as LiveChannelLeaseRow | undefined;
     return row ?? null;
+  }
+
+  private async scheduleLeaseExpiryAlarm(): Promise<void> {
+    const row = this.ctx.storage.sql
+      .exec("SELECT MIN(expires_at) AS due FROM live_channel_leases WHERE status='active'")
+      .toArray()[0] as { due: string | null } | undefined;
+    const dueIso = row?.due ?? null;
+    if (!dueIso) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const dueMs = Date.parse(dueIso);
+    if (!Number.isFinite(dueMs)) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    await this.ctx.storage.setAlarm(dueMs);
   }
 
   private async upsertFanoutLease(
@@ -689,6 +739,7 @@ export class UserConnection extends DurableObject<Env> {
       sessionId,
       channelId,
     );
+    await this.scheduleLeaseExpiryAlarm();
     await this.revokeFanoutLease(channelId, leaseId);
   }
 
@@ -762,6 +813,7 @@ export class UserConnection extends DurableObject<Env> {
       upsertedCount += 1;
     }
 
+    await this.scheduleLeaseExpiryAlarm();
     return { active_count: channels.length, upserted_count: upsertedCount, closed_count: closedCount, lease_expires_at: latestExpires };
   }
 
@@ -1069,6 +1121,7 @@ export class UserConnection extends DurableObject<Env> {
     await Promise.all(
       leases.map(async (lease) => this.revokeFanoutLease(lease.channel_id, lease.lease_id)),
     );
+    await this.scheduleLeaseExpiryAlarm();
 
     console.log("session_closed_cleanup", { session_id: sessionId, reason, lease_count: leases.length });
   }
