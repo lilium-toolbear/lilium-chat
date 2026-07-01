@@ -17,7 +17,9 @@ import type {
 import type { CommandInvokeResponse } from "../../../contract/bot-api";
 import { buildSessionStart, buildSessionClosed, type StatefulSessionInputStored } from "../../../chat/bot-gateway-session";
 import type { CommandBindingSnapshot } from "../../../contract/bot-api";
-import type { WireChatMessage } from "../../../contract/message";
+import type { WireChatMessage, MessageImageAttachment } from "../../../contract/message";
+import type { MessageRow } from "../../../contract/persisted";
+import { projectMessageForBrowser } from "../../../chat/message-projection";
 import {
   DEFAULT_MAX_PENDING_INPUTS,
   listenRulesFromStatefulConfig,
@@ -372,6 +374,57 @@ export async function closeStatefulSession(
 
   await channel.scheduleOutboxAlarm(now);
   await channel.scheduleArchiveAlarm(now);
+}
+
+export interface MessageCreatedStatefulInput {
+  channelId: string;
+  messageId: string;
+  eventId: string;
+  occurredAt: string;
+  messageRow: MessageRow;
+  messageProjection: WireChatMessage;
+}
+
+export async function enqueueStatefulInputForMessageCreated(
+  channel: ChatChannelHandlerRef,
+  input: MessageCreatedStatefulInput,
+): Promise<void> {
+  await maybeEnqueueStatefulSessionInput(channel, {
+    channelId: input.channelId,
+    messageId: input.messageId,
+    eventId: input.eventId,
+    occurredAt: input.occurredAt,
+    senderKind: input.messageRow.sender_kind,
+    senderUserId: input.messageRow.sender_user_id,
+    senderBotId: input.messageRow.sender_bot_id,
+    messageType: input.messageRow.type,
+    messageProjection: input.messageProjection,
+  });
+}
+
+export async function enqueueStatefulInputForBotMessageCreated(
+  channel: ChatChannelHandlerRef,
+  input: {
+    channelId: string;
+    messageId: string;
+    eventId: string;
+    occurredAt: string;
+    messageRow: MessageRow;
+    components?: WireChatMessage["components"];
+    attachments?: MessageImageAttachment[];
+  },
+): Promise<void> {
+  await enqueueStatefulInputForMessageCreated(channel, {
+    channelId: input.channelId,
+    messageId: input.messageId,
+    eventId: input.eventId,
+    occurredAt: input.occurredAt,
+    messageRow: input.messageRow,
+    messageProjection: projectMessageForBrowser(input.messageRow, {
+      components: input.components,
+      attachments: input.attachments,
+    }),
+  });
 }
 
 export async function maybeEnqueueStatefulSessionInput(

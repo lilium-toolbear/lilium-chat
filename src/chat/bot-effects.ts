@@ -3,6 +3,12 @@ import type { StartStreamEffectResponse } from "./stream-registry";
 import type { MessageRow } from "../contract/persisted";
 import type { WireChatMessage } from "../contract/message";
 import { isAllowedBotMessageFormat } from "./bot-message-format";
+import {
+  ComponentValidationError,
+  rejectNonEmptyStreamComponents,
+  validateComponents,
+  type WireComponent,
+} from "./components";
 import { isRecord } from "../contract/utils";
 import { logSwallowedError } from "../errors";
 
@@ -15,7 +21,7 @@ export interface BotEffectMessageBody {
   text: string;
   reply_to_message_id: string | null;
   attachment_ids: string[];
-  components: unknown[];
+  components: WireComponent[];
 }
 
 export interface ParsedSendMessageEffect {
@@ -31,7 +37,7 @@ export interface ParsedUpdateMessageEffect {
   message: {
     text?: string;
     attachment_ids?: string[];
-    components?: unknown[];
+    components?: WireComponent[];
   };
 }
 
@@ -63,8 +69,28 @@ export class BotEffectValidationError extends Error {
   }
 }
 
+function wrapComponentValidation<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof ComponentValidationError) {
+      throw new BotEffectValidationError(err.message);
+    }
+    throw err;
+  }
+}
+
 export function computeEffectRequestHash(effect: BotEffectWire): string {
   return JSON.stringify(effect);
+}
+
+export function computeSessionEffectsRequestHash(effects: BotEffectWire[]): string {
+  return JSON.stringify(
+    effects.map((effect) => {
+      const { client_effect_id: _clientEffectId, ...rest } = effect;
+      return rest;
+    }),
+  );
 }
 
 function parseStartStreamMessageBody(raw: unknown): BotEffectMessageBody {
@@ -96,7 +122,14 @@ function parseStartStreamMessageBody(raw: unknown): BotEffectMessageBody {
   const attachmentIds = Array.isArray(raw.attachment_ids)
     ? raw.attachment_ids.filter((id): id is string => typeof id === "string")
     : [];
-  const components = Array.isArray(raw.components) ? raw.components : [];
+  if (attachmentIds.length > 0) {
+    throw new BotEffectValidationError("attachment_ids not supported for start_stream");
+  }
+  const components = wrapComponentValidation(() => {
+    const parsed = Array.isArray(raw.components) ? raw.components : [];
+    rejectNonEmptyStreamComponents(parsed);
+    return validateComponents(parsed);
+  });
   return {
     type,
     format,
@@ -117,8 +150,8 @@ function parseMessageBody(raw: unknown): BotEffectMessageBody {
   if (typeof type !== "string" || type.length === 0) {
     throw new BotEffectValidationError("send_message.message.type required");
   }
-  if (type !== "text") {
-    throw new BotEffectValidationError("only text messages are supported");
+  if (type !== "text" && type !== "image") {
+    throw new BotEffectValidationError("only text and image messages are supported");
   }
   if (typeof format !== "string" || !isAllowedBotMessageFormat(format)) {
     throw new BotEffectValidationError(
@@ -140,10 +173,15 @@ function parseMessageBody(raw: unknown): BotEffectMessageBody {
   const attachmentIds = Array.isArray(raw.attachment_ids)
     ? raw.attachment_ids.filter((id): id is string => typeof id === "string")
     : [];
-  if (attachmentIds.length > 0) {
-    throw new BotEffectValidationError("attachment_ids are not supported yet");
+  if (type === "text" && attachmentIds.length > 0) {
+    throw new BotEffectValidationError("attachment_ids not allowed for text messages");
   }
-  const components = Array.isArray(raw.components) ? raw.components : [];
+  if (type === "image" && attachmentIds.length === 0) {
+    throw new BotEffectValidationError("image message requires attachment_ids");
+  }
+  const components = wrapComponentValidation(() =>
+    validateComponents(Array.isArray(raw.components) ? raw.components : []),
+  );
   return {
     type,
     format,
@@ -209,14 +247,14 @@ export function parseNonStreamEffect(raw: BotEffectWire): ParsedNonStreamEffect 
       if (!Array.isArray(messageRaw.attachment_ids)) {
         throw new BotEffectValidationError("update_message.message.attachment_ids must be an array");
       }
-      const attachmentIds = messageRaw.attachment_ids.filter((id): id is string => typeof id === "string");
-      if (attachmentIds.length > 0) {
-        throw new BotEffectValidationError("attachment_ids are not supported yet");
-      }
-      message.attachment_ids = attachmentIds;
+      message.attachment_ids = messageRaw.attachment_ids.filter((id): id is string => typeof id === "string");
     }
-    if (message.text === undefined && message.components === undefined) {
-      throw new BotEffectValidationError("update_message requires text and/or components");
+    if (
+      message.text === undefined &&
+      message.components === undefined &&
+      message.attachment_ids === undefined
+    ) {
+      throw new BotEffectValidationError("update_message requires text, components, and/or attachment_ids");
     }
     return { type, client_effect_id: clientEffectId, message_id: messageId, message };
   }
@@ -258,8 +296,14 @@ export function validateEffectsForApply(
     seen.add(raw.client_effect_id);
     const effect = parseBotEffect(raw);
     if (effect.type === "start_stream") {
+      wrapComponentValidation(() => rejectNonEmptyStreamComponents(effect.message.components));
       parsed.push(effect);
       continue;
+    }
+    if (effect.type === "send_message") {
+      // components validated in parseMessageBody
+    } else if (effect.type === "update_message" && effect.message.components !== undefined) {
+      effect.message.components = wrapComponentValidation(() => validateComponents(effect.message.components));
     }
     if (effect.type === "update_message" || effect.type === "disable_components") {
       const row = ctx.loadMessage(effect.message_id);
@@ -268,6 +312,9 @@ export function validateEffectsForApply(
       }
       assertBotOwnsMessage(row, ctx.botId);
       if (row.status === "deleted" || row.status === "recalled") {
+        throw new BotEffectValidationError("message is not mutable");
+      }
+      if (row.stream_state !== "none") {
         throw new BotEffectValidationError("message is not mutable");
       }
       if (effect.type === "disable_components") {

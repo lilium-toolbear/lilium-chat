@@ -81,3 +81,26 @@ export interface BotDeliveryAck {
   effect_results?: EffectResult[];
   error?: BotDeliveryAckError;
 }
+
+export interface SessionEffectsFrame {
+  type: "session.effects";
+  api_version: typeof BOT_GATEWAY_API_VERSION;
+  session_id: string;
+  effect_seq: number;
+  effects: BotEffectWire[];
+}
+
+export interface SessionEffectsAckError {
+  code: string;
+  message: string;
+}
+
+export interface SessionEffectsAckFrame {
+  type: "session.effects_ack";
+  api_version: typeof BOT_GATEWAY_API_VERSION;
+  session_id: string;
+  effect_seq: number;
+  status: "applied" | "rejected";
+  effect_results?: EffectResult[];
+  error?: SessionEffectsAckError;
+}

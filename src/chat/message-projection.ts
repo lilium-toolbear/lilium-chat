@@ -91,7 +91,7 @@ export function projectMessageForBrowser(
     reply_snapshot: replySnapshot,
     attachments: hidden ? [] : (opts.attachments ?? []),
     sticker: hidden ? null : (opts.sticker ?? null),
-    components: hidden ? [] : (opts.components ?? []),
+    components: hidden || row.stream_state !== "none" ? [] : (opts.components ?? []),
     mentions: hidden ? [] : ((opts.mentions ?? []) as Mention[]),
     command_invocation: hidden ? null : parseInvocationJson(row.invocation_json),
     created_at: row.created_at,

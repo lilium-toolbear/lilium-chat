@@ -10,7 +10,7 @@ import {
 } from "../../shared/sql-migrations";
 import { applyArchiveOutboxMigration } from "../../../archive/apply-archive-migration";
 
-export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026063001;
+export const CHAT_CHANNEL_CURRENT_SCHEMA_VERSION = 2026070104;
 
 export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS channel_meta (
@@ -54,10 +54,11 @@ export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_logs(target_type, target_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor_kind, actor_id, created_at)`,
   `CREATE TABLE IF NOT EXISTS attachments (
-    attachment_id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, kind TEXT NOT NULL,
-    filename TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+    attachment_id TEXT PRIMARY KEY, owner_user_id TEXT, owner_bot_id TEXT, channel_id TEXT,
+    kind TEXT NOT NULL, filename TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
     width INTEGER, height INTEGER, storage_key TEXT NOT NULL, url TEXT NOT NULL,
-    status TEXT NOT NULL, created_at TEXT NOT NULL, blurhash TEXT
+    status TEXT NOT NULL, created_at TEXT NOT NULL, blurhash TEXT, expires_at TEXT,
+    CHECK (owner_user_id IS NOT NULL OR owner_bot_id IS NOT NULL)
   )`,
   `CREATE TABLE IF NOT EXISTS message_attachments (
     message_id TEXT NOT NULL, attachment_id TEXT NOT NULL, PRIMARY KEY (message_id, attachment_id)
@@ -139,6 +140,15 @@ export const CHAT_CHANNEL_BASELINE_SCHEMA: string[] = [
     sent_at TEXT,
     acked_at TEXT,
     PRIMARY KEY (session_id, seq)
+  )`,
+  `CREATE TABLE IF NOT EXISTS stateful_session_effects_applied (
+    session_id TEXT NOT NULL,
+    effect_seq INTEGER NOT NULL,
+    effects_request_hash TEXT NOT NULL,
+    effect_results_json TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    finalize_completed_at TEXT,
+    PRIMARY KEY (session_id, effect_seq)
   )`,
   `CREATE TABLE IF NOT EXISTS interactions (
     interaction_id TEXT PRIMARY KEY, message_id TEXT NOT NULL, component_id TEXT NOT NULL,
@@ -446,6 +456,16 @@ export const chatChannelMigrations: SqlMigration[] = [
           PRIMARY KEY (session_id, seq)
         )`);
       }
+      if (!tableExists(ctx, "stateful_session_effects_applied")) {
+        ctx.storage.sql.exec(`CREATE TABLE stateful_session_effects_applied (
+          session_id TEXT NOT NULL,
+          effect_seq INTEGER NOT NULL,
+          effects_request_hash TEXT NOT NULL,
+          effect_results_json TEXT NOT NULL,
+          applied_at TEXT NOT NULL,
+          PRIMARY KEY (session_id, effect_seq)
+        )`);
+      }
 
       if (tableExists(ctx, "interactions") && !columnExists(ctx, "interactions", "updated_at")) {
         ctx.storage.sql.exec("ALTER TABLE interactions ADD COLUMN updated_at TEXT");
@@ -517,7 +537,7 @@ export const chatChannelMigrations: SqlMigration[] = [
     },
   },
   {
-    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    version: 2026063001,
     name: "message_stream_registry for bot streaming",
     up(ctx) {
       if (!tableExists(ctx, "message_stream_registry")) {
@@ -552,6 +572,90 @@ export const chatChannelMigrations: SqlMigration[] = [
       if (!indexExists(ctx, "idx_message_stream_registry_expiry")) {
         ctx.storage.sql.exec(
           "CREATE INDEX idx_message_stream_registry_expiry ON message_stream_registry(status, expires_at)",
+        );
+      }
+    },
+  },
+  {
+    version: 2026070101,
+    name: "stateful_session_effects_applied for session.effects replay",
+    up(ctx) {
+      if (!tableExists(ctx, "stateful_session_effects_applied")) {
+        ctx.storage.sql.exec(`CREATE TABLE stateful_session_effects_applied (
+          session_id TEXT NOT NULL,
+          effect_seq INTEGER NOT NULL,
+          effects_request_hash TEXT NOT NULL,
+          effect_results_json TEXT NOT NULL,
+          applied_at TEXT NOT NULL,
+          PRIMARY KEY (session_id, effect_seq)
+        )`);
+      }
+    },
+  },
+  {
+    version: 2026070102,
+    name: "attachments owner_bot_id and channel_id for bot uploads",
+    up(ctx) {
+      if (!tableExists(ctx, "attachments")) return;
+
+      if (!columnExists(ctx, "attachments", "owner_bot_id")) {
+        ctx.storage.sql.exec(`CREATE TABLE attachments_bot_scope (
+          attachment_id TEXT PRIMARY KEY,
+          owner_user_id TEXT,
+          owner_bot_id TEXT,
+          channel_id TEXT,
+          kind TEXT NOT NULL,
+          filename TEXT NOT NULL,
+          mime_type TEXT NOT NULL,
+          size_bytes INTEGER NOT NULL,
+          width INTEGER,
+          height INTEGER,
+          storage_key TEXT NOT NULL,
+          url TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          blurhash TEXT,
+          CHECK (owner_user_id IS NOT NULL OR owner_bot_id IS NOT NULL)
+        )`);
+        ctx.storage.sql.exec(`INSERT INTO attachments_bot_scope (
+          attachment_id, owner_user_id, owner_bot_id, channel_id, kind, filename, mime_type,
+          size_bytes, width, height, storage_key, url, status, created_at, blurhash
+        ) SELECT
+          attachment_id, owner_user_id, NULL, NULL, kind, filename, mime_type,
+          size_bytes, width, height, storage_key, url, status, created_at, blurhash
+        FROM attachments`);
+        ctx.storage.sql.exec("DROP TABLE attachments");
+        ctx.storage.sql.exec("ALTER TABLE attachments_bot_scope RENAME TO attachments");
+      } else if (!columnExists(ctx, "attachments", "channel_id")) {
+        ctx.storage.sql.exec("ALTER TABLE attachments ADD COLUMN channel_id TEXT");
+      }
+    },
+  },
+  {
+    version: 2026070103,
+    name: "stateful_session_effects_applied finalize_completed_at",
+    up(ctx) {
+      if (
+        tableExists(ctx, "stateful_session_effects_applied") &&
+        !columnExists(ctx, "stateful_session_effects_applied", "finalize_completed_at")
+      ) {
+        ctx.storage.sql.exec(
+          "ALTER TABLE stateful_session_effects_applied ADD COLUMN finalize_completed_at TEXT",
+        );
+      }
+    },
+  },
+  {
+    version: CHAT_CHANNEL_CURRENT_SCHEMA_VERSION,
+    name: "attachments expires_at for pending bot upload GC",
+    up(ctx) {
+      if (!tableExists(ctx, "attachments")) return;
+      if (!columnExists(ctx, "attachments", "expires_at")) {
+        ctx.storage.sql.exec("ALTER TABLE attachments ADD COLUMN expires_at TEXT");
+      }
+      if (!indexExists(ctx, "idx_attachments_pending_expires")) {
+        ctx.storage.sql.exec(
+          "CREATE INDEX idx_attachments_pending_expires ON attachments(status, expires_at)",
         );
       }
     },

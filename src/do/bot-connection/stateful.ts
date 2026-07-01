@@ -1,5 +1,6 @@
 import type { Env } from "../../env";
 import { apiErrorFromRemote } from "../../errors";
+import type { BotSessionEffectsResponse } from "../../contract/bot-api";
 import type { ChatChannel } from "../chat-channel";
 import { RESUMABLE_REF_STATUSES } from "../../chat/stateful-session";
 import { buildSessionInput, type SessionInputFrame } from "../../chat/bot-gateway-session";
@@ -100,4 +101,12 @@ export async function notifyBotSessionInputAck(
 
 export async function notifyBotSessionClose(env: Env, channelId: string, body: { session_id: string; reason?: string }): Promise<void> {
   await env.CHAT_CHANNEL.getByName(channelId).botSessionClose(body);
+}
+
+export async function notifyBotSessionEffects(
+  env: Env,
+  channelId: string,
+  body: { session_id: string; bot_id: string; effect_seq: number; effects: unknown[] },
+): Promise<BotSessionEffectsResponse> {
+  return env.CHAT_CHANNEL.getByName(channelId).botSessionEffects(body);
 }

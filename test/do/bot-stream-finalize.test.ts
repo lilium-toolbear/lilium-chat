@@ -399,7 +399,7 @@ describe("BotStreamConnection finalize", () => {
     ws2.close();
   });
 
-  it("returns BOT_STREAM_CONFLICT when components differ but text matches", async () => {
+  it("returns BOT_EFFECT_INVALID when finalize includes non-empty components", async () => {
     const botId = `bot-fin-comp-${crypto.randomUUID()}`;
     await seedBot({ botId, token: `tok-${botId}` });
     const { channelId, browserWs } = await setupStreamChannel();
@@ -414,35 +414,29 @@ describe("BotStreamConnection finalize", () => {
     const { ws } = await openStreamWs({ botId, channelId, messageId, expiresAt });
     await appendAndFlush(ws, channelId, messageId, [{ seq: 1, delta: "same" }]);
 
-    const componentsA = [
-      {
-        component_id: "c1",
-        kind: "button",
-        style: "primary",
-        custom_id: "btn-1",
-        label: "OK",
-      },
-    ];
-    const fin1Promise = nextMessageOfType(ws, "finalized_ack");
-    ws.send(JSON.stringify(buildBotStreamFinalize({ final_seq: 1, components: componentsA })));
-    await fin1Promise;
-
-    const { ws: ws2 } = await openStreamWs({ botId, channelId, messageId, expiresAt });
-    const errPromise = nextMessageOfType(ws2, "stream_error");
-    ws2.send(
+    const errPromise = nextMessageOfType(ws, "stream_error");
+    ws.send(
       JSON.stringify(
         buildBotStreamFinalize({
           final_seq: 1,
-          components: [{ ...componentsA[0], label: "Different" }],
+          components: [
+            {
+              component_id: "00000000-0000-7000-8000-000000000a01",
+              kind: "button",
+              style: "primary",
+              custom_id: "btn-1",
+              label: "OK",
+              disabled: false,
+            },
+          ],
         }),
       ),
     );
     const err = parseBotStreamError(await errPromise);
-    expect(err.code).toBe("BOT_STREAM_CONFLICT");
+    expect(err.code).toBe("BOT_EFFECT_INVALID");
 
     browserWs.close();
     ws.close();
-    ws2.close();
   });
 
   it("rejects attachment_ids on finalize", async () => {

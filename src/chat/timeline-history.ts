@@ -29,7 +29,7 @@ function timelineTypePlaceholders(): { clause: string; types: string[] } {
   };
 }
 
-async function projectTimelineRows(opts: {
+export async function projectTimelineRows(opts: {
   sql: SyncSql;
   env: Env;
   channelId: string;

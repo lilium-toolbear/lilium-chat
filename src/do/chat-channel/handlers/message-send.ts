@@ -29,7 +29,7 @@ import {
   upsertEventChange,
   upsertMessageChange,
 } from "../../../archive/chat-channel-record";
-import { maybeEnqueueStatefulSessionInput } from "./stateful-session";
+import { enqueueStatefulInputForMessageCreated } from "./stateful-session";
 import { resolveUserSummaries } from "../../../profile/resolve";
 import type { Constructor } from "../mixin";
 import { ChatChannelCore } from "../core";
@@ -378,15 +378,12 @@ export function MessageSendMixin<T extends Constructor<ChatChannelCore>>(Base: T
       if (txResult.kind === "created") {
         await this.scheduleArchiveAlarm(now);
         const ackMessage = parseMessageMutationAckFromCached(txResult.response_json);
-        await maybeEnqueueStatefulSessionInput(asHandlerRef(this), {
+        await enqueueStatefulInputForMessageCreated(asHandlerRef(this), {
           channelId,
           messageId,
           eventId,
           occurredAt: now,
-          senderKind: "user",
-          senderUserId: userId,
-          senderBotId: null,
-          messageType: input.type,
+          messageRow: messageRowForProjection,
           messageProjection: ackMessage.message,
         });
         return ackMessage;

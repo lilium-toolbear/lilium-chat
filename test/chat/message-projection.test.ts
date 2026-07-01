@@ -61,6 +61,25 @@ describe("projectMessageForBrowser", () => {
     expect(p.attachments).toEqual([]);
   });
 
+  it("forces components empty on stream messages even if provided", () => {
+    const p = projectMessageForBrowser(
+      baseRow({ stream_state: "final", sender_kind: "bot", sender_bot_id: "bot-1", sender_user_id: null }),
+      {
+        components: [
+          {
+            component_id: "00000000-0000-7000-8000-000000000a01",
+            kind: "button",
+            style: "primary",
+            label: "Go",
+            custom_id: "go",
+            disabled: false,
+          },
+        ],
+      },
+    );
+    expect(p.components).toEqual([]);
+  });
+
   it("falls back to user-<shortid> when no summary provided", () => {
     const p = projectMessageForBrowser(baseRow());
     expect((p as any).sender.user.display_name).toBe("user-u1");

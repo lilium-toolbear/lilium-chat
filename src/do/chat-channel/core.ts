@@ -15,7 +15,8 @@ import type {
   ManagementPersistedPayload,
   ManagementPersistedPayloadByType,
 } from "../../contract/persisted";
-import { buildReplayEventsPage, type ReplayEnvelope } from "../../chat/replay-projection";
+import { buildReplayEventsPage, type ReplayEnvelope, type ReplayEventsPage } from "../../chat/replay-projection";
+import { buildMessageContextPage, type MessageContextPage } from "../../chat/message-context";
 import { buildTimelineHistoryPage, type TimelineHistoryPage } from "../../chat/timeline-history";
 import type { ChatEventPayloadByType } from "../../contract/events";
 import type {
@@ -40,6 +41,7 @@ import type {
   DissolveChannelApiResponse,
   DissolveChannelRpcInput,
   GetInviteRpcInput,
+  GetMessageContextRpcInput,
   GetMessagesRpcInput,
   GetStatefulSessionResponse,
   InteractionSubmitResponse,
@@ -90,6 +92,7 @@ import type {
 import { OUTBOX_MAX_ATTEMPTS } from "../../contract/outbox";
 import { bumpQueueRetry } from "../shared/retry-backoff";
 import { isoDueTable, runDueJobs, scheduleNextAlarm, type DueRow, type DueTable } from "../shared/scheduler";
+import { flushExpiredPendingBotAttachments } from "./handlers/pending-bot-attachment-gc";
 import { rpcErrorMessage, shouldRetryRpcError } from "../shared/rpc-errors";
 import { archiveOutboxDueTable, flushArchiveOutboxToQueue } from "../../archive/queue-flush";
 import { parseRpcCachedJson } from "../shared/do-rpc";
@@ -163,12 +166,39 @@ export class ChatChannelCore extends DurableObject<Env> {
     });
   }
 
+  async getMessageContext(userId: string, input: GetMessageContextRpcInput): Promise<MessageContextPage> {
+    return buildMessageContextPage({
+      sql: this.ctx.storage.sql,
+      env: this.env,
+      userId,
+      messageId: input.message_id,
+      beforeCount: input.before,
+      afterCount: input.after,
+    });
+  }
+
   async replayEvents(userId: string, after: string): Promise<{ events: ReplayEnvelope[] }> {
+    const page = await buildReplayEventsPage({
+      sql: this.ctx.storage.sql,
+      env: this.env,
+      userId,
+      after,
+    });
+    return {
+      events: page.events.map((frame) => ({
+        event_id: frame.event_id,
+        event_json: JSON.stringify(frame),
+      })),
+    };
+  }
+
+  async replayEventsPage(userId: string, after: string, limit: number): Promise<ReplayEventsPage> {
     return buildReplayEventsPage({
       sql: this.ctx.storage.sql,
       env: this.env,
       userId,
       after,
+      limit,
     });
   }
 
@@ -418,6 +448,7 @@ export class ChatChannelCore extends DurableObject<Env> {
         ...this.outboxDueTables(async () => Promise.resolve()),
         ...this.statefulSessionDueTables(),
         ...this.streamRegistryDueTables(),
+        ...this.pendingBotAttachmentDueTables(),
         archiveOutboxDueTable(),
       ],
       { respectExistingAlarm: true },
@@ -459,6 +490,14 @@ export class ChatChannelCore extends DurableObject<Env> {
           const streamDo = this.env.BOT_STREAM_CONNECTION.getByName(botStreamDoName(channelId, messageId));
           await streamDo.expireStream({ channel_id: channelId, message_id: messageId, bot_id: botId });
         }
+      }),
+    ];
+  }
+
+  private pendingBotAttachmentDueTables(): DueTable[] {
+    return [
+      isoDueTable("attachments", "expires_at", "status", "pending", async (rows) => {
+        await flushExpiredPendingBotAttachments(this.env, this.ctx.storage.sql, rows);
       }),
     ];
   }
@@ -768,6 +807,7 @@ export class ChatChannelCore extends DurableObject<Env> {
       }
     }),
       ...this.streamRegistryDueTables(),
+      ...this.pendingBotAttachmentDueTables(),
     ]);
     try {
       await flushArchiveOutboxToQueue(this.ctx, this.env.CHAT_ARCHIVE_QUEUE, { now: nowIso });

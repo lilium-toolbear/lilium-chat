@@ -3,10 +3,20 @@ import {
   BotEffectValidationError,
   computeEffectRequestHash,
   disableComponentsInJson,
+  parseBotEffect,
   parseNonStreamEffect,
   validateNonStreamEffectsForApply,
 } from "../../src/chat/bot-effects";
 import type { MessageRow } from "../../src/contract/persisted";
+
+const VALID_BUTTON = {
+  component_id: "00000000-0000-7000-8000-000000000a01",
+  kind: "button",
+  style: "primary",
+  label: "Go",
+  custom_id: "go",
+  disabled: false,
+};
 
 const baseRow = (overrides: Partial<MessageRow & { components_json?: string }> = {}): MessageRow & {
   components_json?: string;
@@ -32,9 +42,7 @@ const baseRow = (overrides: Partial<MessageRow & { components_json?: string }> =
   deleted_at: null,
   deleted_by: null,
   recalled_at: null,
-  components_json: JSON.stringify([
-    { component_id: "cmp-1", kind: "button", style: "primary", label: "Go", custom_id: "go", disabled: false },
-  ]),
+  components_json: JSON.stringify([VALID_BUTTON]),
   ...overrides,
 });
 
@@ -111,8 +119,145 @@ describe("bot-effects validation", () => {
   });
 
   it("marks targeted components disabled in stored json", () => {
-    const next = disableComponentsInJson(baseRow().components_json!, ["cmp-1"]);
+    const next = disableComponentsInJson(baseRow().components_json!, ["00000000-0000-7000-8000-000000000a01"]);
     const parsed = JSON.parse(next) as Array<{ component_id: string; disabled: boolean }>;
     expect(parsed[0]?.disabled).toBe(true);
+  });
+
+  it("validates send_message components per §3.8", () => {
+    expect(() =>
+      parseNonStreamEffect({
+        type: "send_message",
+        client_effect_id: "eff-components",
+        message: {
+          type: "text",
+          format: "plain",
+          text: "hi",
+          reply_to_message_id: null,
+          attachment_ids: [],
+          components: [{ ...VALID_BUTTON, kind: "slider" }],
+        },
+      }),
+    ).toThrow(BotEffectValidationError);
+  });
+
+  it("rejects start_stream with non-empty components", () => {
+    expect(() =>
+      parseBotEffect({
+        type: "start_stream",
+        client_effect_id: "eff-stream-components",
+        message: {
+          type: "text",
+          format: "plain",
+          text: "",
+          reply_to_message_id: null,
+          attachment_ids: [],
+          components: [VALID_BUTTON],
+        },
+      }),
+    ).toThrow(/must not include components/);
+  });
+
+  it("validates update_message components in validateEffectsForApply", () => {
+    expect(() =>
+      validateNonStreamEffectsForApply(
+        [
+          {
+            type: "update_message",
+            client_effect_id: "eff-update-components",
+            message_id: "msg-1",
+            message: {
+              components: [{ ...VALID_BUTTON, component_id: "not-a-uuid" }],
+            },
+          },
+        ],
+        {
+          botId: "bot-1",
+          loadMessage: () => baseRow(),
+        },
+      ),
+    ).toThrow(/UUIDv7/);
+  });
+
+  it("parses send_message type=image with attachment_ids", () => {
+    const parsed = parseNonStreamEffect({
+      type: "send_message",
+      client_effect_id: "eff-img",
+      message: {
+        type: "image",
+        format: "plain",
+        text: "",
+        reply_to_message_id: null,
+        attachment_ids: ["att-1"],
+        components: [],
+      },
+    });
+    expect(parsed.type).toBe("send_message");
+    if (parsed.type !== "send_message") return;
+    expect(parsed.message.type).toBe("image");
+    expect(parsed.message.attachment_ids).toEqual(["att-1"]);
+  });
+
+  it("rejects text send_message with attachment_ids", () => {
+    expect(() =>
+      parseNonStreamEffect({
+        type: "send_message",
+        client_effect_id: "eff-text-att",
+        message: {
+          type: "text",
+          format: "plain",
+          text: "hi",
+          reply_to_message_id: null,
+          attachment_ids: ["att-1"],
+          components: [],
+        },
+      }),
+    ).toThrow(/not allowed for text/);
+  });
+
+  it("rejects image send_message without attachment_ids", () => {
+    expect(() =>
+      parseNonStreamEffect({
+        type: "send_message",
+        client_effect_id: "eff-img-empty",
+        message: {
+          type: "image",
+          format: "plain",
+          text: "",
+          reply_to_message_id: null,
+          attachment_ids: [],
+          components: [],
+        },
+      }),
+    ).toThrow(/requires attachment_ids/);
+  });
+
+  it("parses update_message with attachment_ids only", () => {
+    const parsed = parseNonStreamEffect({
+      type: "update_message",
+      client_effect_id: "eff-upd-att",
+      message_id: "msg-1",
+      message: { attachment_ids: ["att-2"] },
+    });
+    expect(parsed.type).toBe("update_message");
+    if (parsed.type !== "update_message") return;
+    expect(parsed.message.attachment_ids).toEqual(["att-2"]);
+  });
+
+  it("rejects start_stream with attachment_ids", () => {
+    expect(() =>
+      parseBotEffect({
+        type: "start_stream",
+        client_effect_id: "eff-stream-att",
+        message: {
+          type: "text",
+          format: "plain",
+          text: "",
+          reply_to_message_id: null,
+          attachment_ids: ["att-1"],
+          components: [],
+        },
+      }),
+    ).toThrow(/not supported for start_stream/);
   });
 });

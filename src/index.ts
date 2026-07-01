@@ -8,6 +8,8 @@ import { bootstrapHandler } from "./routes/bootstrap";
 import { wsUpgradeHandler } from "./routes/ws";
 import { listChannelsHandler, channelDetailHandler } from "./routes/channels";
 import { listMessagesHandler } from "./routes/messages";
+import { messageContextHandler } from "./routes/message-context";
+import { channelEventsHandler } from "./routes/channel-events";
 import { eventsHandler } from "./routes/events";
 import { botWsUpgradeHandler } from "./routes/bot-ws";
 import { botStreamWsUpgradeHandler } from "./routes/bot-stream-ws";
@@ -32,6 +34,7 @@ import {
   deleteStickerHandler,
 } from "./routes/channel-mutations";
 import { putBotCommandsHandler } from "./routes/bot";
+import { botPresignUploadHandler, botFinalizeUploadHandler } from "./routes/bot-uploads";
 import {
   createBotHandler,
   createBotTokenHandler,
@@ -107,6 +110,8 @@ app.get("/api/chat/channels/:channel_id/members/:user_id", (c) => getMemberHandl
 app.patch("/api/chat/channels/:channel_id/members/:user_id", (c) => updateMemberRoleHandler(c));
 app.delete("/api/chat/channels/:channel_id/members/:user_id", (c) => removeMemberHandler(c));
 app.get("/api/chat/channels/:channel_id/messages", (c) => listMessagesHandler(c));
+app.get("/api/chat/channels/:channel_id/messages/:message_id/context", (c) => messageContextHandler(c));
+app.get("/api/chat/channels/:channel_id/events", (c) => channelEventsHandler(c));
 app.get("/api/chat/channels/:channel_id", (c) => channelDetailHandler(c));
 app.post("/api/chat/uploads/images/presign", (c) => presignUploadHandler(c));
 app.post("/api/chat/uploads/images/:attachment_id/finalize", (c) => finalizeUploadHandler(c));
@@ -119,6 +124,8 @@ app.get("/api/chat/events", (c) => eventsHandler(c));
 app.get("/api/chat/bot/ws", (c) => botWsUpgradeHandler(c));
 app.get("/api/chat/bot/channels/:channel_id/streams/:message_id/ws", (c) => botStreamWsUpgradeHandler(c));
 app.put("/api/chat/bot/commands", (c) => putBotCommandsHandler(c));
+app.post("/api/chat/bot/channels/:channel_id/uploads/images/presign", (c) => botPresignUploadHandler(c));
+app.post("/api/chat/bot/channels/:channel_id/uploads/images/:attachment_id/finalize", (c) => botFinalizeUploadHandler(c));
 app.post("/api/chat/bots", (c) => createBotHandler(c));
 app.get("/api/chat/bots", (c) => listBotsHandler(c));
 app.get("/api/chat/bots/:bot_id", (c) => getBotHandler(c));
