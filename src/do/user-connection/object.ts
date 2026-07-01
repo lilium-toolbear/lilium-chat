@@ -554,13 +554,10 @@ export class UserConnection extends DurableObject<Env> {
     const ts = nowIso();
     const expiredSessions = this.ctx.storage.sql
       .exec(
-        `SELECT DISTINCT live_sessions.session_id
-         FROM live_sessions
-         JOIN live_channel_leases
-           ON live_channel_leases.session_id = live_sessions.session_id
-         WHERE live_sessions.status='live'
-           AND live_channel_leases.status='active'
-           AND live_channel_leases.expires_at <= ?`,
+        `SELECT DISTINCT session_id
+         FROM live_channel_leases
+         WHERE status='active'
+           AND expires_at <= ?`,
         ts,
       )
       .toArray() as Array<{ session_id: string }>;
